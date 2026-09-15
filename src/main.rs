@@ -1105,10 +1105,17 @@ fn wire_sentence_actions(
         }
         ui.set_selected(i);
         ui.set_busy(true);
-        let _ = tx3.send(Cmd::Redo {
-            revision: state3.project_revision.get(),
-            index: idx,
-        });
+        if tx3
+            .send(Cmd::Redo {
+                revision: state3.project_revision.get(),
+                index: idx,
+            })
+            .is_err()
+        {
+            ui.set_busy(false);
+            ui.set_status_text("工作线程不可用：重录未发出，请重启应用".into());
+            return;
+        }
         ui.set_status_text(format!("单句重录中：第 {} 句（换 seed 重跑）", i + 1).into());
     });
 
@@ -1190,13 +1197,21 @@ fn wire_run(
         state1.project_ready.set(false);
         let stem = file_stem(&ui.get_project_name());
         *state1.project_dir.borrow_mut() = Some(project_dir(&stem));
-        let _ = tx.send(Cmd::Run {
-            revision: state1.project_revision.get(),
-            script: ui.get_script_text().to_string(),
-            model: model_name.clone(),
-            voice_ref,
-            project_name: stem,
-        });
+        if tx
+            .send(Cmd::Run {
+                revision: state1.project_revision.get(),
+                script: ui.get_script_text().to_string(),
+                model: model_name.clone(),
+                voice_ref,
+                project_name: stem,
+            })
+            .is_err()
+        {
+            ui.set_running(false);
+            state1.project_ready.set(false);
+            ui.set_status_text("工作线程不可用：合成未发出，请重启应用".into());
+            return;
+        }
         ui.set_status_text(
             if resume {
                 format!(
@@ -1265,9 +1280,16 @@ fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
             return;
         }
         ui.set_busy(true);
-        let _ = tx.send(Cmd::Assemble {
-            revision: state.project_revision.get(),
-        });
+        if tx
+            .send(Cmd::Assemble {
+                revision: state.project_revision.get(),
+            })
+            .is_err()
+        {
+            ui.set_busy(false);
+            ui.set_status_text("工作线程不可用：导出未发出，请重启应用".into());
+            return;
+        }
         ui.set_status_text("拼装成品中（完成后按导出开关复制）…".into());
     });
 }

@@ -269,7 +269,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 PixelTextInput {
                     text <=> root.voice-ref-path;
                     placeholder: "参考音频路径（可选，克隆用）";
-                    enabled: !root.running;
+                    enabled: !root.running && !root.busy;
                     edited => { root.voice-ref-changed(); }
                 }
                 Text {
