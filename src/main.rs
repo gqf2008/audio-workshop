@@ -1,144 +1,467 @@
-//! 音频作坊 · 配音工作台（M1 桌面壳原型）
+//! 音频作坊 · 配音工作台（M1 桌面壳——真实链路版）
 //!
-//! 定位：把界面跑起来、把关键交互接上线。**不含真实合成**——
-//! 切句、时长、进度、导出全部是桩数据，真实链路在 M0 的
-//! `tools/audio_config.py` + `audiocpp_server`（见 CHARTER 第 6/9 节）。
+//! 链路：UI（本文件）↔ 工作线程（合成/拼装）↔ audiocpp_server
+//! （aw-core 的 `Client`，POST /v1/tasks/run）。核心逻辑全在 aw-core
+//! （切句/文本兜底/逐句合成/拼装），与 Python tools/ 行为由 parity 夹具固定；
+//! 本文件只做：界面状态、线程间消息、校听播放。
 //!
-//! 接线关系：
-//!   - `ui/app.slint`           主窗口：标题栏（含抽屉开关）/ 场景导航 / 主题切换 / 状态栏
-//!   - `ui/dub_workbench.slint` 配音工作台：首屏「稿件 + 句子列表 + 时间轴细条」，
-//!     加右侧抽屉「工程 / 音色 / 任务 / 导出」
-//!   - `ui/model.slint`         数据模型（Sentence / Voice），字段对齐配置层产物
-//!
-//! 桩数据的集中点就在本文件底部：`SAMPLE_SCRIPT`、`VOICES`，
-//! 以及 `build_rows` 里的时长估算（中文口播按 0.18 秒/字，约 5.5 字/秒）。
+//! 落盘布局（`~/Documents/音频作坊/`）：
+//!   projects/<工程名>/project.json      工程（逐句落盘 → 断点续作）
+//!   projects/<工程名>/sentences/NNN.wav  逐句音频
+//!   projects/<工程名>/out/final.wav|srt 成品
+//!   <工程名>.wav / <工程名>.srt          导出（复制自 out/）
 
-use std::cell::Cell;
+mod player;
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+use aw_core::{Client, Project, DEFAULT_PUNCTUATION};
+
 slint::include_modules!();
 
-// 把生成的窗口类型适配到组件库的接线契约（固有方法优先于 trait 方法）
 slint_pixel::impl_title_bar_ui!(MainWindow);
 slint_pixel::impl_resize_ui!(MainWindow);
 
-/// 主循环节拍：40ms。
+/// 主循环节拍：40ms（消息泵 + 播放头推进）。
 const TICK_MS: u64 = 40;
-/// 每个节拍推进的合成进度（≈ 10 秒跑完，纯演示用）。
-const SYNTH_PER_TICK: f32 = 0.004;
-/// 中文口播时长估算：秒/字。
-const SECS_PER_CHAR: f32 = 0.18;
-/// 「单句重录」要等几个节拍才回填结果（≈ 0.5 秒）。
-const REDO_TICKS: i32 = 12;
-
+/// 与 Python `tools/audio_dub.py` 同款链路参数。
+const GAP_MS: u64 = 250;
+const MAX_CHARS: usize = 80;
+const BASE_SEED: u64 = 831001;
+/// 工程目录与导出目录的根目录名（`~/Documents/音频作坊/`）。
+const WORKSHOP_DIR: &str = "音频作坊";
 const DEFAULT_PROJECT: &str = "示例工程 · 频道口播";
+/// 中文口播时长估算：秒/字（未合成句的展示用估值；合成后由真实时长覆盖）。
+const SECS_PER_CHAR: f32 = 0.18;
 
-/// 启动提示：告诉第一次打开的人「合成 / 音色 / 导出」在哪。
-const READY_NOTE: &str =
-    "就绪：示例稿已切句（合成走桩数据）· 合成 / 音色 / 导出在标题栏右上角的抽屉里";
+// ── 工作线程消息 ──
 
-/// 示例稿（桩）：换真实场景时从剪贴板 / 文件来。
-const SAMPLE_SCRIPT: &str = "大家好，欢迎回到音频作坊。今天聊三件事。\
-第一，声音是你自己的，素材不出机器，断网也能干活。\
-第二，不按字收费，想生成多少就生成多少。\
-第三，配音先行，BGM 和歌曲排在后面，成熟一个上一个。";
+enum Cmd {
+    /// 开始/继续合成。script/model/voice_ref/project_name 取自界面当前值。
+    Run {
+        script: String,
+        model: String,
+        voice_ref: Option<String>,
+        project_name: String,
+    },
+    /// 单句重录（换 seed 重合成该句）
+    Redo { index: usize },
+    /// 拼装成品 + SRT
+    Assemble,
+}
 
-/// 音色清单（桩）。真实来源是 config/models.schema.yaml：
-/// 许可一栏对应 `product_excluded`（红线见 CHARTER 第 5 节：只做下载器，不打包权重）。
-const VOICES: [(&str, &str, &str, &str); 4] = [
-    (
-        "晓晨 · 本地参考",
-        "audio8-tts 0.6B · Metal",
-        "中文男声，语速稳、断句规矩。",
-        "仅自用",
-    ),
-    (
-        "林夏 · 本地参考",
-        "audio8-tts 0.6B · Metal",
-        "中文女声，偏软，适合知识类。",
-        "仅自用",
-    ),
-    (
-        "阿哲 · 参考音频",
-        "index-tts2 · voice_ref",
-        "需 10 秒参考音频，更贴原声。",
-        "仅自用",
-    ),
-    (
-        "旁白 · 通用",
-        "audio8-tts 0.6B · Metal",
-        "中性旁白，纪录片式叙述。",
-        "可商用",
-    ),
-];
+enum Msg {
+    /// 状态栏一句话
+    Note(String),
+    /// 句子状态推进（running / done / error）
+    Sentence {
+        index: usize,
+        status: String,
+        duration: Option<f64>,
+    },
+    /// 一轮合成结束：失败句数、是否被停止
+    RunDone { failed: usize, stopped: bool },
+    /// 拼装完成（路径给导出用）
+    Assembled {
+        wav: PathBuf,
+        srt: PathBuf,
+        duration: f64,
+        done: usize,
+        skipped: usize,
+    },
+    /// 工作线程无法继续的错误
+    Fatal(String),
+}
 
-/// 导航到非配音场景时的提示（配音先行，其余占位）。
-const SCENE_NOTES: [&str; 4] = [
-    "配音工作台",
-    "BGM 场景：M2 接入（与配音同框，自动 ducking）",
-    "歌曲场景：M4 接入（yue2 / ace-step，降级为彩蛋）",
-    "素材库：M4 接入（工程版本 / 音色库 / 发音词典库）",
-];
+// ===========================================================================
+// 服务发现：server.json → 音色清单 + 服务地址
+// ===========================================================================
 
-/// 跨回调共享的桩状态（用 Cell 免去 RefCell 借用冲突）。
-struct Stub {
-    /// 正在「单句重录」的行号（-1 = 没有）
-    redo_row: Cell<i32>,
-    /// 距回填结果还剩几个节拍
-    redo_left: Cell<i32>,
+#[derive(serde::Deserialize)]
+struct ServerConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    models: Vec<ServerModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct ServerModel {
+    id: String,
+    #[serde(default)]
+    task: String,
+    #[serde(default)]
+    family: String,
+    #[serde(default)]
+    path: String,
+}
+
+/// 读取 server.json：音色 = task=="tts" 的模型；地址取 AW_SERVER，否则 host:port。
+/// 文件缺失/解析失败返回空清单 + 原因说明（不 panic：服务没配时界面也可打开）。
+fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
+    let cfg_path = std::env::var("AW_SERVER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".local/opt/audio.cpp/server.json")
+        });
+    let raw = std::fs::read_to_string(&cfg_path).ok();
+    let base = std::env::var("AW_SERVER").ok().or_else(|| {
+        raw.as_deref().and_then(|r| {
+            let cfg: ServerConfig = serde_json::from_str(r).ok()?;
+            Some(format!(
+                "http://{}:{}",
+                cfg.host.unwrap_or_else(|| "127.0.0.1".into()),
+                cfg.port.unwrap_or(8080)
+            ))
+        })
+    });
+    let Some(raw) = raw else {
+        return (Vec::new(), base, format!("没找到 {}", cfg_path.display()));
+    };
+    let cfg: ServerConfig = match serde_json::from_str(&raw) {
+        Ok(c) => c,
+        Err(e) => return (Vec::new(), base, format!("server.json 解析失败: {e}")),
+    };
+    let voices = cfg
+        .models
+        .iter()
+        .filter(|m| m.task == "tts")
+        .map(|m| Voice {
+            name: m.id.clone().into(),
+            engine: format!("{} · 本地", m.family).into(),
+            note: short_path(&m.path).into(),
+            license: "仅自用".into(),
+        })
+        .collect();
+    (voices, base, String::new())
+}
+
+fn short_path(p: &str) -> String {
+    Path::new(p)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string())
+}
+
+// ===========================================================================
+// 工作线程：持有 Project，顺序处理命令（合成是串行关键路径，无需并行）
+// ===========================================================================
+
+struct WorkerCtx {
+    rx: Receiver<Cmd>,
+    tx: Sender<Msg>,
+    stop: Arc<AtomicBool>,
+}
+
+fn worker_loop(ctx: WorkerCtx) {
+    // 当前工程：dir + project。Assemble/Redo 复用 Run 留下的那份。
+    let mut current: Option<(PathBuf, Project)> = None;
+    while let Ok(cmd) = ctx.rx.recv() {
+        match cmd {
+            Cmd::Run {
+                script,
+                model,
+                voice_ref,
+                project_name,
+            } => {
+                let dir = project_dir(&file_stem(&project_name));
+                let mut project = match load_resumable(&dir, &script, &model, voice_ref) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = ctx.tx.send(Msg::Fatal(e));
+                        continue;
+                    }
+                };
+                let client = match make_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ctx.tx.send(Msg::Fatal(e));
+                        continue;
+                    }
+                };
+                let tx = ctx.tx.clone();
+                let started = RefCell::new(std::collections::HashSet::new());
+                let failed = project
+                    .synthesize_stoppable(
+                        &client,
+                        &dir,
+                        None,
+                        None,
+                        Some(&ctx.stop),
+                        |idx, note| {
+                            report_progress(&tx, &mut started.borrow_mut(), idx, note);
+                        },
+                    )
+                    .unwrap_or(usize::MAX);
+                let stopped = ctx.stop.load(Ordering::Relaxed);
+                current = Some((dir, project));
+                let _ = ctx.tx.send(Msg::RunDone { failed, stopped });
+            }
+            Cmd::Redo { index } => {
+                let Some((dir, project)) = current.as_mut() else {
+                    let _ = ctx.tx.send(Msg::Note("先跑一次合成".into()));
+                    continue;
+                };
+                let client = match make_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ctx.tx.send(Msg::Fatal(e));
+                        continue;
+                    }
+                };
+                let tx = ctx.tx.clone();
+                let started = RefCell::new(std::collections::HashSet::new());
+                match project.redo(
+                    &client,
+                    dir,
+                    index,
+                    None,
+                    |t| aw_core::normalize(t, &Default::default()),
+                    None,
+                    |idx, note| {
+                        report_progress(&tx, &mut started.borrow_mut(), idx, note);
+                    },
+                ) {
+                    Ok(n) => {
+                        let _ = tx.send(Msg::Note(if n > 0 {
+                            format!("第 {} 句重录失败（见句子状态，可再试）", index + 1)
+                        } else {
+                            format!("第 {} 句重录完成", index + 1)
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Note(format!("重录失败: {e}")));
+                    }
+                }
+            }
+            Cmd::Assemble => {
+                let Some((dir, project)) = current.as_mut() else {
+                    let _ = ctx.tx.send(Msg::Note("先跑一次合成".into()));
+                    continue;
+                };
+                match project.assemble(dir) {
+                    Ok(a) => {
+                        let _ = ctx.tx.send(Msg::Assembled {
+                            wav: a.wav,
+                            srt: a.srt,
+                            duration: a.duration,
+                            done: a.done,
+                            skipped: a.skipped,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ctx.tx.send(Msg::Note(format!("拼装中止: {e}")));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// progress 回调 → Msg::Sentence。用 started 集区分「句首回调（note=spoken）」
+/// 与「结果回调（done/error）」——不能靠文本前缀判断：spoken 本身可能以
+/// "done"/"error" 开头。
+fn report_progress(
+    tx: &Sender<Msg>,
+    started: &mut std::collections::HashSet<usize>,
+    idx: usize,
+    note: &str,
+) {
+    if idx == usize::MAX || note == "stopped" {
+        return; // 控制消息，不映射句子状态
+    }
+    if !started.insert(idx) {
+        let (status, duration) = if let Some(rest) = note.strip_prefix("done ") {
+            let d = rest.trim_end_matches('s').parse::<f64>().ok();
+            ("done", d)
+        } else if note.starts_with("error") {
+            ("error", None)
+        } else {
+            ("running", None)
+        };
+        let _ = tx.send(Msg::Sentence {
+            index: idx,
+            status: status.into(),
+            duration,
+        });
+    } else {
+        let _ = tx.send(Msg::Sentence {
+            index: idx,
+            status: "running".into(),
+            duration: None,
+        });
+    }
+}
+
+fn make_client() -> Result<Client, String> {
+    let (_, base, note) = discover_engine();
+    let base = base.ok_or_else(|| format!("没有服务地址。{note}"))?;
+    Ok(Client::new(base))
+}
+
+/// 工程目录：~/Documents/音频作坊/projects/<stem>/
+fn projects_root() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Documents")
+        .join(WORKSHOP_DIR)
+        .join("projects")
+}
+
+fn project_dir(stem: &str) -> PathBuf {
+    projects_root().join(stem)
+}
+
+/// 恢复或新建工程：project.json 存在、模型一致、切句结果一致 → 续作；否则新建。
+fn load_resumable(
+    dir: &Path,
+    script: &str,
+    model: &str,
+    voice_ref: Option<String>,
+) -> Result<Project, String> {
+    if let Ok(saved) = Project::load(dir) {
+        let same_script =
+            saved
+                .sentences
+                .iter()
+                .map(|s| s.text.as_str())
+                .eq(
+                    aw_core::split_sentences(script, DEFAULT_PUNCTUATION, MAX_CHARS)
+                        .iter()
+                        .map(|s| s.as_str()),
+                );
+        if saved.model == model && same_script {
+            return Ok(saved);
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("建工程目录失败: {e}"))?;
+    let project = Project::new(
+        script,
+        model,
+        GAP_MS,
+        BASE_SEED,
+        voice_ref,
+        DEFAULT_PUNCTUATION,
+        MAX_CHARS,
+        |t| aw_core::normalize(t, &Default::default()),
+    );
+    project
+        .save(dir)
+        .map_err(|e| format!("工程落盘失败: {e}"))?;
+    Ok(project)
+}
+
+// ===========================================================================
+// 界面共享状态（UI 线程单线程 Rc）
+// ===========================================================================
+
+struct AssembledInfo {
+    wav: PathBuf,
+    duration: f64,
+}
+
+struct UiState {
+    /// 最近一次拼装结果（导出复制 / 全篇试听用）
+    assembled: RefCell<Option<AssembledInfo>>,
+    /// 当前工程目录（试听找句子 wav、恢复进度用）
+    project_dir: RefCell<Option<PathBuf>>,
+    /// 试听播放的总时长（秒）：播放头 = position / total
+    playing_total: std::cell::Cell<f32>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
 
     let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::default());
-    let stub = Rc::new(Stub {
-        redo_row: Cell::new(-1),
-        redo_left: Cell::new(0),
-    });
 
-    // ── 初始数据 ──
-    let voices = voice_rows();
+    // ── 引擎发现 → 音色清单 ──
+    let (voices, base, discover_note) = discover_engine();
+    if !discover_note.is_empty() {
+        ui.set_status_text(format!("引擎发现: {discover_note}").into());
+    }
     let names: Vec<SharedString> = voices.iter().map(|v| v.name.clone()).collect();
     ui.set_voice_names(ModelRc::from(Rc::new(VecModel::from(names))));
     ui.set_voices(ModelRc::from(Rc::new(VecModel::from(voices))));
+    // 默认音色：优先 audio8-tts
+    let default_voice = (0..ui.get_voice_names().row_count())
+        .find(|&i| {
+            ui.get_voice_names()
+                .row_data(i)
+                .map(|n| n == "audio8-tts")
+                .unwrap_or(false)
+        })
+        .unwrap_or(0) as i32;
+    ui.set_voice_index(default_voice);
+
     ui.set_export_dir(export_dir().into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
-    // 输入框与句子列表同源：启动就填示例稿，否则会出现「框里空的、列表里有 5 句」
     ui.set_script_text(SAMPLE_SCRIPT.into());
     rebuild(&ui, &rows, SAMPLE_SCRIPT);
-    ui.set_status_text(READY_NOTE.into());
+    ui.set_status_text(ready_note(base.as_deref()).into());
 
-    // 产截图 / 演示用初始态（`AW_UI_STATE=selected|drawer|dark`；默认不生效）
-    apply_shot_state(&ui, &rows);
+    // ── 播放器（音频输出不可用时试听给出明确报错，不拖垮界面）──
+    let player = Rc::new(player::Player::open().unwrap_or_else(|e| {
+        eprintln!("音频输出不可用（试听将报错）: {e}");
+        player::Player::disabled()
+    }));
 
-    // ── 窗口控制：拖拽 / 最小化 / 最大化 / 关闭 / 四边缩放 ──
+    // ── 线程通道 + 停止位（UI 与工作线程共享同一个 stop）──
+    let (cmd_tx, cmd_rx) = channel::<Cmd>();
+    let (msg_tx, msg_rx) = channel::<Msg>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let state = Rc::new(UiState {
+        assembled: RefCell::new(None),
+        project_dir: RefCell::new(None),
+        playing_total: std::cell::Cell::new(1.0),
+    });
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop,
+            })
+        });
+    }
+
+    // 启动时恢复默认工程的进度（断点续作可见）
+    restore_project(&ui, &rows, &state);
+
+    // ── 窗口控制 ──
     slint_pixel::install_title_bar_controls(&ui);
     slint_pixel::install_window_resize(&ui);
 
     wire_theme(&ui);
     wire_script(&ui, &rows);
-    wire_sentence_actions(&ui, &rows, &stub);
-    wire_run(&ui, &rows);
-    wire_export(&ui);
+    wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
+    wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
+    wire_export(&ui, &cmd_tx);
+    wire_keys(&ui, &rows, &player, &state);
 
-    // ── 主循环节拍：合成进度 / 单句重录回填 / 试听播放头 ──
-    // timer 是 main 的局部变量，存活到 ui.run() 返回之后，无需泄漏。
+    // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
+    apply_shot_state(&ui);
+
+    // ── 主循环 ──
     let timer = Timer::default();
     {
         let weak = ui.as_weak();
         let rows = rows.clone();
-        let stub = stub.clone();
+        let msg_rx = Rc::new(RefCell::new(msg_rx));
         timer.start(
             TimerMode::Repeated,
             Duration::from_millis(TICK_MS),
             move || {
                 if let Some(ui) = weak.upgrade() {
-                    tick(&ui, &rows, &stub);
+                    tick(&ui, &rows, &msg_rx, &player, &state);
                 }
             },
         );
@@ -147,29 +470,20 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.run()
 }
 
-/// 把界面直接摆到某个「跑一遍流程就能走到」的状态，供产截图 / 演示评审用。
-///
-/// **只在 debug 构建里存在**（`#[cfg(debug_assertions)]`）：release 版本整个函数
-/// 被编译掉，不存在任何「用环境变量伪造已完成 / 可导出」的旁路，
-/// 验证：`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0。
-///
-/// 取值（不设则完全是默认态）：
-///   - `selected` 选中第 2 句（展开行里能看到时长 / 起始 / 试听 / 重录）
-///   - `drawer`   展开右侧抽屉（工程 / 视图 / 音色 / 任务 / 导出）
-///   - `dark`     切到暗色主题
+fn ready_note(base: Option<&str>) -> String {
+    match base {
+        Some(b) => format!("就绪：示例稿已切句 · 服务 {b} · 合成 / 音色 / 导出在右上角抽屉"),
+        None => "就绪：未发现服务（server.json），合成会失败——先启动 audiocpp_server".into(),
+    }
+}
+
+/// 产截图 / 演示用初始态（`AW_UI_STATE=selected|drawer|dark`；仅 debug 构建存在，
+/// release 整个函数被编译掉，验证：`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0）
 #[cfg(debug_assertions)]
-fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
+fn apply_shot_state(ui: &MainWindow) {
     let Ok(state) = std::env::var("AW_UI_STATE") else {
         return;
     };
-    // 前两句已合成、第三句合成中：状态点的三种形态在图上都能看到
-    for i in 0..rows.row_count().min(3) {
-        set_status(rows, i, if i < 2 { "已合成" } else { "合成中" });
-    }
-    ui.set_done_count(2);
-    ui.set_progress(0.5);
-    ui.set_has_result(true);
-    ui.set_playhead(0.35);
     match state.as_str() {
         "selected" => {
             ui.set_selected(1);
@@ -187,9 +501,46 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
     }
 }
 
-/// release 构建：没有演示旁路，界面只按真实运行状态走。
 #[cfg(not(debug_assertions))]
-fn apply_shot_state(_ui: &MainWindow, _rows: &Rc<VecModel<Sentence>>) {}
+fn apply_shot_state(_ui: &MainWindow) {}
+
+/// 启动时恢复工程：project.json 在 → 句子列表/状态/时长从磁盘回灌界面。
+fn restore_project(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
+    let stem = file_stem(&ui.get_project_name());
+    let dir = project_dir(&stem);
+    let Ok(project) = Project::load(&dir) else {
+        return;
+    };
+    *state.project_dir.borrow_mut() = Some(dir);
+    // 输入框与列表同源：把保存的句子文本回填到输入框
+    let script: String = project.sentences.iter().map(|s| s.text.as_str()).collect();
+    ui.set_script_text(script.clone().into());
+    rebuild(ui, rows, &script);
+    // 回填状态与真实时长
+    let mut done: i32 = 0;
+    for (i, s) in project.sentences.iter().enumerate() {
+        if s.status == "done" {
+            done += 1;
+            set_status(rows, i, "done");
+            if let Some(d) = s.duration {
+                set_row_duration(rows, i, d as f32);
+            }
+        }
+    }
+    recompute_total(ui, rows);
+    ui.set_done_count(done);
+    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
+    if done > 0 {
+        ui.set_has_result(true);
+        ui.set_status_text(
+            format!(
+                "已恢复上次进度：{done}/{} 句已合成（断点续作）",
+                rows.row_count()
+            )
+            .into(),
+        );
+    }
+}
 
 // ===========================================================================
 // 回调接线
@@ -230,7 +581,7 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         rebuild(&ui, &rows1, &text);
         ui.set_status_text(
             format!(
-                "稿件已更新：{} 字 / {} 句 · 已合成状态已重置（M0 不做逐句复用）",
+                "稿件已更新：{} 字 / {} 句 · 状态已重置（重跑合成时自动续作未变句）",
                 ui.get_char_count(),
                 rows1.row_count()
             )
@@ -268,7 +619,13 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
     });
 }
 
-fn wire_sentence_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &Rc<Stub>) {
+fn wire_sentence_actions(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    cmd_tx: &Sender<Cmd>,
+    player: &Rc<player::Player>,
+    state: &Rc<UiState>,
+) {
     let weak = ui.as_weak();
     let model1 = rows.clone();
     ui.on_select_sentence(move |i| {
@@ -292,6 +649,8 @@ fn wire_sentence_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &
 
     let weak = ui.as_weak();
     let model2 = rows.clone();
+    let player2 = player.clone();
+    let state2 = state.clone();
     ui.on_preview_one(move |i| {
         if i < 0 {
             return;
@@ -300,16 +659,13 @@ fn wire_sentence_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &
         let Some(row) = model2.row_data(i as usize) else {
             return;
         };
-        let total = ui.get_total_duration().max(0.001);
         ui.set_selected(i);
-        ui.set_playhead((row.start / total).clamp(0.0, 1.0));
-        ui.set_playing(true);
-        ui.set_status_text(format!("试听第 {} 句：{}", i + 1, row.text).into());
+        play_sentence(&ui, &model2, &player2, &state2, i as usize, row.duration);
     });
 
     let weak = ui.as_weak();
     let model3 = rows.clone();
-    let stub1 = stub.clone();
+    let tx3 = cmd_tx.clone();
     ui.on_redo_one(move |i| {
         if i < 0 {
             return;
@@ -319,23 +675,52 @@ fn wire_sentence_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &
         if model3.row_data(idx).is_none() {
             return;
         }
+        if ui.get_running() {
+            ui.set_status_text("合成进行中：等这轮跑完再重录单句".into());
+            return;
+        }
         ui.set_selected(i);
-        set_status(&model3, idx, "合成中");
-        stub1.redo_row.set(i);
-        stub1.redo_left.set(REDO_TICKS);
-        ui.set_status_text(format!("单句重录中：第 {} 句（只重跑这一句）", i + 1).into());
+        set_status(&model3, idx, "running");
+        let _ = tx3.send(Cmd::Redo { index: idx });
+        ui.set_status_text(format!("单句重录中：第 {} 句（换 seed 重跑）", i + 1).into());
     });
 
+    // 时间轴点击 = 从那句话开始听（M1 不做拖动定位，逐句跳转即定位）
     let weak = ui.as_weak();
+    let model4 = rows.clone();
+    let player4 = player.clone();
+    let state4 = state.clone();
     ui.on_seek(move |p| {
         let Some(ui) = weak.upgrade() else { return };
-        ui.set_playhead(p.clamp(0.0, 1.0));
+        let total = ui.get_total_duration().max(0.001);
+        let at = p.clamp(0.0, 1.0) * total;
+        let hit = (0..model4.row_count()).find(|&i| {
+            let r = model4.row_data(i).unwrap();
+            r.start <= at && at < r.start + r.duration.max(0.01)
+        });
+        if let Some(i) = hit {
+            ui.set_selected(i as i32);
+            let r = model4.row_data(i).unwrap();
+            play_sentence(&ui, &model4, &player4, &state4, i, r.duration);
+        }
     });
 }
 
-fn wire_run(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
+#[allow(clippy::too_many_arguments)]
+fn wire_run(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    cmd_tx: &Sender<Cmd>,
+    player: &Rc<player::Player>,
+    stop: &Arc<AtomicBool>,
+    state: &Rc<UiState>,
+) {
     let weak = ui.as_weak();
     let model4 = rows.clone();
+    let tx = cmd_tx.clone();
+    let stop1 = Arc::clone(stop);
+    let player1 = player.clone();
+    let state1 = state.clone();
     ui.on_start_run(move || {
         let Some(ui) = weak.upgrade() else { return };
         let n = model4.row_count();
@@ -343,147 +728,427 @@ fn wire_run(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
             ui.set_status_text("稿件为空：先粘稿子或点「载入示例稿」".into());
             return;
         }
-        for i in 0..n {
-            set_status(&model4, i, "待合成");
+        let model_name = selected_model(&ui);
+        if model_name.is_empty() {
+            ui.set_status_text("没有可用音色：检查 server.json / audiocpp_server".into());
+            return;
         }
-        ui.set_progress(0.0);
-        ui.set_playhead(0.0);
-        ui.set_playing(false);
-        ui.set_done_count(0);
-        ui.set_has_result(false);
+        // 续作语义：已合成句保持原样（worker 跳过 done 句），其余重跑
+        let resume = ui.get_done_count() > 0;
+        if !resume {
+            for i in 0..n {
+                set_status(&model4, i, "待合成");
+            }
+        }
+        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        stop1.store(false, Ordering::Relaxed);
         ui.set_running(true);
-        ui.set_status_text("合成中 · audio8-tts 0.6B · Metal（桩）".into());
+        ui.set_has_result(false);
+        ui.set_progress(ui.get_done_count() as f32 / n.max(1) as f32);
+        ui.set_playing(false);
+        player1.stop();
+        state1.assembled.borrow_mut().take();
+        let stem = file_stem(&ui.get_project_name());
+        *state1.project_dir.borrow_mut() = Some(project_dir(&stem));
+        let _ = tx.send(Cmd::Run {
+            script: ui.get_script_text().to_string(),
+            model: model_name.clone(),
+            voice_ref,
+            project_name: stem,
+        });
+        ui.set_status_text(
+            if resume {
+                format!(
+                    "继续合成 · {model_name} · 已完成的 {} 句自动跳过",
+                    ui.get_done_count()
+                )
+            } else {
+                format!("合成中 · {model_name}")
+            }
+            .into(),
+        );
     });
 
     let weak = ui.as_weak();
+    let stop2 = Arc::clone(stop);
     ui.on_stop_run(move || {
         let Some(ui) = weak.upgrade() else { return };
-        ui.set_running(false);
-        // 停止合成是一条「停下来」的指令：正在跑的试听也一起停
-        ui.set_playing(false);
-        ui.set_status_text("已停止合成".into());
+        if !ui.get_running() {
+            return;
+        }
+        stop2.store(true, Ordering::Relaxed);
+        ui.set_status_text("正在停止：当前句合成完就停".into());
     });
 
-    // 停止试听：首屏主按钮在 playing 时显示「停止试听」，走这个出口
     let weak = ui.as_weak();
+    let player3 = player.clone();
     ui.on_stop_preview(move || {
         let Some(ui) = weak.upgrade() else { return };
+        player3.stop();
         ui.set_playing(false);
         ui.set_status_text("已停止试听".into());
     });
 
     let weak = ui.as_weak();
+    let model5 = rows.clone();
+    let player5 = player.clone();
+    let state5 = state.clone();
     ui.on_preview_all(move || {
         let Some(ui) = weak.upgrade() else { return };
-        ui.set_playhead(0.0);
-        ui.set_playing(true);
-        ui.set_status_text("试听全篇（桩音频）".into());
+        play_all(&ui, &model5, &player5, &state5);
     });
 
     let weak = ui.as_weak();
+    let player6 = player.clone();
     ui.on_speed_changed(move |v| {
         let Some(ui) = weak.upgrade() else { return };
         let label = format!("{v:.2}x");
         ui.set_speed_label(label.clone().into());
-        ui.set_status_text(format!("语速 {label}（真实链路写回模型参数）").into());
+        player6.set_speed(v);
+        ui.set_status_text(format!("试听倍速 {label}（回放即时生效，不动合成参数）").into());
     });
 }
 
-fn wire_export(ui: &MainWindow) {
+fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>) {
     let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
     ui.on_export_wav(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let stem = file_stem(&ui.get_project_name());
-        let path = format!("{}/{}.wav", ui.get_export_dir(), stem);
-        ui.set_status_text(format!("已导出整段 WAV：{path}（桩：未真正落盘）").into());
-        toast(&ui, &format!("WAV 已导出：{stem}.wav"));
+        let _ = tx.send(Cmd::Assemble);
+        ui.set_status_text("拼装成品中（完成后按导出开关复制）…".into());
     });
-
     let weak = ui.as_weak();
+    let tx2 = cmd_tx.clone();
     ui.on_export_srt(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let stem = file_stem(&ui.get_project_name());
-        let path = format!("{}/{}.srt", ui.get_export_dir(), stem);
-        ui.set_status_text(format!("已导出逐句 SRT：{path}（桩：未真正落盘）").into());
-        toast(&ui, &format!("SRT 已导出：{stem}.srt"));
+        let _ = tx2.send(Cmd::Assemble);
+        ui.set_status_text("拼装成品中（完成后按导出开关复制）…".into());
+    });
+}
+
+fn wire_keys(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    player: &Rc<player::Player>,
+    state: &Rc<UiState>,
+) {
+    let weak = ui.as_weak();
+    let model = rows.clone();
+    ui.on_key_prev(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let cur = ui.get_selected();
+        let next = if cur < 0 { 0 } else { (cur - 1).max(0) };
+        if (next as usize) < model.row_count() {
+            ui.set_selected(next);
+            ui.set_status_text(format!("已选中第 {} 句", next + 1).into());
+        }
+    });
+    let weak = ui.as_weak();
+    let model = rows.clone();
+    ui.on_key_next(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let cur = ui.get_selected();
+        let next = if cur < 0 {
+            0
+        } else {
+            (cur + 1).min(model.row_count() as i32 - 1)
+        };
+        if next >= 0 && (next as usize) < model.row_count() {
+            ui.set_selected(next);
+            ui.set_status_text(format!("已选中第 {} 句", next + 1).into());
+        }
+    });
+    let weak = ui.as_weak();
+    let model = rows.clone();
+    let player = player.clone();
+    let state = state.clone();
+    ui.on_key_toggle(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if player.is_playing() {
+            player.stop();
+            ui.set_playing(false);
+            ui.set_status_text("已停止试听".into());
+            return;
+        }
+        let sel = ui.get_selected();
+        if sel < 0 {
+            ui.set_status_text("先选中一句（↑/↓ 或点击）".into());
+            return;
+        }
+        if let Some(row) = model.row_data(sel as usize) {
+            play_sentence(&ui, &model, &player, &state, sel as usize, row.duration);
+        }
     });
 }
 
 // ===========================================================================
-// 主循环节拍
+// 主循环节拍：消息泵 + 播放头
 // ===========================================================================
 
-fn tick(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &Rc<Stub>) {
-    if ui.get_running() {
-        let next = ui.get_progress() + SYNTH_PER_TICK;
-        if next >= 1.0 {
-            ui.set_progress(1.0);
-            ui.set_running(false);
+fn tick(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    msg_rx: &Rc<RefCell<Receiver<Msg>>>,
+    player: &Rc<player::Player>,
+    state: &Rc<UiState>,
+) {
+    // ── 工作线程消息 ──
+    let mut run_finished: Option<(usize, bool)> = None;
+    loop {
+        let msg = msg_rx.borrow_mut().try_recv();
+        let Ok(msg) = msg else { break };
+        match msg {
+            Msg::Note(t) => ui.set_status_text(t.into()),
+            Msg::Fatal(t) => {
+                ui.set_running(false);
+                ui.set_status_text(t.into());
+            }
+            Msg::Sentence {
+                index,
+                status,
+                duration,
+            } => {
+                if let Some(d) = duration {
+                    set_row_duration(rows, index, d as f32);
+                    recompute_total(ui, rows);
+                }
+                set_status(rows, index, &status);
+                if status == "done" || status == "error" {
+                    let done = (0..rows.row_count())
+                        .filter(|&i| {
+                            rows.row_data(i)
+                                .map(|r| r.status.as_str() == "已合成")
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    ui.set_done_count(done as i32);
+                    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
+                }
+            }
+            Msg::RunDone { failed, stopped } => run_finished = Some((failed, stopped)),
+            Msg::Assembled {
+                wav,
+                srt,
+                duration,
+                done,
+                skipped,
+            } => {
+                *state.assembled.borrow_mut() = Some(AssembledInfo {
+                    wav: wav.clone(),
+                    duration,
+                });
+                ui.set_has_result(true);
+                let skipped_note = if skipped > 0 {
+                    format!(" · 跳过 {skipped} 句失败句")
+                } else {
+                    String::new()
+                };
+                export_copies(
+                    ui,
+                    &stem_of(ui),
+                    &PathBuf::from(ui.get_export_dir().to_string()),
+                    &wav,
+                    &srt,
+                    ui.get_export_wav_on(),
+                    ui.get_export_srt_on(),
+                );
+                ui.set_status_text(
+                    format!("成品 {duration:.1}s（{done} 句{skipped_note}）").into(),
+                );
+            }
+        }
+    }
+    if let Some((failed, stopped)) = run_finished {
+        ui.set_running(false);
+        let n = rows.row_count() as i32;
+        let done = ui.get_done_count();
+        ui.set_progress(done as f32 / n.max(1) as f32);
+        ui.set_status_text(
+            if stopped {
+                format!("已停止：完成 {done}/{n} 句，可随时继续")
+            } else if failed > 0 {
+                format!("本轮完成 {done}/{n} 句（{failed} 句失败：重跑自动重试失败句）")
+            } else {
+                format!("合成完成 {done}/{n} 句：可试听、可导出 WAV / SRT")
+            }
+            .into(),
+        );
+        if done > 0 {
             ui.set_has_result(true);
-            for i in 0..rows.row_count() {
-                set_status(rows, i, "已合成");
-            }
-            ui.set_done_count(rows.row_count() as i32);
-            ui.set_status_text("合成完成：可试听、可导出 WAV / SRT".into());
-        } else {
-            ui.set_progress(next);
-            apply_progress(ui, rows, next);
         }
     }
 
-    if stub.redo_left.get() > 0 {
-        let left = stub.redo_left.get() - 1;
-        stub.redo_left.set(left);
-        if left == 0 {
-            let row = stub.redo_row.get();
-            stub.redo_row.set(-1);
-            if row >= 0 {
-                set_status(rows, row as usize, "已合成");
-                ui.set_status_text(format!("第 {} 句重录完成", row + 1).into());
-            }
-        }
-    }
-
+    // ── 播放头 ──
     if ui.get_playing() {
-        let total = ui.get_total_duration().max(0.001);
-        let next = ui.get_playhead() + (TICK_MS as f32 / 1000.0) / total;
-        if next >= 1.0 {
-            ui.set_playhead(0.0);
+        if !player.is_playing() {
             ui.set_playing(false);
+            ui.set_playhead(0.0);
             ui.set_status_text("试听结束".into());
         } else {
-            ui.set_playhead(next);
+            let total = state.playing_total.get().max(0.01);
+            ui.set_playhead((player.position().as_secs_f32() / total).clamp(0.0, 1.0));
         }
     }
 }
 
-fn apply_progress(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, progress: f32) {
-    let n = rows.row_count();
-    if n == 0 {
+/// 按导出开关把成品复制到导出目录（成功后弹通知）
+fn export_copies(
+    ui: &MainWindow,
+    stem: &str,
+    dir: &Path,
+    wav: &Path,
+    srt: &Path,
+    wav_on: bool,
+    srt_on: bool,
+) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        ui.set_status_text(format!("导出目录不可写: {e}").into());
         return;
     }
-    let done = ((progress * n as f32) as usize).min(n);
-    for i in 0..n {
-        let want = if i < done {
-            "已合成"
-        } else if i == done {
-            "合成中"
-        } else {
-            "待合成"
-        };
-        set_status(rows, i, want);
+    let mut written: Vec<String> = Vec::new();
+    if wav_on {
+        let t = dir.join(format!("{stem}.wav"));
+        if std::fs::copy(wav, &t).is_ok() {
+            written.push(t.display().to_string());
+        }
     }
-    ui.set_done_count(done as i32);
-    // 不在这里改 selected：那会把「选中展开 44px」一路带着走，整列逐句抖动。
-    // 进度由状态点（合成中=粗圆环）、时间轴与抽屉里的进度条表达。
-    ui.set_status_text(format!("合成中 · 已完成 {done}/{n} 句").into());
+    if srt_on {
+        let t = dir.join(format!("{stem}.srt"));
+        if std::fs::copy(srt, &t).is_ok() {
+            written.push(t.display().to_string());
+        }
+    }
+    if !written.is_empty() {
+        toast(ui, &format!("已导出 {}", written.last().unwrap()));
+    }
+}
+
+fn stem_of(ui: &MainWindow) -> String {
+    file_stem(&ui.get_project_name())
 }
 
 // ===========================================================================
-// 桩数据构造（接真实链路时只改这一段）
+// 试听
 // ===========================================================================
 
-/// 稿件 → 逐句模型：估时长、排起始时间、填展示用文案。
+/// 逐句试听：播 sentences/NNN.wav，播放头按该句时长推进。
+fn play_sentence(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    player: &Rc<player::Player>,
+    state: &Rc<UiState>,
+    i: usize,
+    duration: f32,
+) {
+    let Some(dir) = state.project_dir.borrow().clone() else {
+        ui.set_status_text("先跑一次合成".into());
+        return;
+    };
+    let wav = dir.join(format!("sentences/{i:03}.wav"));
+    if !wav.is_file() {
+        ui.set_status_text("这句还没合成：先点「开始合成」".into());
+        return;
+    }
+    match player.play_wav(&wav) {
+        Ok(()) => {
+            state.playing_total.set(duration.max(0.01));
+            ui.set_playing(true);
+            ui.set_playhead(0.0);
+            let text = rows
+                .row_data(i)
+                .map(|r| r.text.to_string())
+                .unwrap_or_default();
+            ui.set_status_text(format!("试听第 {} 句：{text}", i + 1).into());
+        }
+        Err(e) => ui.set_status_text(e.into()),
+    }
+}
+
+/// 全篇试听：有成品播 final.wav，否则按序播全部已合成句。
+fn play_all(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    player: &Rc<player::Player>,
+    state: &Rc<UiState>,
+) {
+    let assembled = state.assembled.borrow();
+    if let Some(info) = assembled.as_ref() {
+        if info.wav.is_file() {
+            match player.play_wav(&info.wav) {
+                Ok(()) => {
+                    state.playing_total.set(info.duration as f32);
+                    ui.set_playing(true);
+                    ui.set_playhead(0.0);
+                    ui.set_status_text("试听全篇成品".into());
+                }
+                Err(e) => ui.set_status_text(e.into()),
+            }
+            return;
+        }
+    }
+    drop(assembled);
+    let Some(dir) = state.project_dir.borrow().clone() else {
+        ui.set_status_text("先跑一次合成".into());
+        return;
+    };
+    let done: Vec<(usize, f32)> = (0..rows.row_count())
+        .filter_map(|i| {
+            rows.row_data(i)
+                .filter(|r| r.status.as_str() == "已合成")
+                .map(|r| (i, r.duration))
+        })
+        .collect();
+    if done.is_empty() {
+        ui.set_status_text("还没有已合成的句子".into());
+        return;
+    }
+    let paths: Vec<PathBuf> = done
+        .iter()
+        .map(|(i, _)| dir.join(format!("sentences/{i:03}.wav")))
+        .collect();
+    match player.play_many(&paths) {
+        Ok(()) => {
+            let total: f32 = done.iter().map(|(_, d)| d).sum();
+            state.playing_total.set(total.max(0.01));
+            ui.set_playing(true);
+            ui.set_playhead(0.0);
+            ui.set_status_text(format!("试听全篇（{} 句连播，未拼间隙）", done.len()).into());
+        }
+        Err(e) => ui.set_status_text(e.into()),
+    }
+}
+
+// ===========================================================================
+// 行模型 / 数据构造
+// ===========================================================================
+
+fn selected_model(ui: &MainWindow) -> String {
+    let idx = ui.get_voice_index().max(0) as usize;
+    ui.get_voices()
+        .row_data(idx)
+        .map(|v| v.name.to_string())
+        .unwrap_or_default()
+}
+
+fn non_empty(s: String) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn set_row_duration(rows: &Rc<VecModel<Sentence>>, i: usize, duration: f32) {
+    let Some(mut row) = rows.row_data(i) else {
+        return;
+    };
+    row.duration = duration;
+    row.duration_label = format!("{duration:.1}s").into();
+    rows.set_row_data(i, row);
+}
+
+/// 切句 → 行模型（未合成句的时长按口播语速估算；合成后由真实时长覆盖）
 fn build_rows(lines: &[String]) -> Vec<Sentence> {
     let mut start = 0.0_f32;
     let mut rows = Vec::with_capacity(lines.len());
@@ -503,70 +1168,56 @@ fn build_rows(lines: &[String]) -> Vec<Sentence> {
     rows
 }
 
-/// 按 。！？；与换行切句（口播稿常一行一句）。
-fn split_sentences(text: &str) -> Vec<String> {
-    const ENDERS: [char; 6] = ['。', '！', '？', '；', '!', '?'];
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for ch in text.chars() {
-        if ch == '\n' {
-            push_trimmed(&mut out, &mut cur);
+/// 切句（与 aw-core 同算法；UI 预览用，真实切句以 aw-core 为准）
+fn split_for_preview(text: &str) -> Vec<String> {
+    aw_core::split_sentences(text, DEFAULT_PUNCTUATION, MAX_CHARS)
+}
+
+/// 按当前各行时长重排起始时间与总时长（合成拿到真实时长后调用）
+fn recompute_total(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
+    let mut start = 0.0_f32;
+    for i in 0..rows.row_count() {
+        let Some(mut row) = rows.row_data(i) else {
             continue;
-        }
-        cur.push(ch);
-        if ENDERS.contains(&ch) {
-            push_trimmed(&mut out, &mut cur);
-        }
+        };
+        row.start = start;
+        row.start_label = clock_label(start).into();
+        start += row.duration;
+        rows.set_row_data(i, row);
     }
-    push_trimmed(&mut out, &mut cur);
-    out
+    ui.set_total_duration(if start > 0.0 { start } else { 1.0 });
+    ui.set_total_label(clock_label(start).into());
 }
 
-fn push_trimmed(out: &mut Vec<String>, cur: &mut String) {
-    let line = cur.trim();
-    if !line.is_empty() {
-        out.push(line.to_string());
-    }
-    cur.clear();
-}
+const SAMPLE_SCRIPT: &str = "大家好，欢迎回到音频作坊。今天聊三件事。\
+第一，声音是你自己的，素材不出机器，断网也能干活。\
+第二，不按字收费，想生成多少就生成多少。\
+第三，配音先行，BGM 和歌曲排在后面，成熟一个上一个。";
 
-fn voice_rows() -> Vec<Voice> {
-    VOICES
-        .iter()
-        .map(|(name, engine, note, license)| Voice {
-            name: (*name).into(),
-            engine: (*engine).into(),
-            note: (*note).into(),
-            license: (*license).into(),
-        })
-        .collect()
-}
+const SCENE_NOTES: [&str; 4] = [
+    "配音工作台",
+    "BGM 场景：M2 接入（与配音同框，自动 ducking）",
+    "歌曲场景：M4 接入（yue2 / ace-step，降级为彩蛋）",
+    "素材库：M4 接入（工程版本 / 音色库 / 发音词典库）",
+];
 
 fn export_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{home}/Documents/音频作坊")
+    format!("{home}/Documents/{WORKSHOP_DIR}")
 }
 
-// ===========================================================================
-// 小工具
-// ===========================================================================
-
-/// 重算整条链路的派生状态（切句 / 字数 / 总时长 / 复位运行态）。
 fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
-    let built = build_rows(&split_sentences(text));
-    let total: f32 = built.iter().map(|row| row.duration).sum();
+    let built = build_rows(&split_for_preview(text));
     let chars = text.chars().count();
 
     rows.set_vec(built);
-    ui.set_total_duration(if total > 0.0 { total } else { 1.0 });
-    ui.set_total_label(clock_label(total).into());
     ui.set_char_count(chars as i32);
     ui.set_est_duration(if chars == 0 {
         "--".into()
     } else {
-        clock_label(total).into()
+        clock_label(chars as f32 * SECS_PER_CHAR).into()
     });
-    // 默认不选中：首屏是干净的列表，展开行由用户点出来（渐进披露）
+    recompute_total(ui, rows);
     ui.set_selected(-1);
     ui.set_done_count(0);
     ui.set_has_result(false);
@@ -576,14 +1227,21 @@ fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
     ui.set_playing(false);
 }
 
+/// 状态标签映射：内部状态（aw-core）→ 界面文案
 fn set_status(rows: &Rc<VecModel<Sentence>>, i: usize, status: &str) {
+    let label = match status {
+        "done" => "已合成",
+        "running" => "合成中",
+        "error" => "失败",
+        other => other,
+    };
     let Some(mut row) = rows.row_data(i) else {
         return;
     };
-    if row.status.as_str() == status {
+    if row.status.as_str() == label {
         return;
     }
-    row.status = SharedString::from(status);
+    row.status = SharedString::from(label);
     rows.set_row_data(i, row);
 }
 

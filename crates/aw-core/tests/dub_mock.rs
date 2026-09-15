@@ -138,3 +138,124 @@ fn redo_bumps_seed_and_normalizes_new_text() {
         .redo(&c, &dir, 99, None, |t| t.to_string(), None, |_, _| {})
         .is_err());
 }
+
+/// 每合成完一句，project.json 必须已经落盘（Python `cmd_synth` 逐句落盘同款）：
+/// 中途被杀也能从磁盘恢复到「已完成句 done」的状态继续跑。
+#[test]
+fn project_is_saved_after_every_sentence() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let dir = temp_dir("save-per-sentence");
+    let mut prj = project();
+    let dir_c = dir.clone();
+    prj.synthesize(&client(&mock.base), &dir, None, None, move |idx, msg| {
+        if msg.starts_with("done") {
+            // 在「下一句合成完成之前」，磁盘上的 project.json 必须已反映这句 done
+            let on_disk = aw_core::Project::load(&dir_c).expect("project.json 应已存在");
+            assert_eq!(
+                on_disk.sentences[idx].status, "done",
+                "第 {idx} 句完成后应立即落盘"
+            );
+        }
+    })
+    .unwrap();
+    assert!(dir.join("project.json").is_file());
+}
+
+/// 截断的句 wav 必须让拼装中止并指认（Python 同款判据：实际字节 < 头声明需要）。
+/// 截断的证据不在 WAV 头里——头仍合法、头里的帧数也不被截断改写，只有字节数可信。
+#[test]
+fn truncated_sentence_file_aborts_assemble() {
+    let wav = support::tiny_wav(&[7i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let dir = temp_dir("truncated");
+    let mut prj = project();
+    prj.synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+        .unwrap();
+
+    // 把第 0 句截掉一半（hound 的 44 字节头还在，所以"头检查"看不出问题）
+    let p0 = dir.join("sentences/000.wav");
+    let full = std::fs::metadata(&p0).unwrap().len();
+    let mut bytes = std::fs::read(&p0).unwrap();
+    bytes.truncate((full / 2) as usize);
+    std::fs::write(&p0, &bytes).unwrap();
+
+    let err = prj.assemble(&dir).unwrap_err();
+    assert!(
+        err.contains("拼装中止") && err.contains("截断"),
+        "应指认截断并中止: {err}"
+    );
+    // 半成品不得冒充成品
+    assert!(!dir.join("out/final.wav").is_file());
+}
+
+/// 重录的文本/seed 修改必须先落盘再合成（Python cmd_redo 修复的坑：
+/// synthesize 从磁盘重载时会丢掉未保存的修改）。
+#[test]
+fn redo_persists_before_resynthesis() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let dir = temp_dir("redo-persist");
+    let mut prj = project();
+    let c = client(&mock.base);
+    prj.synthesize(&c, &dir, None, None, |_, _| {}).unwrap();
+
+    prj.redo(
+        &c,
+        &dir,
+        2,
+        Some("全新文本 2026 年。"),
+        |t| aw_core::normalize(t, &Default::default()),
+        None,
+        |_, _| {},
+    )
+    .unwrap();
+
+    // 磁盘上的工程必须已带新文本与新 seed（seed 在原值 +1000 的位置）
+    let on_disk = aw_core::Project::load(&dir).expect("重录后 project.json 可读");
+    assert_eq!(on_disk.sentences[2].text, "全新文本 2026 年。");
+    assert_eq!(
+        on_disk.sentences[2].seed,
+        prj.base_seed + 2 + aw_core::REDO_SEED_STEP
+    );
+}
+
+/// 成品与 SRT 的原子性：拼装完成后不得残留 .tmp 文件
+#[test]
+fn assemble_leaves_no_tmp_files() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let dir = temp_dir("no-tmp");
+    let mut prj = project();
+    prj.synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+        .unwrap();
+    prj.assemble(&dir).unwrap();
+    for entry in std::fs::read_dir(dir.join("out")).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".tmp"), "不得残留临时文件: {name}");
+    }
+}
+
+/// 协作取消：置 stop 位后，已完成句保留、剩余句不再发起请求
+#[test]
+fn stoppable_synthesize_keeps_done_and_stops() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let dir = temp_dir("stoppable");
+    let mut prj = project();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let c = client(&mock.base);
+    let mut done_seen = 0usize;
+    prj.synthesize_stoppable(&c, &dir, None, None, Some(&stop), |_, msg| {
+        if msg.starts_with("done") {
+            done_seen += 1;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    })
+    .unwrap();
+    assert_eq!(done_seen, 1, "只应完成一句就被取消");
+    assert_eq!(prj.sentences[0].status, "done");
+    assert_eq!(prj.sentences[1].status, "pending");
+    assert_eq!(prj.sentences[2].status, "pending");
+    assert_eq!(mock.hit_count(), 1, "取消后不得再发请求");
+}

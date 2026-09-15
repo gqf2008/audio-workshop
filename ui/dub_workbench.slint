@@ -172,6 +172,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <[string]> voice-names: [];
     in property <[Voice]> voices: [];
     in-out property <int> voice-index: 0;
+    in-out property <string> voice-ref-path: "";
     in-out property <float> speed: 1.0;
     in property <string> speed-label: "1.00x";
     in-out property <bool> auto-normalize: true;
@@ -258,11 +259,21 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     font-size: 12px;
                     wrap: word-wrap;
                 }
+                PixelTextInput {
+                    text <=> root.voice-ref-path;
+                    placeholder: "参考音频路径（可选，克隆用）";
+                }
+                Text {
+                    text: "留空用模型默认音色；填 wav 路径即 voice_ref 克隆（index-tts2）";
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
                 HorizontalLayout {
                     spacing: 16px;
                     Text {
                         width: 34px;
-                        text: "语速";
+                        text: "倍速";
                         color: PixelTheme.text;
                         font-size: 12px;
                         vertical-alignment: center;
