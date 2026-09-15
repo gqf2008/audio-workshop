@@ -138,10 +138,9 @@ def cmd_synth(a):
         if err:
             s["status"] = f"error: {err}"; print(f"    [{s['index']:>3}] ❌ {err[:70]}"); continue
         path = os.path.join(a.dir, s["wav"])
+        # write_atomic 保证"写完 len(raw) 字节 + fsync 后才 rename"：返回即完整，
+        # 落盘失败会抛异常而不是留下半截文件（此前这里的 getsize 校验恒为假，是装饰）
         write_atomic(path, raw)
-        if os.path.getsize(path) != len(raw):      # 回读校验：截断必须立刻暴露
-            s["status"] = f"error: 落盘不完整 ({os.path.getsize(path)}/{len(raw)} 字节)"
-            print(f"    [{s['index']:>3}] ❌ 落盘不完整"); continue
         sr, ch, sw, n = wav_meta(raw)
         s.update({"duration": round(n / sr, 3), "sample_rate": sr, "channels": ch,
                   "status": "done"})
@@ -202,6 +201,9 @@ def cmd_assemble(a):
             m0, s0 = divmod(s["start"], 60); m1, s1 = divmod(s["start"] + s["duration"], 60)
             srt.append(f"{len(srt)+1}\n{int(m0):02d}:{s0:06.3f}".replace(".", ",") +
                        f" --> {int(m1):02d}:{s1:06.3f}".replace(".", ",") + f"\n{s['text']}\n")
+    with open(final_tmp, "rb+") as f:                  # 成品是本工程最要紧的产物：
+        f.flush()                                      # wave 关闭后补一次 fsync，否则
+        os.fsync(f.fileno())                           # 掉电可能留下已 rename 到位的空文件
     os.replace(final_tmp, final)                       # 原子替换：旧成品在写完前不受影响
     write_atomic(os.path.join(a.dir, "out", "final.srt"), "\n".join(srt).encode("utf-8"))
     save_project(a.dir, prj)
