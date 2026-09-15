@@ -49,17 +49,24 @@ const SECS_PER_CHAR: f32 = 0.18;
 enum Cmd {
     /// 开始/继续合成。script/model/voice_ref/project_name 取自界面当前值。
     Run {
+        revision: u64,
         script: String,
         model: String,
         voice_ref: Option<String>,
         project_name: String,
     },
     /// 单句重录（换 seed 重合成该句）
-    Redo { index: usize },
+    Redo { revision: u64, index: usize },
     /// 拼装成品 + SRT
-    Assemble,
+    Assemble { revision: u64 },
     /// 启动时把已恢复工程交给 worker，保证重开后 Redo/Assemble 仍作用于同一工程。
-    OpenProject { dir: PathBuf, project: Project },
+    OpenProject {
+        revision: u64,
+        dir: PathBuf,
+        project: Project,
+    },
+    /// UI 的稿件/工程名/模型/参考音已变；旧 current 立即作废，直到下一轮 Run。
+    InvalidateProject,
 }
 
 enum Msg {
@@ -173,13 +180,21 @@ struct WorkerCtx {
 
 fn worker_loop(ctx: WorkerCtx) {
     // 当前工程：dir + project。Assemble/Redo 复用 Run 留下的那份。
-    let mut current: Option<(PathBuf, Project)> = None;
+    let mut current: Option<(u64, PathBuf, Project)> = None;
     while let Ok(cmd) = ctx.rx.recv() {
         match cmd {
-            Cmd::OpenProject { dir, project } => {
-                current = Some((dir, project));
+            Cmd::OpenProject {
+                revision,
+                dir,
+                project,
+            } => {
+                current = Some((revision, dir, project));
+            }
+            Cmd::InvalidateProject => {
+                current = None;
             }
             Cmd::Run {
+                revision,
                 script,
                 model,
                 voice_ref,
@@ -202,7 +217,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 let client = match make_client() {
                     Ok(c) => c,
                     Err(e) => {
-                        current = Some((dir, project));
+                        current = Some((revision, dir, project));
                         let _ = ctx.tx.send(Msg::Fatal(e));
                         continue;
                     }
@@ -220,7 +235,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     },
                 );
                 let stopped = ctx.stop.load(Ordering::Relaxed);
-                current = Some((dir, project));
+                current = Some((revision, dir, project));
                 match run {
                     Ok(failed) => {
                         let _ = ctx.tx.send(Msg::RunDone {
@@ -236,11 +251,19 @@ fn worker_loop(ctx: WorkerCtx) {
                     }
                 }
             }
-            Cmd::Redo { index } => {
-                let Some((dir, project)) = current.as_mut() else {
-                    let _ = ctx.tx.send(Msg::Note("先跑一次合成".into()));
+            Cmd::Redo { revision, index } => {
+                let Some((current_revision, dir, project)) = current.as_mut() else {
+                    let _ = ctx
+                        .tx
+                        .send(Msg::Note("工程已变更：先开始合成再重录单句".into()));
                     continue;
                 };
+                if *current_revision != revision {
+                    let _ = ctx
+                        .tx
+                        .send(Msg::Note("工程版本已变更：先开始合成再重录单句".into()));
+                    continue;
+                }
                 let client = match make_client() {
                     Ok(c) => c,
                     Err(e) => {
@@ -273,11 +296,19 @@ fn worker_loop(ctx: WorkerCtx) {
                     }
                 }
             }
-            Cmd::Assemble => {
-                let Some((dir, project)) = current.as_mut() else {
-                    let _ = ctx.tx.send(Msg::Note("先跑一次合成".into()));
+            Cmd::Assemble { revision } => {
+                let Some((current_revision, dir, project)) = current.as_mut() else {
+                    let _ = ctx
+                        .tx
+                        .send(Msg::Note("工程已变更：先开始合成再导出".into()));
                     continue;
                 };
+                if *current_revision != revision {
+                    let _ = ctx
+                        .tx
+                        .send(Msg::Note("工程版本已变更：先开始合成再导出".into()));
+                    continue;
+                }
                 match project.assemble(dir) {
                     Ok(a) => {
                         let _ = ctx.tx.send(Msg::Assembled {
@@ -350,22 +381,24 @@ fn project_dir(stem: &str) -> PathBuf {
     projects_root().join(stem)
 }
 
+#[derive(Debug)]
 struct LoadedProject {
     project: Project,
     /// 新稿件中按文本继承的已合成句数（音色/模型不变时才可能 >0）。
     reused: usize,
 }
 
-fn sha256_file(path: &Path) -> Option<String> {
+fn sha256_file(path: &Path) -> Result<String, String> {
     use std::fmt::Write as _;
 
-    let bytes = std::fs::read(path).ok()?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("参考音频不可读（{}）: {e}", path.display()))?;
     let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         let _ = write!(hex, "{byte:02x}");
     }
-    Some(hex)
+    Ok(hex)
 }
 
 fn voice_ref_matches(
@@ -476,9 +509,10 @@ fn load_resumable(
     model: &str,
     voice_ref: Option<String>,
 ) -> Result<LoadedProject, String> {
-    let voice_ref_hash = voice_ref
-        .as_deref()
-        .and_then(|path| sha256_file(Path::new(path)));
+    let voice_ref_hash = match voice_ref.as_deref() {
+        Some(path) => Some(sha256_file(Path::new(path))?),
+        None => None,
+    };
     let saved = Project::load(dir).ok();
     if let Some(saved) = saved.as_ref() {
         if saved.model == model
@@ -534,6 +568,10 @@ struct UiState {
     project_dir: RefCell<Option<PathBuf>>,
     /// 试听播放的总时长（秒）：播放头 = position / total
     playing_total: std::cell::Cell<f32>,
+    /// worker 当前是否持有与本 UI 一致的工程；变更后到下一轮 ProjectLoaded 前为 false。
+    project_ready: std::cell::Cell<bool>,
+    /// 工程输入的单调版本；任何会改变工程语义的 UI 修改都递增。
+    project_revision: std::cell::Cell<u64>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -581,6 +619,8 @@ fn main() -> Result<(), slint::PlatformError> {
         assembled: RefCell::new(None),
         project_dir: RefCell::new(None),
         playing_total: std::cell::Cell::new(1.0),
+        project_ready: std::cell::Cell::new(false),
+        project_revision: std::cell::Cell::new(0),
     });
     {
         let stop = Arc::clone(&stop);
@@ -601,10 +641,11 @@ fn main() -> Result<(), slint::PlatformError> {
     slint_pixel::install_window_resize(&ui);
 
     wire_theme(&ui);
-    wire_script(&ui, &rows);
+    wire_script(&ui, &rows, &cmd_tx, &state);
+    wire_engine_changes(&ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
-    wire_export(&ui, &cmd_tx);
+    wire_export(&ui, &cmd_tx, &state);
     wire_keys(&ui, &rows, &player, &state);
 
     // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
@@ -740,12 +781,18 @@ fn restore_project(
     ui.set_script_text(script.clone().into());
     rebuild(ui, rows, &script);
     let model_restored = restore_voice_index(ui, &project.model);
+    if !model_restored {
+        // 不保留默认 index，否则“开始合成”会把缺失模型静默换成另一音色。
+        ui.set_voice_index(-1);
+    }
     ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
     let done = apply_project_to_rows(ui, rows, &project);
     let _ = cmd_tx.send(Cmd::OpenProject {
+        revision: state.project_revision.get(),
         dir,
         project: project.clone(),
     });
+    state.project_ready.set(true);
 
     let mut notes = Vec::new();
     if done > 0 {
@@ -789,19 +836,39 @@ fn wire_theme(ui: &MainWindow) {
     });
 }
 
-fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
+fn invalidate_worker_project(cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+    state.project_ready.set(false);
+    state
+        .project_revision
+        .set(state.project_revision.get().wrapping_add(1));
+    state.assembled.borrow_mut().take();
+    let _ = cmd_tx.send(Cmd::InvalidateProject);
+}
+
+fn wire_script(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    cmd_tx: &Sender<Cmd>,
+    state: &Rc<UiState>,
+) {
     let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let state0 = state.clone();
     ui.on_project_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() {
             ui.set_status_text("合成进行中：工程名暂不可改".into());
             return;
         }
+        invalidate_worker_project(&tx, &state0);
+        ui.set_has_result(false);
         ui.set_status_text(format!("工程名：{}", ui.get_project_name()).into());
     });
 
     let weak = ui.as_weak();
     let rows1 = rows.clone();
+    let tx1 = cmd_tx.clone();
+    let state1 = state.clone();
     ui.on_script_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() {
@@ -810,6 +877,7 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         }
         let text = ui.get_script_text();
         rebuild(&ui, &rows1, &text);
+        invalidate_worker_project(&tx1, &state1);
         ui.set_status_text(
             format!(
                 "稿件已更新：{} 字 / {} 句 · 状态已重置（重跑合成时自动续作未变句）",
@@ -822,6 +890,8 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
 
     let weak = ui.as_weak();
     let rows2 = rows.clone();
+    let tx2 = cmd_tx.clone();
+    let state2 = state.clone();
     ui.on_use_sample(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() {
@@ -830,11 +900,14 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         }
         ui.set_script_text(SAMPLE_SCRIPT.into());
         rebuild(&ui, &rows2, SAMPLE_SCRIPT);
+        invalidate_worker_project(&tx2, &state2);
         ui.set_status_text(format!("已载入示例稿：{} 句", rows2.row_count()).into());
     });
 
     let weak = ui.as_weak();
     let rows3 = rows.clone();
+    let tx3 = cmd_tx.clone();
+    let state3 = state.clone();
     ui.on_clear_script(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() {
@@ -843,11 +916,14 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         }
         ui.set_script_text("".into());
         rebuild(&ui, &rows3, "");
+        invalidate_worker_project(&tx3, &state3);
         ui.set_status_text("稿件已清空，粘一段口播稿试试".into());
     });
 
     let weak = ui.as_weak();
     let rows4 = rows.clone();
+    let tx4 = cmd_tx.clone();
+    let state4 = state.clone();
     ui.on_resplit(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() {
@@ -856,9 +932,40 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         }
         let text = ui.get_script_text();
         rebuild(&ui, &rows4, &text);
+        invalidate_worker_project(&tx4, &state4);
         let n = rows4.row_count();
         ui.set_status_text(format!("已重新切句：{n} 句").into());
         toast(&ui, &format!("已重新切句：{n} 句"));
+    });
+}
+
+fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let state1 = state.clone();
+    ui.on_model_changed(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() {
+            ui.set_status_text("合成进行中：音色暂不可改".into());
+            return;
+        }
+        invalidate_worker_project(&tx, &state1);
+        ui.set_has_result(false);
+        ui.set_status_text("音色已变更：请重新开始合成，旧工程音频暂不可导出".into());
+    });
+
+    let weak = ui.as_weak();
+    let tx2 = cmd_tx.clone();
+    let state2 = state.clone();
+    ui.on_voice_ref_changed(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() {
+            ui.set_status_text("合成进行中：参考音暂不可改".into());
+            return;
+        }
+        invalidate_worker_project(&tx2, &state2);
+        ui.set_has_result(false);
+        ui.set_status_text("参考音已变更：请重新开始合成，旧工程音频暂不可导出".into());
     });
 }
 
@@ -909,6 +1016,7 @@ fn wire_sentence_actions(
     let weak = ui.as_weak();
     let model3 = rows.clone();
     let tx3 = cmd_tx.clone();
+    let state3 = state.clone();
     ui.on_redo_one(move |i| {
         if i < 0 {
             return;
@@ -922,9 +1030,15 @@ fn wire_sentence_actions(
             ui.set_status_text("合成进行中：等这轮跑完再重录单句".into());
             return;
         }
+        if !state3.project_ready.get() {
+            ui.set_status_text("工程已变更：先开始合成，再重录单句".into());
+            return;
+        }
         ui.set_selected(i);
-        set_status(&model3, idx, "running");
-        let _ = tx3.send(Cmd::Redo { index: idx });
+        let _ = tx3.send(Cmd::Redo {
+            revision: state3.project_revision.get(),
+            index: idx,
+        });
         ui.set_status_text(format!("单句重录中：第 {} 句（换 seed 重跑）", i + 1).into());
     });
 
@@ -984,6 +1098,14 @@ fn wire_run(
             }
         }
         let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        if let Some(path) = voice_ref.as_deref() {
+            if !Path::new(path).is_file() {
+                ui.set_status_text(
+                    format!("参考音频不存在或不可读：{path}（修正后再开始合成）").into(),
+                );
+                return;
+            }
+        }
         stop1.store(false, Ordering::Relaxed);
         ui.set_running(true);
         ui.set_has_result(false);
@@ -991,9 +1113,11 @@ fn wire_run(
         ui.set_playing(false);
         player1.stop();
         state1.assembled.borrow_mut().take();
+        state1.project_ready.set(false);
         let stem = file_stem(&ui.get_project_name());
         *state1.project_dir.borrow_mut() = Some(project_dir(&stem));
         let _ = tx.send(Cmd::Run {
+            revision: state1.project_revision.get(),
             script: ui.get_script_text().to_string(),
             model: model_name.clone(),
             voice_ref,
@@ -1052,12 +1176,19 @@ fn wire_run(
     });
 }
 
-fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>) {
+fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
+    let state = state.clone();
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let _ = tx.send(Cmd::Assemble);
+        if !state.project_ready.get() {
+            ui.set_status_text("工程已变更：先开始合成，再导出".into());
+            return;
+        }
+        let _ = tx.send(Cmd::Assemble {
+            revision: state.project_revision.get(),
+        });
         ui.set_status_text("拼装成品中（完成后按导出开关复制）…".into());
     });
 }
@@ -1136,6 +1267,7 @@ fn tick(
         match msg {
             Msg::ProjectLoaded { project, reused } => {
                 apply_project_to_rows(ui, rows, &project);
+                state.project_ready.set(true);
                 if reused > 0 {
                     ui.set_status_text(
                         format!("工程已恢复：按文本复用 {reused} 句，未变句无需重录").into(),
@@ -1405,7 +1537,11 @@ fn play_all(
 // ===========================================================================
 
 fn selected_model(ui: &MainWindow) -> String {
-    let idx = ui.get_voice_index().max(0) as usize;
+    let index = ui.get_voice_index();
+    if index < 0 {
+        return String::new();
+    }
+    let idx = index as usize;
     ui.get_voices()
         .row_data(idx)
         .map(|v| v.name.to_string())
@@ -1537,9 +1673,23 @@ fn clock_label(secs: f32) -> String {
 fn file_stem(name: &str) -> String {
     let trimmed = name.trim();
     if trimmed.is_empty() {
+        return "未命名工程".to_string();
+    }
+    let sanitized: String = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if sanitized == "." || sanitized == ".." {
         "未命名工程".to_string()
     } else {
-        trimmed.to_string()
+        sanitized
     }
 }
 
@@ -1668,18 +1818,52 @@ mod tests {
         let dir = temp_dir("resume-voice-change");
         let mut old = saved_project("第一句。第二句。", None);
         save_done_project(&dir, &mut old);
+        let new_voice = dir.join("new-voice.wav");
+        std::fs::write(&new_voice, b"new-voice").unwrap();
 
         let loaded = load_resumable(
             &dir,
             "第一句。第二句。",
             "audio8-tts",
-            Some("new-voice.wav".into()),
+            Some(new_voice.display().to_string()),
         )
         .unwrap();
         assert_eq!(loaded.reused, 0);
         let loaded = loaded.project;
 
         assert!(loaded.sentences.iter().all(|s| s.status == "pending"));
+    }
+
+    #[test]
+    fn unreadable_voice_ref_is_reported_instead_of_reusing_old_audio() {
+        let dir = temp_dir("resume-voice-missing");
+        let missing = dir.join("missing.wav");
+        let missing_path = missing.display().to_string();
+        let mut old = saved_project("第一句。第二句。", Some(&missing_path));
+        assert_eq!(old.voice_ref_hash, None, "模拟旧工程尚无内容哈希");
+        save_done_project(&dir, &mut old);
+
+        let err =
+            load_resumable(&dir, "第一句。第二句。", "audio8-tts", Some(missing_path)).unwrap_err();
+        assert!(err.contains("参考音频不可读"), "应明确报错: {err}");
+        let on_disk = Project::load(&dir).unwrap();
+        assert_eq!(on_disk.sentences[0].status, "done", "旧工程不得被覆盖");
+    }
+
+    #[test]
+    fn invalidation_bumps_revision_and_clears_ready() {
+        let state = Rc::new(UiState {
+            assembled: RefCell::new(None),
+            project_dir: RefCell::new(None),
+            playing_total: std::cell::Cell::new(1.0),
+            project_ready: std::cell::Cell::new(true),
+            project_revision: std::cell::Cell::new(7),
+        });
+        let (tx, rx) = channel();
+        invalidate_worker_project(&tx, &state);
+        assert!(!state.project_ready.get());
+        assert_eq!(state.project_revision.get(), 8);
+        assert!(matches!(rx.recv().unwrap(), Cmd::InvalidateProject));
     }
 
     #[test]
@@ -1704,7 +1888,7 @@ mod tests {
         std::fs::write(&voice, b"voice-a").unwrap();
         let voice_path = voice.display().to_string();
         let mut old = saved_project("第一句。第二句。", Some(&voice_path));
-        old.voice_ref_hash = sha256_file(&voice);
+        old.voice_ref_hash = Some(sha256_file(&voice).unwrap());
         save_done_project(&dir, &mut old);
 
         std::fs::write(&voice, b"voice-b").unwrap();
@@ -1716,7 +1900,10 @@ mod tests {
             .sentences
             .iter()
             .all(|s| s.status == "pending"));
-        assert_eq!(loaded.project.voice_ref_hash, sha256_file(&voice));
+        assert_eq!(
+            loaded.project.voice_ref_hash,
+            Some(sha256_file(&voice).unwrap())
+        );
     }
 
     #[test]
@@ -1805,5 +1992,9 @@ mod tests {
     fn file_stem_trims_and_defaults() {
         assert_eq!(file_stem(" 我的工程 "), "我的工程");
         assert_eq!(file_stem("  "), "未命名工程");
+        assert_eq!(file_stem(".."), "未命名工程");
+        assert_eq!(file_stem("../逃逸/名字"), ".._逃逸_名字");
+        assert_eq!(file_stem("/tmp/out"), "_tmp_out");
+        assert_eq!(file_stem(r"C:\tmp\x"), "C__tmp_x");
     }
 }

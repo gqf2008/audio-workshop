@@ -173,6 +173,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <[Voice]> voices: [];
     in-out property <int> voice-index: 0;
     in-out property <string> voice-ref-path: "";
+    callback model-changed();
+    callback voice-ref-changed();
     in-out property <float> speed: 1.0;
     in property <string> speed-label: "1.00x";
     in-out property <bool> auto-normalize: true;
@@ -252,6 +254,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     model: root.voice-names;
                     index <=> root.voice-index;
                     placeholder: "选择音色";
+                    enabled: !root.running;
+                    selected(i) => { root.model-changed(); }
                 }
                 Text {
                     text: root.voice.engine + " · 许可 " + root.voice.license + " · " + root.voice.note;
@@ -262,6 +266,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 PixelTextInput {
                     text <=> root.voice-ref-path;
                     placeholder: "参考音频路径（可选，克隆用）";
+                    enabled: !root.running;
+                    edited => { root.voice-ref-changed(); }
                 }
                 Text {
                     text: "留空用模型默认音色；填 wav 路径即 voice_ref 克隆（index-tts2）";

@@ -90,6 +90,8 @@ export component MainWindow inherits Window {
     callback theme-picked(string);
     callback scene-changed(int);
     callback project-edited();
+    callback model-changed();
+    callback voice-ref-changed();
     callback script-edited();
     callback use-sample();
     callback clear-script();
@@ -259,6 +261,8 @@ export component MainWindow inherits Window {
             voices: root.voices;
             voice-index <=> root.voice-index;
             voice-ref-path <=> root.voice-ref-path;
+            model-changed => { root.model-changed(); }
+            voice-ref-changed => { root.voice-ref-changed(); }
             speed <=> root.speed;
             speed-label: root.speed-label;
             speed-changed(v) => { root.speed-changed(v); }
