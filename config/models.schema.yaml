@@ -1,0 +1,173 @@
+# ============================================================================
+# 音频作坊 · 模型参数化配置（草案 v1）
+# 目的：技术会进步、模型会换 —— 产品的价值在于「每个模型的旋钮都配置化」，
+#       以及「模型不稳的地方，配置层兜住」。
+# 原则：不另造一套，全部映射到上游既有落点（server.json + session_options
+#       + request options），配置层只做声明、覆盖、兜底与登记。
+# ============================================================================
+version: 1
+profile: creator-zh-mac          # 一份配置 = 一套决策；换人群/换机器可换 profile
+
+# ── 1. 运行时：部署与资源（谁管：产品自动探测，不暴露给创作者）────────────
+runtime:
+  backend: metal                 # mac→metal / nvidia→cuda / 其它→cpu（可自动探测）
+  threads: 8
+  models_root: /Volumes/DataExt/models
+  memory:
+    max_loaded_models: 2         # 创作者机器内存有限，比服务端默认(4)更保守
+    idle_unload_ms: 300000
+    min_free_memory_mb: 1024     # 低于此值拒绝加载，避免把用户机器拖死
+
+# ── 2. 文本层：产品独有的兜底能力（模型没有的东西，靠这里补）──────────────
+# 今天实测：同一句数字密集文本，同一模型跑三轮可懂度 83.3/98.1/94.4；
+#          接了规范化的模型读「一千两百三十四」，没接的读「一千二三四」。
+text:
+  normalization:
+    enabled: true
+    default_ruleset: zh-wetext   # 复用上游 normalize_chinese_text 的规则集
+    numbers:
+      year_digit_by_digit: true  # 2026 → 二零二六（上游规则缺失，这里补）
+      phone_yao: true            # 电话首位 1 → 幺
+      currency_cardinal: true    # ¥1234.56 → 一千二百三十四点五六元
+    dictionary:                  # 发音词典：用户级覆盖，优先级最高
+      - match: "13812345678"
+        read: "幺三八幺二三四五六七八"
+        scope: user              # user | profile | model
+  chunking:
+    mode: sentence               # sentence | fixed | none
+    max_chars: 80
+    punctuation: "。！？；…"
+
+# ── 3. 场景：创作者看到的入口（不是模型列表）────────────────────────────
+scenarios:
+  dub:                           # ① 配音
+    pipeline: [normalize, tts, align]
+    model: audio8-tts
+    voice: { mode: builtin }     # builtin | clone{ref, ref_text}
+    rate: 1.0
+    seed: null                   # null=随机；固定值=同文本逐字节可复现
+  bgm:                           # ② 背景音乐
+    pipeline: [normalize, gen]
+    model: stable-audio-small-music
+    duration_s: 30
+  song:                          # ③ 歌曲
+    pipeline: [normalize, gen]
+    model: yue2
+    steps: 8
+    max_tokens: 4200
+
+# ── 4. 模型层：每模型的旋钮 + 已知缺陷登记 ────────────────────────────────
+models:
+  audio8-tts:
+    family: audio8_tts
+    task: tts
+    path: ${models_root}/Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf
+    precision_preference: [q8_0, q4_0]      # 按机器显存挑，缺档则降级
+    text_overrides:
+      normalization: enforce                # 本模型不接 TN → 配置层强制先做
+    request_defaults: { instruction: "自然、清晰的叙述语气" }
+    limits: { max_chars_per_request: 300 }
+    known_issues:                           # 让产品"知道自己站在什么上"
+      - "数字/电话/金额读法不稳定，必须依赖 text.normalization"
+      - "audio8-tts-01b 变体在当前上游不可用（可懂度 0~3%、时长乱跳）"
+
+  index-tts2:
+    family: index_tts2
+    task: tts
+    path: ${models_root}/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf
+    requires: { voice_ref: true }           # 服务端硬要求，缺则 500
+    text_overrides:
+      normalization: engine                 # 上游已接 → 不重复处理（避免双重转换）
+    request_defaults: { duration_factor: 1.0 }
+    known_issues: ["不接 voice_ref 会直接报错，需在 UI 层强制选音色"]
+
+  yue2:
+    family: yue2
+    task: gen
+    path: ${models_root}/Yue2-3B-GGUF       # 注意：gen 类指向目录
+    session_options: { yue2.model_gguf: yue2-3b-q4_0.gguf, yue2.vae_gguf: yue2-vae-f16.gguf }
+    request_defaults: { cot: off, num_inference_steps: 8, semantic_max_tokens: 4200 }
+    known_issues:
+      - "spec 标称仅英文，实测中文咬字可通过（ASR 回查 85%）"
+      - "NAR 步数 8→32 耗时 ×6，质量提升有限（波形差 18.7%，电平/频谱基本一致）"
+
+  ace-step:
+    family: ace_step
+    task: gen
+    path: ${models_root}/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf  # gen 里它指文件
+    request_defaults: { task_route: text2music, language: zh, duration_seconds: 120 }
+    known_issues: ["--model 指目录会 fallback 到 safetensors 源并报缺 config.json"]
+
+  stable-audio-small-music:
+    family: stable_audio
+    task: gen
+    path: ${models_root}/Stable-Audio-3-Small-Music-GGUF
+    request_defaults: { duration_seconds: 30 }
+
+  qwen3-asr:
+    family: qwen3_asr
+    task: asr
+    path: ${models_root}/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
+    session_options:
+      qwen3_asr.forced_aligner_model_path: "${models_root}/Qwen3-ForcedAligner-0.6B-GGUF/qwen3-forced-aligner-0.6b-q8_0.gguf"
+      qwen3_asr.vad_model_path: "${models_root}/silero_vad"     # 缺了它会丢 VAD/分块能力
+    role: scoring                   # 评估台打分用（不可用时自动降级 fun-asr）
+
+  audio8-asr:
+    family: audio8_asr
+    task: asr
+    path: ${models_root}/Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf
+    role: fast-asr                        # 最小最快（服务侧 ~0.3s），无时间戳/说话人
+    known_issues: ["对合成语音会退化输出 → 不能用来给 TTS 打分，只用于真实录音"]
+
+  fun-asr:
+    family: fun_asr_nano
+    task: asr
+    path: ${models_root}/Fun-ASR-Nano-2512-GGUF/fun-asr-nano-2512-q8_0.gguf
+    role: asr-no-timestamps               # 快，但无词级时间戳与说话人
+
+  sortformer-diar:
+    family: sortformer_diar
+    task: diar
+    path: ${models_root}/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf
+    role: speaker-turns                   # 配音/转写后处理：谁在什么时候说
+
+  sheetsage2:
+    family: sheetsage2
+    task: midi
+    path: ${models_root}/SheetSage2-GGUF/sheetsage2-orig.gguf   # 注意：指文件
+    known_issues: ["转出的 ABC 谱接 yue2 的 cot=melody 即翻唱链路"]
+
+  # 下面这些仍然注册（保持能力完整、也便于上游修好后复测），
+  # 但 product_excluded 让产品层不在界面上暴露它们。
+  audio8-tts-01b:
+    family: audio8_tts
+    task: tts
+    path: ${models_root}/Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf
+    product_excluded: true
+    known_issues:
+      - "可懂度 0~3%、时长在 0.37~9.89s 乱跳（2026-09-15 实测），当前不可用"
+      - "PR #444 修的就是这条 0.1B(Falcon-H1) 链路 —— 合入后复跑 audio-eval 即可验证"
+
+  audio8-tts-stream:
+    family: audio8_tts
+    task: tts
+    mode: streaming
+    path: ${models_root}/Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf
+    role: streaming                       # 走 /v1/audio/speech/live，离线批量与评估不适用
+
+  audio8-tts-01b-stream:
+    family: audio8_tts
+    task: tts
+    mode: streaming
+    path: ${models_root}/Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf
+    role: streaming
+    product_excluded: true
+
+# ── 5. 覆盖优先级（从低到高，后者覆盖前者）──────────────────────────────
+#   runtime 默认 < models.<id> < scenarios.<scene> < 用户 UI 选择 < dictionary(user)
+#
+# ── 6. 谁能看到什么（产品决策）────────────────────────────────────────
+#   创作者可见：场景入口、音色、语速、seed、发音词典
+#   自动决策：后端、量化档、内存策略、规范化规则集、切句
+#   只读展示：known_issues（"这个模型在什么情况下不稳"）
