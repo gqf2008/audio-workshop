@@ -29,6 +29,28 @@ AW_MODELS_ROOT=/tmp/aw-models-override python3 tools/audio_config.py check
 
 结果：Rust 原生门禁全绿；平台路径/backend/models_root 覆盖冒烟通过。
 
+Linux 原生（Colima aarch64 + rust:1.95-bookworm）：
+
+```bash
+docker run --rm -v "$HOME/.cache/audio-workshop-m3-snapshot:/work:ro" \
+  -e CARGO_TARGET_DIR=/tmp/target -w /work rust:1.95-bookworm bash -c \
+  'apt-get update -qq && apt-get install -y -qq pkg-config libx11-dev libxkbcommon-dev \
+   libwayland-dev libasound2-dev libfontconfig1-dev clang >/dev/null && cargo check --workspace'
+```
+
+结果：通过（2026-09-16，约 2m20s；日志 `/tmp/m3-linux-docker-check2.log`）。
+
+Windows GNU 交叉：
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+cargo check --workspace --target x86_64-pc-windows-gnu
+```
+
+结果：通过（2026-09-16，约 30s）。
+
 ## 交叉编译阻塞
 
 ```bash
@@ -36,9 +58,10 @@ RUST_FONTCONFIG_DLOPEN=1 cargo check --workspace --target x86_64-unknown-linux-g
 cargo check --workspace --target x86_64-pc-windows-msvc
 ```
 
-- Linux：fontconfig 已通过 dlopen 解决，继续到 `ring` 时缺 `x86_64-linux-gnu-gcc`，
-  属目标 C 工具链/系统 sysroot 未安装。
-- Windows：`ring` 交叉编译到 MSVC 时缺 MSVC SDK 的 C 头（`assert.h`）。
+- Linux GNU target：fontconfig 已通过 dlopen 解决；宿主机继续到 `ring` 时缺
+  `x86_64-linux-gnu-gcc`，属目标 C 工具链/系统 sysroot 未安装；已用原生 Linux 容器绕开验证。
+- Windows MSVC target：`ring` 交叉编译到 MSVC 时缺 MSVC SDK 的 C 头（`assert.h`）；
+  已用 Windows GNU target 验证同一源码树。
 
 因此这两个命令不能代替目标机器构建；需要 Windows/Linux 真机或完整交叉工具链。
 
