@@ -1,0 +1,12 @@
+[package]
+name = "aw-core"
+version = "0.1.0"
+edition = "2021"
+description = "音频作坊核心：服务客户端、文本兜底层、配音链路（无 UI 依赖）"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+hound = "3.5"
