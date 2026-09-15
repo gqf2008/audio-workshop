@@ -68,6 +68,7 @@ export component MainWindow inherits Window {
     in-out property <float> playhead: 0.0;
     in-out property <bool> playing: false;
     in-out property <bool> running: false;
+    in-out property <bool> busy: false;
     in property <bool> has-result: false;
     in property <string> status-text: "就绪";
     in property <string> export-dir: "";
@@ -176,6 +177,7 @@ export component MainWindow inherits Window {
 
             playhead <=> root.playhead;
             running: root.running;
+            busy: root.busy;
             playing: root.playing;
 
             script-edited => { root.script-edited(); }
@@ -270,6 +272,7 @@ export component MainWindow inherits Window {
 
             progress: root.progress;
             running: root.running;
+            busy: root.busy;
             status-text: root.status-text;
             preview-all => { root.preview-all(); }
 

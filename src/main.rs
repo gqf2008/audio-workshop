@@ -72,8 +72,6 @@ enum Cmd {
 enum Msg {
     /// 工程已从磁盘载入（含断点状态与句级复用结果），供 UI 在合成前对齐。
     ProjectLoaded { project: Project, reused: usize },
-    /// 状态栏一句话
-    Note(String),
     /// 句子状态推进（running / done / error）
     Sentence {
         index: usize,
@@ -94,8 +92,21 @@ enum Msg {
         done: usize,
         skipped: usize,
     },
+    /// 单句重录终态；`error=Some` 时保留失败文案。
+    RedoDone { index: usize, error: Option<String> },
+    /// 拼装未产出成品（版本不符或 IO 失败）。
+    AssembleFailed(String),
     /// 工作线程无法继续的错误
     Fatal(String),
+}
+
+struct WorkerMsg {
+    revision: u64,
+    msg: Msg,
+}
+
+fn worker_message_is_current(worker_msg: &WorkerMsg, revision: u64) -> bool {
+    worker_msg.revision == revision
 }
 
 // ===========================================================================
@@ -174,7 +185,7 @@ fn short_path(p: &str) -> String {
 
 struct WorkerCtx {
     rx: Receiver<Cmd>,
-    tx: Sender<Msg>,
+    tx: Sender<WorkerMsg>,
     stop: Arc<AtomicBool>,
 }
 
@@ -204,21 +215,30 @@ fn worker_loop(ctx: WorkerCtx) {
                 let loaded = match load_resumable(&dir, &script, &model, voice_ref) {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = ctx.tx.send(Msg::Fatal(e));
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::Fatal(e),
+                        });
                         continue;
                     }
                 };
                 let reused = loaded.reused;
                 let mut project = loaded.project;
-                let _ = ctx.tx.send(Msg::ProjectLoaded {
-                    project: project.clone(),
-                    reused,
+                let _ = ctx.tx.send(WorkerMsg {
+                    revision,
+                    msg: Msg::ProjectLoaded {
+                        project: project.clone(),
+                        reused,
+                    },
                 });
                 let client = match make_client() {
                     Ok(c) => c,
                     Err(e) => {
                         current = Some((revision, dir, project));
-                        let _ = ctx.tx.send(Msg::Fatal(e));
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::Fatal(e),
+                        });
                         continue;
                     }
                 };
@@ -231,43 +251,63 @@ fn worker_loop(ctx: WorkerCtx) {
                     None,
                     Some(&ctx.stop),
                     |idx, note| {
-                        report_progress(&tx, &mut started.borrow_mut(), idx, note);
+                        report_progress(&tx, revision, &mut started.borrow_mut(), idx, note);
                     },
                 );
                 let stopped = ctx.stop.load(Ordering::Relaxed);
                 current = Some((revision, dir, project));
                 match run {
                     Ok(failed) => {
-                        let _ = ctx.tx.send(Msg::RunDone {
-                            failed,
-                            stopped,
-                            reused,
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::RunDone {
+                                failed,
+                                stopped,
+                                reused,
+                            },
                         });
                     }
                     Err(e) => {
                         // 落盘/解码等无法继续的失败不能伪装成 usize::MAX 个失败句。
                         // current 已保留，磁盘恢复后可直接重跑。
-                        let _ = ctx.tx.send(Msg::Fatal(format!("合成中止: {e}")));
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::Fatal(format!("合成中止: {e}")),
+                        });
                     }
                 }
             }
             Cmd::Redo { revision, index } => {
                 let Some((current_revision, dir, project)) = current.as_mut() else {
-                    let _ = ctx
-                        .tx
-                        .send(Msg::Note("工程已变更：先开始合成再重录单句".into()));
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::RedoDone {
+                            index,
+                            error: Some("工程已变更：先开始合成再重录单句".into()),
+                        },
+                    });
                     continue;
                 };
                 if *current_revision != revision {
-                    let _ = ctx
-                        .tx
-                        .send(Msg::Note("工程版本已变更：先开始合成再重录单句".into()));
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::RedoDone {
+                            index,
+                            error: Some("工程版本已变更：先开始合成再重录单句".into()),
+                        },
+                    });
                     continue;
                 }
                 let client = match make_client() {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = ctx.tx.send(Msg::Fatal(e));
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::RedoDone {
+                                index,
+                                error: Some(e),
+                            },
+                        });
                         continue;
                     }
                 };
@@ -281,46 +321,64 @@ fn worker_loop(ctx: WorkerCtx) {
                     |t| aw_core::normalize(t, &Default::default()),
                     None,
                     |idx, note| {
-                        report_progress(&tx, &mut started.borrow_mut(), idx, note);
+                        report_progress(&tx, revision, &mut started.borrow_mut(), idx, note);
                     },
                 ) {
                     Ok(n) => {
-                        let _ = tx.send(Msg::Note(if n > 0 {
-                            format!("第 {} 句重录失败（见句子状态，可再试）", index + 1)
+                        let error = if n > 0 {
+                            Some(format!("第 {} 句重录失败（见句子状态，可再试）", index + 1))
                         } else {
-                            format!("第 {} 句重录完成", index + 1)
-                        }));
+                            None
+                        };
+                        let _ = tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::RedoDone { index, error },
+                        });
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::Note(format!("重录失败: {e}")));
+                        let _ = tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::RedoDone {
+                                index,
+                                error: Some(format!("重录失败: {e}")),
+                            },
+                        });
                     }
                 }
             }
             Cmd::Assemble { revision } => {
                 let Some((current_revision, dir, project)) = current.as_mut() else {
-                    let _ = ctx
-                        .tx
-                        .send(Msg::Note("工程已变更：先开始合成再导出".into()));
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::AssembleFailed("工程已变更：先开始合成再导出".into()),
+                    });
                     continue;
                 };
                 if *current_revision != revision {
-                    let _ = ctx
-                        .tx
-                        .send(Msg::Note("工程版本已变更：先开始合成再导出".into()));
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::AssembleFailed("工程版本已变更：先开始合成再导出".into()),
+                    });
                     continue;
                 }
                 match project.assemble(dir) {
                     Ok(a) => {
-                        let _ = ctx.tx.send(Msg::Assembled {
-                            wav: a.wav,
-                            srt: a.srt,
-                            duration: a.duration,
-                            done: a.done,
-                            skipped: a.skipped,
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::Assembled {
+                                wav: a.wav,
+                                srt: a.srt,
+                                duration: a.duration,
+                                done: a.done,
+                                skipped: a.skipped,
+                            },
                         });
                     }
                     Err(e) => {
-                        let _ = ctx.tx.send(Msg::Note(format!("拼装中止: {e}")));
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::AssembleFailed(format!("拼装中止: {e}")),
+                        });
                     }
                 }
             }
@@ -332,7 +390,8 @@ fn worker_loop(ctx: WorkerCtx) {
 /// 与「结果回调（done/error）」——不能靠文本前缀判断：spoken 本身可能以
 /// "done"/"error" 开头。
 fn report_progress(
-    tx: &Sender<Msg>,
+    tx: &Sender<WorkerMsg>,
+    revision: u64,
     started: &mut std::collections::HashSet<usize>,
     idx: usize,
     note: &str,
@@ -349,16 +408,22 @@ fn report_progress(
         } else {
             ("running", None)
         };
-        let _ = tx.send(Msg::Sentence {
-            index: idx,
-            status: status.into(),
-            duration,
+        let _ = tx.send(WorkerMsg {
+            revision,
+            msg: Msg::Sentence {
+                index: idx,
+                status: status.into(),
+                duration,
+            },
         });
     } else {
-        let _ = tx.send(Msg::Sentence {
-            index: idx,
-            status: "running".into(),
-            duration: None,
+        let _ = tx.send(WorkerMsg {
+            revision,
+            msg: Msg::Sentence {
+                index: idx,
+                status: "running".into(),
+                duration: None,
+            },
         });
     }
 }
@@ -613,7 +678,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // ── 线程通道 + 停止位（UI 与工作线程共享同一个 stop）──
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
-    let (msg_tx, msg_rx) = channel::<Msg>();
+    let (msg_tx, msg_rx) = channel::<WorkerMsg>();
     let stop = Arc::new(AtomicBool::new(false));
     let state = Rc::new(UiState {
         assembled: RefCell::new(None),
@@ -856,8 +921,8 @@ fn wire_script(
     let state0 = state.clone();
     ui.on_project_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：工程名暂不可改".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：工程名暂不可改".into());
             return;
         }
         invalidate_worker_project(&tx, &state0);
@@ -871,8 +936,8 @@ fn wire_script(
     let state1 = state.clone();
     ui.on_script_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：等这轮跑完或先停止，再编辑稿件".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：等这轮跑完或先停止，再编辑稿件".into());
             return;
         }
         let text = ui.get_script_text();
@@ -894,8 +959,8 @@ fn wire_script(
     let state2 = state.clone();
     ui.on_use_sample(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：暂不能载入示例稿".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：暂不能载入示例稿".into());
             return;
         }
         ui.set_script_text(SAMPLE_SCRIPT.into());
@@ -910,8 +975,8 @@ fn wire_script(
     let state3 = state.clone();
     ui.on_clear_script(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：暂不能清空稿件".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：暂不能清空稿件".into());
             return;
         }
         ui.set_script_text("".into());
@@ -926,8 +991,8 @@ fn wire_script(
     let state4 = state.clone();
     ui.on_resplit(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：暂不能重新切句".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：暂不能重新切句".into());
             return;
         }
         let text = ui.get_script_text();
@@ -945,8 +1010,8 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
     let state1 = state.clone();
     ui.on_model_changed(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：音色暂不可改".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：音色暂不可改".into());
             return;
         }
         invalidate_worker_project(&tx, &state1);
@@ -959,8 +1024,8 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
     let state2 = state.clone();
     ui.on_voice_ref_changed(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：参考音暂不可改".into());
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：参考音暂不可改".into());
             return;
         }
         invalidate_worker_project(&tx2, &state2);
@@ -1030,11 +1095,16 @@ fn wire_sentence_actions(
             ui.set_status_text("合成进行中：等这轮跑完再重录单句".into());
             return;
         }
+        if ui.get_busy() {
+            ui.set_status_text("重录 / 导出正在进行：请等当前任务结束".into());
+            return;
+        }
         if !state3.project_ready.get() {
             ui.set_status_text("工程已变更：先开始合成，再重录单句".into());
             return;
         }
         ui.set_selected(i);
+        ui.set_busy(true);
         let _ = tx3.send(Cmd::Redo {
             revision: state3.project_revision.get(),
             index: idx,
@@ -1080,6 +1150,10 @@ fn wire_run(
     let state1 = state.clone();
     ui.on_start_run(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_busy() {
+            ui.set_status_text("重录 / 导出正在进行：请等当前任务结束".into());
+            return;
+        }
         let n = model4.row_count();
         if n == 0 {
             ui.set_status_text("稿件为空：先粘稿子或点「载入示例稿」".into());
@@ -1182,10 +1256,15 @@ fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let state = state.clone();
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_busy() {
+            ui.set_status_text("已有导出 / 重录任务正在进行".into());
+            return;
+        }
         if !state.project_ready.get() {
             ui.set_status_text("工程已变更：先开始合成，再导出".into());
             return;
         }
+        ui.set_busy(true);
         let _ = tx.send(Cmd::Assemble {
             revision: state.project_revision.get(),
         });
@@ -1255,16 +1334,19 @@ fn wire_keys(
 fn tick(
     ui: &MainWindow,
     rows: &Rc<VecModel<Sentence>>,
-    msg_rx: &Rc<RefCell<Receiver<Msg>>>,
+    msg_rx: &Rc<RefCell<Receiver<WorkerMsg>>>,
     player: &Rc<player::Player>,
     state: &Rc<UiState>,
 ) {
     // ── 工作线程消息 ──
     let mut run_finished: Option<(usize, bool, usize)> = None;
     loop {
-        let msg = msg_rx.borrow_mut().try_recv();
-        let Ok(msg) = msg else { break };
-        match msg {
+        let worker_msg = msg_rx.borrow_mut().try_recv();
+        let Ok(worker_msg) = worker_msg else { break };
+        if !worker_message_is_current(&worker_msg, state.project_revision.get()) {
+            continue;
+        }
+        match worker_msg.msg {
             Msg::ProjectLoaded { project, reused } => {
                 apply_project_to_rows(ui, rows, &project);
                 state.project_ready.set(true);
@@ -1274,10 +1356,10 @@ fn tick(
                     );
                 }
             }
-            Msg::Note(t) => ui.set_status_text(t.into()),
             Msg::Fatal(t) => {
                 mark_running_rows_failed(rows);
                 ui.set_running(false);
+                ui.set_busy(false);
                 ui.set_status_text(t.into());
             }
             Msg::Sentence {
@@ -1306,7 +1388,23 @@ fn tick(
                 failed,
                 stopped,
                 reused,
-            } => run_finished = Some((failed, stopped, reused)),
+            } => {
+                ui.set_busy(false);
+                run_finished = Some((failed, stopped, reused));
+            }
+            Msg::RedoDone { index, error } => {
+                ui.set_busy(false);
+                if let Some(error) = error {
+                    set_status(rows, index, "error");
+                    ui.set_status_text(error.into());
+                } else {
+                    ui.set_status_text(format!("第 {} 句重录完成", index + 1).into());
+                }
+            }
+            Msg::AssembleFailed(error) => {
+                ui.set_busy(false);
+                ui.set_status_text(error.into());
+            }
             Msg::Assembled {
                 wav,
                 srt,
@@ -1314,6 +1412,7 @@ fn tick(
                 done,
                 skipped,
             } => {
+                ui.set_busy(false);
                 *state.assembled.borrow_mut() = Some(AssembledInfo {
                     wav: wav.clone(),
                     duration,
@@ -1867,6 +1966,20 @@ mod tests {
     }
 
     #[test]
+    fn stale_worker_messages_are_filtered_by_revision() {
+        let stale = WorkerMsg {
+            revision: 7,
+            msg: Msg::Fatal("旧任务的错误".into()),
+        };
+        let current = WorkerMsg {
+            revision: 8,
+            msg: Msg::Fatal("新任务的错误".into()),
+        };
+        assert!(!worker_message_is_current(&stale, 8));
+        assert!(worker_message_is_current(&current, 8));
+    }
+
+    #[test]
     fn model_change_invalidates_all_sentence_reuse() {
         let dir = temp_dir("resume-model-change");
         let mut old = saved_project("第一句。第二句。", None);
@@ -1959,10 +2072,12 @@ mod tests {
     fn report_progress_emits_running_then_terminal_result() {
         let (tx, rx) = channel();
         let mut started = std::collections::HashSet::new();
-        report_progress(&tx, &mut started, 2, "第二句");
-        report_progress(&tx, &mut started, 2, "done 1.25s");
+        report_progress(&tx, 7, &mut started, 2, "第二句");
+        report_progress(&tx, 7, &mut started, 2, "done 1.25s");
 
-        match rx.recv().unwrap() {
+        let first = rx.recv().unwrap();
+        assert_eq!(first.revision, 7);
+        match first.msg {
             Msg::Sentence {
                 index,
                 status,
@@ -1974,7 +2089,9 @@ mod tests {
             }
             _ => panic!("第一条应为 running"),
         }
-        match rx.recv().unwrap() {
+        let second = rx.recv().unwrap();
+        assert_eq!(second.revision, 7);
+        match second.msg {
             Msg::Sentence {
                 index,
                 status,

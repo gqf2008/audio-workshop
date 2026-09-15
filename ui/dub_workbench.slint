@@ -43,6 +43,7 @@ component SectionLabel inherits Text {
 component SentenceRow inherits Rectangle {
     in property <Sentence> item;
     in property <bool> picked: false;
+    in property <bool> busy: false;
     callback pick();
     callback audition();
     callback redo();
@@ -139,6 +140,7 @@ component SentenceRow inherits Rectangle {
                 size: "small";
                 variant: "primary";
                 text: "重录";
+                enabled: !root.busy;
                 Tooltip { text: @markdown("只重跑这一句"); }
                 clicked => { root.redo(); }
             }
@@ -182,6 +184,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
 
     in property <float> progress: 0.0;
     in property <bool> running: false;
+    in property <bool> busy: false;
     in property <string> status-text: "";
     callback preview-all();
 
@@ -217,7 +220,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 PixelTextInput {
                     text <=> root.project-name;
                     placeholder: "工程名，如：0921 开箱口播";
-                    enabled: !root.running;
+                    enabled: !root.running && !root.busy;
                     edited => { root.project-edited(); }
                 }
             }
@@ -254,7 +257,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     model: root.voice-names;
                     index <=> root.voice-index;
                     placeholder: "选择音色";
-                    enabled: !root.running;
+                    enabled: !root.running && !root.busy;
                     selected(i) => { root.model-changed(); }
                 }
                 Text {
@@ -365,7 +368,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 PixelButton {
                     text: "开始导出";
                     variant: "primary";
-                    enabled: root.has-result;
+                    enabled: root.has-result && !root.busy && !root.running;
                     clicked => { root.export-requested(); }
                 }
                 Text {
@@ -399,6 +402,7 @@ export component DubWorkbench inherits Rectangle {
     // ── 运行状态（首屏主按钮要按状态换文案；playhead 给时间轴画播放头） ──
     in-out property <float> playhead: 0.0;
     in property <bool> running: false;
+    in property <bool> busy: false;
     in property <bool> playing: false;
 
     // ── 事件出口 ──
@@ -434,7 +438,7 @@ export component DubWorkbench inherits Rectangle {
                         horizontal-stretch: 1;
                         height: 132px;
                         frame-height: 132px;
-                        enabled: !root.running;
+                        enabled: !root.running && !root.busy;
                         text <=> root.script-text;
                         placeholder: "把口播稿粘进来，按 。！？ 自动切句…";
                         edited => { root.script-edited(); }
@@ -444,7 +448,7 @@ export component DubWorkbench inherits Rectangle {
                         Rectangle { // 首屏
                             width: 22px;
                             height: 22px;
-                            visible: root.script-text != "" && !root.running;
+                            visible: root.script-text != "" && !root.running && !root.busy;
                             background: clear-ta.pressed ? PixelTheme.shadow : (clear-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
                             border-width: 2px;
                             border-color: PixelTheme.edge;
@@ -482,14 +486,14 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 92px;
                         text: "重新切句";
-                        enabled: root.script-text != "" && !root.running;
+                        enabled: root.script-text != "" && !root.running && !root.busy;
                         clicked => { root.resplit(); }
                     }
                     PixelButton { // 首屏
                         width: 104px;
                         variant: "primary";
                         text: root.running ? "停止合成" : (root.playing ? "停止试听" : "开始合成");
-                        enabled: root.running || root.playing || root.sentences.length > 0;
+                        enabled: (root.running || root.playing || root.sentences.length > 0) && !root.busy;
                         clicked => {
                             if root.running { root.stop-run(); }
                             else if root.playing { root.stop-preview(); }
@@ -512,7 +516,7 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏-空态
                         width: 120px;
                         text: "载入示例稿";
-                        enabled: !root.running;
+                        enabled: !root.running && !root.busy;
                         clicked => { root.use-sample(); }
                     }
                 }
@@ -525,6 +529,7 @@ export component DubWorkbench inherits Rectangle {
                         for s[i] in root.sentences : SentenceRow {
                             item: s;
                             picked: root.selected == i;
+                            busy: root.busy;
                             pick => { root.select-sentence(i); }
                             audition => { root.preview-one(i); }
                             redo => { root.redo-one(i); }
