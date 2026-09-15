@@ -37,7 +37,8 @@ const REDO_TICKS: i32 = 12;
 const DEFAULT_PROJECT: &str = "示例工程 · 频道口播";
 
 /// 启动提示：告诉第一次打开的人「合成 / 音色 / 导出」在哪。
-const READY_NOTE: &str = "就绪：示例稿已切句。合成 / 音色 / 导出在标题栏右上角的抽屉里";
+const READY_NOTE: &str =
+    "就绪：示例稿已切句（合成走桩数据）· 合成 / 音色 / 导出在标题栏右上角的抽屉里";
 
 /// 示例稿（桩）：换真实场景时从剪贴板 / 文件来。
 const SAMPLE_SCRIPT: &str = "大家好，欢迎回到音频作坊。今天聊三件事。\
@@ -148,10 +149,15 @@ fn main() -> Result<(), slint::PlatformError> {
 
 /// 把界面直接摆到某个「跑一遍流程就能走到」的状态，供产截图 / 演示评审用。
 ///
-/// 只在设置了 `AW_UI_STATE` 时生效，正常运行路径一行都不受影响：
+/// **只在 debug 构建里存在**（`#[cfg(debug_assertions)]`）：release 版本整个函数
+/// 被编译掉，不存在任何「用环境变量伪造已完成 / 可导出」的旁路，
+/// 验证：`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0。
+///
+/// 取值（不设则完全是默认态）：
 ///   - `selected` 选中第 2 句（展开行里能看到时长 / 起始 / 试听 / 重录）
-///   - `drawer`   展开右侧抽屉（音色 / 任务 / 导出）
+///   - `drawer`   展开右侧抽屉（工程 / 视图 / 音色 / 任务 / 导出）
 ///   - `dark`     切到暗色主题
+#[cfg(debug_assertions)]
 fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
     let Ok(state) = std::env::var("AW_UI_STATE") else {
         return;
@@ -171,7 +177,7 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         }
         "drawer" => {
             ui.set_drawer_open(true);
-            ui.set_status_text("抽屉：音色 / 任务 / 导出都在这儿（点空白处收起）".into());
+            ui.set_status_text("抽屉：工程 / 视图 / 音色 / 任务 / 导出都在这儿".into());
         }
         "dark" => {
             ui.set_theme_scheme("dark".into());
@@ -180,6 +186,10 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         _ => {}
     }
 }
+
+/// release 构建：没有演示旁路，界面只按真实运行状态走。
+#[cfg(not(debug_assertions))]
+fn apply_shot_state(_ui: &MainWindow, _rows: &Rc<VecModel<Sentence>>) {}
 
 // ===========================================================================
 // 回调接线
@@ -220,7 +230,7 @@ fn wire_script(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         rebuild(&ui, &rows1, &text);
         ui.set_status_text(
             format!(
-                "稿件已更新：{} 字 / {} 句",
+                "稿件已更新：{} 字 / {} 句 · 已合成状态已重置（M0 不做逐句复用）",
                 ui.get_char_count(),
                 rows1.row_count()
             )
@@ -349,7 +359,17 @@ fn wire_run(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
     ui.on_stop_run(move || {
         let Some(ui) = weak.upgrade() else { return };
         ui.set_running(false);
+        // 停止合成是一条「停下来」的指令：正在跑的试听也一起停
+        ui.set_playing(false);
         ui.set_status_text("已停止合成".into());
+    });
+
+    // 停止试听：首屏主按钮在 playing 时显示「停止试听」，走这个出口
+    let weak = ui.as_weak();
+    ui.on_stop_preview(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_playing(false);
+        ui.set_status_text("已停止试听".into());
     });
 
     let weak = ui.as_weak();
@@ -454,9 +474,8 @@ fn apply_progress(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, progress: f32)
         set_status(rows, i, want);
     }
     ui.set_done_count(done as i32);
-    if done < n {
-        ui.set_selected(done as i32);
-    }
+    // 不在这里改 selected：那会把「选中展开 44px」一路带着走，整列逐句抖动。
+    // 进度由状态点（合成中=粗圆环）、时间轴与抽屉里的进度条表达。
     ui.set_status_text(format!("合成中 · 已完成 {done}/{n} 句").into());
 }
 

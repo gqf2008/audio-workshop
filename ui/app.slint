@@ -1,19 +1,23 @@
 // ============================================================================
 // 音频作坊 · 主窗口（低密度 / 渐进披露版）
 //
-// 一屏一事：首屏只有「稿件输入 + 句子列表 + 底部时间轴细条」；
-// 音色 / 任务 / 导出 全部收进右侧抽屉，默认收起，点标题栏 ☰ 展开。
+// 一屏一事：首屏只有「稿件输入 + 一句话状态行 + 句子列表 + 底部时间轴细条」，
+// 外壳只剩标题栏与状态栏（场景导航并入抽屉；主题切换也在抽屉里）。
+// 工程 / 视图（场景 + 主题）/ 音色 / 任务 / 导出 全部在右侧抽屉，默认收起，
+// 点标题栏的抽屉开关展开。
 //
-// 密度约定：行高 ≥44px、区块间距 ≥16px、同级并列元素 ≤3 个；
-//          用留白与细分隔线分区，不套一层层面板边框。
+// 首屏元素逐个用 `// 首屏` 标在声明行上；计数口径与可复现命令见
+// docs/ui/首屏清单.md：
+//   grep -c '// 首屏$' ui/*.slint           # 默认态首屏可见元素（外壳标题栏/状态栏各计 1）
+//   grep -c '// 首屏-空态$' ui/*.slint      # 空稿态额外出现的元素（此时列表消失）
 //
+// 间距约定：块间 20px、块内与抽屉内 ≥16px、同级并列元素 ≤3 个。
 // 主题：PixelTheme.scheme 一键换肤（light / dark），全部组件同时生效。
 // 本文件只做「组装 + 转发」：状态与动作都在 src/main.rs（桩数据）。
 // ============================================================================
 
 import {
-    PixelDrawer, PixelEmpty, PixelNavbar, PixelSegmentedControl,
-    PixelTheme, PixelTitleBar, PixelToast, PixelWindowResize,
+    PixelDrawer, PixelEmpty, PixelTheme, PixelTitleBar, PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
 import { Sentence, Voice } from "model.slint";
@@ -34,14 +38,14 @@ export component MainWindow inherits Window {
     // ── 主题（改 theme-scheme 即换肤；Rust 侧 set_theme_scheme） ──
     in property <string> theme-scheme: "light";
 
-    // ── 场景导航 ──
+    // ── 场景导航（首屏只显示当前场景，切换在抽屉里） ──
     in-out property <int> scene: 0;
     in property <[string]> scenes: ["配音", "BGM", "歌曲", "素材库"];
 
-    // ── 右侧抽屉（音色 / 任务 / 导出）：默认收起，点标题栏按钮展开 ──
+    // ── 右侧抽屉（工程 / 场景 / 主题 / 音色 / 任务 / 导出）：默认收起 ──
     in-out property <bool> drawer-open: false;
 
-    // ── 工作台状态（转发给 DubWorkbench，见下） ──
+    // ── 工作台状态（转发给 DubWorkbench / WorkbenchDrawer，见下） ──
     in property <string> project-name: "";
     in-out property <string> script-text: "";
     in property <int> char-count: 0;
@@ -97,9 +101,12 @@ export component MainWindow inherits Window {
     callback speed-changed(float);
     callback start-run();
     callback stop-run();
+    callback stop-preview();
     callback export-wav();
     callback export-srt();
     callback seek(float);
+
+    property <string> scene-name: root.scenes[Math.max(0, Math.min(root.scene, root.scenes.length - 1))];
 
     init => { PixelTheme.scheme = root.theme-scheme; }
     changed theme-scheme => { PixelTheme.scheme = root.theme-scheme; }
@@ -107,21 +114,21 @@ export component MainWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
 
-        // ── 标题栏：右侧叠一个抽屉开关（不动标题栏自身的拖拽与窗口按钮） ──
-        Rectangle {
+        // ── 标题栏（含当前场景名、窗口按钮与抽屉开关） ──
+        Rectangle { // 首屏
             height: 34px;
 
             PixelTitleBar {
                 width: 100%;
                 height: 100%;
-                title: "音频作坊 · 配音工作台";
+                title: "音频作坊 · " + root.scene-name;
                 drag-start => { root.drag-start(); }
                 minimize => { root.minimize(); }
                 toggle-maximize => { root.toggle-maximize(); }
                 close-window => { root.close-window(); }
             }
             // 抽屉开关：像素风三横条（自绘，不依赖字体字形——☰ 这类符号本机字体缺失会变方块）
-            Rectangle {
+            Rectangle { // 首屏
                 x: parent.width - 176px;
                 y: 4px;
                 width: 26px;
@@ -140,25 +147,7 @@ export component MainWindow inherits Window {
                     mouse-cursor: pointer;
                     clicked => { root.drawer-open = !root.drawer-open; }
                 }
-                Tooltip { text: @markdown("工作台设置：音色 / 任务 / 导出"); }
-            }
-        }
-
-        PixelNavbar {
-            brand: "音频作坊";
-            items: root.scenes;
-            active <=> root.scene;
-            selected(i) => { root.scene-changed(i); }
-
-            // 右侧插槽：主题切换（浅色 / 暗色）
-            Rectangle { horizontal-stretch: 1; }
-            PixelSegmentedControl {
-                width: 132px;
-                options: ["浅色", "暗色"];
-                // 组件库的选中项固定用白字：暗色下把选中面压成深灰，否则白字压白面看不见
-                face-active: root.theme-scheme == "dark" ? #525252 : PixelTheme.accent;
-                index: root.theme-scheme == "dark" ? 1 : 0;
-                selected(i) => { root.theme-picked(i == 1 ? "dark" : "light"); }
+                Tooltip { text: @markdown("工作台设置：工程 / 视图 / 音色 / 任务 / 导出"); }
             }
         }
 
@@ -166,7 +155,6 @@ export component MainWindow inherits Window {
             vertical-stretch: 1;
             horizontal-stretch: 1;
 
-            project-name: root.project-name;
             script-text <=> root.script-text;
             char-count: root.char-count;
             est-duration: root.est-duration;
@@ -177,38 +165,20 @@ export component MainWindow inherits Window {
             total-duration: root.total-duration;
             total-label: root.total-label;
 
-            voice-names: root.voice-names;
-            voices: root.voices;
-            voice-index <=> root.voice-index;
-            speed <=> root.speed;
-            speed-label: root.speed-label;
-            auto-normalize <=> root.auto-normalize;
-
-            progress <=> root.progress;
             playhead <=> root.playhead;
-            playing <=> root.playing;
-            running <=> root.running;
-            has-result: root.has-result;
-            status-text: root.status-text;
-            export-dir: root.export-dir;
+            running: root.running;
+            playing: root.playing;
 
-            export-wav-on <=> root.export-wav-on;
-            export-srt-on <=> root.export-srt-on;
-
-            project-edited => { root.project-edited(); }
             script-edited => { root.script-edited(); }
             use-sample => { root.use-sample(); }
             clear-script => { root.clear-script(); }
             resplit => { root.resplit(); }
             select-sentence(i) => { root.select-sentence(i); }
-            preview-all => { root.preview-all(); }
             preview-one(i) => { root.preview-one(i); }
             redo-one(i) => { root.redo-one(i); }
-            speed-changed(v) => { root.speed-changed(v); }
             start-run => { root.start-run(); }
             stop-run => { root.stop-run(); }
-            export-wav => { root.export-wav(); }
-            export-srt => { root.export-srt(); }
+            stop-preview => { root.stop-preview(); }
             seek(p) => { root.seek(p); }
         }
 
@@ -225,7 +195,7 @@ export component MainWindow inherits Window {
         }
 
         // ── 状态栏 ──
-        Rectangle {
+        Rectangle { // 首屏
             height: 30px;
             background: PixelTheme.panel;
 
@@ -237,7 +207,7 @@ export component MainWindow inherits Window {
             HorizontalLayout {
                 padding-left: 16px;
                 padding-right: 16px;
-                spacing: 10px;
+                spacing: 16px;
                 Text {
                     horizontal-stretch: 1;
                     text: root.status-text;
@@ -252,23 +222,17 @@ export component MainWindow inherits Window {
                     font-size: 12px;
                     vertical-alignment: center;
                 }
-                Text {
-                    text: root.theme-scheme == "dark" ? "暗色" : "浅色";
-                    color: PixelTheme.dim;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
             }
         }
     }
 
-    // ── 右侧抽屉：默认收起（渐进披露），点标题栏 ☰ 展开 ──
+    // ── 右侧抽屉：默认收起（渐进披露），点标题栏开关展开 ──
     PixelDrawer {
         x: 0px; y: 0px;
         width: 100%; height: 100%;
         open: root.drawer-open;
         title: "工作台设置";
-        drawer-width: 340px;
+        drawer-width: 380px;
         close => { root.drawer-open = false; }
 
         WorkbenchDrawer {
@@ -276,6 +240,13 @@ export component MainWindow inherits Window {
 
             project-name: root.project-name;
             project-edited => { root.project-edited(); }
+
+            scene-names: root.scenes;
+            scene <=> root.scene;
+            scene-changed(i) => { root.scene-changed(i); }
+
+            theme-scheme: root.theme-scheme;
+            theme-picked(s) => { root.theme-picked(s); }
 
             voice-names: root.voice-names;
             voices: root.voices;
@@ -288,8 +259,6 @@ export component MainWindow inherits Window {
             progress: root.progress;
             running: root.running;
             status-text: root.status-text;
-            start-run => { root.start-run(); }
-            stop-run => { root.stop-run(); }
             preview-all => { root.preview-all(); }
 
             has-result: root.has-result;
