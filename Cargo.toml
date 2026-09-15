@@ -1,0 +1,30 @@
+[package]
+name = "audio-workshop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "音频作坊：本地优先的音频工作台（配音 / BGM / 歌曲），配音先行"
+build = "build.rs"
+
+[dependencies]
+# GUI：Rust + Slint 1.17。渲染走默认 femtovg（OpenGL）；macOS 上 Metal 由系统 GL 层接管。
+# `unstable-winit-030`：无边框自绘标题栏要拿 winit 窗口做拖拽/最小化/最大化/缩放
+# （slint-pixel 的 install_title_bar_controls / install_window_resize 依赖它）。
+slint = { version = "1.17", features = ["unstable-winit-030"] }
+# 像素风组件库：全部界面控件经 `@slint_pixel` 导入（Pixel* 前缀），无 std-widgets 控件。
+slint-pixel = "0.2.1"
+
+[build-dependencies]
+slint-build = "1.17"
+# build.rs 需要 slint_pixel::library_paths() 注册 `@slint_pixel` 库路径。
+slint-pixel = "0.2.1"
+
+# Cargo 工作区。M1 阶段只有这一个 crate（最小桌面壳）；后续批量/模板等能力
+# （CHARTER 第 9 节 M4）再拆成员 crate，届时往 members 里加即可。
+[workspace]
+resolver = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+strip = true
