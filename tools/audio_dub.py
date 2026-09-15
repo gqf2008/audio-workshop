@@ -67,6 +67,19 @@ def synth_one(text, model, seed, voice_ref=None, extra=None):
     return base64.b64decode(resp["audio"]), None
 
 
+
+# ── 落盘：一律"临时文件 + fsync + 原子替换" ─────────────────────────────
+# 评审指出：原地覆盖 final.wav、无 fsync、project.json 非原子写，都会在崩溃/磁盘满时
+# 留下静默损坏的产物或不可读的工程。这里统一收口。
+def write_atomic(path, data: bytes):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 # ── 工程文件 ────────────────────────────────────────────────────────
 def load_project(d):
     p = os.path.join(d, "project.json")
@@ -75,8 +88,8 @@ def load_project(d):
 
 
 def save_project(d, prj):
-    json.dump(prj, open(os.path.join(d, "project.json"), "w", encoding="utf-8"),
-              ensure_ascii=False, indent=1)
+    write_atomic(os.path.join(d, "project.json"),
+                 json.dumps(prj, ensure_ascii=False, indent=1).encode("utf-8"))
 
 
 # ── 子命令 ──────────────────────────────────────────────────────────
@@ -124,11 +137,16 @@ def cmd_synth(a):
                              {"instruction": "自然、清晰的叙述语气"})
         if err:
             s["status"] = f"error: {err}"; print(f"    [{s['index']:>3}] ❌ {err[:70]}"); continue
-        path = os.path.join(a.dir, s["wav"]); open(path, "wb").write(raw)
+        path = os.path.join(a.dir, s["wav"])
+        write_atomic(path, raw)
+        if os.path.getsize(path) != len(raw):      # 回读校验：截断必须立刻暴露
+            s["status"] = f"error: 落盘不完整 ({os.path.getsize(path)}/{len(raw)} 字节)"
+            print(f"    [{s['index']:>3}] ❌ 落盘不完整"); continue
         sr, ch, sw, n = wav_meta(raw)
         s.update({"duration": round(n / sr, 3), "sample_rate": sr, "channels": ch,
                   "status": "done"})
         print(f"    [{s['index']:>3}] ✅ {s['duration']:5.2f}s  {s['spoken'][:40]}")
+        save_project(a.dir, prj)                   # 逐句落盘：中途被杀不退已完成的部分
     save_project(a.dir, prj)
     print(f"  用时 {time.time()-t0:.1f}s")
 
@@ -137,14 +155,39 @@ def cmd_assemble(a):
     prj = load_project(a.dir)
     done = [s for s in prj["sentences"] if s["status"] == "done"]
     if not done: sys.exit("  还没有已合成的句子")
+    # 拼装前逐句校验：文件存在、可读、位深/采样率/声道与元数据一致
+    bad = []
+    for s in done:
+        path = os.path.join(a.dir, s["wav"])
+        if not os.path.isfile(path):
+            bad.append(f"[{s['index']}] 文件缺失"); continue
+        try:
+            with wave.open(path, "rb") as w:
+                if w.getsampwidth() != 2 or w.getframerate() != s["sample_rate"] or w.getnchannels() != s["channels"]:
+                    bad.append(f"[{s['index']}] 参数不符 (位深{w.getsampwidth()*8}bit "
+                               f"{w.getframerate()}Hz {w.getnchannels()}ch)")
+                else:
+                    # 关键：截断文件的两处证据都不在"头"里——头仍合法、参数仍正确、
+                    # 头里的帧数也不会被截断改写。唯一可信的判据是**实际字节数**是否
+                    # 覆盖头声明的数据量（截断 → 实际 < 应有）。
+                    need = 44 + w.getnframes() * w.getnchannels() * w.getsampwidth()
+                    actual_bytes = os.path.getsize(path)
+                    if actual_bytes < need:
+                        bad.append(f"[{s['index']}] 文件被截断 (实际 {actual_bytes} 字节，"
+                                   f"头声明需要 {need} 字节)")
+        except Exception as e:
+            bad.append(f"[{s['index']}] 不可读: {e}")
+    if bad:
+        sys.exit("  拼装中止，以下句子有问题：\n    " + "\n    ".join(bad))
     rates = {(s["sample_rate"], s["channels"]) for s in done}
     if len(rates) > 1: sys.exit(f"  采样率/声道不一致，无法拼装: {rates}")
     sr, ch = rates.pop()
     gap = int(sr * prj["gap_ms"] / 1000)
     os.makedirs(os.path.join(a.dir, "out"), exist_ok=True)
     final = os.path.join(a.dir, "out", "final.wav")
+    final_tmp = f"{final}.tmp{os.getpid()}"
     cursor, srt = 0, []
-    with wave.open(final, "wb") as out:
+    with wave.open(final_tmp, "wb") as out:
         out.setnchannels(ch); out.setsampwidth(2); out.setframerate(sr)
         for k, s in enumerate(prj["sentences"]):
             if s["status"] != "done":
@@ -159,7 +202,8 @@ def cmd_assemble(a):
             m0, s0 = divmod(s["start"], 60); m1, s1 = divmod(s["start"] + s["duration"], 60)
             srt.append(f"{len(srt)+1}\n{int(m0):02d}:{s0:06.3f}".replace(".", ",") +
                        f" --> {int(m1):02d}:{s1:06.3f}".replace(".", ",") + f"\n{s['text']}\n")
-    open(os.path.join(a.dir, "out", "final.srt"), "w", encoding="utf-8").write("\n".join(srt))
+    os.replace(final_tmp, final)                       # 原子替换：旧成品在写完前不受影响
+    write_atomic(os.path.join(a.dir, "out", "final.srt"), "\n".join(srt).encode("utf-8"))
     save_project(a.dir, prj)
     print(f"  ✅ {final}  {cursor/sr:.1f}s  共 {len(done)}/{len(prj['sentences'])} 句")
     print(f"  ✅ {os.path.join(a.dir, 'out', 'final.srt')}（句子级时间轴）")

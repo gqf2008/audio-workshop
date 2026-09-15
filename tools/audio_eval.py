@@ -86,6 +86,8 @@ TEXTS = {
 TRICKY = {
     "多音字": "他去银行取钱，然后步行去医院，路上听着音乐很快乐。重庆的厦门的六安的朋友都说这个方法很好。",
     "数字": "会议定在 2026 年 3 月 17 日下午 3 点 05 分，联系电话 13812345678，报价 1234.56 元，涨幅百分之三十。",
+    # 国内稿最常见形态：数字紧贴汉字（旧用例全带空格，曾漏掉 \b 在 Python 下对汉字失效的 bug）
+    "数字-紧凑": "会议定在2026年3月17日下午3点05分，联系电话13812345678，报价1234.56元，涨幅30%。",
     "专名缩写": "我们用 AI 和 GPU 做 5G 网络优化，WiFi 信号覆盖了百分之九十的区域，高铁 3 小时能到。",
 }
 
@@ -261,13 +263,6 @@ def transcribe(path, asr_model):
     if err: return None, err
     if isinstance(r, dict) and "error" in r: return None, str(r["error"])
     return r.get("text", ""), None
-
-
-def unload_all():
-    try:
-        post("/v1/tasks/unload_all_models", {}, timeout=60)
-    except Exception:
-        pass
 
 
 def main():
