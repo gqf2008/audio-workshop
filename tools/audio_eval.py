@@ -13,7 +13,6 @@
 import argparse, base64, json, os, re, subprocess, sys, threading, time, urllib.request, wave, io, difflib
 
 
-# ============ 原型 TN 层：中文数字读法规范化 ============
 # 与框架 src/framework/text/chinese_normalization.cpp 同一套规则：
 #   电话号码/长数字串 → 逐位读（1 读"幺"）；金额/数量 → 读基数词；年份 → 逐位读
 _CN = "零一二三四五六七八九"
@@ -21,58 +20,14 @@ _UNITS = ["", "十", "百", "千"]
 _BIG = ["", "万", "亿"]
 
 
-def _cardinal(n):
-    """0..9999亿 → 中文基数词（1234 → 一千二百三十四；10086 → 一万零八十六）"""
-    if n == 0: return "零"
-
-    def under_10000(x):
-        out, zero = "", False
-        for i in (3, 2, 1, 0):
-            d = (x // 10 ** i) % 10
-            if d == 0:
-                zero = True
-            else:
-                if zero and out: out += "零"
-                zero = False
-                if d == 1 and i == 1 and not out:
-                    out += "十"              # 十七 而非 一十七
-                else:
-                    out += _CN[d] + _UNITS[i]
-        return out
-
-    groups = []
-    x = n
-    while x > 0:
-        groups.append(x % 10000); x //= 10000
-    out = ""
-    for gi in range(len(groups) - 1, -1, -1):
-        g = groups[gi]
-        if g == 0:
-            if out and not out.endswith("零"): out += "零"
-            continue
-        if out and g < 1000 and not out.endswith("零"): out += "零"   # 组间补零
-        out += under_10000(g) + _BIG[gi]
-    return out.rstrip("零") or "零"
-
-
-def _digits_zh(digits, telephone=False):
-    return "".join("幺" if (telephone and c == "1") else _CN[int(c)] for c in digits)
-
-
 def verbalize_zh(text):
-    """把文本里的阿拉伯数字改写成期望的中文读法（原型，供评估与产品 TN 层参考）"""
-    t = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)          # 去掉千分位
-    t = re.sub(r"\b1\d{10}\b", lambda m: _digits_zh(m.group(0), True), t)   # 手机号 → 幺…
-    t = re.sub(r"\b\d{3,4}[- ]\d{4}[- ]?\d{0,4}\b", lambda m: _digits_zh(re.sub(r"\D", "", m.group(0)), True), t)
-    t = re.sub(r"\b(\d+)\.(\d+)\b", lambda m: _cardinal(int(m.group(1))) + "点" + _digits_zh(m.group(2)), t)  # 小数
-    t = re.sub(r"(\d+)\s*%", lambda m: "百分之" + _cardinal(int(m.group(1))), t)      # 百分比
-    t = re.sub(r"\b(19|20)\d{2}\b", lambda m: _digits_zh(m.group(0)), t)            # 年份 → 逐位
-    t = re.sub(r"\b(\d+)\b", lambda m: _cardinal(int(m.group(1))), t)               # 其余整数 → 基数词
-    return t
+    """中文数字读法规范化——**委托给产品唯一的实现**（tools/audio_config.verbalize）。
 
-
-# ============ 原型 TN 层结束 ============
-
+    这里曾有一份独立实现（多一条固话规则、年份正则不带"年"前瞻），与产品实际发送的
+    文本不一致，且同样带 \b 缺陷 → 评估台测的不是产品链路。评审要求收敛为单一来源。
+    """
+    import audio_config as _cfg
+    return _cfg.verbalize(text)
 SERVER = "http://127.0.0.1:8080"
 OUTDIR = os.path.expanduser("~/.local/opt/audio.cpp/eval")
 
@@ -274,7 +229,8 @@ def main():
     ap.add_argument("--voice-ref", default=None, help="需要参考音色的模型（index-tts2 等）用；也可让报错中的模型自动重试")
     ap.add_argument("--asr-model", default="qwen3-asr", help="打分用 ASR（audio8-asr 小但对合成语音会退化，默认 qwen3-asr）")
     ap.add_argument("--tag", default="")
-    ap.add_argument("--verbalize", action="store_true", help="合成前先做中文数字读法规范化（原型 TN 层）")
+    ap.add_argument("--raw", action="store_true",
+                    help="关闭文本兜底，直接送原文（默认按产品配置启用兜底——评估台应测产品实际发送的文本）")
     ap.add_argument("--detail", action="store_true", help="所有用例都打印原文/读文对照")
     a = ap.parse_args()
 
@@ -302,8 +258,8 @@ def main():
             if not text: continue
             for r in range(1, a.repeats + 1):
                 wavpath = os.path.join(wavdir, f"{model}-{key}-{r}.wav")
-                spoken = verbalize_zh(text) if a.verbalize else text
-                if a.verbalize and spoken != text and r == 1:
+                spoken = text if a.raw else verbalize_zh(text)
+                if not a.raw and spoken != text and r == 1:
                     print(f"      TN: {spoken[:70]}")
                 wall, peak, dur, sr, err = generate(model, spoken, wavpath, a.voice_ref)
                 if err:
