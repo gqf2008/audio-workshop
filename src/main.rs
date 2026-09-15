@@ -14,6 +14,7 @@
 mod player;
 
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,8 @@ enum Cmd {
 }
 
 enum Msg {
+    /// 工程已从磁盘载入（含断点状态与句级复用结果），供 UI 在合成前对齐。
+    ProjectLoaded { project: Project, reused: usize },
     /// 状态栏一句话
     Note(String),
     /// 句子状态推进（running / done / error）
@@ -68,7 +71,11 @@ enum Msg {
         duration: Option<f64>,
     },
     /// 一轮合成结束：失败句数、是否被停止
-    RunDone { failed: usize, stopped: bool },
+    RunDone {
+        failed: usize,
+        stopped: bool,
+        reused: usize,
+    },
     /// 拼装完成（路径给导出用）
     Assembled {
         wav: PathBuf,
@@ -173,37 +180,55 @@ fn worker_loop(ctx: WorkerCtx) {
                 project_name,
             } => {
                 let dir = project_dir(&file_stem(&project_name));
-                let mut project = match load_resumable(&dir, &script, &model, voice_ref) {
+                let loaded = match load_resumable(&dir, &script, &model, voice_ref) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = ctx.tx.send(Msg::Fatal(e));
                         continue;
                     }
                 };
+                let reused = loaded.reused;
+                let mut project = loaded.project;
+                let _ = ctx.tx.send(Msg::ProjectLoaded {
+                    project: project.clone(),
+                    reused,
+                });
                 let client = match make_client() {
                     Ok(c) => c,
                     Err(e) => {
+                        current = Some((dir, project));
                         let _ = ctx.tx.send(Msg::Fatal(e));
                         continue;
                     }
                 };
                 let tx = ctx.tx.clone();
                 let started = RefCell::new(std::collections::HashSet::new());
-                let failed = project
-                    .synthesize_stoppable(
-                        &client,
-                        &dir,
-                        None,
-                        None,
-                        Some(&ctx.stop),
-                        |idx, note| {
-                            report_progress(&tx, &mut started.borrow_mut(), idx, note);
-                        },
-                    )
-                    .unwrap_or(usize::MAX);
+                let run = project.synthesize_stoppable(
+                    &client,
+                    &dir,
+                    None,
+                    None,
+                    Some(&ctx.stop),
+                    |idx, note| {
+                        report_progress(&tx, &mut started.borrow_mut(), idx, note);
+                    },
+                );
                 let stopped = ctx.stop.load(Ordering::Relaxed);
                 current = Some((dir, project));
-                let _ = ctx.tx.send(Msg::RunDone { failed, stopped });
+                match run {
+                    Ok(failed) => {
+                        let _ = ctx.tx.send(Msg::RunDone {
+                            failed,
+                            stopped,
+                            reused,
+                        });
+                    }
+                    Err(e) => {
+                        // 落盘/解码等无法继续的失败不能伪装成 usize::MAX 个失败句。
+                        // current 已保留，磁盘恢复后可直接重跑。
+                        let _ = ctx.tx.send(Msg::Fatal(format!("合成中止: {e}")));
+                    }
+                }
             }
             Cmd::Redo { index } => {
                 let Some((dir, project)) = current.as_mut() else {
@@ -319,43 +344,127 @@ fn project_dir(stem: &str) -> PathBuf {
     projects_root().join(stem)
 }
 
-/// 恢复或新建工程：project.json 存在、模型一致、切句结果一致 → 续作；否则新建。
+struct LoadedProject {
+    project: Project,
+    /// 新稿件中按文本继承的已合成句数（音色/模型不变时才可能 >0）。
+    reused: usize,
+}
+
+fn sentence_texts_match(project: &Project, script: &str) -> bool {
+    project
+        .sentences
+        .iter()
+        .map(|s| s.text.as_str())
+        .eq(
+            aw_core::split_sentences(script, DEFAULT_PUNCTUATION, MAX_CHARS)
+                .iter()
+                .map(|s| s.as_str()),
+        )
+}
+
+/// 稿件变化时按“未变句文本”继承旧工程的 done 音频；新下标先全部暂存，最后统一
+/// rename，避免编辑/重排后边复制边覆盖仍会被后续句子使用的源文件。
+fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<usize, String> {
+    let mut available: HashMap<String, VecDeque<aw_core::Sentence>> = HashMap::new();
+    for sentence in &old.sentences {
+        if sentence.status == "done" {
+            available
+                .entry(sentence.text.clone())
+                .or_default()
+                .push_back(sentence.clone());
+        }
+    }
+
+    let sentences_dir = dir.join("sentences");
+    std::fs::create_dir_all(&sentences_dir)
+        .map_err(|e| format!("建逐句目录失败（{}）: {e}", sentences_dir.display()))?;
+    let mut staged: Vec<(usize, PathBuf, PathBuf, aw_core::Sentence)> = Vec::new();
+    for i in 0..new.sentences.len() {
+        let text = new.sentences[i].text.clone();
+        let Some(old_sentence) = available.get_mut(&text).and_then(VecDeque::pop_front) else {
+            continue;
+        };
+        let src = sentences_dir.join(format!("{:03}.wav", old_sentence.index));
+        if !src.is_file() {
+            continue;
+        }
+        let dst = sentences_dir.join(format!("{:03}.wav", new.sentences[i].index));
+        let tmp = sentences_dir.join(format!(
+            ".reuse-{:03}.wav.tmp{}",
+            new.sentences[i].index,
+            std::process::id()
+        ));
+        std::fs::copy(&src, &tmp).map_err(|e| {
+            format!(
+                "复用第 {} 句失败（{}）: {e}",
+                old_sentence.index,
+                src.display()
+            )
+        })?;
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("复用第 {} 句落盘失败: {e}", old_sentence.index))?;
+        staged.push((i, tmp, dst, old_sentence));
+    }
+
+    let mut reused = 0;
+    for (i, tmp, dst, old_sentence) in staged {
+        std::fs::rename(&tmp, &dst)
+            .map_err(|e| format!("复用句落到 {} 失败: {e}", dst.display()))?;
+        let sentence = &mut new.sentences[i];
+        sentence.seed = old_sentence.seed;
+        sentence.duration = old_sentence.duration;
+        sentence.start = None;
+        sentence.status = "done".into();
+        reused += 1;
+    }
+    Ok(reused)
+}
+
+/// 恢复或新建工程：模型与音色一致且句子文本完全一致 → 原样续作；
+/// 稿件变化时按未变句文本继承 done 音频；模型/音色变化则整工程重录。
 fn load_resumable(
     dir: &Path,
     script: &str,
     model: &str,
     voice_ref: Option<String>,
-) -> Result<Project, String> {
-    if let Ok(saved) = Project::load(dir) {
-        let same_script =
-            saved
-                .sentences
-                .iter()
-                .map(|s| s.text.as_str())
-                .eq(
-                    aw_core::split_sentences(script, DEFAULT_PUNCTUATION, MAX_CHARS)
-                        .iter()
-                        .map(|s| s.as_str()),
-                );
-        if saved.model == model && same_script {
-            return Ok(saved);
+) -> Result<LoadedProject, String> {
+    let saved = Project::load(dir).ok();
+    if let Some(saved) = saved.as_ref() {
+        if saved.model == model
+            && saved.voice_ref == voice_ref
+            && sentence_texts_match(saved, script)
+        {
+            return Ok(LoadedProject {
+                project: saved.clone(),
+                reused: 0,
+            });
         }
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("建工程目录失败: {e}"))?;
-    let project = Project::new(
+    let mut project = Project::new(
         script,
         model,
         GAP_MS,
         BASE_SEED,
-        voice_ref,
+        voice_ref.clone(),
         DEFAULT_PUNCTUATION,
         MAX_CHARS,
         |t| aw_core::normalize(t, &Default::default()),
     );
+    let reused = if let Some(saved) = saved.as_ref() {
+        if saved.model == model && saved.voice_ref == voice_ref {
+            reuse_done_sentences(&mut project, saved, dir)?
+        } else {
+            0
+        }
+    } else {
+        0
+    };
     project
         .save(dir)
         .map_err(|e| format!("工程落盘失败: {e}"))?;
-    Ok(project)
+    Ok(LoadedProject { project, reused })
 }
 
 // ===========================================================================
@@ -512,7 +621,8 @@ fn restore_project(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<Ui
         return;
     };
     *state.project_dir.borrow_mut() = Some(dir);
-    // 输入框与列表同源：把保存的句子文本回填到输入框
+    // 输入框与列表同源：把保存的句子文本回填到输入框。
+    // 每个保存句已经 trim 且折叠过空白，重新拼接后再 split 是幂等的。
     let script: String = project.sentences.iter().map(|s| s.text.as_str()).collect();
     ui.set_script_text(script.clone().into());
     rebuild(ui, rows, &script);
@@ -893,11 +1003,39 @@ fn tick(
     state: &Rc<UiState>,
 ) {
     // ── 工作线程消息 ──
-    let mut run_finished: Option<(usize, bool)> = None;
+    let mut run_finished: Option<(usize, bool, usize)> = None;
     loop {
         let msg = msg_rx.borrow_mut().try_recv();
         let Ok(msg) = msg else { break };
         match msg {
+            Msg::ProjectLoaded { project, reused } => {
+                let mut done = 0usize;
+                for (i, sentence) in project.sentences.iter().enumerate() {
+                    if i >= rows.row_count() {
+                        break;
+                    }
+                    if sentence.status == "done" {
+                        done += 1;
+                        set_status(rows, i, "done");
+                        if let Some(d) = sentence.duration {
+                            set_row_duration(rows, i, d as f32);
+                        }
+                    } else if sentence.status.starts_with("error") {
+                        set_status(rows, i, "error");
+                    } else {
+                        set_status(rows, i, "pending");
+                    }
+                }
+                recompute_total(ui, rows);
+                ui.set_done_count(done as i32);
+                ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
+                ui.set_has_result(done > 0);
+                if reused > 0 {
+                    ui.set_status_text(
+                        format!("工程已恢复：按文本复用 {reused} 句，未变句无需重录").into(),
+                    );
+                }
+            }
             Msg::Note(t) => ui.set_status_text(t.into()),
             Msg::Fatal(t) => {
                 ui.set_running(false);
@@ -925,7 +1063,11 @@ fn tick(
                     ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
                 }
             }
-            Msg::RunDone { failed, stopped } => run_finished = Some((failed, stopped)),
+            Msg::RunDone {
+                failed,
+                stopped,
+                reused,
+            } => run_finished = Some((failed, stopped, reused)),
             Msg::Assembled {
                 wav,
                 srt,
@@ -943,8 +1085,7 @@ fn tick(
                 } else {
                     String::new()
                 };
-                export_copies(
-                    ui,
+                let export_outcome = export_copies(
                     &stem_of(ui),
                     &PathBuf::from(ui.get_export_dir().to_string()),
                     &wav,
@@ -952,24 +1093,39 @@ fn tick(
                     ui.get_export_wav_on(),
                     ui.get_export_srt_on(),
                 );
+                let export_note = match export_outcome {
+                    ExportOutcome::Exported(path) => {
+                        toast(ui, &format!("已导出 {}", path.display()));
+                        format!(" · 已导出 {}", path.display())
+                    }
+                    ExportOutcome::NoneSelected => " · 未选择导出格式，仅更新成品".into(),
+                    ExportOutcome::Failed(e) => format!(" · 导出失败: {e}"),
+                };
                 ui.set_status_text(
-                    format!("成品 {duration:.1}s（{done} 句{skipped_note}）").into(),
+                    format!("成品 {duration:.1}s（{done} 句{skipped_note}）{export_note}").into(),
                 );
             }
         }
     }
-    if let Some((failed, stopped)) = run_finished {
+    if let Some((failed, stopped, reused)) = run_finished {
         ui.set_running(false);
         let n = rows.row_count() as i32;
         let done = ui.get_done_count();
         ui.set_progress(done as f32 / n.max(1) as f32);
+        let reused_note = if reused > 0 {
+            format!("（复用 {reused} 句）")
+        } else {
+            String::new()
+        };
         ui.set_status_text(
             if stopped {
-                format!("已停止：完成 {done}/{n} 句，可随时继续")
+                format!("已停止：完成 {done}/{n} 句{reused_note}，可随时继续")
             } else if failed > 0 {
-                format!("本轮完成 {done}/{n} 句（{failed} 句失败：重跑自动重试失败句）")
+                format!(
+                    "本轮完成 {done}/{n} 句{reused_note}（{failed} 句失败：重跑自动重试失败句）"
+                )
             } else {
-                format!("合成完成 {done}/{n} 句：可试听、可导出 WAV / SRT")
+                format!("合成完成 {done}/{n} 句{reused_note}：可试听、可导出 WAV / SRT")
             }
             .into(),
         );
@@ -991,36 +1147,47 @@ fn tick(
     }
 }
 
-/// 按导出开关把成品复制到导出目录（成功后弹通知）
+enum ExportOutcome {
+    Exported(PathBuf),
+    NoneSelected,
+    Failed(String),
+}
+
+/// 按导出开关把成品复制到导出目录。未勾选格式也给出明确结果，不再静默返回。
 fn export_copies(
-    ui: &MainWindow,
     stem: &str,
     dir: &Path,
     wav: &Path,
     srt: &Path,
     wav_on: bool,
     srt_on: bool,
-) {
+) -> ExportOutcome {
+    if !wav_on && !srt_on {
+        return ExportOutcome::NoneSelected;
+    }
     if let Err(e) = std::fs::create_dir_all(dir) {
-        ui.set_status_text(format!("导出目录不可写: {e}").into());
-        return;
+        return ExportOutcome::Failed(format!("导出目录不可写（{}）: {e}", dir.display()));
     }
     let mut written: Vec<String> = Vec::new();
     if wav_on {
         let t = dir.join(format!("{stem}.wav"));
-        if std::fs::copy(wav, &t).is_ok() {
-            written.push(t.display().to_string());
+        if let Err(e) = std::fs::copy(wav, &t) {
+            return ExportOutcome::Failed(format!("复制 {} 失败: {e}", t.display()));
         }
+        written.push(t.display().to_string());
     }
     if srt_on {
         let t = dir.join(format!("{stem}.srt"));
-        if std::fs::copy(srt, &t).is_ok() {
-            written.push(t.display().to_string());
+        if let Err(e) = std::fs::copy(srt, &t) {
+            return ExportOutcome::Failed(format!("复制 {} 失败: {e}", t.display()));
         }
+        written.push(t.display().to_string());
     }
-    if !written.is_empty() {
-        toast(ui, &format!("已导出 {}", written.last().unwrap()));
-    }
+    let last = written
+        .last()
+        .cloned()
+        .unwrap_or_else(|| dir.display().to_string());
+    ExportOutcome::Exported(PathBuf::from(last))
 }
 
 fn stem_of(ui: &MainWindow) -> String {
@@ -1040,6 +1207,14 @@ fn play_sentence(
     i: usize,
     duration: f32,
 ) {
+    if rows
+        .row_data(i)
+        .map(|row| row.status.as_str() != "已合成")
+        .unwrap_or(true)
+    {
+        ui.set_status_text("这句还没合成：先点「开始合成」".into());
+        return;
+    }
     let Some(dir) = state.project_dir.borrow().clone() else {
         ui.set_status_text("先跑一次合成".into());
         return;
@@ -1231,6 +1406,7 @@ fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
 fn set_status(rows: &Rc<VecModel<Sentence>>, i: usize, status: &str) {
     let label = match status {
         "done" => "已合成",
+        "pending" => "待合成",
         "running" => "合成中",
         "error" => "失败",
         other => other,
@@ -1264,4 +1440,122 @@ fn file_stem(name: &str) -> String {
 fn toast(ui: &MainWindow, text: &str) {
     ui.set_toast_text(text.into());
     ui.set_toast_shown(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("audio-workshop-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn saved_project(script: &str, voice_ref: Option<&str>) -> Project {
+        Project::new(
+            script,
+            "audio8-tts",
+            GAP_MS,
+            BASE_SEED,
+            voice_ref.map(str::to_string),
+            DEFAULT_PUNCTUATION,
+            MAX_CHARS,
+            |t| aw_core::normalize(t, &Default::default()),
+        )
+    }
+
+    fn save_done_project(dir: &Path, project: &mut Project) {
+        std::fs::create_dir_all(dir.join("sentences")).unwrap();
+        for sentence in &mut project.sentences {
+            sentence.status = "done".into();
+            sentence.duration = Some(1.0);
+            std::fs::write(
+                dir.join(format!("sentences/{:03}.wav", sentence.index)),
+                format!("wav-{}", sentence.index).as_bytes(),
+            )
+            .unwrap();
+        }
+        project.save(dir).unwrap();
+    }
+
+    /// 评审 MUST-1：稿件改一句后，未变句必须按文本复用，而不是整工程重录。
+    #[test]
+    fn edited_script_reuses_unchanged_done_sentences() {
+        let dir = temp_dir("resume-edited-script");
+        let mut old = saved_project("第一句。第二句。第三句。", None);
+        save_done_project(&dir, &mut old);
+
+        let loaded =
+            load_resumable(&dir, "第一句。改过的第二句。第三句。", "audio8-tts", None).unwrap();
+        let loaded = loaded.project;
+        assert_eq!(loaded.sentences.len(), 3);
+
+        assert_eq!(loaded.sentences[0].status, "done");
+        assert_eq!(loaded.sentences[1].status, "pending");
+        assert_eq!(loaded.sentences[2].status, "done");
+        assert!(dir.join("sentences/000.wav").is_file());
+        assert!(dir.join("sentences/002.wav").is_file());
+    }
+
+    /// 评审 SHOULD-2：参考音色变了就不能复用旧声音的 wav。
+    #[test]
+    fn voice_ref_change_invalidates_all_sentence_reuse() {
+        let dir = temp_dir("resume-voice-change");
+        let mut old = saved_project("第一句。第二句。", None);
+        save_done_project(&dir, &mut old);
+
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            Some("new-voice.wav".into()),
+        )
+        .unwrap();
+        assert_eq!(loaded.reused, 0);
+        let loaded = loaded.project;
+
+        assert!(loaded.sentences.iter().all(|s| s.status == "pending"));
+    }
+
+    #[test]
+    fn report_progress_emits_running_then_terminal_result() {
+        let (tx, rx) = channel();
+        let mut started = std::collections::HashSet::new();
+        report_progress(&tx, &mut started, 2, "第二句");
+        report_progress(&tx, &mut started, 2, "done 1.25s");
+
+        match rx.recv().unwrap() {
+            Msg::Sentence {
+                index,
+                status,
+                duration,
+            } => {
+                assert_eq!(index, 2);
+                assert_eq!(status, "running");
+                assert_eq!(duration, None);
+            }
+            _ => panic!("第一条应为 running"),
+        }
+        match rx.recv().unwrap() {
+            Msg::Sentence {
+                index,
+                status,
+                duration,
+            } => {
+                assert_eq!(index, 2);
+                assert_eq!(status, "done");
+                assert_eq!(duration, Some(1.25));
+            }
+            _ => panic!("第二条应为 done"),
+        }
+    }
+
+    #[test]
+    fn file_stem_trims_and_defaults() {
+        assert_eq!(file_stem(" 我的工程 "), "我的工程");
+        assert_eq!(file_stem("  "), "未命名工程");
+    }
 }
