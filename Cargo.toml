@@ -20,6 +20,7 @@ aw-core = { path = "crates/aw-core" }
 rodio = { version = "0.20", default-features = false, features = ["wav"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [build-dependencies]
 slint-build = "1.17"

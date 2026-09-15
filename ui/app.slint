@@ -46,7 +46,7 @@ export component MainWindow inherits Window {
     in-out property <bool> drawer-open: false;
 
     // ── 工作台状态（转发给 DubWorkbench / WorkbenchDrawer，见下） ──
-    in property <string> project-name: "";
+    in-out property <string> project-name: "";
     in-out property <string> script-text: "";
     in property <int> char-count: 0;
     in property <string> est-duration: "--";
@@ -102,8 +102,7 @@ export component MainWindow inherits Window {
     callback start-run();
     callback stop-run();
     callback stop-preview();
-    callback export-wav();
-    callback export-srt();
+    callback export-requested();
     callback seek(float);
     // 键盘翻句（FocusScope 转发）：上一句 / 下一句 / 播放·停止
     callback key-prev();
@@ -246,7 +245,7 @@ export component MainWindow inherits Window {
         WorkbenchDrawer {
             vertical-stretch: 1;
 
-            project-name: root.project-name;
+            project-name <=> root.project-name;
             project-edited => { root.project-edited(); }
 
             scene-names: root.scenes;
@@ -274,8 +273,7 @@ export component MainWindow inherits Window {
             export-dir: root.export-dir;
             export-wav-on <=> root.export-wav-on;
             export-srt-on <=> root.export-srt-on;
-            export-wav => { root.export-wav(); }
-            export-srt => { root.export-srt(); }
+            export-requested => { root.export-requested(); }
         }
     }
 

@@ -118,6 +118,10 @@ pub struct Project {
     pub model: String,
     #[serde(default)]
     pub voice_ref: Option<String>,
+    /// 参考音频内容哈希。只比路径无法识别“同路径文件被替换”；旧工程缺此字段时
+    /// 下一次会保守重录并按新内容写入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_ref_hash: Option<String>,
     pub gap_ms: u64,
     pub base_seed: u64,
     pub sentences: Vec<Sentence>,
@@ -164,6 +168,7 @@ impl Project {
         Self {
             model: model.into(),
             voice_ref,
+            voice_ref_hash: None,
             gap_ms,
             base_seed,
             sentences,

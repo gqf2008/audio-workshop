@@ -159,7 +159,7 @@ component SentenceRow inherits Rectangle {
 // 抽屉内区块间距 20px、区块内 16px。
 // ---------------------------------------------------------------------------
 export component WorkbenchDrawer inherits VerticalLayout {
-    in property <string> project-name: "";
+    in-out property <string> project-name: "";
     callback project-edited();
 
     in property <[string]> scene-names: [];
@@ -187,14 +187,13 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <string> export-dir: "";
     in-out property <bool> export-wav-on: true;
     in-out property <bool> export-srt-on: true;
-    callback export-wav();
-    callback export-srt();
+    callback export-requested();
 
-    // 导出格式：0=整段 WAV、1=逐句 SRT、2=两者（落到既有两个开关上）
+    // 导出格式：0=整段 WAV、1=逐句 SRT、2=两者、3=仅生成不导出
     in-out property <int> export-index: 2;
     changed export-index => {
-        root.export-wav-on = root.export-index != 1;
-        root.export-srt-on = root.export-index != 0;
+        root.export-wav-on = root.export-index != 1 && root.export-index != 3;
+        root.export-srt-on = root.export-index != 0 && root.export-index != 3;
     }
 
     property <Voice> voice: root.voices[Math.max(0, Math.min(root.voice-index, root.voices.length - 1))];
@@ -214,8 +213,9 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 spacing: 16px;
                 SectionLabel { text: "工程"; }
                 PixelTextInput {
-                    text: root.project-name;
+                    text <=> root.project-name;
                     placeholder: "工程名，如：0921 开箱口播";
+                    enabled: !root.running;
                     edited => { root.project-edited(); }
                 }
             }
@@ -353,17 +353,14 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 spacing: 16px;
                 SectionLabel { text: "导出"; }
                 PixelSegmentedControl {
-                    options: ["整段 WAV", "逐句 SRT", "两者"];
+                    options: ["整段 WAV", "逐句 SRT", "两者", "仅生成"];
                     index <=> root.export-index;
                 }
                 PixelButton {
                     text: "开始导出";
                     variant: "primary";
-                    enabled: root.has-result && (root.export-wav-on || root.export-srt-on);
-                    clicked => {
-                        if root.export-wav-on { root.export-wav(); }
-                        if root.export-srt-on { root.export-srt(); }
-                    }
+                    enabled: root.has-result;
+                    clicked => { root.export-requested(); }
                 }
                 Text {
                     text: "输出目录 " + root.export-dir;
@@ -431,6 +428,7 @@ export component DubWorkbench inherits Rectangle {
                         horizontal-stretch: 1;
                         height: 132px;
                         frame-height: 132px;
+                        enabled: !root.running;
                         text <=> root.script-text;
                         placeholder: "把口播稿粘进来，按 。！？ 自动切句…";
                         edited => { root.script-edited(); }
@@ -440,7 +438,7 @@ export component DubWorkbench inherits Rectangle {
                         Rectangle { // 首屏
                             width: 22px;
                             height: 22px;
-                            visible: root.script-text != "";
+                            visible: root.script-text != "" && !root.running;
                             background: clear-ta.pressed ? PixelTheme.shadow : (clear-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
                             border-width: 2px;
                             border-color: PixelTheme.edge;
@@ -478,7 +476,7 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 92px;
                         text: "重新切句";
-                        enabled: root.script-text != "";
+                        enabled: root.script-text != "" && !root.running;
                         clicked => { root.resplit(); }
                     }
                     PixelButton { // 首屏
@@ -508,6 +506,7 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏-空态
                         width: 120px;
                         text: "载入示例稿";
+                        enabled: !root.running;
                         clicked => { root.use-sample(); }
                     }
                 }
