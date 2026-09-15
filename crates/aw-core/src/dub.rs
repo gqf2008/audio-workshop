@@ -449,7 +449,7 @@ impl Project {
 
 /// 原子写：同目录临时文件 + fsync + rename（Python `write_atomic` 同款）。
 /// 崩溃/掉电/磁盘满时，目标路径要么还是旧内容，要么是新内容，不会写一半。
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_file_name(format!(
         "{}.tmp{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),

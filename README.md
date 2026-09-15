@@ -4,15 +4,15 @@
 
 三场景统一设计（配音 / BGM / 歌曲），**配音先行**。立项依据、实测基线、风险与路线图见 [CHARTER.md](CHARTER.md)。
 
-> 当前阶段：**M1** —— 最小桌面壳：完整配音工作台（句子列表 + 校听器 + 键盘翻句）
-> + 基础模型下载器（免费）+ 本地音色克隆（voice_ref）。完成判据：脱离命令行可自用。
+> 当前阶段：**M2** —— 在 M1 配音工作台之上接入 BGM：文本生成 30s 分段、按配音时长
+> 对齐、按句时间轴自动 ducking，并导出 voice / BGM / mixed 三轨。完成判据：一条视频的音频部分全用它。
 
 ## 本仓库（开源层）
 
 | 路径 | 作用 |
 |---|---|
-| `src/` + `ui/` | **桌面壳**（Rust + Slint 1.17 + slint-pixel）：配音工作台真实链路版 |
-| `crates/aw-core/` | **核心库**：切句 / 文本兜底 / 服务客户端 / 逐句合成 / 拼装（与 Python 行为由 90 例 parity 夹具固定） |
+| `src/` + `ui/` | **桌面壳**（Rust + Slint 1.17 + slint-pixel）：配音 + BGM 真实链路 |
+| `crates/aw-core/` | **核心库**：切句 / 文本兜底 / 服务客户端 / 逐句合成 / 拼装 / BGM 生成与混音（与 Python 行为由 90 例 parity 夹具固定） |
 | `config/models.schema.yaml` | **模型参数化配置**：每个模型的旋钮、已知缺陷登记、文本兜底规则 |
 | `tools/audio_config.py` | 配置层（CLI 形态）：渲染服务配置 / 文本兜底 / 按场景端到端执行 |
 | `tools/audio_dub.py` | 配音链路 CLI（M0）：切句 / 逐句合成 / 拼装 / 单句重录，工程可断点续作 |
@@ -25,7 +25,7 @@
 
 ## 快速开始
 
-### 桌面壳（M1 主入口）
+### 桌面壳（主入口）
 
 前置：`audiocpp_server` 在跑（默认 `http://127.0.0.1:8080`，可用 `AW_SERVER` 覆盖），
 音色清单从 `~/.local/opt/audio.cpp/server.json` 发现（可用 `AW_SERVER_CONFIG` 覆盖）。
@@ -35,12 +35,14 @@ cargo run --release        # 打开配音工作台
 ```
 
 流程：粘稿（或示例稿）→ 点「开始合成」→ 逐句状态流转 → 点句子试听 / ↑↓ 翻句 /
-空格 播放停止 → 抽屉里导出 WAV / SRT。
+空格 播放停止 → 抽屉里导出 WAV / SRT → 切到 BGM 场景写描述，生成并混音 → 导出三轨。
 
 - **断点续作**：工程逐句落盘（`~/Documents/音频作坊/projects/<工程名>/`），
   重开 / 重跑自动跳过已合成句。
 - **单句重录**：行内「重录」换 seed 只重跑该句；时间轴点击 = 从那句开始听。
 - **音色克隆**：抽屉「音色」填参考 wav 路径（index-tts2 的 voice_ref）。
+- **BGM 三轨**：BGM 场景按当前配音工程时长生成 30s 分段，按句子时间轴自动 duck，
+  导出 `<工程>_voice.wav`、`<工程>_bgm.wav`、`<工程>_mixed.wav` 和 SRT。
 - 校听倍速即时生效（回放层，不动合成产物）；合成语速是模型参数，属配置层。
 
 ### 命令行（M0 链路，仍然可用）
@@ -50,6 +52,9 @@ cargo run --release        # 打开配音工作台
 ./tools/audio_config.py text "报价 1234.56 元" --model audio8-tts
 ./tools/audio_eval.py                            # 质量评估 + 回归对比
 ./tools/audio_dub.py new --out 工程目录 ...      # 配音工程（见 --help）
+# M2 BGM：对已有配音工程跑完整生成/对齐/duck/mix（真服务）
+cargo run -p aw-core --example bgm_run -- ~/Documents/音频作坊/projects/工程名 \
+  "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好"
 ```
 
 ### 模型下载（基础下载器，免费）

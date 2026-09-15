@@ -75,3 +75,75 @@ fn dub_pipeline_end_to_end() {
         out.wav.display()
     );
 }
+
+#[test]
+#[ignore = "需要本机 audiocpp_server + stable-audio-small-music；用 -- --ignored 显式跑"]
+fn bgm_pipeline_end_to_end() {
+    let base = env_or("AW_SERVER", "http://127.0.0.1:8080");
+    let client = Client::new(&base);
+    assert!(client.healthy(), "服务不可用: {base}/health");
+
+    let dir = std::env::temp_dir().join("aw-core-bgm-e2e");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+
+    // 2s 静音人声轨：BGM e2e 只验证生成/对齐/duck/mix，不为再跑一次 TTS 增加内存压力。
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 44_100,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    {
+        let mut w = hound::WavWriter::create(dir.join("out/final.wav"), spec).unwrap();
+        for _ in 0..(44_100 * 2) {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    std::fs::write(
+        dir.join("out/final.srt"),
+        "1\n00:00:00,000 --> 00:00:02,000\n测试\n",
+    )
+    .unwrap();
+
+    let mut project = Project::new(
+        "测试句。",
+        "audio8-tts",
+        0,
+        831001,
+        None,
+        "。！？；…",
+        80,
+        |t| t.to_string(),
+    );
+    project.sentences[0].start = Some(0.0);
+    project.sentences[0].duration = Some(2.0);
+    project.save(&dir).unwrap();
+
+    let options = aw_core::BgmOptions {
+        prompt: "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声".into(),
+        segment_seconds: 30.0,
+        target_seconds: 2.0,
+        base_seed: 831001,
+        duck_gain: 0.22,
+        fade_ms: 200,
+        ..Default::default()
+    };
+    let segments = aw_core::generate_segments(&client, &dir, &options, |done, total, _| {
+        eprintln!("  BGM [{done}/{total}]");
+    })
+    .expect("BGM 生成调用失败");
+    assert_eq!(segments, 1, "2s 目标只需 1 个 30s 段");
+    let bgm = aw_core::assemble_bgm(&dir, &options).expect("BGM 对齐失败");
+    let artifacts = aw_core::mix_project(&dir, &options).expect("BGM 混音失败");
+    assert!(bgm.is_file() && artifacts.mixed.is_file() && artifacts.voice.is_file());
+    let mixed = hound::WavReader::open(&artifacts.mixed).unwrap();
+    assert_eq!(mixed.spec().channels, 2);
+    assert!((artifacts.duration - 2.0).abs() < 0.01);
+    eprintln!(
+        "  BGM 成品 {:.2}s → {}",
+        artifacts.duration,
+        artifacts.mixed.display()
+    );
+}

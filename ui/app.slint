@@ -22,6 +22,7 @@ import {
 
 import { Sentence, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
+import { BgmWorkbench } from "bgm_workbench.slint";
 
 export { Sentence, Voice } from "model.slint";
 
@@ -70,6 +71,10 @@ export component MainWindow inherits Window {
     in-out property <bool> running: false;
     in-out property <bool> busy: false;
     in property <bool> has-result: false;
+    in-out property <string> bgm-prompt: "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好";
+    in-out property <float> bgm-progress: 0.0;
+    in property <bool> bgm-has-result: false;
+    in property <string> bgm-status-text: "先完成配音，再用当前工程生成 BGM。";
     in property <string> status-text: "就绪";
     in property <string> export-dir: "";
 
@@ -97,6 +102,9 @@ export component MainWindow inherits Window {
     callback use-sample();
     callback clear-script();
     callback resplit();
+    callback bgm-generate();
+    callback bgm-preview();
+    callback bgm-export-tracks();
     callback select-sentence(int);
     callback preview-all();
     callback preview-one(int);
@@ -193,7 +201,18 @@ export component MainWindow inherits Window {
             seek(p) => { root.seek(p); }
         }
 
-        if root.scene != 0 : Rectangle {
+        if root.scene == 1 : BgmWorkbench {
+            prompt <=> root.bgm-prompt;
+            progress: root.bgm-progress;
+            busy: root.busy || root.running;
+            has-result: root.bgm-has-result;
+            status-text: root.bgm-status-text + (root.status-text == "" ? "" : " · " + root.status-text);
+            generate => { root.bgm-generate(); }
+            preview => { root.bgm-preview(); }
+            export-tracks => { root.bgm-export-tracks(); }
+        }
+
+        if root.scene != 0 && root.scene != 1 : Rectangle {
             vertical-stretch: 1;
             background: PixelTheme.bg;
 
