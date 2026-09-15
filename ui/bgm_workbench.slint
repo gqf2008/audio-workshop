@@ -1,0 +1,87 @@
+// ============================================================================
+// BGM 工作台：当前配音工程 + 文本描述 → 生成/对齐/duck → voice/BGM/mixed 三轨
+// ============================================================================
+import { PixelButton, PixelProgressBar, PixelTextArea, PixelTheme } from "@slint_pixel";
+
+export component BgmWorkbench inherits Rectangle {
+    in-out property <string> prompt: "";
+    in property <float> progress: 0.0;
+    in property <bool> busy: false;
+    in property <bool> has-result: false;
+    in property <string> status-text: "";
+
+    callback generate();
+    callback preview();
+    callback export-tracks();
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        vertical-stretch: 1;
+        padding-top: 20px;
+        padding-bottom: 16px;
+        alignment: center;
+        spacing: 18px;
+
+        Rectangle {
+            width: 880px;
+            height: 100%;
+            background: transparent;
+
+            VerticalLayout {
+                width: 100%;
+                height: 100%;
+                spacing: 18px;
+                alignment: center;
+
+                Text {
+                    text: "BGM · 当前配音工程";
+                    color: PixelTheme.text;
+                    font-size: 22px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "按描述生成 30 秒音乐段，自动生成到配音时长，并在人声句段压低音量。";
+                    color: PixelTheme.dim;
+                    font-size: 13px;
+                }
+                PixelTextArea {
+                    width: 100%;
+                    height: 104px;
+                    frame-height: 104px;
+                    enabled: !root.busy;
+                    text <=> root.prompt;
+                    placeholder: "例如：温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好";
+                }
+                HorizontalLayout {
+                    spacing: 16px;
+                    PixelButton {
+                        width: 160px;
+                        variant: "primary";
+                        text: root.busy ? "生成中…" : "生成并混音";
+                        enabled: !root.busy && root.prompt != "";
+                        clicked => { root.generate(); }
+                    }
+                    PixelButton {
+                        width: 110px;
+                        text: "试听混音";
+                        enabled: root.has-result && !root.busy;
+                        clicked => { root.preview(); }
+                    }
+                    PixelButton {
+                        width: 150px;
+                        text: "导出三轨";
+                        enabled: root.has-result && !root.busy;
+                        clicked => { root.export-tracks(); }
+                    }
+                }
+                PixelProgressBar { progress: root.progress; }
+                Text {
+                    text: root.status-text;
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

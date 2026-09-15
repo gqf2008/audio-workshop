@@ -83,6 +83,12 @@ impl Client {
         if let Some(v) = voice_ref {
             request["voice_ref"] = json!(v);
         }
+        self.run_audio(model, request)
+    }
+
+    /// 发送任意 audio.cpp 音频任务并取回 wav 字节。TTS 之外的 gen 场景
+    /// （BGM/歌曲）需要自己的 `request_defaults`，由调用方组装 request。
+    pub fn run_audio(&self, model: &str, request: Value) -> Result<Vec<u8>, ClientError> {
         let body = json!({ "model": model, "request": request });
 
         let resp = self.post_with_retry("/v1/tasks/run", &body)?;
