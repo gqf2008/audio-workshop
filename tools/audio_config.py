@@ -16,8 +16,10 @@
 """
 import argparse, json, os, re, subprocess, sys, urllib.request
 
+from platform_paths import detect_backend, resolve_models_root, server_json_path
+
 CFG_DEFAULT = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "models.schema.yaml")
-SERVER_JSON = os.path.expanduser("~/.local/opt/audio.cpp/server.json")
+SERVER_JSON = str(server_json_path())
 SERVER = "http://127.0.0.1:8080"
 
 try:
@@ -29,7 +31,10 @@ except ImportError:
 # ── 配置加载 ────────────────────────────────────────────────────────────
 def load(path=CFG_DEFAULT):
     cfg = yaml.safe_load(open(path, encoding="utf-8"))
-    root = cfg.get("runtime", {}).get("models_root", "")
+    runtime = cfg.setdefault("runtime", {})
+    root = resolve_models_root(runtime.get("models_root", ""))
+    runtime["models_root"] = root
+    runtime["backend"] = detect_backend(runtime.get("backend", "auto"))
     def expand(v):
         if isinstance(v, str): return v.replace("${models_root}", root)
         if isinstance(v, dict): return {k: expand(x) for k, x in v.items()}

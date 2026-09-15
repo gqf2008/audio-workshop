@@ -111,6 +111,20 @@ impl Client {
             .unwrap_or(false)
     }
 
+    /// 服务健康 JSON 里的 backend（metal/cuda/cpu/...），不可用时返回 None。
+    pub fn backend_label(&self) -> Option<String> {
+        let value = ureq::get(&format!("{}/health", self.base))
+            .timeout(Duration::from_secs(5))
+            .call()
+            .ok()?
+            .into_json::<Value>()
+            .ok()?;
+        value
+            .get("backend")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     /// 503 才退避重试（内存预检拒绝 / 模型忙碌），其余错误立即返回。
     fn post_with_retry(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
         let tries = self.retries.max(1);

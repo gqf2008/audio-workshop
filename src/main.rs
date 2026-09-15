@@ -154,12 +154,7 @@ struct ServerModel {
 /// 读取 server.json：音色 = task=="tts" 的模型；地址取 AW_SERVER，否则 host:port。
 /// 文件缺失/解析失败返回空清单 + 原因说明（不 panic：服务没配时界面也可打开）。
 fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
-    let cfg_path = std::env::var("AW_SERVER_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/opt/audio.cpp/server.json")
-        });
+    let cfg_path = server_config_path();
     let raw = std::fs::read_to_string(&cfg_path).ok();
     let base = std::env::var("AW_SERVER").ok().or_else(|| {
         raw.as_deref().and_then(|r| {
@@ -197,6 +192,39 @@ fn short_path(p: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.to_string())
+}
+
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn documents_dir() -> PathBuf {
+    dirs::document_dir().unwrap_or_else(|| home_dir().join("Documents"))
+}
+
+fn server_config_path() -> PathBuf {
+    if let Ok(path) = std::env::var("AW_SERVER_CONFIG") {
+        return PathBuf::from(path);
+    }
+    let legacy = home_dir().join(".local/opt/audio.cpp/server.json");
+    let mut candidates = vec![legacy.clone()];
+    if let Some(config) = dirs::config_dir() {
+        candidates.push(config.join("audio.cpp/server.json"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or(legacy)
+}
+
+fn engine_label(base: Option<&str>) -> String {
+    let Some(base) = base else {
+        return "audio.cpp · 未发现服务".into();
+    };
+    match Client::new(base).backend_label() {
+        Some(backend) => format!("audio.cpp · {}", backend.to_uppercase()),
+        None => "audio.cpp · 服务不可达".into(),
+    }
 }
 
 // ===========================================================================
@@ -551,10 +579,7 @@ fn make_client() -> Result<Client, String> {
 
 /// 工程目录：~/Documents/音频作坊/projects/<stem>/
 fn projects_root() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("Documents")
-        .join(WORKSHOP_DIR)
-        .join("projects")
+    documents_dir().join(WORKSHOP_DIR).join("projects")
 }
 
 fn project_dir(stem: &str) -> PathBuf {
@@ -781,6 +806,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_voice_index(default_voice);
 
     ui.set_export_dir(export_dir().into());
+    ui.set_engine_label(engine_label(base.as_deref()).into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
     ui.set_script_text(SAMPLE_SCRIPT.into());
@@ -2007,8 +2033,7 @@ const SCENE_NOTES: [&str; 4] = [
 ];
 
 fn export_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{home}/Documents/{WORKSHOP_DIR}")
+    documents_dir().join(WORKSHOP_DIR).display().to_string()
 }
 
 fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {

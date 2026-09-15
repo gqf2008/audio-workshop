@@ -26,6 +26,8 @@ import os
 import subprocess
 import sys
 
+from platform_paths import resolve_models_root, server_json_path
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 SCHEMA = os.path.join(REPO_ROOT, "config", "models.schema.yaml")
 
@@ -76,7 +78,7 @@ def expand(path, models_root):
 
 
 def cmd_list(schema):
-    models_root = schema.get("runtime", {}).get("models_root", "")
+    models_root = resolve_models_root(schema.get("runtime", {}).get("models_root", ""))
     rows = []
     for mid, m in sorted(schema.get("models", {}).items()):
         p = expand(m.get("path", ""), models_root)
@@ -91,7 +93,7 @@ def cmd_list(schema):
 
 def cmd_fetch(schema, upstream, model_ids, precision=None):
     models = schema.get("models", {})
-    models_root = schema.get("runtime", {}).get("models_root", "")
+    models_root = resolve_models_root(schema.get("runtime", {}).get("models_root", ""))
     if not models_root:
         sys.exit("schema runtime.models_root 未配置")
     os.makedirs(models_root, exist_ok=True)
@@ -122,8 +124,15 @@ def cmd_fetch(schema, upstream, model_ids, precision=None):
         if not ok:
             # 上游包布局可能和 schema path 差一级（repo 目录名），给出实际线索
             base = os.path.basename(p)
-            hits = subprocess.run(["find", models_root, "-name", base, "-maxdepth", "3"],
-                                  capture_output=True, text=True).stdout.strip()
+            hits = []
+            for root, dirs, files in os.walk(models_root):
+                depth = root[len(models_root):].count(os.sep)
+                if depth >= 3:
+                    dirs[:] = []
+                    continue
+                if base in files:
+                    hits.append(os.path.join(root, base))
+            hits = "\n".join(hits)
             if hits:
                 print(f"  提示：找到同名文件：\n{hits}\n  （schema path 与上游包布局不一致，以上面的实际路径为准）")
         snippet = {"id": mid, "family": family, "path": os.path.abspath(p) if ok else p,
@@ -131,7 +140,7 @@ def cmd_fetch(schema, upstream, model_ids, precision=None):
         if m.get("session_options"):
             snippet["session_options"] = m["session_options"]
         import json
-        print("  server.json 手动路径片段（加进 ~/.local/opt/audio.cpp/server.json 的 models 数组）:")
+        print(f"  server.json 手动路径片段（加进 {server_json_path()} 的 models 数组）:")
         print("  " + json.dumps(snippet, ensure_ascii=False))
 
 

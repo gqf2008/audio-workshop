@@ -76,6 +76,7 @@ export component MainWindow inherits Window {
     in property <bool> bgm-has-result: false;
     in property <string> bgm-status-text: "先完成配音，再用当前工程生成 BGM。";
     in property <string> status-text: "就绪";
+    in property <string> engine-label: "audio.cpp";
     in property <string> export-dir: "";
 
     in-out property <bool> export-wav-on: true;
@@ -247,7 +248,7 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
                 Text {
-                    text: "audio.cpp · Metal";
+                    text: root.engine-label;
                     color: PixelTheme.dim;
                     font-size: 12px;
                     vertical-alignment: center;
