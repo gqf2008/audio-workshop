@@ -93,6 +93,41 @@ fn changing_prompt_invalidates_cached_segments() {
 }
 
 #[test]
+fn failed_prompt_change_invalidates_old_manifest() {
+    let mock = support::Mock::start(vec![
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![200; 8000]))),
+        (500, r#"{"error":"forced failure"}"#.into()),
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+    ]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("cache-pending");
+    let a = BgmOptions {
+        prompt: "prompt A".into(),
+        segment_seconds: 1.0,
+        target_seconds: 2.0,
+        base_seed: 1,
+        ..Default::default()
+    };
+    generate_segments(&client, &dir, &a, |_, _, _| {}).unwrap();
+
+    let b = BgmOptions {
+        prompt: "prompt B".into(),
+        ..a.clone()
+    };
+    assert!(generate_segments(&client, &dir, &b, |_, _, _| {}).is_err());
+
+    // 切回 A 时旧 manifest 已 pending，不允许把已经覆盖成 B 的第 0 段当缓存。
+    generate_segments(&client, &dir, &a, |_, _, _| {}).unwrap();
+    assert_eq!(mock.hit_count(), 6);
+    let bodies = mock.bodies();
+    assert!(bodies[4].contains("prompt A"));
+    assert!(bodies[5].contains("prompt A"));
+}
+
+#[test]
 fn zero_frame_segment_is_rejected() {
     let mock = support::Mock::start(vec![(200, support::audio_response(&mono_8k(&[])))]);
     let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));

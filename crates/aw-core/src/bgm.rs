@@ -64,6 +64,13 @@ impl BgmManifest {
             base_seed: options.base_seed,
         }
     }
+
+    fn pending(options: &BgmOptions) -> Self {
+        Self {
+            version: 0,
+            ..Self::from_options(options)
+        }
+    }
 }
 
 fn manifest_path(dir: &Path) -> PathBuf {
@@ -114,6 +121,14 @@ pub fn generate_segments(
     let total = segment_count(options).map_err(ClientError::Http)?;
     std::fs::create_dir_all(dir.join("bgm/segments")).ok();
     let reuse_cache = manifest_matches(dir, options);
+    if !reuse_cache {
+        // 一旦开始覆盖旧分段，旧 manifest 就不能再保持“有效”：否则中途失败后
+        // 切回旧 prompt 会把已经覆盖的新段错误当成旧 prompt 的缓存。
+        let pending = serde_json::to_vec(&BgmManifest::pending(options))
+            .map_err(|e| ClientError::Decode(e.to_string()))?;
+        write_atomic(&manifest_path(dir), &pending)
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+    }
     for i in 0..total {
         let path = segment_path(dir, i);
         if reuse_cache

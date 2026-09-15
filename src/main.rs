@@ -1492,7 +1492,9 @@ fn wire_bgm(
             .is_err()
         {
             ui.set_busy(false);
-            ui.set_status_text("工作线程不可用：BGM 未发出，请重启应用".into());
+            let note = "工作线程不可用：BGM 未发出，请重启应用";
+            ui.set_bgm_status_text(note.into());
+            ui.set_status_text(note.into());
         }
     });
 
