@@ -1,0 +1,46 @@
+# Work-unit board for audio-workshop (docs/D1_COLLAB_DESIGN.md §8).
+# Cards move when a signed `status` entry is appended to the thread; this file
+# only declares the deterministic projection into lanes.
+
+version = 1
+
+[sort]
+by = "ts"
+direction = "desc"
+
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "ready"
+status = "ready"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "blocked"
+status = "blocked"
+
+[[column]]
+name = "needs-human"
+status = "needs-human"
+
+[[column]]
+name = "merged"
+status = "merged"
+
+[[column]]
+name = "closed"
+status = "closed"
+
+# Catch-all: never hide a thread with a status this board does not know yet.
+[[column]]
+name = "other"
+status = "other"
