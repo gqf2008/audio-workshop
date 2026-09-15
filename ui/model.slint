@@ -1,0 +1,26 @@
+// ============================================================================
+// 音频作坊 · 界面数据模型（原型阶段：结构先定，数据是桩）
+//
+// 字段刻意与 tools/audio_config.py 的产物对齐：
+//   切句 → 逐句合成 → 回填 start/duration → 时间轴 / SRT / 整段 WAV。
+// 接真实链路时只需换掉 src/main.rs 里的桩数据构造，界面一行不用改。
+// ============================================================================
+
+// 一句话：配音的最小单位。
+export struct Sentence {
+    no: int,                 // 句序号（从 1 开始）
+    text: string,            // 句子文本
+    status: string,          // 待合成 / 合成中 / 已合成 / 失败
+    duration: float,         // 该句时长（秒），未合成为 0
+    start: float,            // 在整段音频中的起始时间（秒）
+    duration-label: string,  // 展示用，如 "2.4s"
+    start-label: string,     // 展示用，如 "0:12"
+}
+
+// 音色：本地模型 + 参考音频，不联网（CHARTER 第 4 节平台策略）。
+export struct Voice {
+    name: string,     // 显示名（同时是下拉框选项文案）
+    engine: string,   // 推理引擎 / 模型档位
+    note: string,     // 一句话描述，给创作者看
+    license: string,  // 许可：可商用 / 仅自用（红线见 CHARTER 第 5 节）
+}
