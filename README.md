@@ -17,7 +17,7 @@
 
 设计原则：**技术会进步、模型会换 —— 价值在配置层，不在改模型**。模型不稳的地方（数字读法、不可用变体）由配置声明与兜底，不写死在代码里。
 
-引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0），以 **submodule 锁定 tag** 引入，适配只写在本仓库的薄层。
+引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0），当前为**独立仓库 checkout（v0.7.3）**，submodule 化待落；适配只写在本仓库的薄层。
 
 ## 快速开始
 
