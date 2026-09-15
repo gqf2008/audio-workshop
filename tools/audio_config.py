@@ -74,19 +74,34 @@ def digits_zh(s, telephone=False):
 
 
 def verbalize(text, numbers=None):
-    """数字读法规范化（默认规则集：基数词 + 年份逐位 + 电话幺 + 货币）"""
+    r"""数字读法规范化（基数词 / 年份逐位 / 电话幺 / 小数 / 百分比 / 金额）
+
+    注意：**不能用 \b 词边界**——Python 里汉字属于 \w，"数字紧贴汉字"（中文稿最常见的
+    形态，如"今年2026年"）会让整条规则不匹配而静默失效。改用"左右不挨着数字"的前后瞻。
+    """
     n = {"year_digit_by_digit": True, "phone_yao": True, "currency_cardinal": True}
     n.update(numbers or {})
-    t = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
+    NB_L, NB_R = r"(?<!\d)", r"(?!\d)"          # 不挨数字，而非 \b
+    t = re.sub(r"(?<=\d),(?=\d{3}" + NB_R + ")", "", text)      # 千分位
+    if n["currency_cardinal"]:                     # ¥1234.56 / 1234.56 元 → 一千二百三十四点五六元
+        t = re.sub(r"[¥￥]\s*" + NB_L + r"(\d+(?:\.\d+)?)", lambda m: _money(m.group(1)), t)
+        t = re.sub(NB_L + r"(\d+(?:\.\d+)?)\s*(?=元)", lambda m: _money(m.group(1)), t)
     if n["phone_yao"]:
-        t = re.sub(r"\b1\d{10}\b", lambda m: digits_zh(m.group(0), True), t)
-    t = re.sub(r"\b(\d+)\.(\d+)\b", lambda m: cardinal(int(m.group(1))) + "点" + digits_zh(m.group(2)), t)
-    t = re.sub(r"(\d+)\s*%", lambda m: "百分之" + cardinal(int(m.group(1))), t)
+        t = re.sub(NB_L + r"1\d{10}" + NB_R, lambda m: digits_zh(m.group(0), True), t)
+    t = re.sub(NB_L + r"(\d+)\.(\d+)" + NB_R, lambda m: cardinal(int(m.group(1))) + "点" + digits_zh(m.group(2)), t)
+    t = re.sub(NB_L + r"(\d+)\s*%", lambda m: "百分之" + cardinal(int(m.group(1))), t)
     if n["year_digit_by_digit"]:
-        # 年份/日期里的 4 位数逐位读（上游规则缺失的一项，配置层补上）
-        t = re.sub(r"\b(1\d{3}|20\d{2})\s*(?=年)", lambda m: digits_zh(m.group(1)), t)
-    t = re.sub(r"\b(\d+)\b", lambda m: cardinal(int(m.group(1))), t)
+        t = re.sub(NB_L + r"(1\d{3}|20\d{2})\s*(?=年)", lambda m: digits_zh(m.group(1)), t)
+    t = re.sub(NB_L + r"(\d+)" + NB_R, lambda m: cardinal(int(m.group(1))), t)
     return t
+
+
+def _money(digits):
+    """1234.56 → 一千二百三十四点五六"""
+    if "." in digits:
+        a, b = digits.split(".", 1)
+        return cardinal(int(a)) + "点" + digits_zh(b)
+    return cardinal(int(digits))
 
 
 def apply_dictionary(text, entries):
@@ -106,7 +121,11 @@ def normalize(text, cfg, model_id=None):
     text = apply_dictionary(text, tcfg.get("dictionary"))
     if policy in ("engine", "off"):
         return text, f"dictionary-only({policy})"
-    return verbalize(text, tcfg.get("numbers")), "dictionary+rules"
+    before_rules = text
+    out = verbalize(text, tcfg.get("numbers"))
+    if out == before_rules:
+        return out, "no-change"          # 词典与规则都没改动文本，UI 不应标"已兜底"
+    return out, "dictionary+rules"
 
 
 # ── server.json 生成 ────────────────────────────────────────────────────
