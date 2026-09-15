@@ -1,23 +1,42 @@
 //! audiocpp_server 客户端（POST /v1/tasks/run）。
 //!
-//! 行为对齐 Python 侧 tools/audio_dub.py：错误体要透出、503（内存预检/忙碌）要退避重试、
-//! 失败必须可见——这几条都是实测踩出来的（见 LESSON：指标噪声、静默失败类）。
+//! 行为对齐 Python 侧 tools/audio_eval.py 的 `post_retry(tries=6, wait=5.0)`：
+//! - 错误体要透出（503 的原因"内存预检/忙碌"就在 body 里）
+//! - 只有 **503** 才退避重试，且按**状态码**判定
+//! - 传输/解码错误不重试：服务没起来时重试只是让每句白等一整个退避周期
 
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Python `post_retry` 的 `tries=6`：最多 6 次尝试（不是 6 次重试）
+pub const DEFAULT_RETRIES: u32 = 6;
+pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub enum ClientError {
+    /// 传输层失败（连不上 / 超时 / 连接被重置）：不重试
     Http(String),
-    Server(String),
+    /// 服务端返回的 HTTP 错误：**状态码 + body**（body 必须透出，503 靠它解释原因）
+    Server(u16, String),
+    /// 响应解析失败
     Decode(String),
+}
+
+impl ClientError {
+    /// HTTP 状态码；传输/解析错误没有状态码
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            ClientError::Server(code, _) => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Http(e) => write!(f, "请求失败: {e}"),
-            ClientError::Server(e) => write!(f, "服务端拒绝: {e}"),
+            ClientError::Server(code, body) => write!(f, "服务端拒绝: HTTP {code} {body}"),
             ClientError::Decode(e) => write!(f, "响应解析失败: {e}"),
         }
     }
@@ -33,8 +52,8 @@ impl Client {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
-            retries: 6,
-            backoff: Duration::from_secs(5),
+            retries: DEFAULT_RETRIES,
+            backoff: DEFAULT_BACKOFF,
         }
     }
 
@@ -67,8 +86,9 @@ impl Client {
         let body = json!({ "model": model, "request": request });
 
         let resp = self.post_with_retry("/v1/tasks/run", &body)?;
+        // 响应体合法但没有 audio 字段：属于"响应不可用"，不是 HTTP 错误，也不可重试
         let audio = resp.get("audio").and_then(Value::as_str).ok_or_else(|| {
-            ClientError::Server(format!(
+            ClientError::Decode(format!(
                 "响应缺少 audio 字段: {}",
                 truncate(&resp.to_string())
             ))
@@ -85,29 +105,26 @@ impl Client {
             .unwrap_or(false)
     }
 
+    /// 503 才退避重试（内存预检拒绝 / 模型忙碌），其余错误立即返回。
     fn post_with_retry(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
-        let mut last = ClientError::Http("未发起请求".into());
-        for attempt in 0..=self.retries {
+        let tries = self.retries.max(1);
+        let mut last: Option<ClientError> = None;
+        for attempt in 0..tries {
             match self.post_once(path, body) {
                 Ok(v) => return Ok(v),
-                Err(e @ ClientError::Server(_)) => {
-                    // 503 = 内存预检拒绝或模型忙碌：退避重试（与 Python 侧同一策略）
-                    if e.to_string().contains("503") && attempt < self.retries {
-                        std::thread::sleep(self.backoff);
-                        last = e;
-                        continue;
-                    }
-                    return Err(e);
-                }
                 Err(e) => {
-                    last = e;
-                    if attempt < self.retries {
-                        std::thread::sleep(self.backoff);
+                    // 按状态码判定，不看消息内容：500 且 body 里恰好含 "503"
+                    // （比如错误信息里提到端口/编号）不该被当成可重试
+                    let retryable = e.status() == Some(503) && attempt + 1 < tries;
+                    last = Some(e);
+                    if !retryable {
+                        break;
                     }
+                    std::thread::sleep(self.backoff);
                 }
             }
         }
-        Err(last)
+        Err(last.unwrap_or_else(|| ClientError::Http("未发起请求".into())))
     }
 
     fn post_once(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
@@ -123,10 +140,7 @@ impl Client {
             Err(ureq::Error::Status(code, r)) => {
                 // 关键：HTTP 错误也要读 body，否则 503 的原因（内存不足/忙碌）看不见
                 let text = r.into_string().unwrap_or_default();
-                Err(ClientError::Server(format!(
-                    "HTTP {code} {}",
-                    truncate(&text)
-                )))
+                Err(ClientError::Server(code, truncate(&text)))
             }
             Err(e) => Err(ClientError::Http(e.to_string())),
         }
@@ -178,5 +192,17 @@ mod tests {
     #[test]
     fn base64_rejects_invalid() {
         assert!(decode_base64("****").is_err());
+    }
+
+    /// 重试判定必须看状态码，不看消息文本
+    #[test]
+    fn retry_is_decided_by_status_code() {
+        let e503 = ClientError::Server(503, "内存预检拒绝：需要 1200MB".into());
+        assert_eq!(e503.status(), Some(503));
+        // 500 而 body 里恰好含 "503"（如端口/编号）：不得被判成可重试
+        let e500 = ClientError::Server(500, "后端 audio8-tts 在 503 号槽位启动失败".into());
+        assert_ne!(e500.status(), Some(503));
+        assert!(ClientError::Http("连接被拒绝".into()).status().is_none());
+        assert!(ClientError::Decode("坏 json".into()).status().is_none());
     }
 }

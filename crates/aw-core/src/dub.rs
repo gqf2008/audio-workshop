@@ -2,54 +2,86 @@
 //!
 //! 与 Python 侧 tools/audio_dub.py 行为一致：句子级时间轴让「改一句只重录那一句」
 //! 成为天然能力，也顺带产出 SRT。
+//!
+//! 踩过的坑（Python 侧已修，这里补齐）：
+//! - 句首逗号不能当断点：`cut <= 0` 是"没有可用断点"，切出来会是只含逗号的垃圾句
+//! - 重录必须换 seed，否则拿回同一条不满意的音频
+//! - 合成/拼装的失败句必须**报数**，不能静默跳过（成品少一句没人知道）
 
 use crate::audio_client::{Client, ClientError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PUNCTUATION: &str = "。！？；…";
+/// Python 侧 cmd_synth 恒发这条 instruction（不是可选装饰：不发音色/语气线索时读法更飘）
+pub const DEFAULT_INSTRUCTION: &str = "自然、清晰的叙述语气";
+/// 重录时的 seed 步进（Python `cmd_redo`：`s["seed"] += 1000`）
+pub const REDO_SEED_STEP: u64 = 1000;
+
+/// 折叠空格与制表符（Python `re.sub(r"[ \t]+", " ", text)`）
+fn collapse_blanks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank = false;
+    for ch in text.chars() {
+        if ch == ' ' || ch == '\t' {
+            blank = true;
+            continue;
+        }
+        if blank {
+            out.push(' ');
+            blank = false;
+        }
+        out.push(ch);
+    }
+    out
+}
 
 /// 按句末标点切句；超长句子再按逗号断（避免单次请求过长）
+///
+/// 与 Python `split_sentences` 同算法，断点判定一律用**字符**下标
+/// （字节下标在中文标点上会切出半个字符）。
 pub fn split_sentences(text: &str, punctuation: &str, max_chars: usize) -> Vec<String> {
     let punct: Vec<char> = punctuation.chars().collect();
-    let mut sentences = Vec::new();
+    let push = |out: &mut Vec<String>, piece: &str| {
+        let s = piece.trim();
+        if !s.is_empty() {
+            out.push(s.to_string());
+        }
+    };
+
+    // ① 按句末标点切（标点留在句尾）
+    let mut sentences: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for ch in text.chars() {
+    for ch in collapse_blanks(text).chars() {
         cur.push(ch);
         if punct.contains(&ch) {
-            let s = cur.trim();
-            if !s.is_empty() {
-                sentences.push(s.to_string());
-            }
+            push(&mut sentences, &cur);
             cur.clear();
         }
     }
-    if !cur.trim().is_empty() {
-        sentences.push(cur.trim().to_string());
-    }
+    push(&mut sentences, &cur);
 
-    // 超长再按逗号/顿号断
+    // ② 超长再按逗号/顿号断
     let mut out = Vec::new();
     for s in sentences {
         let mut rest = s;
         while rest.chars().count() > max_chars {
             let chars: Vec<char> = rest.chars().collect();
-            let window: String = chars[..max_chars.min(chars.len())].iter().collect();
-            // rfind 给的是**字节**下标；中文标点是多字节，必须加上该字符本身的长度，
-            // 否则 ..=i 会切在字符中间（byte index is not a char boundary）。
-            let cut = window
-                .rfind(['，', ',', '、'])
-                .map(|i| i + window[i..].chars().next().map_or(0, |c| c.len_utf8()))
-                .unwrap_or(0);
-            if cut == 0 {
-                break; // 没有可断点，保留整句
+            let cut = ['，', ',', '、']
+                .iter()
+                .filter_map(|c| chars[..max_chars].iter().rposition(|x| x == c))
+                .max();
+            // cut 为 None（窗口内没有断点）或 0（句首就是逗号）都要放弃：
+            // 0 当哨兵却按字节加长度的话，会切出一个只含"，"的垃圾句
+            match cut {
+                Some(c) if c > 0 => {
+                    push(&mut out, &chars[..=c].iter().collect::<String>());
+                    rest = chars[c + 1..].iter().collect::<String>().trim().to_string();
+                }
+                _ => break,
             }
-            out.push(rest[..cut].trim().to_string());
-            rest = rest[cut..].trim().to_string();
         }
-        if !rest.is_empty() {
-            out.push(rest);
-        }
+        push(&mut out, &rest);
     }
     out
 }
@@ -90,6 +122,17 @@ pub struct Project {
     pub sentences: Vec<Sentence>,
 }
 
+/// 拼装结果。`skipped` 是**必须报出来的数**：失败句此前被静默跳过，
+/// 成品听起来"少了一句"却没有任何信号。
+#[derive(Debug, Clone)]
+pub struct Assembled {
+    pub duration: f64,
+    pub wav: PathBuf,
+    pub srt: PathBuf,
+    pub done: usize,
+    pub skipped: usize,
+}
+
 impl Project {
     // 构造参数确实多（脚本/模型/间隔/种子/参考音/标点/长度/规范化闭包），
     // 但每个都是调用方必须显式给出的决策；改为配置结构体会让调用点更啰嗦。
@@ -126,7 +169,9 @@ impl Project {
         }
     }
 
-    /// 合成未完成的句子（或指定序号）
+    /// 合成未完成的句子（或指定序号）。返回**失败的句数**：
+    /// 全句失败时返回 `Ok(n>0)` 而不是 `Ok(0)` 那样的"成功"假象，
+    /// 调用方据此决定是否继续拼装/退出码。
     pub fn synthesize(
         &mut self,
         client: &Client,
@@ -134,8 +179,10 @@ impl Project {
         only: Option<&[usize]>,
         instruction: Option<&str>,
         mut on_progress: impl FnMut(usize, &str),
-    ) -> Result<(), ClientError> {
+    ) -> Result<usize, ClientError> {
         std::fs::create_dir_all(dir.join("sentences")).ok();
+        let instruction = instruction.unwrap_or(DEFAULT_INSTRUCTION);
+        let mut failed = 0usize;
         for s in self.sentences.iter_mut() {
             if let Some(list) = only {
                 if !list.contains(&s.index) {
@@ -150,7 +197,7 @@ impl Project {
                 &s.spoken,
                 Some(s.seed),
                 self.voice_ref.as_deref(),
-                instruction,
+                Some(instruction),
             ) {
                 Ok(wav) => {
                     let path = dir.join(format!("sentences/{:03}.wav", s.index));
@@ -161,29 +208,61 @@ impl Project {
                     on_progress(s.index, &format!("done {d:.2}s"));
                 }
                 Err(e) => {
+                    failed += 1;
                     s.status = format!("error: {e}");
                     on_progress(s.index, &format!("error {e}"));
                 }
             }
         }
-        Ok(())
+        Ok(failed)
     }
 
-    /// 拼装成品 + SRT（句子级时间轴）
-    pub fn assemble(&mut self, dir: &Path) -> Result<(f64, PathBuf, PathBuf), String> {
-        let done: Vec<&Sentence> = self
+    /// 单句重录（对应 Python `cmd_redo`）：换 seed → 可选改文本 → 重合成该句。
+    ///
+    /// **必须换 seed**：不换的话"重录"回来的是同一条不满意的音频。
+    /// 重录后要刷新成品，调用方接着调 [`Project::assemble`]（Python 的 cmd_redo 也顺手重拼）。
+    /// 返回值同 [`Project::synthesize`]：失败的句数。
+    // 参数多与 `Project::new` 同理：client/dir/序号/新文本/规范化/instruction/回调
+    // 都是调用方必须显式给出的决策，包成配置结构体只会让调用点更啰嗦
+    #[allow(clippy::too_many_arguments)]
+    pub fn redo(
+        &mut self,
+        client: &Client,
+        dir: &Path,
+        index: usize,
+        new_text: Option<&str>,
+        normalize: impl Fn(&str) -> String,
+        instruction: Option<&str>,
+        on_progress: impl FnMut(usize, &str),
+    ) -> Result<usize, ClientError> {
+        let s = self
+            .sentences
+            .iter_mut()
+            .find(|s| s.index == index)
+            .ok_or_else(|| ClientError::Http(format!("没有第 {index} 句")))?;
+        if let Some(t) = new_text {
+            s.text = t.to_string();
+            s.spoken = normalize(t);
+        }
+        s.seed += REDO_SEED_STEP;
+        self.synthesize(client, dir, Some(&[index]), instruction, on_progress)
+    }
+
+    /// 拼装成品 + SRT（句子级时间轴）。返回值带**跳过的句数**，不再静默丢句。
+    pub fn assemble(&mut self, dir: &Path) -> Result<Assembled, String> {
+        let done: Vec<usize> = self
             .sentences
             .iter()
             .filter(|s| s.status == "done")
+            .map(|s| s.index)
             .collect();
         if done.is_empty() {
             return Err("还没有已合成的句子".into());
         }
-        let reader =
-            hound::WavReader::open(dir.join(format!("sentences/{:03}.wav", done[0].index)))
-                .map_err(|e| e.to_string())?;
-        let spec = reader.spec();
-        drop(reader);
+        let skipped = self.sentences.len() - done.len();
+        let spec = hound::WavReader::open(dir.join(format!("sentences/{:03}.wav", done[0])))
+            .map_err(|e| e.to_string())?
+            .spec();
 
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
@@ -203,6 +282,22 @@ impl Project {
             }
             let path = dir.join(format!("sentences/{:03}.wav", s.index));
             let mut r = hound::WavReader::open(&path).map_err(|e| e.to_string())?;
+            // 参数不一致的句子直接拒绝：混着拼会把后面的句子读成噪声（Python 同样中止）
+            let got = r.spec();
+            if (got.sample_rate, got.channels, got.bits_per_sample)
+                != (spec.sample_rate, spec.channels, spec.bits_per_sample)
+            {
+                return Err(format!(
+                    "第 {} 句参数与首句不一致（{}Hz/{}ch/{}bit vs {}Hz/{}ch/{}bit），拒绝拼装",
+                    s.index,
+                    got.sample_rate,
+                    got.channels,
+                    got.bits_per_sample,
+                    spec.sample_rate,
+                    spec.channels,
+                    spec.bits_per_sample
+                ));
+            }
             let samples: Vec<i16> = r
                 .samples::<i16>()
                 .collect::<Result<_, _>>()
@@ -235,11 +330,13 @@ impl Project {
         writer.finalize().map_err(|e| e.to_string())?;
         let srt_path = out_dir.join("final.srt");
         std::fs::write(&srt_path, srt).map_err(|e| e.to_string())?;
-        Ok((
-            cursor_frames as f64 / spec.sample_rate as f64,
-            final_wav,
-            srt_path,
-        ))
+        Ok(Assembled {
+            duration: cursor_frames as f64 / spec.sample_rate as f64,
+            wav: final_wav,
+            srt: srt_path,
+            done: done.len(),
+            skipped,
+        })
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
@@ -284,6 +381,25 @@ mod tests {
             s.iter().all(|x| x.chars().count() <= 14 + 1),
             "断点应贴近上限: {s:?}"
         );
+    }
+
+    /// 句首逗号不是断点：`cut == 0` 时若按字节当断点，会切出一个只含"，"的垃圾句
+    #[test]
+    fn leading_comma_is_not_a_break_point() {
+        let text = "，开头就是逗号而且很长很长很长很长很长的句子。";
+        assert_eq!(
+            split_sentences(text, DEFAULT_PUNCTUATION, 12),
+            vec![text.to_string()]
+        );
+    }
+
+    #[test]
+    fn collapses_blanks_and_keeps_no_empty_pieces() {
+        assert_eq!(
+            split_sentences("含  \t 多余空白。第二句。", DEFAULT_PUNCTUATION, 80),
+            vec!["含 多余空白。", "第二句。"]
+        );
+        assert!(split_sentences("   \t ", DEFAULT_PUNCTUATION, 80).is_empty());
     }
 
     #[test]
