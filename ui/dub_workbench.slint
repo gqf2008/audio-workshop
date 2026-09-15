@@ -43,6 +43,7 @@ component SectionLabel inherits Text {
 component SentenceRow inherits Rectangle {
     in property <Sentence> item;
     in property <bool> picked: false;
+    in property <bool> busy: false;
     callback pick();
     callback audition();
     callback redo();
@@ -139,6 +140,7 @@ component SentenceRow inherits Rectangle {
                 size: "small";
                 variant: "primary";
                 text: "重录";
+                enabled: !root.busy;
                 Tooltip { text: @markdown("只重跑这一句"); }
                 clicked => { root.redo(); }
             }
@@ -159,7 +161,7 @@ component SentenceRow inherits Rectangle {
 // 抽屉内区块间距 20px、区块内 16px。
 // ---------------------------------------------------------------------------
 export component WorkbenchDrawer inherits VerticalLayout {
-    in property <string> project-name: "";
+    in-out property <string> project-name: "";
     callback project-edited();
 
     in property <[string]> scene-names: [];
@@ -172,6 +174,9 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <[string]> voice-names: [];
     in property <[Voice]> voices: [];
     in-out property <int> voice-index: 0;
+    in-out property <string> voice-ref-path: "";
+    callback model-changed();
+    callback voice-ref-changed();
     in-out property <float> speed: 1.0;
     in property <string> speed-label: "1.00x";
     in-out property <bool> auto-normalize: true;
@@ -179,6 +184,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
 
     in property <float> progress: 0.0;
     in property <bool> running: false;
+    in property <bool> busy: false;
     in property <string> status-text: "";
     callback preview-all();
 
@@ -186,14 +192,13 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <string> export-dir: "";
     in-out property <bool> export-wav-on: true;
     in-out property <bool> export-srt-on: true;
-    callback export-wav();
-    callback export-srt();
+    callback export-requested();
 
-    // 导出格式：0=整段 WAV、1=逐句 SRT、2=两者（落到既有两个开关上）
+    // 导出格式：0=整段 WAV、1=逐句 SRT、2=两者、3=仅生成不导出
     in-out property <int> export-index: 2;
     changed export-index => {
-        root.export-wav-on = root.export-index != 1;
-        root.export-srt-on = root.export-index != 0;
+        root.export-wav-on = root.export-index != 1 && root.export-index != 3;
+        root.export-srt-on = root.export-index != 0 && root.export-index != 3;
     }
 
     property <Voice> voice: root.voices[Math.max(0, Math.min(root.voice-index, root.voices.length - 1))];
@@ -213,8 +218,9 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 spacing: 16px;
                 SectionLabel { text: "工程"; }
                 PixelTextInput {
-                    text: root.project-name;
+                    text <=> root.project-name;
                     placeholder: "工程名，如：0921 开箱口播";
+                    enabled: !root.running && !root.busy;
                     edited => { root.project-edited(); }
                 }
             }
@@ -251,9 +257,23 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     model: root.voice-names;
                     index <=> root.voice-index;
                     placeholder: "选择音色";
+                    enabled: !root.running && !root.busy;
+                    selected(i) => { root.model-changed(); }
                 }
                 Text {
                     text: root.voice.engine + " · 许可 " + root.voice.license + " · " + root.voice.note;
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                PixelTextInput {
+                    text <=> root.voice-ref-path;
+                    placeholder: "参考音频路径（可选，克隆用）";
+                    enabled: !root.running && !root.busy;
+                    edited => { root.voice-ref-changed(); }
+                }
+                Text {
+                    text: "留空用模型默认音色；填 wav 路径即 voice_ref 克隆（index-tts2）";
                     color: PixelTheme.dim;
                     font-size: 12px;
                     wrap: word-wrap;
@@ -262,7 +282,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     spacing: 16px;
                     Text {
                         width: 34px;
-                        text: "语速";
+                        text: "倍速";
                         color: PixelTheme.text;
                         font-size: 12px;
                         vertical-alignment: center;
@@ -342,17 +362,14 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 spacing: 16px;
                 SectionLabel { text: "导出"; }
                 PixelSegmentedControl {
-                    options: ["整段 WAV", "逐句 SRT", "两者"];
+                    options: ["整段 WAV", "逐句 SRT", "两者", "仅生成"];
                     index <=> root.export-index;
                 }
                 PixelButton {
                     text: "开始导出";
                     variant: "primary";
-                    enabled: root.has-result && (root.export-wav-on || root.export-srt-on);
-                    clicked => {
-                        if root.export-wav-on { root.export-wav(); }
-                        if root.export-srt-on { root.export-srt(); }
-                    }
+                    enabled: root.has-result && !root.busy && !root.running;
+                    clicked => { root.export-requested(); }
                 }
                 Text {
                     text: "输出目录 " + root.export-dir;
@@ -385,6 +402,7 @@ export component DubWorkbench inherits Rectangle {
     // ── 运行状态（首屏主按钮要按状态换文案；playhead 给时间轴画播放头） ──
     in-out property <float> playhead: 0.0;
     in property <bool> running: false;
+    in property <bool> busy: false;
     in property <bool> playing: false;
 
     // ── 事件出口 ──
@@ -420,6 +438,7 @@ export component DubWorkbench inherits Rectangle {
                         horizontal-stretch: 1;
                         height: 132px;
                         frame-height: 132px;
+                        enabled: !root.running && !root.busy;
                         text <=> root.script-text;
                         placeholder: "把口播稿粘进来，按 。！？ 自动切句…";
                         edited => { root.script-edited(); }
@@ -429,7 +448,7 @@ export component DubWorkbench inherits Rectangle {
                         Rectangle { // 首屏
                             width: 22px;
                             height: 22px;
-                            visible: root.script-text != "";
+                            visible: root.script-text != "" && !root.running && !root.busy;
                             background: clear-ta.pressed ? PixelTheme.shadow : (clear-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
                             border-width: 2px;
                             border-color: PixelTheme.edge;
@@ -467,14 +486,14 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 92px;
                         text: "重新切句";
-                        enabled: root.script-text != "";
+                        enabled: root.script-text != "" && !root.running && !root.busy;
                         clicked => { root.resplit(); }
                     }
                     PixelButton { // 首屏
                         width: 104px;
                         variant: "primary";
                         text: root.running ? "停止合成" : (root.playing ? "停止试听" : "开始合成");
-                        enabled: root.running || root.playing || root.sentences.length > 0;
+                        enabled: (root.running || root.playing || root.sentences.length > 0) && !root.busy;
                         clicked => {
                             if root.running { root.stop-run(); }
                             else if root.playing { root.stop-preview(); }
@@ -497,6 +516,7 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏-空态
                         width: 120px;
                         text: "载入示例稿";
+                        enabled: !root.running && !root.busy;
                         clicked => { root.use-sample(); }
                     }
                 }
@@ -509,6 +529,7 @@ export component DubWorkbench inherits Rectangle {
                         for s[i] in root.sentences : SentenceRow {
                             item: s;
                             picked: root.selected == i;
+                            busy: root.busy;
                             pick => { root.select-sentence(i); }
                             audition => { root.preview-one(i); }
                             redo => { root.redo-one(i); }

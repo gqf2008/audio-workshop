@@ -10,6 +10,7 @@
 
 use crate::audio_client::{Client, ClientError};
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PUNCTUATION: &str = "。！？；…";
@@ -117,6 +118,10 @@ pub struct Project {
     pub model: String,
     #[serde(default)]
     pub voice_ref: Option<String>,
+    /// 参考音频内容哈希。只比路径无法识别“同路径文件被替换”；旧工程缺此字段时
+    /// 下一次会保守重录并按新内容写入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_ref_hash: Option<String>,
     pub gap_ms: u64,
     pub base_seed: u64,
     pub sentences: Vec<Sentence>,
@@ -163,6 +168,7 @@ impl Project {
         Self {
             model: model.into(),
             voice_ref,
+            voice_ref_hash: None,
             gap_ms,
             base_seed,
             sentences,
@@ -178,41 +184,77 @@ impl Project {
         dir: &Path,
         only: Option<&[usize]>,
         instruction: Option<&str>,
+        on_progress: impl FnMut(usize, &str),
+    ) -> Result<usize, ClientError> {
+        self.synthesize_stoppable(client, dir, only, instruction, None, on_progress)
+    }
+
+    /// 带协作取消的合成：UI 的「停止合成」置 `stop` 位，句间检查（正在合成的那句
+    /// 会跑完——不中断单个 HTTP 请求，避免服务端半状态）。取消时已完成的句保留。
+    pub fn synthesize_stoppable(
+        &mut self,
+        client: &Client,
+        dir: &Path,
+        only: Option<&[usize]>,
+        instruction: Option<&str>,
+        stop: Option<&std::sync::atomic::AtomicBool>,
         mut on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
         std::fs::create_dir_all(dir.join("sentences")).ok();
         let instruction = instruction.unwrap_or(DEFAULT_INSTRUCTION);
         let mut failed = 0usize;
-        for s in self.sentences.iter_mut() {
-            if let Some(list) = only {
-                if !list.contains(&s.index) {
+        // 按下标迭代而不是 iter_mut：循环体里要 self.save(dir)（逐句落盘），
+        // iter_mut 会把 self.sentences 的可变借用一直占着，与 save 的 &self 冲突。
+        for i in 0..self.sentences.len() {
+            if stop
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                on_progress(usize::MAX, "stopped");
+                break;
+            }
+            let (index, spoken, seed) = {
+                let s = &self.sentences[i];
+                if let Some(list) = only {
+                    if !list.contains(&s.index) {
+                        continue;
+                    }
+                } else if s.status == "done" {
                     continue;
                 }
-            } else if s.status == "done" {
-                continue;
-            }
-            on_progress(s.index, &s.spoken);
-            match client.synth(
+                (s.index, s.spoken.clone(), s.seed)
+            };
+            on_progress(index, &spoken);
+            let outcome = match client.synth(
                 &self.model,
-                &s.spoken,
-                Some(s.seed),
+                &spoken,
+                Some(seed),
                 self.voice_ref.as_deref(),
                 Some(instruction),
             ) {
                 Ok(wav) => {
-                    let path = dir.join(format!("sentences/{:03}.wav", s.index));
-                    std::fs::write(&path, &wav).map_err(|e| ClientError::Http(e.to_string()))?;
+                    let path = dir.join(format!("sentences/{index:03}.wav"));
+                    write_atomic(&path, &wav).map_err(|e| ClientError::Http(e.to_string()))?;
                     let d = wav_duration(&wav)?;
+                    let s = &mut self.sentences[i];
                     s.duration = Some(d);
                     s.status = "done".into();
-                    on_progress(s.index, &format!("done {d:.2}s"));
+                    format!("done {d:.2}s")
                 }
                 Err(e) => {
                     failed += 1;
-                    s.status = format!("error: {e}");
-                    on_progress(s.index, &format!("error {e}"));
+                    self.sentences[i].status = format!("error: {e}");
+                    format!("error {e}")
                 }
+            };
+            // 逐句落盘（Python `cmd_synth` 同款）：中途被杀/断电，已完成句与状态不丢。
+            // 崩溃恢复 = 重跑 synthesize，done 句自动跳过。
+            // 顺序必须是「先落盘、再回调」：回调里（UI 刷新/测试断言）读到的状态
+            // 必须是磁盘上已持久化的状态。
+            if let Err(e) = self.save(dir) {
+                on_progress(index, &format!("工程落盘失败（续作仍可重跑）: {e}"));
             }
+            on_progress(index, &outcome);
         }
         Ok(failed)
     }
@@ -235,16 +277,27 @@ impl Project {
         instruction: Option<&str>,
         on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
-        let s = self
-            .sentences
-            .iter_mut()
-            .find(|s| s.index == index)
-            .ok_or_else(|| ClientError::Http(format!("没有第 {index} 句")))?;
         if let Some(t) = new_text {
+            let s = self
+                .sentences
+                .iter_mut()
+                .find(|s| s.index == index)
+                .ok_or_else(|| ClientError::Http(format!("没有第 {index} 句")))?;
             s.text = t.to_string();
             s.spoken = normalize(t);
         }
-        s.seed += REDO_SEED_STEP;
+        {
+            let s = self
+                .sentences
+                .iter_mut()
+                .find(|s| s.index == index)
+                .ok_or_else(|| ClientError::Http(format!("没有第 {index} 句")))?;
+            s.seed += REDO_SEED_STEP;
+        }
+        // 先落盘再合成（Python cmd_redo 修过的坑：synthesize 从磁盘重载工程时，
+        // 未保存的文本/seed 修改会被静默丢弃，"重录"回来还是旧文本）。
+        self.save(dir)
+            .map_err(|e| ClientError::Http(format!("重录前落盘失败: {e}")))?;
         self.synthesize(client, dir, Some(&[index]), instruction, on_progress)
     }
 
@@ -260,14 +313,61 @@ impl Project {
             return Err("还没有已合成的句子".into());
         }
         let skipped = self.sentences.len() - done.len();
+
+        // ── 拼装前逐句校验（Python cmd_assemble 同款）：任何一句有问题都中止并列出全部，
+        // 不在拼到一半时才发现第 N 句是噪声。截断文件的证据不在 WAV 头里
+        // （头仍合法、头里的帧数也不被截断改写），唯一可信判据是**实际字节数**。
         let spec = hound::WavReader::open(dir.join(format!("sentences/{:03}.wav", done[0])))
             .map_err(|e| e.to_string())?
             .spec();
+        let mut bad: Vec<String> = Vec::new();
+        for &idx in &done {
+            let path = dir.join(format!("sentences/{idx:03}.wav"));
+            let r = match hound::WavReader::open(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    bad.push(format!("[{idx}] 不可读: {e}"));
+                    continue;
+                }
+            };
+            let got = r.spec();
+            if (got.sample_rate, got.channels, got.bits_per_sample)
+                != (spec.sample_rate, spec.channels, spec.bits_per_sample)
+            {
+                bad.push(format!(
+                    "[{idx}] 参数不符 ({}Hz/{}ch/{}bit，首句 {}Hz/{}ch/{}bit)",
+                    got.sample_rate,
+                    got.channels,
+                    got.bits_per_sample,
+                    spec.sample_rate,
+                    spec.channels,
+                    spec.bits_per_sample
+                ));
+                continue;
+            }
+            let bytes_per_sample = got.bits_per_sample as u64 / 8;
+            let need = 44 + r.duration() as u64 * got.channels as u64 * bytes_per_sample;
+            let actual = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if actual < need {
+                bad.push(format!(
+                    "[{idx}] 文件被截断 (实际 {actual} 字节，头声明需要 {need} 字节)"
+                ));
+            }
+        }
+        if !bad.is_empty() {
+            return Err(format!(
+                "拼装中止，以下句子有问题：\n    {}",
+                bad.join("\n    ")
+            ));
+        }
 
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
         let final_wav = out_dir.join("final.wav");
-        let mut writer = hound::WavWriter::create(&final_wav, spec).map_err(|e| e.to_string())?;
+        // 成品走"临时文件 + fsync + 原子替换"：旧成品在写完前不受影响，
+        // 掉电不会留下 rename 到位的空文件（Python cmd_assemble 同款）。
+        let final_tmp = out_dir.join(format!("final.wav.tmp{}", std::process::id()));
+        let mut writer = hound::WavWriter::create(&final_tmp, spec).map_err(|e| e.to_string())?;
 
         let gap_frames = (spec.sample_rate as u64 * self.gap_ms / 1000) as usize;
         let mut cursor_frames: u64 = 0;
@@ -282,22 +382,7 @@ impl Project {
             }
             let path = dir.join(format!("sentences/{:03}.wav", s.index));
             let mut r = hound::WavReader::open(&path).map_err(|e| e.to_string())?;
-            // 参数不一致的句子直接拒绝：混着拼会把后面的句子读成噪声（Python 同样中止）
-            let got = r.spec();
-            if (got.sample_rate, got.channels, got.bits_per_sample)
-                != (spec.sample_rate, spec.channels, spec.bits_per_sample)
-            {
-                return Err(format!(
-                    "第 {} 句参数与首句不一致（{}Hz/{}ch/{}bit vs {}Hz/{}ch/{}bit），拒绝拼装",
-                    s.index,
-                    got.sample_rate,
-                    got.channels,
-                    got.bits_per_sample,
-                    spec.sample_rate,
-                    spec.channels,
-                    spec.bits_per_sample
-                ));
-            }
+            // 参数/截断校验已在拼装前统一做过；这里只读数据
             let samples: Vec<i16> = r
                 .samples::<i16>()
                 .collect::<Result<_, _>>()
@@ -328,8 +413,15 @@ impl Project {
             ));
         }
         writer.finalize().map_err(|e| e.to_string())?;
+        // 关文件后补一次 fsync 再 rename（wave 关闭不落盘到点，掉电可能留下空成品）
+        std::fs::File::open(&final_tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&final_tmp, &final_wav).map_err(|e| e.to_string())?;
         let srt_path = out_dir.join("final.srt");
-        std::fs::write(&srt_path, srt).map_err(|e| e.to_string())?;
+        write_atomic(&srt_path, srt.as_bytes()).map_err(|e| e.to_string())?;
+        // 时间轴落进 project.json：下次打开工程/重录单句都从这里续
+        self.save(dir).map_err(|e| e.to_string())?;
         Ok(Assembled {
             duration: cursor_frames as f64 / spec.sample_rate as f64,
             wav: final_wav,
@@ -339,10 +431,12 @@ impl Project {
         })
     }
 
+    /// 工程落盘（原子写：临时文件 + fsync + rename）。
+    /// 崩溃/磁盘满时不会留下写了一半的 project.json。
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        std::fs::write(
-            dir.join("project.json"),
-            serde_json::to_string_pretty(self).unwrap(),
+        write_atomic(
+            &dir.join("project.json"),
+            serde_json::to_string_pretty(self).unwrap().as_bytes(),
         )
     }
 
@@ -351,6 +445,22 @@ impl Project {
         serde_json::from_str(&raw)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+}
+
+/// 原子写：同目录临时文件 + fsync + rename（Python `write_atomic` 同款）。
+/// 崩溃/掉电/磁盘满时，目标路径要么还是旧内容，要么是新内容，不会写一半。
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_file_name(format!(
+        "{}.tmp{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 /// 从 wav 字节读时长（秒）

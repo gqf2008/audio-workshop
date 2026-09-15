@@ -46,7 +46,7 @@ export component MainWindow inherits Window {
     in-out property <bool> drawer-open: false;
 
     // ── 工作台状态（转发给 DubWorkbench / WorkbenchDrawer，见下） ──
-    in property <string> project-name: "";
+    in-out property <string> project-name: "";
     in-out property <string> script-text: "";
     in property <int> char-count: 0;
     in property <string> est-duration: "--";
@@ -68,6 +68,7 @@ export component MainWindow inherits Window {
     in-out property <float> playhead: 0.0;
     in-out property <bool> playing: false;
     in-out property <bool> running: false;
+    in-out property <bool> busy: false;
     in property <bool> has-result: false;
     in property <string> status-text: "就绪";
     in property <string> export-dir: "";
@@ -90,6 +91,8 @@ export component MainWindow inherits Window {
     callback theme-picked(string);
     callback scene-changed(int);
     callback project-edited();
+    callback model-changed();
+    callback voice-ref-changed();
     callback script-edited();
     callback use-sample();
     callback clear-script();
@@ -102,9 +105,16 @@ export component MainWindow inherits Window {
     callback start-run();
     callback stop-run();
     callback stop-preview();
-    callback export-wav();
-    callback export-srt();
+    callback export-requested();
     callback seek(float);
+    // 键盘翻句（FocusScope 转发）：上一句 / 下一句 / 播放·停止
+    callback key-prev();
+    callback key-next();
+    callback key-toggle();
+
+    // ── 引擎 / 音色 ──
+    // 参考音频路径（可选）：填了就走 voice_ref 克隆（index-tts2），留空用模型默认音色
+    in-out property <string> voice-ref-path: "";
 
     property <string> scene-name: root.scenes[Math.max(0, Math.min(root.scene, root.scenes.length - 1))];
 
@@ -167,6 +177,7 @@ export component MainWindow inherits Window {
 
             playhead <=> root.playhead;
             running: root.running;
+            busy: root.busy;
             playing: root.playing;
 
             script-edited => { root.script-edited(); }
@@ -238,7 +249,7 @@ export component MainWindow inherits Window {
         WorkbenchDrawer {
             vertical-stretch: 1;
 
-            project-name: root.project-name;
+            project-name <=> root.project-name;
             project-edited => { root.project-edited(); }
 
             scene-names: root.scenes;
@@ -251,6 +262,9 @@ export component MainWindow inherits Window {
             voice-names: root.voice-names;
             voices: root.voices;
             voice-index <=> root.voice-index;
+            voice-ref-path <=> root.voice-ref-path;
+            model-changed => { root.model-changed(); }
+            voice-ref-changed => { root.voice-ref-changed(); }
             speed <=> root.speed;
             speed-label: root.speed-label;
             speed-changed(v) => { root.speed-changed(v); }
@@ -258,6 +272,7 @@ export component MainWindow inherits Window {
 
             progress: root.progress;
             running: root.running;
+            busy: root.busy;
             status-text: root.status-text;
             preview-all => { root.preview-all(); }
 
@@ -265,14 +280,35 @@ export component MainWindow inherits Window {
             export-dir: root.export-dir;
             export-wav-on <=> root.export-wav-on;
             export-srt-on <=> root.export-srt-on;
-            export-wav => { root.export-wav(); }
-            export-srt => { root.export-srt(); }
+            export-requested => { root.export-requested(); }
         }
     }
 
     // 四边 / 四角缩放热区（install_window_resize 接 winit 的系统级缩放）
     PixelWindowResize {
         begin-resize(dir) => { root.begin-resize(dir); }
+    }
+
+    // 键盘翻句：↑/↓ 选句、空格 播放/停止。FocusScope 不抢鼠标（无 TouchArea），
+    // 焦点在输入框里时按键归输入框，这是预期行为。
+    FocusScope {
+        width: root.width;
+        height: root.height;
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow) {
+                root.key-prev();
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.key-next();
+                return accept;
+            }
+            if (event.text == Key.Space) {
+                root.key-toggle();
+                return accept;
+            }
+            return reject;
+        }
     }
 
     // 右下角通知（导出提示等）：用 if 控制实例化，保证每次弹出都是干净状态
