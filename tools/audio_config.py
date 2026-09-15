@@ -41,7 +41,7 @@ def load(path=CFG_DEFAULT):
 # ── 文本层：发音词典 + 数字规范化 ───────────────────────────────────────
 _CN = "零一二三四五六七八九"
 _UNITS = ["", "十", "百", "千"]
-_BIG = ["", "万", "亿"]
+_BIG = ["", "万", "亿", "万亿", "亿亿"]   # 与 u4 的分组数对应，防止索引越界
 
 
 def cardinal(n):
@@ -81,10 +81,12 @@ def verbalize(text, numbers=None):
     """
     n = {"year_digit_by_digit": True, "phone_yao": True, "currency_cardinal": True}
     n.update(numbers or {})
-    NB_L, NB_R = r"(?<!\d)", r"(?!\d)"          # 不挨数字，而非 \b
+    # 边界：左右都不能挨着数字**或拉丁字母**——否则 iPhone15 / MP3 / A4纸 / ISO9001
+    # 会被读成 iPhone十五 / MP三 / A四纸（旧实现因 \b 不匹配而侥幸不改，改边界后必须显式排除）
+    NB_L, NB_R = r"(?<![0-9A-Za-z_])", r"(?![0-9A-Za-z_])"
     t = re.sub(r"(?<=\d),(?=\d{3}" + NB_R + ")", "", text)      # 千分位
     if n["currency_cardinal"]:                     # ¥1234.56 / 1234.56 元 → 一千二百三十四点五六元
-        t = re.sub(r"[¥￥]\s*" + NB_L + r"(\d+(?:\.\d+)?)", lambda m: _money(m.group(1)), t)
+        t = re.sub(r"[¥￥]\s*(\d+(?:\.\d+)?)", lambda m: _money(m.group(1)) + "元", t)
         t = re.sub(NB_L + r"(\d+(?:\.\d+)?)\s*(?=元)", lambda m: _money(m.group(1)), t)
     if n["phone_yao"]:
         t = re.sub(NB_L + r"1\d{10}" + NB_R, lambda m: digits_zh(m.group(0), True), t)
@@ -92,6 +94,9 @@ def verbalize(text, numbers=None):
     t = re.sub(NB_L + r"(\d+)\s*%", lambda m: "百分之" + cardinal(int(m.group(1))), t)
     if n["year_digit_by_digit"]:
         t = re.sub(NB_L + r"(1\d{3}|20\d{2})\s*(?=年)", lambda m: digits_zh(m.group(1)), t)
+    # 超长数字串（订单号/卡号/信用代码）不是数量，读法应逐位——也正是这类输入
+    # 曾让 cardinal 的分组单位越界（13 位 = 4 组 > _BIG 长度）
+    t = re.sub(NB_L + r"(\d{12,})" + NB_R, lambda m: digits_zh(m.group(0)), t)
     t = re.sub(NB_L + r"(\d+)" + NB_R, lambda m: cardinal(int(m.group(1))), t)
     return t
 

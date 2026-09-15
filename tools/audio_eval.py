@@ -15,7 +15,6 @@ import argparse, base64, json, os, re, subprocess, sys, threading, time, urllib.
 
 # 与框架 src/framework/text/chinese_normalization.cpp 同一套规则：
 #   电话号码/长数字串 → 逐位读（1 读"幺"）；金额/数量 → 读基数词；年份 → 逐位读
-_CN = "零一二三四五六七八九"
 _UNITS = ["", "十", "百", "千"]
 _BIG = ["", "万", "亿"]
 
@@ -223,7 +222,7 @@ def transcribe(path, asr_model):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="*", default=None)
-    ap.add_argument("--texts", nargs="*", default=["zh", "en", "多音字", "数字", "专名缩写"])
+    ap.add_argument("--texts", nargs="*", default=["zh", "en", "多音字", "数字", "数字-紧凑", "专名缩写"])
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--include-gen", action="store_true")
     ap.add_argument("--voice-ref", default=None, help="需要参考音色的模型（index-tts2 等）用；也可让报错中的模型自动重试")
