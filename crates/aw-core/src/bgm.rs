@@ -2,6 +2,7 @@
 
 use crate::audio_client::{Client, ClientError};
 use crate::dub::{write_atomic, Project};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,41 @@ pub struct BgmArtifacts {
     pub segments: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BgmManifest {
+    version: u32,
+    model: String,
+    prompt: String,
+    segment_seconds: f64,
+    target_seconds: f64,
+    base_seed: u64,
+}
+
+impl BgmManifest {
+    fn from_options(options: &BgmOptions) -> Self {
+        Self {
+            version: 1,
+            model: options.model.clone(),
+            prompt: options.prompt.clone(),
+            segment_seconds: options.segment_seconds,
+            target_seconds: options.target_seconds,
+            base_seed: options.base_seed,
+        }
+    }
+}
+
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join("bgm/manifest.json")
+}
+
+fn manifest_matches(dir: &Path, options: &BgmOptions) -> bool {
+    std::fs::read_to_string(manifest_path(dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<BgmManifest>(&raw).ok())
+        .map(|saved| saved == BgmManifest::from_options(options))
+        .unwrap_or(false)
+}
+
 fn segment_count(options: &BgmOptions) -> Result<usize, String> {
     if options.prompt.trim().is_empty() {
         return Err("BGM 描述为空".into());
@@ -77,11 +113,13 @@ pub fn generate_segments(
 ) -> Result<usize, ClientError> {
     let total = segment_count(options).map_err(ClientError::Http)?;
     std::fs::create_dir_all(dir.join("bgm/segments")).ok();
+    let reuse_cache = manifest_matches(dir, options);
     for i in 0..total {
         let path = segment_path(dir, i);
-        if wav_duration_seconds(&path)
-            .map(|d| d + 0.05 >= options.segment_seconds)
-            .unwrap_or(false)
+        if reuse_cache
+            && wav_duration_seconds(&path)
+                .map(|d| d > 0.0 && d + 0.05 >= options.segment_seconds)
+                .unwrap_or(false)
         {
             on_progress(i + 1, total, "cached");
             continue;
@@ -101,9 +139,15 @@ pub fn generate_segments(
         if spec.bits_per_sample != 16 || spec.channels == 0 || spec.sample_rate == 0 {
             return Err(ClientError::Decode("BGM 不是 16-bit PCM WAV".into()));
         }
+        if reader.duration() == 0 {
+            return Err(ClientError::Decode("BGM 段为 0 帧".into()));
+        }
         write_atomic(&path, &wav).map_err(|e| ClientError::Http(e.to_string()))?;
         on_progress(i + 1, total, "done");
     }
+    let manifest = serde_json::to_vec(&BgmManifest::from_options(options))
+        .map_err(|e| ClientError::Decode(e.to_string()))?;
+    write_atomic(&manifest_path(dir), &manifest).map_err(|e| ClientError::Http(e.to_string()))?;
     Ok(total)
 }
 
@@ -136,6 +180,9 @@ pub fn assemble_bgm(dir: &Path, options: &BgmOptions) -> Result<PathBuf, String>
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         let frames = samples.len() / spec.channels as usize;
+        if frames == 0 {
+            return Err(format!("BGM 分段为 0 帧: {}", path.display()));
+        }
         for frame in 0..frames {
             if written >= target_frames {
                 break;
@@ -182,24 +229,49 @@ fn mix_sample(voice: i16, bgm: i16, gain: f32) -> i16 {
         .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
-fn duck_gain_at(t: f64, segments: &[(f64, f64)], index: &mut usize, gain: f32, fade: f64) -> f32 {
-    while *index < segments.len() && t >= segments[*index].1 + fade {
-        *index += 1;
+fn merged_segments(mut segments: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    segments.retain(|(start, end)| start.is_finite() && end.is_finite() && end > start);
+    segments.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (start, end) in segments {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
     }
-    let Some(&(start, end)) = segments.get(*index) else {
-        return 1.0;
-    };
-    if t >= start && t <= end {
-        gain
-    } else if t >= start - fade && t < start {
-        let p = ((t - (start - fade)) / fade).clamp(0.0, 1.0) as f32;
-        1.0 + (gain - 1.0) * p
-    } else if t > end && t <= end + fade {
-        let p = ((t - end) / fade).clamp(0.0, 1.0) as f32;
-        gain + (1.0 - gain) * p
-    } else {
-        1.0
+    merged
+}
+
+fn build_duck_gains(
+    segments: Vec<(f64, f64)>,
+    frames: usize,
+    sample_rate: u32,
+    gain: f32,
+    fade: f64,
+) -> Vec<f32> {
+    let mut gains = vec![1.0f32; frames];
+    let sr = sample_rate as f64;
+    for (start, end) in merged_segments(segments) {
+        let first = (((start - fade).max(0.0)) * sr).floor() as usize;
+        let last = (((end + fade) * sr).ceil() as usize).min(frames);
+        for (frame, value) in gains.iter_mut().enumerate().take(last).skip(first) {
+            let t = frame as f64 / sr;
+            let candidate = if t < start {
+                let p = ((t - (start - fade)) / fade).clamp(0.0, 1.0) as f32;
+                1.0 + (gain - 1.0) * p
+            } else if t <= end {
+                gain
+            } else {
+                let p = ((t - end) / fade).clamp(0.0, 1.0) as f32;
+                gain + (1.0 - gain) * p
+            };
+            *value = value.min(candidate);
+        }
     }
+    gains
 }
 
 /// 用配音成品的句子时间轴压低 BGM，并导出 voice / bgm / mixed。
@@ -222,6 +294,9 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
     let srt_path = dir.join("out/final.srt");
     if !voice_path.is_file() || !bgm_path.is_file() {
         return Err("缺少 out/final.wav 或 bgm/bgm.wav".into());
+    }
+    if !srt_path.is_file() || std::fs::metadata(&srt_path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Err("缺少非空的 out/final.srt：先完成配音拼装".into());
     }
     let mut voice = hound::WavReader::open(&voice_path).map_err(|e| e.to_string())?;
     let vs = voice.spec();
@@ -258,17 +333,11 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
     let mut bi = bgm.samples::<i16>();
     let fade = (options.fade_ms as f64 / 1000.0).max(0.001);
     let gain = options.duck_gain.clamp(0.0, 1.0);
-    let mut seg_index = 0usize;
+    let gains = build_duck_gains(segments, frames as usize, vs.sample_rate, gain, fade);
     for frame in 0..frames {
         let (vl, vr) = read_stereo_frame(&mut vi, vs.channels)?;
         let (bl, br) = read_stereo_frame(&mut bi, bs.channels)?;
-        let g = duck_gain_at(
-            frame as f64 / vs.sample_rate as f64,
-            &segments,
-            &mut seg_index,
-            gain,
-            fade,
-        );
+        let g = gains[frame as usize];
         out.write_sample(mix_sample(vl, bl, g))
             .map_err(|e| e.to_string())?;
         out.write_sample(mix_sample(vr, br, g))
@@ -287,4 +356,30 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
         duration: frames as f64 / vs.sample_rate as f64,
         segments: segment_count(options)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duck_envelope_keeps_adjacent_and_overlapping_segments_ducked() {
+        let adjacent = build_duck_gains(vec![(0.0, 1.0), (1.0, 2.0)], 16_000, 8_000, 0.2, 0.2);
+        assert!(
+            (adjacent[8_400] - 0.2).abs() < 0.01,
+            "gap=0 时第二句起始段仍应压低"
+        );
+
+        let overlapping = build_duck_gains(vec![(1.0, 3.0), (0.0, 2.0)], 32_000, 8_000, 0.2, 0.2);
+        assert!(
+            (overlapping[12_000] - 0.2).abs() < 0.01,
+            "重叠/乱序段应合并后保持压低"
+        );
+
+        let short_gap = build_duck_gains(vec![(0.0, 0.5), (0.6, 1.0)], 8_000, 8_000, 0.2, 0.2);
+        assert!(
+            (short_gap[4_800] - 0.2).abs() < 0.01,
+            "gap<fade 在下一句活跃时应保持压低"
+        );
+    }
 }

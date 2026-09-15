@@ -63,6 +63,51 @@ fn generating_two_segments_sends_duration_and_fixed_seeds() {
 }
 
 #[test]
+fn changing_prompt_invalidates_cached_segments() {
+    let mock = support::Mock::start(vec![
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![200; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![200; 8000]))),
+    ]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("cache-key");
+    let a = BgmOptions {
+        prompt: "prompt A".into(),
+        segment_seconds: 1.0,
+        target_seconds: 2.0,
+        base_seed: 1,
+        ..Default::default()
+    };
+    generate_segments(&client, &dir, &a, |_, _, _| {}).unwrap();
+    generate_segments(&client, &dir, &a, |_, _, _| {}).unwrap();
+    assert_eq!(mock.hit_count(), 2, "同 manifest 应命中缓存");
+
+    let b = BgmOptions {
+        prompt: "prompt B".into(),
+        ..a
+    };
+    generate_segments(&client, &dir, &b, |_, _, _| {}).unwrap();
+    assert_eq!(mock.hit_count(), 4, "prompt 变化必须重新请求所有段");
+    assert!(mock.bodies()[3].contains("prompt B"));
+}
+
+#[test]
+fn zero_frame_segment_is_rejected() {
+    let mock = support::Mock::start(vec![(200, support::audio_response(&mono_8k(&[])))]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("zero-frame");
+    let options = BgmOptions {
+        prompt: "zero".into(),
+        segment_seconds: 1.0,
+        target_seconds: 1.0,
+        ..Default::default()
+    };
+    let err = generate_segments(&client, &dir, &options, |_, _, _| {}).unwrap_err();
+    assert!(err.to_string().contains("0 帧"), "应拒绝零帧段: {err}");
+}
+
+#[test]
 fn ducking_lowers_bgm_only_around_voice_timeline() {
     let mock = support::Mock::start(vec![
         (200, support::audio_response(&mono_8k(&vec![1000; 8000]))),
@@ -113,4 +158,39 @@ fn ducking_lowers_bgm_only_around_voice_timeline() {
     // 帧 100 在人声起点前 0.2375s，已离开 100ms fade：BGM 保持原音量
     assert_eq!(samples[100 * 2], 1000);
     assert_eq!(samples[100 * 2 + 1], 1000);
+}
+
+#[test]
+fn mix_requires_existing_srt() {
+    let mock = support::Mock::start(vec![(
+        200,
+        support::audio_response(&mono_8k(&vec![1000; 8000])),
+    )]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("missing-srt");
+    let options = BgmOptions {
+        prompt: "srt".into(),
+        segment_seconds: 1.0,
+        target_seconds: 1.0,
+        ..Default::default()
+    };
+    generate_segments(&client, &dir, &options, |_, _, _| {}).unwrap();
+    assemble_bgm(&dir, &options).unwrap();
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::write(dir.join("out/final.wav"), mono_8k(&vec![0; 8000])).unwrap();
+    let mut project = Project::new(
+        "句。",
+        "audio8-tts",
+        0,
+        1,
+        None,
+        aw_core::DEFAULT_PUNCTUATION,
+        80,
+        |t| t.to_string(),
+    );
+    project.sentences[0].start = Some(0.0);
+    project.sentences[0].duration = Some(1.0);
+    project.save(&dir).unwrap();
+    let err = mix_project(&dir, &options).unwrap_err();
+    assert!(err.contains("final.srt"), "应指出 SRT 缺失: {err}");
 }

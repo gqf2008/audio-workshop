@@ -206,7 +206,7 @@ export component MainWindow inherits Window {
             progress: root.bgm-progress;
             busy: root.busy || root.running;
             has-result: root.bgm-has-result;
-            status-text: root.bgm-status-text + (root.status-text == "" ? "" : " · " + root.status-text);
+            status-text: root.bgm-status-text;
             generate => { root.bgm-generate(); }
             preview => { root.bgm-preview(); }
             export-tracks => { root.bgm-export-tracks(); }
