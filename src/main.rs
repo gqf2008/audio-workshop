@@ -5,8 +5,9 @@
 //! `tools/audio_config.py` + `audiocpp_server`（见 CHARTER 第 6/9 节）。
 //!
 //! 接线关系：
-//!   - `ui/app.slint`          主窗口：无边框标题栏 / 场景导航 / 主题切换 / 状态栏
-//!   - `ui/dub_workbench.slint` 配音工作台：稿件 / 音色 / 导出 / 句子列表 / 时间轴与任务
+//!   - `ui/app.slint`           主窗口：标题栏（含抽屉开关）/ 场景导航 / 主题切换 / 状态栏
+//!   - `ui/dub_workbench.slint` 配音工作台：首屏「稿件 + 句子列表 + 时间轴细条」，
+//!     加右侧抽屉「工程 / 音色 / 任务 / 导出」
 //!   - `ui/model.slint`         数据模型（Sentence / Voice），字段对齐配置层产物
 //!
 //! 桩数据的集中点就在本文件底部：`SAMPLE_SCRIPT`、`VOICES`，
@@ -34,6 +35,9 @@ const SECS_PER_CHAR: f32 = 0.18;
 const REDO_TICKS: i32 = 12;
 
 const DEFAULT_PROJECT: &str = "示例工程 · 频道口播";
+
+/// 启动提示：告诉第一次打开的人「合成 / 音色 / 导出」在哪。
+const READY_NOTE: &str = "就绪：示例稿已切句。合成 / 音色 / 导出在标题栏右上角的抽屉里";
 
 /// 示例稿（桩）：换真实场景时从剪贴板 / 文件来。
 const SAMPLE_SCRIPT: &str = "大家好，欢迎回到音频作坊。今天聊三件事。\
@@ -103,8 +107,13 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_export_dir(export_dir().into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
+    // 输入框与句子列表同源：启动就填示例稿，否则会出现「框里空的、列表里有 5 句」
+    ui.set_script_text(SAMPLE_SCRIPT.into());
     rebuild(&ui, &rows, SAMPLE_SCRIPT);
-    ui.set_status_text("就绪：示例稿已切句，点「开始合成」跑一遍流程".into());
+    ui.set_status_text(READY_NOTE.into());
+
+    // 产截图 / 演示用初始态（`AW_UI_STATE=selected|drawer|dark`；默认不生效）
+    apply_shot_state(&ui, &rows);
 
     // ── 窗口控制：拖拽 / 最小化 / 最大化 / 关闭 / 四边缩放 ──
     slint_pixel::install_title_bar_controls(&ui);
@@ -135,6 +144,41 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     ui.run()
+}
+
+/// 把界面直接摆到某个「跑一遍流程就能走到」的状态，供产截图 / 演示评审用。
+///
+/// 只在设置了 `AW_UI_STATE` 时生效，正常运行路径一行都不受影响：
+///   - `selected` 选中第 2 句（展开行里能看到时长 / 起始 / 试听 / 重录）
+///   - `drawer`   展开右侧抽屉（音色 / 任务 / 导出）
+///   - `dark`     切到暗色主题
+fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
+    let Ok(state) = std::env::var("AW_UI_STATE") else {
+        return;
+    };
+    // 前两句已合成、第三句合成中：状态点的三种形态在图上都能看到
+    for i in 0..rows.row_count().min(3) {
+        set_status(rows, i, if i < 2 { "已合成" } else { "合成中" });
+    }
+    ui.set_done_count(2);
+    ui.set_progress(0.5);
+    ui.set_has_result(true);
+    ui.set_playhead(0.35);
+    match state.as_str() {
+        "selected" => {
+            ui.set_selected(1);
+            ui.set_status_text("已选中第 2 句 · 试听 / 重录就在行下方".into());
+        }
+        "drawer" => {
+            ui.set_drawer_open(true);
+            ui.set_status_text("抽屉：音色 / 任务 / 导出都在这儿（点空白处收起）".into());
+        }
+        "dark" => {
+            ui.set_theme_scheme("dark".into());
+            ui.set_status_text("主题已切换：暗色".into());
+        }
+        _ => {}
+    }
 }
 
 // ===========================================================================
@@ -218,9 +262,12 @@ fn wire_sentence_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &
     let weak = ui.as_weak();
     let model1 = rows.clone();
     ui.on_select_sentence(move |i| {
+        if i < 0 {
+            return;
+        }
         let Some(ui) = weak.upgrade() else { return };
         ui.set_selected(i);
-        if let Some(row) = model1.row_data(i.max(0) as usize) {
+        if let Some(row) = model1.row_data(i as usize) {
             ui.set_status_text(
                 format!(
                     "已选中第 {} 句 · 起始 {} · 时长 {}",
@@ -236,8 +283,11 @@ fn wire_sentence_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, stub: &
     let weak = ui.as_weak();
     let model2 = rows.clone();
     ui.on_preview_one(move |i| {
+        if i < 0 {
+            return;
+        }
         let Some(ui) = weak.upgrade() else { return };
-        let Some(row) = model2.row_data(i.max(0) as usize) else {
+        let Some(row) = model2.row_data(i as usize) else {
             return;
         };
         let total = ui.get_total_duration().max(0.001);
@@ -497,7 +547,8 @@ fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
     } else {
         clock_label(total).into()
     });
-    ui.set_selected(if rows.row_count() > 0 { 0 } else { -1 });
+    // 默认不选中：首屏是干净的列表，展开行由用户点出来（渐进披露）
+    ui.set_selected(-1);
     ui.set_done_count(0);
     ui.set_has_result(false);
     ui.set_progress(0.0);

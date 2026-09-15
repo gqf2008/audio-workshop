@@ -1,21 +1,23 @@
 // ============================================================================
-// 音频作坊 · 主窗口
+// 音频作坊 · 主窗口（低密度 / 渐进披露版）
 //
-// 无边框自绘标题栏（PixelTitleBar + 四边/四角缩放热区），
-// 顶部场景导航（配音先行，BGM / 歌曲 / 素材库为占位），
-// 主体是配音工作台（见 dub_workbench.slint），底部状态栏 + 右下角通知。
+// 一屏一事：首屏只有「稿件输入 + 句子列表 + 底部时间轴细条」；
+// 音色 / 任务 / 导出 全部收进右侧抽屉，默认收起，点标题栏 ☰ 展开。
+//
+// 密度约定：行高 ≥44px、区块间距 ≥16px、同级并列元素 ≤3 个；
+//          用留白与细分隔线分区，不套一层层面板边框。
 //
 // 主题：PixelTheme.scheme 一键换肤（light / dark），全部组件同时生效。
 // 本文件只做「组装 + 转发」：状态与动作都在 src/main.rs（桩数据）。
 // ============================================================================
 
 import {
-    PixelAlert, PixelEmpty, PixelNavbar, PixelSegmentedControl, PixelTag, PixelTheme,
-    PixelTitleBar, PixelToast, PixelWindowResize,
+    PixelDrawer, PixelEmpty, PixelNavbar, PixelSegmentedControl,
+    PixelTheme, PixelTitleBar, PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
 import { Sentence, Voice } from "model.slint";
-import { DubWorkbench } from "dub_workbench.slint";
+import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 
 export { Sentence, Voice } from "model.slint";
 
@@ -24,6 +26,9 @@ export component MainWindow inherits Window {
     no-frame: true;
     preferred-width: 1200px;
     preferred-height: 880px;
+    // 内容列定宽 880px + 两侧留白：窗口再窄也不会挤坏版面
+    min-width: 960px;
+    min-height: 640px;
     background: PixelTheme.bg;
 
     // ── 主题（改 theme-scheme 即换肤；Rust 侧 set_theme_scheme） ──
@@ -32,7 +37,9 @@ export component MainWindow inherits Window {
     // ── 场景导航 ──
     in-out property <int> scene: 0;
     in property <[string]> scenes: ["配音", "BGM", "歌曲", "素材库"];
-    in-out property <bool> alert-open: true;
+
+    // ── 右侧抽屉（音色 / 任务 / 导出）：默认收起，点标题栏按钮展开 ──
+    in-out property <bool> drawer-open: false;
 
     // ── 工作台状态（转发给 DubWorkbench，见下） ──
     in property <string> project-name: "";
@@ -100,12 +107,41 @@ export component MainWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
 
-        PixelTitleBar {
-            title: "音频作坊 · 配音工作台";
-            drag-start => { root.drag-start(); }
-            minimize => { root.minimize(); }
-            toggle-maximize => { root.toggle-maximize(); }
-            close-window => { root.close-window(); }
+        // ── 标题栏：右侧叠一个抽屉开关（不动标题栏自身的拖拽与窗口按钮） ──
+        Rectangle {
+            height: 34px;
+
+            PixelTitleBar {
+                width: 100%;
+                height: 100%;
+                title: "音频作坊 · 配音工作台";
+                drag-start => { root.drag-start(); }
+                minimize => { root.minimize(); }
+                toggle-maximize => { root.toggle-maximize(); }
+                close-window => { root.close-window(); }
+            }
+            // 抽屉开关：像素风三横条（自绘，不依赖字体字形——☰ 这类符号本机字体缺失会变方块）
+            Rectangle {
+                x: parent.width - 176px;
+                y: 4px;
+                width: 26px;
+                height: 26px;
+                background: drawer-ta.pressed ? PixelTheme.shadow : (drawer-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
+                border-width: 2px;
+                border-color: root.drawer-open ? PixelTheme.accent : PixelTheme.edge;
+
+                Rectangle { x: 5px; y: 7px; width: 12px; height: 2px; background: PixelTheme.text; }
+                Rectangle { x: 5px; y: 11px; width: 12px; height: 2px; background: PixelTheme.text; }
+                Rectangle { x: 5px; y: 15px; width: 12px; height: 2px; background: PixelTheme.text; }
+
+                drawer-ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    mouse-cursor: pointer;
+                    clicked => { root.drawer-open = !root.drawer-open; }
+                }
+                Tooltip { text: @markdown("工作台设置：音色 / 任务 / 导出"); }
+            }
         }
 
         PixelNavbar {
@@ -119,20 +155,16 @@ export component MainWindow inherits Window {
             PixelSegmentedControl {
                 width: 132px;
                 options: ["浅色", "暗色"];
+                // 组件库的选中项固定用白字：暗色下把选中面压成深灰，否则白字压白面看不见
+                face-active: root.theme-scheme == "dark" ? #525252 : PixelTheme.accent;
                 index: root.theme-scheme == "dark" ? 1 : 0;
                 selected(i) => { root.theme-picked(i == 1 ? "dark" : "light"); }
             }
         }
 
-        PixelAlert {
-            visible: root.alert-open;
-            kind: "warning";
-            text: "M1 原型：界面交互已通，合成链路走桩数据（真实链路见 tools/audio_config.py）";
-            closed => { root.alert-open = false; }
-        }
-
         if root.scene == 0 : DubWorkbench {
             vertical-stretch: 1;
+            horizontal-stretch: 1;
 
             project-name: root.project-name;
             script-text <=> root.script-text;
@@ -203,19 +235,69 @@ export component MainWindow inherits Window {
                 background: PixelTheme.edge;
             }
             HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
+                padding-left: 16px;
+                padding-right: 16px;
                 spacing: 10px;
                 Text {
+                    horizontal-stretch: 1;
                     text: root.status-text;
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "audio.cpp · Metal";
                     color: PixelTheme.dim;
                     font-size: 12px;
                     vertical-alignment: center;
                 }
-                Rectangle { horizontal-stretch: 1; }
-                PixelTag { text: "引擎 audio.cpp · Metal"; }
-                PixelTag { text: root.theme-scheme == "dark" ? "主题 暗色" : "主题 浅色"; }
+                Text {
+                    text: root.theme-scheme == "dark" ? "暗色" : "浅色";
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
             }
+        }
+    }
+
+    // ── 右侧抽屉：默认收起（渐进披露），点标题栏 ☰ 展开 ──
+    PixelDrawer {
+        x: 0px; y: 0px;
+        width: 100%; height: 100%;
+        open: root.drawer-open;
+        title: "工作台设置";
+        drawer-width: 340px;
+        close => { root.drawer-open = false; }
+
+        WorkbenchDrawer {
+            vertical-stretch: 1;
+
+            project-name: root.project-name;
+            project-edited => { root.project-edited(); }
+
+            voice-names: root.voice-names;
+            voices: root.voices;
+            voice-index <=> root.voice-index;
+            speed <=> root.speed;
+            speed-label: root.speed-label;
+            speed-changed(v) => { root.speed-changed(v); }
+            auto-normalize <=> root.auto-normalize;
+
+            progress: root.progress;
+            running: root.running;
+            status-text: root.status-text;
+            start-run => { root.start-run(); }
+            stop-run => { root.stop-run(); }
+            preview-all => { root.preview-all(); }
+
+            has-result: root.has-result;
+            export-dir: root.export-dir;
+            export-wav-on <=> root.export-wav-on;
+            export-srt-on <=> root.export-srt-on;
+            export-wav => { root.export-wav(); }
+            export-srt => { root.export-srt(); }
         }
     }
 
