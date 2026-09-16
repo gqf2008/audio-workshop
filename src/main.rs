@@ -406,6 +406,47 @@ struct AppSettings {
     /// 模型目录：本机模型文件的存放位置（默认 <应用工作目录>/models，用户可选）
     #[serde(default)]
     model_dir: Option<String>,
+    /// BGM 生成的输入（描述 / 压低档位 / 独立生成时长档位）。
+    ///
+    /// 以前这些只活在 UI 内存里：重启回默认值，用户写的描述白写；跨会话也没法判断
+    /// "磁盘上那套 BGM 还算不算当前结果"，只能一律当作过期。落进 settings.json 之后
+    /// 两件事一起解决（判据见 src/export.rs 的产物清单）。
+    #[serde(default)]
+    bgm: BgmSettings,
+}
+
+/// BGM 的默认描述：**与 ui/app.slint 里 `bgm-prompt` 的默认值必须一致**
+/// （有单测用 include_str! 钉住，两边不一致就会红）。
+const DEFAULT_BGM_PROMPT: &str = "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BgmSettings {
+    #[serde(default = "default_bgm_prompt")]
+    prompt: String,
+    /// duck 强度档位（0 弱 / 1 中 / 2 强；换算见 `duck_gain_for`）
+    #[serde(default = "default_bgm_index")]
+    duck_index: i32,
+    /// 独立生成时的目标时长档位
+    #[serde(default = "default_bgm_index")]
+    standalone_index: i32,
+}
+
+fn default_bgm_prompt() -> String {
+    DEFAULT_BGM_PROMPT.to_string()
+}
+
+fn default_bgm_index() -> i32 {
+    1
+}
+
+impl Default for BgmSettings {
+    fn default() -> Self {
+        Self {
+            prompt: default_bgm_prompt(),
+            duck_index: default_bgm_index(),
+            standalone_index: default_bgm_index(),
+        }
+    }
 }
 
 /// 默认模型目录：应用工作目录下的 models/（打包后即应用目录下的 models/）。
@@ -753,6 +794,54 @@ pub fn bgm_track_path(artifacts: &BgmArtifacts, index: i32) -> Option<PathBuf> {
 fn refresh_backend_label(ui: &MainWindow) {
     let (_, base, _) = discover_engine();
     ui.set_backend_label(backend_label(base.as_deref()).into());
+}
+
+/// 启动时把持久化的 BGM 输入灌回界面（描述/两个档位）。
+fn apply_bgm_settings(ui: &MainWindow) {
+    let bgm = settings_snapshot().bgm;
+    ui.set_bgm_prompt(bgm.prompt.into());
+    ui.set_bgm_duck_index(bgm.duck_index);
+    ui.set_bgm_standalone_index(bgm.standalone_index);
+}
+
+/// 把当前界面上的 BGM 输入写回 settings.json。
+///
+/// 触发点：描述编辑（用户可能没生成就退出）、点生成（档位改动没有回调，只能在这里收）。
+/// 写失败只提示、不阻断——丢的是"下次的默认值"，不是这次的任务。
+fn save_bgm_settings(ui: &MainWindow) {
+    let want = BgmSettings {
+        prompt: ui.get_bgm_prompt().to_string(),
+        duck_index: ui.get_bgm_duck_index(),
+        standalone_index: ui.get_bgm_standalone_index(),
+    };
+    let snapshot = {
+        let mut guard = match settings().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard.bgm.prompt == want.prompt
+            && guard.bgm.duck_index == want.duck_index
+            && guard.bgm.standalone_index == want.standalone_index
+        {
+            return; // 值没变就别写盘（打字时每次回调都写一遍是浪费）
+        }
+        guard.bgm = want;
+        guard.clone()
+    };
+    if let Err(e) = save_settings(&snapshot) {
+        ui.set_bgm_status_text(
+            format!("BGM 设置没能保存（{e}）：重启后描述会回到上次保存的值").into(),
+        );
+    }
+}
+
+/// 当前的 BGM 输入 → 导出层要的上下文（UI 认不认这套结果 + 参数摘要）。
+fn bgm_context(ui: &MainWindow) -> export::BgmContext {
+    export::BgmContext::new(
+        bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
+        &ui.get_bgm_prompt(),
+        duck_gain_for(ui.get_bgm_duck_index()),
+    )
 }
 
 /// 把「全局设置 + 模型清单」的现状回灌到界面。
@@ -2504,6 +2593,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_engine_discovery(&ui, None);
 
     ui.set_export_dir(export_dir().into());
+    apply_bgm_settings(&ui);
     ui.set_backend_label(backend_label(base.as_deref()).into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
@@ -3328,22 +3418,30 @@ fn restore_bgm_from_disk(ui: &MainWindow, state: &Rc<UiState>, dir: &Path) {
     if !dir.join("bgm/bgm.wav").is_file() {
         return;
     }
-    if !export::mix_is_current(dir) {
-        return;
-    }
+    let ctx = bgm_context(ui);
+    // 参数（已持久化）与配音指纹都对得上 → 这套仍是当前结果，可以直接导分轨；
+    // 对不上（改过描述/改过稿、或老工程没有清单）→ 只能查看/试听。
+    let current = export::bgm_result_is_current(dir, &ctx.options_digest);
     if let Ok(artifacts) = aw_core::bgm_artifacts_from_disk(dir) {
         apply_bgm_artifacts(ui, state, &artifacts);
-        // 恢复出来的这套**只作查看/试听**：上次会话用的是什么描述、什么参数，重开后
-        // 判不出来（BGM 描述还没持久化），那就不能假装它是"当前结果"。
-        // 要导分轨就重新生成并混音——分段有缓存，通常几秒。
-        ui.set_bgm_stale(true);
-        ui.set_bgm_status_text(
-            format!(
-                "上次的 BGM 产物（{} 段 · {:.1}s）仅供查看/试听；要导分轨请重新生成并混音（分段有缓存）",
-                artifacts.segments, artifacts.duration
-            )
-            .into(),
-        );
+        if current {
+            ui.set_bgm_status_text(
+                format!(
+                    "已恢复上次的 BGM 产物：{} 段 · 成品 {:.1}s（参数与配音成品都对得上，可直接导分轨）",
+                    artifacts.segments, artifacts.duration
+                )
+                .into(),
+            );
+        } else {
+            ui.set_bgm_stale(true);
+            ui.set_bgm_status_text(
+                format!(
+                    "上次的 BGM 产物（{} 段 · {:.1}s）与当前参数/配音成品对不上，仅供查看/试听；要导分轨请重新生成并混音（分段有缓存）",
+                    artifacts.segments, artifacts.duration
+                )
+                .into(),
+            );
+        }
     }
 }
 
@@ -4530,12 +4628,7 @@ fn wire_export(
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         // 判据：UI 认为这套 BGM 结果仍是当前结果（改描述会置 stale、从磁盘恢复的也是 stale）。
         // 描述改没改只有 UI 知道，磁盘那层只看"配没配上这份配音成品"。
-        let outcome = export::export_stems(
-            &name,
-            &project_dir(&name),
-            &dir,
-            bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
-        );
+        let outcome = export::export_stems(&name, &project_dir(&name), &dir, &bgm_context(&ui));
         let text = match &outcome {
             export::StemExportOutcome::Done(s) => {
                 if let Some(first) = s.written.first() {
@@ -4582,6 +4675,8 @@ fn wire_bgm(
             ui.set_status_text("先写一段 BGM 描述".into());
             return;
         }
+        // 档位（duck / 独立时长）没有回调，生成时一起把 BGM 输入落盘
+        save_bgm_settings(&ui);
         reset_bgm(&ui, &state1);
         ui.set_busy(true);
         // 清停止位：否则上一轮遗留的 stop 会让新任务在第一次段间检查时立刻停掉
@@ -4642,6 +4737,8 @@ fn wire_bgm(
                 "prompt 已改：当前显示的是旧版本，重新生成后才是当前结果".into(),
             );
         }
+        // 描述是用户写的内容，不能重启就丢：每次真变了就写回 settings.json
+        save_bgm_settings(&ui);
     });
 
     let weak = ui.as_weak();
@@ -4689,13 +4786,7 @@ fn wire_bgm(
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         let name = file_stem(&ui.get_project_name());
         let project = project_dir(&name);
-        match export::export_stem(
-            &name,
-            &project,
-            &dir,
-            stem_for_track(i),
-            bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
-        ) {
+        match export::export_stem(&name, &project, &dir, stem_for_track(i), &bgm_context(&ui)) {
             export::StemExportOutcome::Done(s) => {
                 let Some(path) = s.written.first() else {
                     ui.set_status_text("这一轨没有导出".into());
@@ -5190,23 +5281,23 @@ fn tick(
                 );
                 ui.set_bgm_status_text(note.clone().into());
                 ui.set_status_text(note.into());
-                // 混音成功就把"这次混的是哪份配音成品"记下来：之后改稿/重录再想导分轨时，
-                // 靠它判断这套 mixed/bgm 是不是已经过期（见 src/export.rs::mix_is_current）
-                if artifacts.mixed.is_some() {
-                    if let Some(dir) = artifacts
-                        .mixed
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .and_then(|p| p.parent())
-                    {
-                        if let Err(e) = export::write_mix_manifest(dir) {
-                            ui.set_status_text(
-                                format!(
-                                    "混音完成，但指纹没记上（{e}）：下次导分轨会提示先重新混音"
-                                )
+                // 产物清单：记下"这套 BGM 是哪个参数、配哪份配音成品做出来的"。
+                // 之后改稿/改描述/跨会话恢复都靠它判断还能不能导分轨
+                // （见 src/export.rs::bgm_result_is_current）。
+                let manifest_dir = artifacts
+                    .mixed
+                    .as_ref()
+                    .or(Some(&artifacts.bgm))
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf());
+                if let Some(dir) = manifest_dir {
+                    let ctx = bgm_context(ui);
+                    if let Err(e) = export::write_result_manifest(&dir, &ctx.options_digest) {
+                        ui.set_status_text(
+                            format!("BGM 完成，但产物清单没写上（{e}）：下次导出会提示先重新生成")
                                 .into(),
-                            );
-                        }
+                        );
                     }
                 }
                 *state.bgm_artifacts.borrow_mut() = Some(artifacts);
@@ -5838,6 +5929,8 @@ fn wire_global_settings(
             },
             port: if locked { prev.port } else { port },
             model_dir: (!dir.is_empty() && !is_default_dir).then_some(dir.clone()),
+            // BGM 输入不在这里改（有自己的落盘点 save_bgm_settings），原样带上
+            bgm: prev.bgm,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -6419,6 +6512,7 @@ mod tests {
             host: None,
             port: Some(9999),
             model_dir: None,
+            bgm: Default::default(),
         };
         assert_eq!(
             resolve_base(&over_port, &cfg, None).0,
@@ -6430,6 +6524,7 @@ mod tests {
             host: Some("10.0.0.1".into()),
             port: None,
             model_dir: None,
+            bgm: Default::default(),
         };
         assert_eq!(
             resolve_base(&over_host, &cfg, None).0,
@@ -8200,6 +8295,59 @@ mod tests {
             accompaniment.display()
         );
     }
+    /// BGM 的默认描述与两个档位：settings.json 的默认值必须与 ui/app.slint 的
+    /// prop 默认值一致，否则"没设置过的用户"启动后看到的界面与落盘值就是两套。
+    /// 用 include_str! 把 Slint 文件读进来断言，改一边不改另一边就会红。
+    #[test]
+    fn bgm_defaults_match_the_slint_props() {
+        let app = include_str!("../ui/app.slint");
+        assert!(
+            app.contains(&format!("bgm-prompt: \"{DEFAULT_BGM_PROMPT}\"")),
+            "engine/app.slint 与 DEFAULT_BGM_PROMPT 不一致：{DEFAULT_BGM_PROMPT}"
+        );
+        assert!(
+            app.contains("bgm-duck-index: 1") && app.contains("bgm-standalone-index: 1"),
+            "两个档位的默认值也要与 BgmSettings::default 一致"
+        );
+        let d = BgmSettings::default();
+        assert_eq!(d.prompt, DEFAULT_BGM_PROMPT);
+        assert_eq!(d.duck_index, 1);
+        assert_eq!(d.standalone_index, 1);
+    }
+
+    /// settings.json 的 BGM 段要能存能读；老文件没有这一段时回落默认值（不能读失败）。
+    #[test]
+    fn settings_roundtrip_keeps_bgm_inputs() {
+        let mut s = AppSettings {
+            bgm: BgmSettings {
+                prompt: "我的口播背景，钢琴，无人声".into(),
+                duck_index: 2,
+                standalone_index: 0,
+            },
+            ..Default::default()
+        };
+        let raw = serde_json::to_string(&s).unwrap();
+        let back: AppSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.bgm.prompt, "我的口播背景，钢琴，无人声");
+        assert_eq!(back.bgm.duck_index, 2);
+        assert_eq!(back.bgm.standalone_index, 0);
+
+        // 老版本（没有 bgm 段）也能读，回落默认
+        let legacy: AppSettings =
+            serde_json::from_str("{\"host\":\"127.0.0.1\",\"port\":8080}").unwrap();
+        assert_eq!(legacy.bgm.prompt, DEFAULT_BGM_PROMPT);
+        assert_eq!(legacy.bgm.duck_index, 1);
+
+        // 段里只写了半截（例如以后加字段）也不能整份读失败
+        let partial: AppSettings =
+            serde_json::from_str("{\"bgm\":{\"prompt\":\"只写了描述\"}}").unwrap();
+        assert_eq!(partial.bgm.prompt, "只写了描述");
+        assert_eq!(partial.bgm.duck_index, 1, "缺的字段才回落默认");
+
+        s.bgm.prompt = "改过了".into();
+        assert_ne!(s.bgm.prompt, DEFAULT_BGM_PROMPT);
+    }
+
     /// "这套 BGM 结果还算不算当前"：`has_result && !stale`。
     /// 改描述后只置 stale（结果还在、能试听），光看 has_result 会把旧结果当当前导出；
     /// 从磁盘恢复的那套一律 stale（重开后判不出上次用的描述）。
