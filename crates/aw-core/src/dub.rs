@@ -12,6 +12,7 @@ use crate::audio_client::{Client, ClientError};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_PUNCTUATION: &str = "。！？；…";
 /// Python 侧 cmd_synth 恒发这条 instruction（不是可选装饰：不发音色/语气线索时读法更飘）
@@ -550,11 +551,7 @@ pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> St
 /// `write_failure_note` 里那句"已写好的文件不会被破坏"对导出并不成立（复核指出）。
 /// 导出是用户交付物，同样值得原子化：要么旧文件不变，要么新文件完整。
 pub fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let tmp = dst.with_file_name(format!(
-        "{}.tmp{}",
-        dst.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
-        std::process::id()
-    ));
+    let tmp = temp_sibling(dst);
     // 三步都算在结果里：只有 rename 成功才算落地。任何一步失败都清临时文件——
     // 只在 copy/sync 失败时清会漏掉"临时文件写完但 rename 失败（例如目标被目录占着）"，
     // 那种情况会在目录里留下 .tmp 残渣（复核抓到）。
@@ -565,6 +562,21 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// 复制用的同目录临时文件路径。
+///
+/// 后缀必须**每次调用都不同**：只带进程 id 的话，同一进程里两个导出（单篇导出与批量
+/// 导出同时写同一个目标名）会抢同一个 `.tmp`——两边各自 create/写/rename，轻则
+/// `rename` 找不到文件，重则把对方写了一半的内容 rename 成"成品"。
+fn temp_sibling(dst: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    dst.with_file_name(format!(
+        "{}.tmp{}-{n}",
+        dst.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
+        std::process::id()
+    ))
 }
 
 /// hound（wav 读写）的错误 → 可执行文案：`IoError` 能按 io 分类的就分类，
@@ -971,6 +983,29 @@ mod tests {
             "rename 失败也要清临时文件：{leftovers:?}"
         );
         assert!(err.raw_os_error().is_some(), "应是真实 io 错误：{err}");
+    }
+
+    /// 复制用的临时文件名必须**每次调用都不同**：同一进程里单篇导出与批量导出可能同时
+    /// 写同一个目标名，只带 pid 的后缀会让它们抢同一个 `.tmp`。
+    #[test]
+    fn copy_temp_names_are_unique_per_call() {
+        let dst = PathBuf::from("/tmp/工程.wav");
+        let a = temp_sibling(&dst);
+        let b = temp_sibling(&dst);
+        assert_ne!(a, b, "两次调用不能拿到同一个临时文件");
+        assert_eq!(
+            a.parent(),
+            dst.parent(),
+            "临时文件必须在目标同目录（rename 才原子）"
+        );
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("工程.wav.tmp"),
+            "临时名要能看出是哪个目标的：{}",
+            a.display()
+        );
     }
 
     /// `wav_duration` 的声道口径：`hound` 的 `duration()` 返回的**已经是每声道帧数**

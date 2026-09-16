@@ -13,6 +13,7 @@
 
 mod batch;
 mod cancel;
+mod export;
 mod player;
 mod tasks;
 
@@ -286,6 +287,12 @@ enum Msg {
     SeparationFailed {
         task_id: u32,
         error: String,
+    },
+    /// 批量导出跑完了（后台线程回报；不是 worker 任务，不进任务台账）
+    BatchExportDone {
+        /// 导出到哪个目录（消息自带，别在用的时候再读一次界面值——那个值可能已经变了）
+        dir: PathBuf,
+        outcome: export::BatchExportOutcome,
     },
     /// 批量：系统文件框选完的多篇稿件（取消 = 空表）
     BatchScriptsPicked {
@@ -889,6 +896,44 @@ fn pick_audio_blocking() -> Option<String> {
         .ok()?;
 
     pick_output_to_path(out)
+}
+
+/// 批量导出的互斥判据：**有别的写 `out/final.*` 的动作在飞时不导**。
+///
+/// 原因不是"读会读到半截文件"——`final.wav` 是原子写出来的；而是 `assemble` 是
+/// **先发布 final.wav、再写 final.srt**：中间那一瞬扫过去，会看到新 WAV 配旧 SRT
+/// （或把新工程误报成"缺字幕"）。两处写者：
+///   · 单篇拼装/导出 → UI 的 `busy`（导出按钮自己也是这个标志）；
+///   · 批量 worker 的 `assemble` → 在跑的那一行是 Running（`batch_in_flight`）。
+/// 都排除掉，成对产物就一定是同一次拼装写出来的。
+fn batch_export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> {
+    if batch_in_flight {
+        return Some("批量任务正在跑：等它跑完再批量导出（避免导到刚写了一半的成对产物）");
+    }
+    if ui_busy {
+        return Some("拼装/导出正在进行：等它结束再批量导出");
+    }
+    None
+}
+
+/// 批量导出：扫 projects/ 下有成品的工程，按导出开关复制到导出目录。
+///
+/// 放后台线程而不是 worker：导出只读磁盘上**已经拼好**的成品（`out/final.wav` 是原子写），
+/// 不碰 worker 的 `current` 工程，也就不该占用任务队列的提交守卫（导出期间还要能继续合成）。
+fn spawn_batch_export(
+    msg_tx: Sender<WorkerMsg>,
+    projects_root: PathBuf,
+    dir: PathBuf,
+    wav_on: bool,
+    srt_on: bool,
+) {
+    std::thread::spawn(move || {
+        let outcome = export::export_all(&projects_root, &dir, wav_on, srt_on);
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::BatchExportDone { dir, outcome },
+        });
+    });
 }
 
 /// 批量导入：系统多选文件框，阻塞式，必须放后台线程（与目录/单文件选择器同款）。
@@ -2424,6 +2469,8 @@ struct UiState {
     batch_running: std::cell::Cell<bool>,
     /// 导入时被跳过的稿件（原因文案）：批量结束后要如实带出来，不能只报成功的篇数
     batch_skipped_notes: RefCell<Vec<String>>,
+    /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
+    batch_export_running: std::cell::Cell<bool>,
     /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
     last_task_refresh: std::cell::Cell<Option<Instant>>,
     /// 截图/演示态（`AW_UI_STATE=tasks`）。演示任务只是给任务中心摆样子、没有对应的
@@ -2513,7 +2560,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
-    wire_export(&ui, &cmd_tx, &state);
+    wire_export(&ui, &cmd_tx, &msg_tx_ui, &state);
     wire_bgm(&ui, &cmd_tx, &state, &player, &stop);
     wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
@@ -4314,12 +4361,25 @@ fn wire_run(
     });
 }
 
-fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+fn wire_export(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
+    state: &Rc<UiState>,
+) {
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
     let state = state.clone();
+    // 批量导出的闭包也要一份（下面这个 clone 必须在 state 被移进 on_export_requested 之前）
+    let state_batch = state.clone();
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
+        // 批量导出正在跑时拒绝：两边都会往导出目录写 `<工程名>.wav`，当前工程也在
+        // 那批里的话就是同一个目标文件（复核指出并发写同一目标的风险）
+        if state.batch_export_running.get() {
+            ui.set_status_text("批量导出还在进行：等它结束再导出当前工程".into());
+            return;
+        }
         // 拼装只有亚秒级，同样不该排队：有任务在飞时直接拒绝并说清
         if ui.get_running() || ui.get_busy() || tasks_in_flight(&state) {
             ui.set_status_text(
@@ -4343,6 +4403,38 @@ fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
             return;
         }
         ui.set_status_text("拼装成品中（完成后按导出开关复制）…".into());
+    });
+
+    // 批量导出：projects/ 下所有有成品（out/final.wav）的工程 → 导出目录
+    let weak = ui.as_weak();
+    let st = state_batch;
+    let msg = msg_tx.clone();
+    ui.on_batch_export(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if st.batch_export_running.get() {
+            ui.set_status_text("批量导出还在进行…".into());
+            return;
+        }
+        if let Some(refusal) = batch_export_refusal(ui.get_busy(), batch_in_flight(&st)) {
+            ui.set_status_text(refusal.into());
+            return;
+        }
+        let wav_on = ui.get_export_wav_on();
+        let srt_on = ui.get_export_srt_on();
+        if !wav_on && !srt_on {
+            // 与单篇同一条口径：没勾格式就说清楚，别假装导了
+            ui.set_status_text("未选择导出格式：先选「整段 WAV」或「逐句 SRT」".into());
+            return;
+        }
+        st.batch_export_running.set(true);
+        ui.set_status_text("批量导出中：正在把有成品工程的 WAV/SRT 复制到导出目录…".into());
+        spawn_batch_export(
+            msg.clone(),
+            projects_root(),
+            PathBuf::from(ui.get_export_dir().to_string()),
+            wav_on,
+            srt_on,
+        );
     });
 }
 
@@ -4736,6 +4828,9 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BatchItemProgress { .. }
         | Msg::BatchItemDone { .. }
         | Msg::BatchDone { .. }
+        // 批量导出同理：它来自后台线程，用户点按钮那一刻与工程版本无关；
+        // 用 revision 0 发回来，按版本过滤就会「点完没反应」
+        | Msg::BatchExportDone { .. }
     )
 }
 
@@ -5204,6 +5299,19 @@ fn tick(
                 ui.set_song_status_text(error.clone().into());
                 ui.set_status_text(error.into());
             }
+            Msg::BatchExportDone { dir, outcome } => {
+                state.batch_export_running.set(false);
+                let text = match outcome {
+                    export::BatchExportOutcome::Done(summary) => {
+                        export::summary_text(&summary, &dir)
+                    }
+                    export::BatchExportOutcome::NoneSelected => {
+                        "未选择导出格式：先选「整段 WAV」或「逐句 SRT」".to_string()
+                    }
+                    export::BatchExportOutcome::Failed(e) => format!("批量导出失败：{e}"),
+                };
+                ui.set_status_text(text.into());
+            }
             Msg::BatchScriptsPicked { paths } => {
                 // 用户在文件框里按了取消（= 没选到任何路径）：这是 no-op，不能把已经
                 // 导入好的那份列表清掉——"取消"不该有破坏性副作用（复核提的 UX 残留）。
@@ -5384,21 +5492,23 @@ fn tick(
                 } else {
                     String::new()
                 };
-                let export_outcome = export_copies(
+                // 单篇导出与批量导出共用同一份实现（src/export.rs）：
+                // 复制语义、覆盖语义、失败文案只有一处
+                let export_outcome = export::export_one(
                     &stem_of(ui),
                     &PathBuf::from(ui.get_export_dir().to_string()),
                     &wav,
-                    &srt,
+                    Some(&srt),
                     ui.get_export_wav_on(),
                     ui.get_export_srt_on(),
                 );
                 let export_note = match export_outcome {
-                    ExportOutcome::Exported(path) => {
+                    export::ExportOutcome::Exported(path) => {
                         toast(ui, &format!("已导出 {}", path.display()));
                         format!(" · 已导出 {}", path.display())
                     }
-                    ExportOutcome::NoneSelected => " · 未选择导出格式，仅更新成品".into(),
-                    ExportOutcome::Failed(e) => format!(" · 导出失败: {e}"),
+                    export::ExportOutcome::NoneSelected => " · 未选择导出格式，仅更新成品".into(),
+                    export::ExportOutcome::Failed(e) => format!(" · 导出失败: {e}"),
                 };
                 ui.set_status_text(
                     format!("成品 {duration:.1}s（{done} 句{skipped_note}）{export_note}").into(),
@@ -5446,49 +5556,6 @@ fn tick(
 
     // ── 任务中心的"已排队 / 已运行 N"走字（按秒节流）──
     maybe_refresh_task_times(ui, state);
-}
-
-enum ExportOutcome {
-    Exported(PathBuf),
-    NoneSelected,
-    Failed(String),
-}
-
-/// 按导出开关把成品复制到导出目录。未勾选格式也给出明确结果，不再静默返回。
-fn export_copies(
-    stem: &str,
-    dir: &Path,
-    wav: &Path,
-    srt: &Path,
-    wav_on: bool,
-    srt_on: bool,
-) -> ExportOutcome {
-    if !wav_on && !srt_on {
-        return ExportOutcome::NoneSelected;
-    }
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        return ExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
-    }
-    let mut written: Vec<String> = Vec::new();
-    if wav_on {
-        let t = dir.join(format!("{stem}.wav"));
-        if let Err(e) = aw_core::dub::copy_atomic(wav, &t) {
-            return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
-        }
-        written.push(t.display().to_string());
-    }
-    if srt_on {
-        let t = dir.join(format!("{stem}.srt"));
-        if let Err(e) = aw_core::dub::copy_atomic(srt, &t) {
-            return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
-        }
-        written.push(t.display().to_string());
-    }
-    let last = written
-        .last()
-        .cloned()
-        .unwrap_or_else(|| dir.display().to_string());
-    ExportOutcome::Exported(PathBuf::from(last))
 }
 
 fn stem_of(ui: &MainWindow) -> String {
@@ -6600,8 +6667,10 @@ mod tests {
         );
     }
 
+    /// 单篇导出走的是 `export::export_one`（批量导出同一个函数）：
+    /// 这里钉住"未选格式不建目录 + 写了哪些文件"，模块内的批量用例再钉复制语义。
     #[test]
-    fn export_copies_reports_selection_and_writes_expected_files() {
+    fn export_one_reports_selection_and_writes_expected_files() {
         let dir = temp_dir("export-copies");
         let src_dir = dir.join("src");
         let out_dir = dir.join("out");
@@ -6611,8 +6680,8 @@ mod tests {
         std::fs::write(&wav, b"wav-data").unwrap();
         std::fs::write(&srt, b"srt-data").unwrap();
 
-        match export_copies("我的工程", &out_dir, &wav, &srt, true, true) {
-            ExportOutcome::Exported(path) => {
+        match export::export_one("我的工程", &out_dir, &wav, Some(&srt), true, true) {
+            export::ExportOutcome::Exported(path) => {
                 assert_eq!(path.file_name().unwrap(), "我的工程.srt");
             }
             _ => panic!("应导出成功"),
@@ -6628,8 +6697,8 @@ mod tests {
 
         let no_export_dir = dir.join("no-export");
         assert!(matches!(
-            export_copies("我的工程", &no_export_dir, &wav, &srt, false, false),
-            ExportOutcome::NoneSelected
+            export::export_one("我的工程", &no_export_dir, &wav, Some(&srt), false, false),
+            export::ExportOutcome::NoneSelected
         ));
         assert!(!no_export_dir.exists());
     }
@@ -7261,6 +7330,7 @@ mod tests {
     /// 台账停在运行中（复核抓到的阻塞项）。
     ///
     /// 这条测试对**每一条**批量消息都要过：以后再加批量消息，忘了进名单就会红。
+    /// `BatchExportDone` 就是同一族的第二个例子（后台线程发回、revision 0）。
     #[test]
     fn batch_messages_survive_revision_changes() {
         let batch_msgs = vec![
@@ -7295,6 +7365,10 @@ mod tests {
                 skipped: 1,
                 stopped: false,
             },
+            Msg::BatchExportDone {
+                dir: PathBuf::from("/tmp/out"),
+                outcome: export::BatchExportOutcome::NoneSelected,
+            },
         ];
         let names = [
             "BatchScriptsPicked",
@@ -7302,6 +7376,7 @@ mod tests {
             "BatchItemProgress",
             "BatchItemDone",
             "BatchDone",
+            "BatchExportDone",
         ];
         assert_eq!(names.len(), batch_msgs.len());
         for (i, msg) in batch_msgs.into_iter().enumerate() {
@@ -7997,6 +8072,23 @@ mod tests {
             accompaniment.display()
         );
     }
+    /// 批量导出的互斥判据：两个写者（单篇拼装/导出、批量 worker 的拼装）任何一个在飞
+    /// 都不许导——`assemble` 先发布 final.wav 再写 final.srt，中间扫过去会配错成对产物。
+    #[test]
+    fn batch_export_refuses_while_any_publisher_is_in_flight() {
+        assert_eq!(batch_export_refusal(false, false), None, "都空闲才允许");
+        let by_batch = batch_export_refusal(false, true).expect("批量在跑要拒绝");
+        assert!(by_batch.contains("批量任务正在跑"), "{by_batch}");
+        assert!(by_batch.contains("成对产物"), "要说清为什么等：{by_batch}");
+        let by_busy = batch_export_refusal(true, false).expect("单篇拼装要拒绝");
+        assert!(by_busy.contains("拼装/导出正在进行"), "{by_busy}");
+        // 两个都在飞时以批量那条为准（先判的那条）
+        assert_eq!(
+            batch_export_refusal(true, true).map(|s| s.contains("批量任务正在跑")),
+            Some(true)
+        );
+    }
+
     /// 多选文件框的输出解析：取消（退出码非 0）必须是空表，空行要滤掉——
     /// 否则一次"取消"会被批量导入记成"跳过了 1 篇（读不到）"。
     #[test]
