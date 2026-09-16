@@ -17,10 +17,14 @@ export component SongWorkbench inherits Rectangle {
     in-out property <string> style: "";
     in-out property <int> model-index: 0;
     in property <bool> busy: false;
+    // 已入队、还没轮到跑：主按钮这时是"取消排队"，不是"生成中…"（排队中取消是硬取消，
+    // 立刻出队且不消耗算力；正在跑的歌曲请求发出去就中断不了，不提供假停止）
+    in property <bool> queued: false;
     in property <bool> has-result: false;
     in property <string> status-text: "";
 
     callback generate();
+    callback stop();
     callback preview();
     callback export-track();
 
@@ -77,9 +81,13 @@ export component SongWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 150px;
                         variant: "primary";
-                        text: root.busy ? "生成中…" : "生成歌曲";
-                        enabled: !root.busy && root.lyrics != "" && root.style != "";
-                        clicked => { root.generate(); }
+                        text: root.queued ? "取消排队" : (root.busy ? "生成中…" : "生成歌曲");
+                        enabled: root.queued
+                            || (!root.busy && root.lyrics != "" && root.style != "");
+                        clicked => {
+                            if root.queued { root.stop(); }
+                            else { root.generate(); }
+                        }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     PixelButton { // 首屏

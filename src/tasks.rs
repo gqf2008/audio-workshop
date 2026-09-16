@@ -6,7 +6,9 @@
 //! 供状态栏计数与任务中心使用。
 //!
 //! 边界：本模块只管**登记**，不负责调度（worker 仍是唯一的执行者，任务串行）。
-//! 因此这里没有"排队中"状态——UI 在任务进行中会拒绝开启新任务。
+//! 但登记包含**排队中**：提交时先入队（Pending），worker 真正开始执行时由它
+//! 回报 TaskStarted 把该条提升为 Running——"在跑"由执行事实决定，不由提交动作决定。
+//! 这样运行中也能继续提交任务，台账里能如实显示"排队中 #N"。
 
 /// 任务种类。tab 决定任务中心里「跳转」会切到哪个主 Tab。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -40,6 +42,8 @@ impl TaskKind {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
+    /// 已登记、还没轮到它跑（worker 仍是串行执行者，先到先跑）
+    Pending,
     Running,
     Done,
     Failed,
@@ -49,6 +53,7 @@ pub enum TaskState {
 impl TaskState {
     pub fn label(self) -> &'static str {
         match self {
+            TaskState::Pending => "排队中",
             TaskState::Running => "运行中",
             TaskState::Done => "已完成",
             TaskState::Failed => "失败",
@@ -58,7 +63,15 @@ impl TaskState {
 
     /// 终态：不再变化，可以「清除已完成」清掉
     pub fn is_final(self) -> bool {
-        !matches!(self, TaskState::Running)
+        matches!(
+            self,
+            TaskState::Done | TaskState::Failed | TaskState::Stopped
+        )
+    }
+
+    /// 未终态：还占着队列（排队中或运行中），**永不裁剪**
+    pub fn is_active(self) -> bool {
+        !self.is_final()
     }
 }
 
@@ -74,6 +87,8 @@ pub struct Task {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Counts {
+    /// 排队中（还没轮到跑）
+    pub pending: usize,
     pub running: usize,
     pub failed: usize,
     /// 终态且非失败：**完成 + 已停止**都算这里。界面文案必须写「结束」而不是「完成」，
@@ -95,15 +110,15 @@ pub struct TaskQueue {
 }
 
 impl TaskQueue {
-    /// 登记一个新任务（调用即视为开始运行），返回任务 id。
-    pub fn start(&mut self, kind: TaskKind, title: impl Into<String>) -> u32 {
+    /// 登记一个**排队中**的新任务，返回任务 id。真正开始跑由 `promote` 决定。
+    pub fn enqueue(&mut self, kind: TaskKind, title: impl Into<String>) -> u32 {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
         self.tasks.push(Task {
             id,
             kind,
             title: title.into(),
-            state: TaskState::Running,
+            state: TaskState::Pending,
             detail: String::new(),
             progress: 0.0,
         });
@@ -111,7 +126,48 @@ impl TaskQueue {
         id
     }
 
-    /// 把终态条目裁到上限之内（运行中的一条都不动）。
+    /// 登记并立即视为开始运行（互斥任务用：提交时已确认没有同组任务在跑）。
+    pub fn start(&mut self, kind: TaskKind, title: impl Into<String>) -> u32 {
+        let id = self.enqueue(kind, title);
+        self.promote(id);
+        id
+    }
+
+    /// 排队 → 运行（worker 真正开始执行时调用）。
+    ///
+    /// 返回 false 表示**没有提升**：任务不存在，或已被停止/失败（迟到的工作线程回报
+    /// 不能把终态复活成运行中——这正是"排队中点了停止"的场景）。
+    pub fn promote(&mut self, id: u32) -> bool {
+        match self.tasks.iter_mut().find(|t| t.id == id) {
+            Some(t) if t.state == TaskState::Pending => {
+                t.state = TaskState::Running;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 队列位次（1 基）：只数**排队中**的条目，正在跑的那个不算位次。
+    /// 非排队条目（运行中/终态/不存在）返回 None。
+    pub fn queue_position(&self, id: u32) -> Option<usize> {
+        let target = self.tasks.iter().find(|t| t.id == id)?;
+        if target.state != TaskState::Pending {
+            return None;
+        }
+        Some(
+            self.tasks
+                .iter()
+                .filter(|t| t.state == TaskState::Pending && t.id <= id)
+                .count(),
+        )
+    }
+
+    /// 排队中的任务（先到先跑的顺序，供测试与状态栏使用）。
+    pub fn pending(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|t| t.state == TaskState::Pending)
+    }
+
+    /// 把终态条目裁到上限之内（**未终态**的条目一条都不动：排队中与运行中同等待遇）。
     fn trim_finished(&mut self) {
         while self.tasks.iter().filter(|t| t.state.is_final()).count() > MAX_TASKS {
             let Some(pos) = self.tasks.iter().position(|t| t.state.is_final()) else {
@@ -138,7 +194,8 @@ impl TaskQueue {
     pub fn finish(&mut self, id: u32, state: TaskState, detail: impl Into<String>) {
         debug_assert!(state.is_final(), "收尾必须是终态");
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-            if t.state == TaskState::Running {
+            // 排队中的任务也能直接收尾（排队时点停止）——所以判据是"未终态"而不是"运行中"
+            if !t.state.is_final() {
                 t.state = state;
                 t.progress = if state == TaskState::Done {
                     1.0
@@ -155,6 +212,7 @@ impl TaskQueue {
         let mut c = Counts::default();
         for t in &self.tasks {
             match t.state {
+                TaskState::Pending => c.pending += 1,
                 TaskState::Running => c.running += 1,
                 TaskState::Failed => c.failed += 1,
                 TaskState::Done | TaskState::Stopped => c.finished += 1,
@@ -184,10 +242,10 @@ impl TaskQueue {
         self.tasks.iter().rev()
     }
 
-    /// 清掉终态条目（运行中的保留）。返回清掉的条数。
+    /// 清掉终态条目（**未终态**的保留：排队中与运行中都不清）。返回清掉的条数。
     pub fn clear_finished(&mut self) -> usize {
         let before = self.tasks.len();
-        self.tasks.retain(|t| !t.state.is_final());
+        self.tasks.retain(|t| t.state.is_active());
         before - self.tasks.len()
     }
 }
@@ -203,6 +261,7 @@ mod tests {
         assert_eq!(
             q.counts(),
             Counts {
+                pending: 0,
                 running: 1,
                 failed: 0,
                 finished: 0
@@ -220,6 +279,7 @@ mod tests {
         assert_eq!(
             q.counts(),
             Counts {
+                pending: 0,
                 running: 0,
                 failed: 0,
                 finished: 1
@@ -306,5 +366,75 @@ mod tests {
             .map(|i| all_running.start(TaskKind::Dub, format!("r{i}")))
             .collect();
         assert_eq!(all_running.counts().running, ids.len());
+    }
+
+    /// 排队中的任务既不是"在跑"也不是"结束"，且**永不裁剪**——这条不变量此前无人守。
+    #[test]
+    fn pending_is_neither_running_nor_finished_and_is_never_trimmed() {
+        let mut q = TaskQueue::default();
+        let queued = q.enqueue(TaskKind::Separation, "排队中的分离");
+
+        let c = q.counts();
+        assert_eq!(c.pending, 1);
+        assert_eq!(c.running, 0, "还没轮到它跑");
+        assert_eq!(c.finished, 0, "排队中不是结束");
+
+        // 堆满终态条目也不该把排队项裁掉
+        for i in 0..(MAX_TASKS + 5) {
+            let id = q.start(TaskKind::Bgm, format!("t{i}"));
+            q.finish(id, TaskState::Done, "ok");
+        }
+        assert!(
+            q.pending().any(|t| t.id == queued),
+            "排队中的任务绝不能被裁剪"
+        );
+        assert_eq!(q.counts().pending, 1);
+    }
+
+    /// worker 真正开始执行时才把排队提升为运行；位次只数排队项。
+    #[test]
+    fn promote_moves_pending_to_running_and_position_counts_only_pending() {
+        let mut q = TaskQueue::default();
+        let running = q.start(TaskKind::Dub, "配音");
+        let first = q.enqueue(TaskKind::Separation, "分离 1");
+        let second = q.enqueue(TaskKind::Song, "歌曲 1");
+
+        assert_eq!(q.queue_position(first), Some(1), "队首");
+        assert_eq!(q.queue_position(second), Some(2));
+        assert_eq!(q.queue_position(running), None, "正在跑的不算排队位次");
+
+        assert!(q.promote(first));
+        assert_eq!(q.counts().running, 2, "台账里可以同时有两个运行中条目");
+        assert_eq!(q.queue_position(first), None, "提升后不再排队");
+        assert_eq!(q.queue_position(second), Some(1), "队首出队后位次前移");
+    }
+
+    /// 排队中点停止：直接终态，且 worker 迟到的 TaskStarted 不能把它复活成运行中。
+    #[test]
+    fn stopping_a_queued_task_is_final_and_late_promote_does_not_resurrect_it() {
+        let mut q = TaskQueue::default();
+        let id = q.enqueue(TaskKind::Song, "排队中就被停掉的歌曲");
+        q.finish(id, TaskState::Stopped, "用户停止（排队中）");
+
+        assert!(!q.promote(id), "终态任务的提升必须失败");
+        let t = q.tasks_newest_first().next().unwrap();
+        assert_eq!(t.state, TaskState::Stopped);
+        assert_eq!(q.counts().pending, 0);
+        assert_eq!(q.counts().finished, 1);
+
+        // 排队中的任务点停止也不该被算成"最近失败"
+        assert!(q.last_failed().is_none());
+    }
+
+    #[test]
+    fn clear_finished_keeps_pending_task_too() {
+        let mut q = TaskQueue::default();
+        let done = q.start(TaskKind::Dub, "a");
+        q.finish(done, TaskState::Done, "ok");
+        let queued = q.enqueue(TaskKind::Song, "还在排队的 b");
+
+        assert_eq!(q.clear_finished(), 1);
+        assert_eq!(q.counts().pending, 1, "排队中的任务不能被清掉");
+        assert!(q.pending().any(|t| t.id == queued));
     }
 }
