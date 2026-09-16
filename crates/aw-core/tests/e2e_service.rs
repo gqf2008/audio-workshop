@@ -18,6 +18,55 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// 质检链路真机：合成一句 → ASR 回读 → 可懂度。
+///
+/// 锚定"应用内质检的口径在真机上成立"——特别是**数字读法差异不该算错**
+/// （参考文本写「二零二六」，ASR 常回读成 2026，归一后必须算一致）。
+#[test]
+#[ignore = "需要本机 audiocpp_server + audio8-tts + qwen3-asr；用 -- --ignored 显式跑"]
+fn eval_roundtrip_end_to_end() {
+    let base = env_or("AW_SERVER", "http://127.0.0.1:8080");
+    let model = env_or("AW_TTS_MODEL", "audio8-tts");
+    let client = Client::new(&base);
+    assert!(
+        client.healthy(),
+        "服务不可用: {base}/health（先 audio-service server ensure）"
+    );
+
+    let text = "质检用例：二零二六年共十七人。";
+    let dict = BTreeMap::new();
+    let mut prj = Project::new(
+        text,
+        &model,
+        200,
+        831001,
+        None,
+        "。！？；…",
+        80,
+        |t| aw_core::normalize(t, &dict),
+    );
+    let dir = std::env::temp_dir().join("aw-core-eval-e2e");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let failed = prj
+        .synthesize(&client, &dir, None, None, |i, s| eprintln!("  [{i}] {s}"))
+        .expect("合成调用本身不应失败");
+    assert_eq!(failed, 0, "不该有失败句");
+
+    let wav = dir.join("sentences/000.wav");
+    let hypothesis = client.asr(&wav).expect("ASR 应返回文本");
+    let score = aw_core::intelligibility(text, &hypothesis);
+    eprintln!(
+        "  参考: {text}\n  回读: {hypothesis}\n  可懂度 {:.1}%（编辑距离 {} / {} 字）",
+        score.percent, score.distance, score.total
+    );
+    assert!(
+        score.percent >= 80.0,
+        "真机回读可懂度应 ≥80%（数字读法差异不该算错）：{:.1}%",
+        score.percent
+    );
+}
+
 #[test]
 #[ignore = "需要本机 audiocpp_server + audio8-tts；用 -- --ignored 显式跑"]
 fn dub_pipeline_end_to_end() {

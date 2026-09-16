@@ -19,6 +19,8 @@ pub enum TaskKind {
     Bgm,
     Separation,
     Song,
+    /// 质检（ASR 回读可懂度）：属于配音工程，入口与结果都在配音页
+    Eval,
 }
 
 impl TaskKind {
@@ -29,7 +31,7 @@ impl TaskKind {
     /// 必须显式决定它有没有进度，而不是被 `_ =>` 静默当作有。
     pub fn reports_progress(self) -> bool {
         match self {
-            TaskKind::Dub | TaskKind::Bgm | TaskKind::Separation => true,
+            TaskKind::Dub | TaskKind::Bgm | TaskKind::Separation | TaskKind::Eval => true,
             TaskKind::Song => false,
         }
     }
@@ -40,6 +42,7 @@ impl TaskKind {
             TaskKind::Bgm => "BGM",
             TaskKind::Separation => "人声分离",
             TaskKind::Song => "音乐制作",
+            TaskKind::Eval => "质检",
         }
     }
 
@@ -50,6 +53,8 @@ impl TaskKind {
             TaskKind::Bgm => 1,
             TaskKind::Separation => 2,
             TaskKind::Song => 3,
+            // 质检是配音工程的一部分：跳转回配音页（Tab 0）
+            TaskKind::Eval => 0,
         }
     }
 }
@@ -382,6 +387,8 @@ mod tests {
         assert_eq!(TaskKind::Bgm.tab(), 1);
         assert_eq!(TaskKind::Separation.tab(), 2);
         assert_eq!(TaskKind::Song.tab(), 3);
+        assert_eq!(TaskKind::Eval.tab(), 0, "质检属于配音工程");
+        assert!(TaskKind::Eval.reports_progress(), "质检有句级进度");
     }
 
     #[test]

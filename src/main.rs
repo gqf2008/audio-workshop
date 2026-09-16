@@ -115,6 +115,15 @@ enum Cmd {
         model_dir: Option<PathBuf>,
         chunk_seconds: Option<u32>,
     },
+    /// 质检：把已合成句逐句交给 ASR 回读，算可懂度并定位最差句。
+    ///
+    /// `dir` 是工程目录（worker 自己读 project.json 拿参考文本，避免 UI 再传一份、
+    /// 两份不一致）；工程损坏会被 `Project::load_if_present` 拦住并如实报错。
+    RunEval {
+        revision: u64,
+        task_id: u32,
+        dir: PathBuf,
+    },
     /// 歌曲彩蛋生成（独立于配音工程内容，只复用工程目录）。
     RunSong {
         revision: u64,
@@ -239,8 +248,45 @@ enum Msg {
         task_id: u32,
         error: String,
     },
+    /// 质检进度：已回读 done / 共 total 句
+    EvalProgress {
+        task_id: u32,
+        done: usize,
+        total: usize,
+    },
+    EvalDone {
+        task_id: u32,
+        summary: EvalSummary,
+    },
+    EvalStopped {
+        task_id: u32,
+    },
+    EvalFailed {
+        task_id: u32,
+        error: String,
+    },
     /// 工作线程无法继续的错误
     Fatal(String),
+}
+
+/// 质检汇总：平均可懂度 + 最差几句（够用户直接去重录那几句）。
+#[derive(Clone, Debug)]
+struct EvalSummary {
+    /// 平均可懂度百分比（只算转写成功的句子）
+    percent: f64,
+    scored: usize,
+    /// ASR 转写失败的句数（服务端错误等）——不混进平均分，但要报出来
+    asr_failed: usize,
+    /// 最差 N 句（按可懂度升序）
+    worst: Vec<EvalIssue>,
+}
+
+#[derive(Clone, Debug)]
+struct EvalIssue {
+    /// 句子序号（0 基，与界面"N 句"一致）
+    index: usize,
+    percent: f64,
+    snippet: String,
 }
 
 struct WorkerMsg {
@@ -869,6 +915,8 @@ struct WorkerCtx {
     /// 人声分离**单独**一个：与上面分开，避免两边互相把对方的停止请求吃掉
     /// （审查抓到过：分离运行中点配音停止，会让分离结果被当成"用户停止"丢掉）。
     sep_stop: Arc<AtomicBool>,
+    /// 质检单独的停止位（与 sep_stop 同理：分开才不会互相吃掉停止请求）
+    eval_stop: Arc<AtomicBool>,
     /// 排队任务的取消登记表（与 UI 线程共享同一张表）。
     /// 采纳自 gqf2008/Xmusic-splitter 的 per-job registry：取消按 task_id 定位，
     /// 执行方取走时摘除，表因此有界。
@@ -1229,6 +1277,146 @@ fn worker_loop(ctx: WorkerCtx) {
                     Err(e) => Msg::SeparationFailed { task_id, error: e },
                 };
                 let _ = tx.send(WorkerMsg { revision: 0, msg });
+            }
+            Cmd::RunEval {
+                // 质检的终态消息靠 task_id 自证身份，与 revision 无关
+                revision: _revision,
+                task_id,
+                dir,
+            } => {
+                if task_take_started(&ctx, task_id) {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::EvalStopped { task_id },
+                    });
+                    continue;
+                }
+                // 参考文本从工程里读：UI 再传一份就有两个真相源了
+                let project = match Project::load_if_present(&dir) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::EvalFailed {
+                                task_id,
+                                error: "没有工程文件：先合成一轮再质检".into(),
+                            },
+                        });
+                        continue;
+                    }
+                    Err(note) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::EvalFailed {
+                                task_id,
+                                error: note,
+                            },
+                        });
+                        continue;
+                    }
+                };
+                let client = match make_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::EvalFailed { task_id, error: e },
+                        });
+                        continue;
+                    }
+                };
+                let done: Vec<usize> = project
+                    .sentences
+                    .iter()
+                    .filter(|s| s.status == "done")
+                    .map(|s| s.index)
+                    .collect();
+                if done.is_empty() {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::EvalFailed {
+                            task_id,
+                            error: "还没有已合成的句子：先合成再质检".into(),
+                        },
+                    });
+                    continue;
+                }
+                let total = done.len();
+                let mut issues: Vec<EvalIssue> = Vec::new();
+                let mut sum = 0.0f64;
+                let mut scored = 0usize;
+                let mut asr_failed = 0usize;
+                let mut stopped = false;
+                for (n, idx) in done.iter().enumerate() {
+                    // 协作式停止：一句转写完再停（ASR 调用本身中断不了）
+                    if ctx.eval_stop.load(Ordering::Relaxed) {
+                        stopped = true;
+                        break;
+                    }
+                    let wav = dir.join(format!("sentences/{idx:03}.wav"));
+                    match client.asr(&wav) {
+                        Ok(hypothesis) => {
+                            let reference = project
+                                .sentences
+                                .iter()
+                                .find(|s| s.index == *idx)
+                                .map(|s| s.text.as_str())
+                                .unwrap_or("");
+                            let score = aw_core::intelligibility(reference, &hypothesis);
+                            sum += score.percent;
+                            scored += 1;
+                            // 只收"有差异"的句子：worst 为空就等于全部一致
+                            // （否则满分句也会被列成"最差 第 1 句 100%"，复核指出过）
+                            if score.distance > 0 {
+                                issues.push(EvalIssue {
+                                    index: *idx,
+                                    percent: score.percent,
+                                    snippet: aw_core::diff_snippet(reference, &hypothesis)
+                                        .unwrap_or_default(),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            // 单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分
+                            asr_failed += 1;
+                            let _ = e;
+                        }
+                    }
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::EvalProgress {
+                            task_id,
+                            done: n + 1,
+                            total,
+                        },
+                    });
+                }
+                if stopped {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::EvalStopped { task_id },
+                    });
+                    continue;
+                }
+                issues.sort_by(|a, b| a.percent.partial_cmp(&b.percent).unwrap());
+                issues.truncate(3);
+                let percent = if scored == 0 {
+                    0.0
+                } else {
+                    sum / scored as f64
+                };
+                let _ = ctx.tx.send(WorkerMsg {
+                    revision: 0,
+                    msg: Msg::EvalDone {
+                        task_id,
+                        summary: EvalSummary {
+                            percent,
+                            scored,
+                            asr_failed,
+                            worst: issues,
+                        },
+                    },
+                });
             }
             Cmd::RunSong {
                 // 歌曲的终态消息靠 task_id 自证身份（见 Msg::SongDone），不需要 revision
@@ -1688,6 +1876,8 @@ struct UiState {
     sep_input: RefCell<Option<String>>,
     sep_tracks: RefCell<Option<(PathBuf, PathBuf)>>,
     sep_task: std::cell::Cell<Option<u32>>,
+    /// 质检任务的 id（配音页那一条）
+    eval_task: std::cell::Cell<Option<u32>>,
     /// 跨 Tab 任务台账（配音 / BGM / 音乐制作 / 人声分离共用一份）。
     tasks: RefCell<tasks::TaskQueue>,
     /// 各类任务当前的 id（进度/收尾消息按 id 回填）
@@ -1744,6 +1934,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // （审查抓到：分离运行中点配音停止，会把分离结果当"用户停止"丢掉）。
     let stop = Arc::new(AtomicBool::new(false));
     let sep_stop = Arc::new(AtomicBool::new(false));
+    // 质检自己的停止位（与 sep_stop 同理：共用会被对方的停/清吃掉）
+    let eval_stop = Arc::new(AtomicBool::new(false));
     // 排队任务的取消登记表：UI 侧登记、worker 侧在开始执行前取走
     let cancel = cancel::CancelRegistry::new();
     let cancel_worker = cancel.clone();
@@ -1757,12 +1949,14 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let stop = Arc::clone(&stop);
         let sep_stop = Arc::clone(&sep_stop);
+        let eval_stop = Arc::clone(&eval_stop);
         std::thread::spawn(move || {
             worker_loop(WorkerCtx {
                 rx: cmd_rx,
                 tx: msg_tx,
                 stop,
                 sep_stop,
+                eval_stop,
                 cancel: cancel_worker,
             })
         });
@@ -1786,8 +1980,9 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_bgm(&ui, &cmd_tx, &state, &player, &stop);
     wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
-    wire_task_center(&ui, &state, &stop, &sep_stop);
+    wire_task_center(&ui, &state, &stop, &sep_stop, &eval_stop);
     wire_separation(&ui, &msg_tx_ui, &cmd_tx, &state, &player, &sep_stop);
+    wire_quality_check(&ui, &cmd_tx, &state, &eval_stop);
 
     // 启动就把"任务 · 空闲"画上（状态栏 chip 与任务中心都读同一份台账）
     refresh_tasks(&ui, &state);
@@ -2127,6 +2322,7 @@ struct TaskSlots {
     bgm: Option<u32>,
     sep: Option<u32>,
     song: Option<u32>,
+    eval: Option<u32>,
 }
 
 impl TaskSlots {
@@ -2136,6 +2332,7 @@ impl TaskSlots {
             bgm: state.bgm_task.get(),
             sep: state.sep_task.get(),
             song: state.song_task.get(),
+            eval: state.eval_task.get(),
         }
     }
 }
@@ -2153,6 +2350,8 @@ fn can_stop_task(t: &tasks::Task, slots: &TaskSlots) -> bool {
         Some(StopTarget::Dub | StopTarget::Bgm) => t.state == tasks::TaskState::Running,
         Some(StopTarget::Separation) => !t.state.is_final(),
         Some(StopTarget::Song) => t.state == tasks::TaskState::Pending,
+        // 质检：排队中硬取消、运行中协作停止（句间检查）
+        Some(StopTarget::Eval) => !t.state.is_final(),
         None => false,
     }
 }
@@ -2314,6 +2513,9 @@ fn set_task_running_text(ui: &MainWindow, state: &Rc<UiState>, task_id: u32) {
         Some(tasks::TaskKind::Separation) => {
             ui.set_sep_status_text("正在加载模型并分离（首次会下载约 200MB 模型）…".into());
         }
+        Some(tasks::TaskKind::Eval) => {
+            ui.set_status_text("质检中：正在逐句 ASR 回读…".into());
+        }
         Some(tasks::TaskKind::Song) => {
             // 轮到它了："取消排队"的窗口关闭（已发出的歌曲请求中断不了，不给假停止）
             ui.set_song_queued(false);
@@ -2374,6 +2576,14 @@ fn progress_task(
     refresh_tasks(ui, state);
 }
 
+/// 工程编辑守卫：合成/其它任务在飞，**或质检在飞**。
+///
+/// 质检结果按"第 N 句"报出来；质检期间改稿会让这个序号指向另一句话，所以质检
+/// （含排队中）也要挡住稿件/工程名编辑。质检本身很短（N×0.3s 量级）。
+fn project_editing_blocked(ui: &MainWindow, state: &Rc<UiState>) -> bool {
+    ui.get_running() || ui.get_busy() || state.eval_task.get().is_some()
+}
+
 fn reset_bgm(ui: &MainWindow, state: &Rc<UiState>) {
     state.bgm_artifacts.borrow_mut().take();
     ui.set_bgm_has_result(false);
@@ -2391,7 +2601,7 @@ fn wire_script(
     let state0 = state.clone();
     ui.on_project_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state0) {
             ui.set_status_text("任务进行中：工程名暂不可改".into());
             return;
         }
@@ -2407,7 +2617,7 @@ fn wire_script(
     let state1 = state.clone();
     ui.on_script_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state1) {
             ui.set_status_text("任务进行中：等这轮跑完或先停止，再编辑稿件".into());
             return;
         }
@@ -2431,7 +2641,7 @@ fn wire_script(
     let state2 = state.clone();
     ui.on_use_sample(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state2) {
             ui.set_status_text("任务进行中：暂不能载入示例稿".into());
             return;
         }
@@ -2448,7 +2658,7 @@ fn wire_script(
     let state3 = state.clone();
     ui.on_clear_script(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state3) {
             ui.set_status_text("任务进行中：暂不能清空稿件".into());
             return;
         }
@@ -2465,7 +2675,7 @@ fn wire_script(
     let state4 = state.clone();
     ui.on_resplit(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state4) {
             ui.set_status_text("任务进行中：暂不能重新切句".into());
             return;
         }
@@ -2609,6 +2819,56 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
     ui.set_sep_status_text("停止中：本轮分离跑完才会丢弃结果（上游没有取消接口）…".into());
 }
 
+/// 质检完成后的摘要文案（抽成纯函数：全失败 / 全一致 / 有最差句三种要分开说，
+/// 否则"0 句评上分"会被说成"平均 0%"甚至"全部一致"——复核抓到过）。
+fn eval_summary_note(summary: &EvalSummary) -> String {
+    if summary.scored == 0 {
+        return format!(
+            "质检未能评分：{} 句 ASR 转写都失败了（检查 ASR 模型/服务）",
+            summary.asr_failed
+        );
+    }
+    let mut note = format!(
+        "质检完成：平均可懂度 {:.1}%（{} 句）",
+        summary.percent, summary.scored
+    );
+    if summary.asr_failed > 0 {
+        note.push_str(&format!("·{} 句转写失败", summary.asr_failed));
+    }
+    match summary.worst.first() {
+        Some(worst) if worst.snippet.is_empty() => note.push_str(&format!(
+            "·最差 第 {} 句 {:.1}%",
+            worst.index + 1,
+            worst.percent
+        )),
+        Some(worst) => note.push_str(&format!(
+            "·最差 第 {} 句 {:.1}%：{}",
+            worst.index + 1,
+            worst.percent,
+            worst.snippet
+        )),
+        None => note.push_str("·全部一致"),
+    }
+    note
+}
+
+/// 停止质检：排队中 = 立刻出队；运行中 = 协作停止（当前句转写完就停，ASR 调用中断不了）。
+fn stop_eval(ui: &MainWindow, state: &Rc<UiState>, eval_stop: &Arc<AtomicBool>) {
+    let queued = state
+        .eval_task
+        .get()
+        .and_then(|id| state.tasks.borrow().queue_position(id).map(|_| id));
+    if let Some(id) = queued {
+        state.cancel.cancel(id);
+        let note = "已从队列中移除（还没开始跑，没有消耗算力）".to_string();
+        ui.set_status_text(note.clone().into());
+        finish_task(ui, state, &state.eval_task, tasks::TaskState::Stopped, note);
+        return;
+    }
+    eval_stop.store(true, Ordering::Relaxed);
+    ui.set_status_text("质检停止中：当前句转写完就停（ASR 调用没法中断）…".into());
+}
+
 /// 取消排队中的歌曲（运行中的歌曲请求发出去就中断不了，这里只处理排队期）。
 fn stop_song(ui: &MainWindow, state: &Rc<UiState>) {
     let queued = state
@@ -2640,6 +2900,7 @@ enum StopTarget {
     Bgm,
     Separation,
     Song,
+    Eval,
 }
 
 /// 判定 (task_id, kind) 对应哪个停止位。**必须同时匹配槽位**——列表里更早的那条
@@ -2650,6 +2911,7 @@ fn stop_target(task_id: u32, kind: tasks::TaskKind, slots: &TaskSlots) -> Option
         tasks::TaskKind::Bgm if slots.bgm == Some(task_id) => Some(StopTarget::Bgm),
         tasks::TaskKind::Separation if slots.sep == Some(task_id) => Some(StopTarget::Separation),
         tasks::TaskKind::Song if slots.song == Some(task_id) => Some(StopTarget::Song),
+        tasks::TaskKind::Eval if slots.eval == Some(task_id) => Some(StopTarget::Eval),
         _ => None,
     }
 }
@@ -2659,6 +2921,7 @@ fn stop_task_from_center(
     state: &Rc<UiState>,
     stop: &Arc<AtomicBool>,
     sep_stop: &Arc<AtomicBool>,
+    eval_stop: &Arc<AtomicBool>,
     task_id: u32,
 ) {
     let slots = TaskSlots::from_state(state);
@@ -2673,6 +2936,7 @@ fn stop_task_from_center(
         Some(StopTarget::Bgm) => stop_bgm_run(ui, stop),
         Some(StopTarget::Separation) => stop_separation(ui, state, sep_stop),
         Some(StopTarget::Song) => stop_song(ui, state),
+        Some(StopTarget::Eval) => stop_eval(ui, state, eval_stop),
         None => {}
     }
 }
@@ -2682,12 +2946,14 @@ fn wire_task_center(
     state: &Rc<UiState>,
     stop: &Arc<AtomicBool>,
     sep_stop: &Arc<AtomicBool>,
+    eval_stop: &Arc<AtomicBool>,
 ) {
     // 任务中心里点「停止」→ 走与各 Tab 按钮完全相同的停止函数（避免两套逻辑漂移）
     let weak_stop = ui.as_weak();
     let st_stop = state.clone();
     let stop_c = Arc::clone(stop);
     let sep_stop_c = Arc::clone(sep_stop);
+    let eval_stop_c = Arc::clone(eval_stop);
     ui.on_task_stop(move |task_id| {
         let Some(ui) = weak_stop.upgrade() else {
             return;
@@ -2695,7 +2961,14 @@ fn wire_task_center(
         if task_id < 0 {
             return;
         }
-        stop_task_from_center(&ui, &st_stop, &stop_c, &sep_stop_c, task_id as u32);
+        stop_task_from_center(
+            &ui,
+            &st_stop,
+            &stop_c,
+            &sep_stop_c,
+            &eval_stop_c,
+            task_id as u32,
+        );
     });
 
     let weak = ui.as_weak();
@@ -3488,6 +3761,11 @@ fn tick(
                 | Msg::SongDone { .. }
                 | Msg::SongStopped { .. }
                 | Msg::SongFailed { .. }
+                // 质检同理：它可能排在别的任务后面，期间改稿不该把终态丢掉
+                | Msg::EvalProgress { .. }
+                | Msg::EvalDone { .. }
+                | Msg::EvalStopped { .. }
+                | Msg::EvalFailed { .. }
         );
         if !revision_agnostic
             && !worker_message_is_current(&worker_msg, state.project_revision.get())
@@ -3803,6 +4081,64 @@ fn tick(
                     ui.set_status_text(format!("人声分离失败：{error}").into());
                     finish_task(ui, state, &state.sep_task, tasks::TaskState::Failed, error);
                 }
+            }
+            Msg::EvalProgress {
+                task_id,
+                done,
+                total,
+            } => {
+                if state.eval_task.get() == Some(task_id) {
+                    let note = format!("质检中：第 {done}/{total} 句");
+                    ui.set_status_text(note.clone().into());
+                    progress_task(
+                        ui,
+                        state,
+                        &state.eval_task,
+                        done as f32 / total.max(1) as f32,
+                        note,
+                    );
+                }
+            }
+            Msg::EvalDone { task_id, summary } => {
+                if state.eval_task.get() != Some(task_id) {
+                    continue;
+                }
+                let note = eval_summary_note(&summary);
+                // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
+                let outcome = if summary.scored == 0 {
+                    tasks::TaskState::Failed
+                } else {
+                    tasks::TaskState::Done
+                };
+                finish_task(ui, state, &state.eval_task, outcome, note.clone());
+                ui.set_status_text(note.into());
+            }
+            Msg::EvalStopped { task_id } => {
+                if state.eval_task.get() != Some(task_id) {
+                    continue;
+                }
+                let note = "质检已停止（已回读的句子不影响工程）".to_string();
+                finish_task(
+                    ui,
+                    state,
+                    &state.eval_task,
+                    tasks::TaskState::Stopped,
+                    note.clone(),
+                );
+                ui.set_status_text(note.into());
+            }
+            Msg::EvalFailed { task_id, error } => {
+                if state.eval_task.get() != Some(task_id) {
+                    continue;
+                }
+                finish_task(
+                    ui,
+                    state,
+                    &state.eval_task,
+                    tasks::TaskState::Failed,
+                    error.clone(),
+                );
+                ui.set_status_text(format!("质检失败：{error}").into());
             }
             Msg::SongDone {
                 task_id,
@@ -4386,6 +4722,58 @@ fn set_separation_input(ui: &MainWindow, state: &Rc<UiState>, path: String) {
 }
 
 /// 人声分离：选文件 / 分离 / 停止 / 两轨试听与导出。
+/// 质检入口：配音页「高级」里的「质检」按钮 → 排队跑一遍 ASR 回读。
+fn wire_quality_check(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    state: &Rc<UiState>,
+    eval_stop: &Arc<AtomicBool>,
+) {
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    let stop_flag = Arc::clone(eval_stop);
+    ui.on_quality_check(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if !ui.get_has_result() {
+            ui.set_status_text("还没有成品：先合成一轮再质检".into());
+            return;
+        }
+        // 同一时刻只允许一条质检（结果只有一个槽位）；它不碰配音工程，可排在别的任务后面
+        if st.eval_task.get().is_some() {
+            ui.set_status_text("已有一条质检在队列里：等它跑完再点".into());
+            return;
+        }
+        let stem = file_stem(&ui.get_project_name());
+        let dir = project_dir(&stem);
+        stop_flag.store(false, Ordering::Relaxed);
+        let id = enqueue_task(
+            &ui,
+            &st,
+            &st.eval_task,
+            tasks::TaskKind::Eval,
+            "质检 · ASR 回读",
+        );
+        let note: String = match queue_note(&st, id) {
+            Some(q) => format!("{q} · 轮到它时自动开始质检"),
+            None => "质检中：正在逐句 ASR 回读（首次会加载 ASR 模型，约 8s）…".to_string(),
+        };
+        ui.set_status_text(note.into());
+        if tx
+            .send(Cmd::RunEval {
+                revision: st.project_revision.get(),
+                task_id: id,
+                dir,
+            })
+            .is_err()
+        {
+            let note = "工作线程不可用：质检未发出，请重启应用";
+            finish_task(&ui, &st, &st.eval_task, tasks::TaskState::Failed, note);
+            ui.set_status_text(note.into());
+        }
+    });
+}
+
 fn wire_separation(
     ui: &MainWindow,
     msg_tx: &Sender<WorkerMsg>,
@@ -5149,6 +5537,7 @@ mod tests {
                 tx: msg_tx,
                 stop: Arc::new(AtomicBool::new(false)),
                 sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
                 cancel,
             })
         });
@@ -5197,6 +5586,7 @@ mod tests {
                 tx: msg_tx,
                 stop: Arc::new(AtomicBool::new(false)),
                 sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
                 cancel: worker_cancel,
             })
         });
@@ -5343,6 +5733,7 @@ mod tests {
             tx: msg_tx,
             stop: Arc::new(AtomicBool::new(false)),
             sep_stop: Arc::new(AtomicBool::new(false)),
+            eval_stop: Arc::new(AtomicBool::new(false)),
             cancel: cancel::CancelRegistry::new(),
         };
 
@@ -5436,6 +5827,7 @@ mod tests {
             bgm: Some(bgm),
             sep: Some(sep),
             song: Some(song),
+            eval: None,
         };
         let by_id = |id: u32| {
             task_rows(&q, &slots)
@@ -5479,6 +5871,20 @@ mod tests {
             "运行中的分离可协作停止"
         );
 
+        // 质检：排队中可硬取消、运行中可协作停止（句间检查）
+        let mut q5 = tasks::TaskQueue::default();
+        let eval_queued = q5.enqueue(tasks::TaskKind::Eval, "质检");
+        let slots5 = TaskSlots {
+            eval: Some(eval_queued),
+            ..TaskSlots::default()
+        };
+        assert!(task_rows(&q5, &slots5)[0].can_stop, "排队中的质检可取消");
+        q5.promote(eval_queued);
+        assert!(
+            task_rows(&q5, &slots5)[0].can_stop,
+            "运行中的质检可协作停止（当前句转写完就停）"
+        );
+
         // 终态条目（含失败）一律不给停止按钮
         let mut q4 = tasks::TaskQueue::default();
         let failed = q4.start(tasks::TaskKind::Bgm, "BGM");
@@ -5499,6 +5905,7 @@ mod tests {
             bgm: Some(20),
             sep: Some(30),
             song: Some(40),
+            eval: None,
         };
         assert_eq!(
             stop_target(10, tasks::TaskKind::Dub, &slots),
@@ -5516,6 +5923,22 @@ mod tests {
             stop_target(40, tasks::TaskKind::Song, &slots),
             Some(StopTarget::Song)
         );
+        assert_eq!(
+            stop_target(
+                50,
+                tasks::TaskKind::Eval,
+                &TaskSlots {
+                    eval: Some(50),
+                    ..TaskSlots::default()
+                }
+            ),
+            Some(StopTarget::Eval)
+        );
+        assert_eq!(
+            stop_target(50, tasks::TaskKind::Eval, &slots),
+            None,
+            "质检槽位为空时不该派发"
+        );
 
         // 同类但 id 不是当前在飞那条（更早的任务）→ 不派发
         assert_eq!(stop_target(9, tasks::TaskKind::Dub, &slots), None);
@@ -5526,6 +5949,51 @@ mod tests {
         assert_eq!(
             stop_target(10, tasks::TaskKind::Dub, &TaskSlots::default()),
             None
+        );
+    }
+
+    /// 质检摘要的三种情形要分开说：全失败**不能**说成"平均 0%"或"全部一致"
+    /// （复核抓到过：0 句评上分时旧文案会同时给出这两个错误结论）。
+    #[test]
+    fn eval_summary_note_handles_all_failed_and_all_clean() {
+        let all_failed = EvalSummary {
+            percent: 0.0,
+            scored: 0,
+            asr_failed: 5,
+            worst: Vec::new(),
+        };
+        let note = eval_summary_note(&all_failed);
+        assert!(note.contains("未能评分"), "{note}");
+        assert!(note.contains('5') && note.contains("转写"), "{note}");
+        assert!(!note.contains("平均"), "没评上分不该给平均分：{note}");
+        assert!(!note.contains("全部一致"), "全失败不是全部一致：{note}");
+
+        let clean = EvalSummary {
+            percent: 100.0,
+            scored: 3,
+            asr_failed: 0,
+            worst: Vec::new(),
+        };
+        let note = eval_summary_note(&clean);
+        assert!(note.contains("100.0%") && note.contains("3 句"), "{note}");
+        assert!(note.contains("全部一致"), "{note}");
+
+        let with_worst = EvalSummary {
+            percent: 96.4,
+            scored: 57,
+            asr_failed: 2,
+            worst: vec![EvalIssue {
+                index: 11,
+                percent: 92.3,
+                snippet: "…质检用【应为 例，读到 力】…".into(),
+            }],
+        };
+        let note = eval_summary_note(&with_worst);
+        assert!(note.contains("96.4%") && note.contains("57 句"), "{note}");
+        assert!(note.contains("2 句转写失败"), "部分失败也要报出来：{note}");
+        assert!(
+            note.contains("第 12 句") && note.contains("92.3%") && note.contains("应为"),
+            "最差句要给序号、分数与差异片段：{note}"
         );
     }
 }

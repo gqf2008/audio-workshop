@@ -10,6 +10,8 @@ use std::time::Duration;
 
 /// Python `post_retry` 的 `tries=6`：最多 6 次尝试（不是 6 次重试）
 pub const DEFAULT_RETRIES: u32 = 6;
+/// 质检默认用的 ASR 模型（M0 定标同款；服务里还有 audio8-asr / fun-asr）
+pub const DEFAULT_ASR_MODEL: &str = "qwen3-asr";
 pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -105,6 +107,24 @@ impl Client {
     }
 
     /// 发送任意 audio.cpp 任务并返回原始 JSON。MIDI/ABC 等非音频产物也走这里。
+    /// 语音识别：把本地 wav 交给 ASR 模型，取回文本。
+    ///
+    /// 请求体与 `tools/audio_eval.py::transcribe` 一致（`{"audio": <path>}`），
+    /// 模型默认 `qwen3-asr`（M0 定标用的就是它）。
+    pub fn asr(&self, audio: &std::path::Path) -> Result<String, ClientError> {
+        self.asr_with(DEFAULT_ASR_MODEL, audio)
+    }
+
+    /// 指定 ASR 模型（服务里还有 audio8-asr / fun-asr）。
+    pub fn asr_with(&self, model: &str, audio: &std::path::Path) -> Result<String, ClientError> {
+        let response = self.run_json(model, json!({ "audio": audio.display().to_string() }))?;
+        response
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ClientError::Decode("ASR 响应缺少 text 字段".into()))
+    }
+
     pub fn run_json(&self, model: &str, request: Value) -> Result<Value, ClientError> {
         let body = json!({ "model": model, "request": request });
         self.post_with_retry("/v1/tasks/run", &body)

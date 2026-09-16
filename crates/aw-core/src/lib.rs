@@ -6,15 +6,17 @@
 //! - [`dub`]：配音链路（切句 / 逐句合成 / 拼装 + 句子级时间轴 / 单句重录）
 //! - [`bgm`]：BGM 生成 / 时长对齐 / ducking / 三轨导出
 //! - [`song`]：yue2 / ace-step 文生歌与 sheetsage2 翻唱链路
+//! - [`eval`]：质检（ASR 回读可懂度 + 首个差异定位；口径与 CHARTER M0 一致）
 
 pub mod audio_client;
 pub mod bgm;
 pub mod dub;
+pub mod eval;
 pub mod separate;
 pub mod song;
 pub mod text_layer;
 
-pub use audio_client::{Client, ClientError};
+pub use audio_client::{Client, ClientError, DEFAULT_ASR_MODEL};
 pub use bgm::{
     assemble_bgm, bgm_only_artifacts, generate_segments, generate_segments_stoppable, mix_project,
     BgmArtifacts, BgmOptions, BgmRun,
@@ -23,6 +25,7 @@ pub use dub::{
     split_sentences, srt_timestamp, Assembled, Project, Sentence, DEFAULT_INSTRUCTION,
     DEFAULT_PUNCTUATION, REDO_SEED_STEP,
 };
+pub use eval::{diff_snippet, intelligibility, Intelligibility};
 pub use separate::{
     separate_tracks, Progress as SeparationProgress, SeparatedTracks, SeparationOutcome,
     SeparationRequest, DEFAULT_MODEL as DEFAULT_SEPARATION_MODEL,
