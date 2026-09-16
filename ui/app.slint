@@ -19,17 +19,17 @@
 // ============================================================================
 
 import {
-    PixelEmpty, PixelScrollPanel, PixelTabs, PixelTheme, PixelTitleBar, PixelToast,
-    PixelWindowResize,
+    PixelButton, PixelEmpty, PixelScrollPanel, PixelTabs, PixelTheme, PixelTitleBar,
+    PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
-import { Sentence, Voice } from "model.slint";
+import { Sentence, TaskRow, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { GatedTab, VoiceDesignTab } from "extra_tabs.slint";
 import { SongWorkbench } from "song_workbench.slint";
 
-export { Sentence, Voice } from "model.slint";
+export { Sentence, TaskRow, Voice } from "model.slint";
 
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
@@ -90,6 +90,14 @@ export component MainWindow inherits Window {
     in property <string> song-status-text: "歌曲质量未达主线产品级，作为彩蛋使用。";
     // 音乐制作页的「高级」展开态（引擎等独有参数在里面）
     in-out property <bool> song-advanced: false;
+
+    // ── 跨 Tab 任务台账（配音 / BGM / 音乐制作共用；见 src/tasks.rs）──
+    in property <[TaskRow]> task-rows: [];
+    in property <int> task-running: 0;
+    in property <int> task-failed: 0;
+    in property <int> task-finished: 0;
+    in property <string> task-chip: "任务 · 空闲";
+    in-out property <bool> task-center-open: false;
 
     // 配音页内的「音色」区展开态（与「高级」同款，默认收起）
     in-out property <bool> dub-voice: false;
@@ -168,6 +176,8 @@ export component MainWindow inherits Window {
     callback song-generate();
     callback song-preview();
     callback song-export-track();
+    callback task-jump(int);
+    callback task-clear-finished();
     callback apply-server-settings();
     callback rescan-models();
     callback check-server();
@@ -397,11 +407,31 @@ export component MainWindow inherits Window {
                         overflow: elide;
                         vertical-alignment: center;
                     }
-                    Text {
-                        text: root.voice-label + " · " + root.voice-source;
-                        color: PixelTheme.dim;
-                        font-size: 12px;
-                        vertical-alignment: center;
+                    // 任务 chip：跨 Tab 可见的唯一任务入口（计入状态栏，不新增首屏元素）
+                    Rectangle {
+                        width: task-chip-text.preferred-width + 16px;
+                        height: 22px;
+                        background: root.task-center-open ? PixelTheme.hover : PixelTheme.panel;
+                        border-width: 2px;
+                        border-color: root.task-failed > 0 ? PixelTheme.danger
+                            : (root.task-running > 0 ? PixelTheme.accent : PixelTheme.edge);
+
+                        task-chip-text := Text {
+                            width: 100%;
+                            height: 100%;
+                            text: root.task-chip;
+                            color: root.task-failed > 0 ? PixelTheme.danger : PixelTheme.dim;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        task-chip-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            mouse-cursor: pointer;
+                            clicked => { root.task-center-open = !root.task-center-open; }
+                        }
+                        Tooltip { text: @markdown("任务中心：跨 Tab 的任务状态（切 Tab 不会取消任务）"); }
                     }
                     Text {
                         text: "audio.cpp · Metal";
@@ -439,9 +469,9 @@ export component MainWindow inherits Window {
         // 面板：浮动圆角卡片
         Rectangle {
             x: parent.width - 380px - 10px;
-            y: 10px;
+            y: 80px;   // 与任务中心同一条基线：标题栏 + Tab 行之下
             width: 380px;
-            height: parent.height - 10px - 42px;
+            height: parent.height - 80px - 42px;
             background: PixelTheme.panel;
             border-width: 2px;
             border-color: PixelTheme.edge;
@@ -502,6 +532,142 @@ export component MainWindow inherits Window {
                     rescan-models => { root.rescan-models(); }
                     check-server => { root.check-server(); }
                     pick-model-dir => { root.pick-model-dir(); }
+                }
+            }
+        }
+    }
+
+    // ── 任务中心（浮动圆角卡片，锚在左侧；与右侧「全局设置」不会互相遮）──
+    if root.task-center-open : Rectangle {
+        x: 10px;
+        y: 80px;   // 标题栏 + Tab 行之下，别盖住窗口按钮与 Tab
+        width: 460px;
+        height: Math.min(parent.height - 122px, 92px + root.task-rows.length * 62px);
+        background: PixelTheme.panel;
+        border-width: 2px;
+        border-color: PixelTheme.edge;
+        border-radius: 8px;
+        clip: true;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: "任务中心";
+                    color: PixelTheme.text;
+                    font-size: 15px;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.task-running + " 运行 · " + root.task-failed + " 失败 · " + root.task-finished + " 结束";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                task-close-ta := TouchArea {
+                    width: 24px;
+                    height: 24px;
+                    mouse-cursor: pointer;
+                    clicked => { root.task-center-open = false; }
+                    Text {
+                        width: 100%; height: 100%;
+                        text: "×";
+                        color: task-close-ta.has-hover ? PixelTheme.text : PixelTheme.dim;
+                        font-size: 15px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle { height: 2px; background: PixelTheme.edge; }
+
+            if root.task-rows.length == 0 : Text {
+                text: "还没有任务。任一 Tab 发起生成后，这里会显示进度；切 Tab 不会取消任务。";
+                color: PixelTheme.dim;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            if root.task-rows.length > 0 : PixelScrollPanel {
+                vertical-stretch: 1;
+                panel-bg: PixelTheme.panel;
+                edge: PixelTheme.hover;
+                VerticalLayout {
+                    width: 100%;
+                    spacing: 6px;
+                    for t in root.task-rows : Rectangle {
+                        width: 100%;
+                        height: 56px;
+                        background: t.state == "运行中" ? PixelTheme.hover : transparent;
+                        border-width: 2px;
+                        border-color: t.state == "失败" ? PixelTheme.danger : PixelTheme.edge;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 8px;
+                            spacing: 10px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 2px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "[" + t.kind + "]";
+                                        color: PixelTheme.dim;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: t.title + " · " + t.state;
+                                        color: t.state == "失败" ? PixelTheme.danger : PixelTheme.text;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                                Text {
+                                    text: t.detail;
+                                    color: PixelTheme.dim;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            PixelButton {
+                                width: 64px;
+                                size: "small";
+                                text: "跳转";
+                                clicked => { root.task-jump(t.tab); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: "点「跳转」回该 Tab 停止 / 重试；任务在后台继续跑。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                PixelButton {
+                    width: 108px;
+                    size: "small";
+                    text: "清除已结束";
+                    enabled: root.task-finished > 0;
+                    clicked => { root.task-clear-finished(); }
                 }
             }
         }
