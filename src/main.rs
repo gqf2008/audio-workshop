@@ -281,8 +281,20 @@ struct EvalSummary {
     worst: Vec<EvalIssue>,
     /// 全部评上的分数（句 index → 可懂度%），给句子行展示用
     scores: Vec<(usize, f64)>,
-    /// 分数没能写进工程时的说明（写成功为 None）——分数仍然有效，但要如实告诉你它没落盘
+    /// 分数/报告没能落盘时的说明（都成功为 None）——分数仍然有效，但要如实告诉你它没落盘
     persist_warning: Option<String>,
+    /// 质检报告的落盘路径（人可读的逐句对照表；写失败为 None）
+    report_path: Option<PathBuf>,
+}
+
+/// 质检报告里的一行：一句的参考文本、ASR 回读、得分与首个差异。
+#[derive(Clone, Debug)]
+struct EvalRow {
+    index: usize,
+    reference: String,
+    hypothesis: String,
+    percent: f64,
+    snippet: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1349,6 +1361,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 let mut project = project;
                 let mut issues: Vec<EvalIssue> = Vec::new();
                 let mut scores: Vec<(usize, f64)> = Vec::new();
+                let mut rows: Vec<EvalRow> = Vec::new();
                 let mut sum = 0.0f64;
                 let mut scored = 0usize;
                 let mut asr_failed = 0usize;
@@ -1370,9 +1383,18 @@ fn worker_loop(ctx: WorkerCtx) {
                                 .map(|s| s.text.clone())
                                 .unwrap_or_default();
                             let score = aw_core::intelligibility(&reference, &hypothesis);
+                            let snippet =
+                                aw_core::diff_snippet(&reference, &hypothesis).unwrap_or_default();
                             sum += score.percent;
                             scored += 1;
                             scores.push((*idx, score.percent));
+                            rows.push(EvalRow {
+                                index: *idx,
+                                reference: reference.clone(),
+                                hypothesis: hypothesis.clone(),
+                                percent: score.percent,
+                                snippet: snippet.clone(),
+                            });
                             // 顺手写进工程：质检结果要能跨会话留存（否则每次开都要重跑 N 句 ASR）
                             if let Some(sen) =
                                 project.sentences.iter_mut().find(|s| s.index == *idx)
@@ -1385,8 +1407,7 @@ fn worker_loop(ctx: WorkerCtx) {
                                 issues.push(EvalIssue {
                                     index: *idx,
                                     percent: score.percent,
-                                    snippet: aw_core::diff_snippet(&reference, &hypothesis)
-                                        .unwrap_or_default(),
+                                    snippet,
                                 });
                             }
                         }
@@ -1425,7 +1446,42 @@ fn worker_loop(ctx: WorkerCtx) {
                 }
                 // 分数落盘：失败不算质检失败（分数本身有效），但要如实报出来
                 let saved = project.save(&dir);
-                let persist_warning = saved.as_ref().err().map(|e| e.to_string());
+                let mut warnings: Vec<String> = Vec::new();
+                if let Some(e) = saved.as_ref().err() {
+                    warnings.push(format!("分数未写入工程：{e}"));
+                }
+                // 质检报告：逐句「参考 vs 回读」只有当场拿得到（分数虽然留在工程里，
+                // 但 ASR 原文不存）——写成文件供用户存档/对比。
+                let project_name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "未命名工程".to_string());
+                let report = qa_report_markdown(
+                    &project_name,
+                    "qwen3-asr",
+                    &rows,
+                    if scored == 0 {
+                        0.0
+                    } else {
+                        sum / scored as f64
+                    },
+                    scored,
+                    asr_failed,
+                );
+                let report_file = dir.join("qa-report.md");
+                let report_path =
+                    match aw_core::dub::write_atomic_explained(&report_file, report.as_bytes()) {
+                        Ok(()) => Some(report_file),
+                        Err(e) => {
+                            warnings.push(format!("质检报告未写入：{e}"));
+                            None
+                        }
+                    };
+                let persist_warning = if warnings.is_empty() {
+                    None
+                } else {
+                    Some(warnings.join("·"))
+                };
                 // 落盘成功后把 worker 手里的 current 一起更新：否则后续 Redo/Assemble
                 // 用旧 Project 再 save 一次，会把刚写下的分数刷掉（复核抓到的阻塞项）
                 if saved.is_ok() {
@@ -1453,6 +1509,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             worst: issues,
                             scores,
                             persist_warning,
+                            report_path,
                         },
                     },
                 });
@@ -2925,6 +2982,47 @@ fn apply_eval_labels(rows: &Rc<VecModel<Sentence>>, scores: &HashMap<usize, f64>
     }
 }
 
+/// 质检报告（Markdown）：逐句对照表 + 汇总。抽成纯函数便于单测。
+///
+/// 为什么要有报告：分数留在工程里是为了跨会话查看，但**逐句的"参考 vs 回读"**只有当场才拿得到；
+/// 写成文件后用户能存档、对比两次改稿、或者贴到笔记里，不用一边听一边记。
+fn qa_report_markdown(
+    project_name: &str,
+    model: &str,
+    rows: &[EvalRow],
+    percent: f64,
+    scored: usize,
+    asr_failed: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# 质检报告 · {project_name}\n\n"));
+    out.push_str(&format!("- 回读模型：{model}\n"));
+    out.push_str(&format!(
+        "- 句数：{}（评分 {scored}，转写失败 {asr_failed}）\n",
+        rows.len()
+    ));
+    if scored > 0 {
+        out.push_str(&format!("- 平均可懂度：{percent:.1}%\n"));
+    } else {
+        out.push_str("- 平均可懂度：未能评分（本次没有一句转写成功）\n");
+    }
+    out.push_str("\n| 句 | 可懂度 | 参考 | 回读 | 首个差异 |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for r in rows {
+        // 表格里换行/竖线会破版：转义掉
+        let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+        out.push_str(&format!(
+            "| {} | {:.1}% | {} | {} | {} |\n",
+            r.index + 1,
+            r.percent,
+            cell(&r.reference),
+            cell(&r.hypothesis),
+            cell(&r.snippet)
+        ));
+    }
+    out
+}
+
 /// 质检完成后的摘要文案（抽成纯函数：全失败 / 全一致 / 有最差句三种要分开说，
 /// 否则"0 句评上分"会被说成"平均 0%"甚至"全部一致"——复核抓到过）。
 fn eval_summary_note(summary: &EvalSummary) -> String {
@@ -2956,7 +3054,10 @@ fn eval_summary_note(summary: &EvalSummary) -> String {
         None => note.push_str("·全部一致"),
     }
     if let Some(warn) = &summary.persist_warning {
-        note.push_str(&format!("·（分数未写入工程：{warn}）"));
+        note.push_str(&format!("·（{warn}）"));
+    }
+    if let Some(path) = &summary.report_path {
+        note.push_str(&format!("·报告 {}", file_label(path)));
     }
     note
 }
@@ -6101,6 +6202,7 @@ mod tests {
             worst: Vec::new(),
             scores: Vec::new(),
             persist_warning: None,
+            report_path: None,
         };
         let note = eval_summary_note(&all_failed);
         assert!(note.contains("未能评分"), "{note}");
@@ -6115,6 +6217,7 @@ mod tests {
             worst: Vec::new(),
             scores: vec![(0, 100.0), (1, 100.0), (2, 100.0)],
             persist_warning: None,
+            report_path: None,
         };
         let note = eval_summary_note(&clean);
         assert!(note.contains("100.0%") && note.contains("3 句"), "{note}");
@@ -6125,7 +6228,8 @@ mod tests {
             scored: 57,
             asr_failed: 2,
             scores: vec![(0, 100.0), (11, 92.3)],
-            persist_warning: Some("磁盘空间不足：…".into()),
+            persist_warning: Some("分数未写入工程：磁盘空间不足（需要 0.1 MB）".into()),
+            report_path: Some(std::path::PathBuf::from("/tmp/示例工程/qa-report.md")),
             worst: vec![EvalIssue {
                 index: 11,
                 percent: 92.3,
@@ -6163,13 +6267,18 @@ mod tests {
                 snippet: "…【应为 例，读到 力】…".into(),
             }],
             scores: vec![(11, 92.3)],
-            persist_warning: Some("磁盘空间不足（需要 0.1 MB）".into()),
+            persist_warning: Some("分数未写入工程：磁盘空间不足（需要 0.1 MB）".into()),
+            report_path: Some(std::path::PathBuf::from("/tmp/示例工程/qa-report.md")),
         };
         let note = eval_summary_note(&summary);
         assert!(note.contains("92.3%"), "{note}");
         assert!(
             note.contains("分数未写入工程") && note.contains("磁盘空间不足"),
             "要如实报出没落盘：{note}"
+        );
+        assert!(
+            note.contains("报告") && note.contains("qa-report.md"),
+            "写成功时要告诉用户报告在哪：{note}"
         );
     }
 
@@ -6213,6 +6322,132 @@ mod tests {
         assert!(
             !sentence_message_invalidates_score("pending"),
             "没开始做就不动"
+        );
+    }
+
+    /// 质检报告：逐句对照 + 汇总；竖线/换行要转义（否则表格破版）。
+    #[test]
+    fn qa_report_markdown_lists_every_sentence() {
+        let rows = vec![
+            EvalRow {
+                index: 0,
+                reference: "第一句测试。".into(),
+                hypothesis: "第一句测试。".into(),
+                percent: 100.0,
+                snippet: String::new(),
+            },
+            EvalRow {
+                index: 11,
+                reference: "含 | 竖线与\n换行".into(),
+                hypothesis: "含 | 竖线与\n换行（读错）".into(),
+                percent: 92.3,
+                snippet: "…【应为 例，读到 力】…".into(),
+            },
+        ];
+        let md = qa_report_markdown("示例工程", "qwen3-asr", &rows, 96.4, 2, 0);
+        assert!(md.contains("# 质检报告 · 示例工程"), "{md}");
+        assert!(md.contains("qwen3-asr"), "要写明回读模型：{md}");
+        assert!(md.contains("平均可懂度：96.4%"), "{md}");
+        assert!(
+            md.contains("| 1 | 100.0% | 第一句测试。"),
+            "逐句都要在表里：{md}"
+        );
+        assert!(md.contains("| 12 | 92.3% |"), "序号按 1 基展示：{md}");
+        assert!(md.contains("【应为 例，读到 力】"), "差异片段要带上：{md}");
+        assert!(
+            !md.contains("含 | 竖线"),
+            "单元格里的竖线必须转义，否则表格破版：{md}"
+        );
+        assert!(!md.contains("与\n换行"), "单元格里的换行也要清掉：{md}");
+    }
+
+    /// 一句都没评上分时，报告不能写"平均 0%"（与摘要同一口径）。
+    #[test]
+    fn qa_report_markdown_says_when_nothing_scored() {
+        let md = qa_report_markdown("示例工程", "qwen3-asr", &[], 0.0, 0, 5);
+        assert!(md.contains("未能评分"), "{md}");
+        assert!(!md.contains("平均可懂度：0.0%"), "{md}");
+        assert!(md.contains("转写失败 5"), "{md}");
+    }
+
+    /// 真机（默认 ignored）：把「合成 → 质检」整条 **worker** 路径跑一遍——GUI 走的就是这条。
+    /// 覆盖 Cmd::RunEval → TaskStarted → EvalProgress… → EvalDone(report_path) → qa-report.md 落盘。
+    #[test]
+    #[ignore = "需要本机 audiocpp_server + audio8-tts + qwen3-asr"]
+    fn worker_eval_writes_report_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("aw-worker-eval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1) 先用 aw-core 合成两句（app 用同一条链路），存成工程
+        let base = std::env::var("AW_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+        let client = Client::new(&base);
+        assert!(client.healthy(), "服务不可用：{base}");
+        let mut project = Project::new(
+            "第一句测试。第二句测试。",
+            "audio8-tts",
+            200,
+            831001,
+            None,
+            aw_core::DEFAULT_PUNCTUATION,
+            80,
+            |t| t.to_string(),
+        );
+        let failed = project
+            .synthesize(&client, &dir, None, None, |_, _| {})
+            .expect("合成调用本身不应失败");
+        assert_eq!(failed, 0, "不该有失败句");
+        project.save(&dir).unwrap();
+
+        // 2) 驱动 worker（与 GUI 同一条命令通道）
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+        cmd_tx
+            .send(Cmd::RunEval {
+                revision: 0,
+                task_id: 7,
+                dir: dir.clone(),
+            })
+            .unwrap();
+
+        let mut progress_seen = 0usize;
+        let report_path = loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::EvalProgress { task_id: 7, .. } => progress_seen += 1,
+                Msg::EvalDone {
+                    task_id: 7,
+                    summary,
+                } => break summary.report_path,
+                Msg::EvalFailed { task_id: 7, error } => panic!("质检失败：{error}"),
+                _ => {}
+            }
+        };
+        drop(cmd_tx);
+        handle.join().unwrap();
+
+        assert!(progress_seen >= 2, "应逐句报进度，实得 {progress_seen}");
+        let path = report_path.expect("EvalDone 应带 qa-report.md 路径");
+        let md = std::fs::read_to_string(&path).expect("报告应已落盘");
+        assert!(md.contains("# 质检报告"), "{md}");
+        assert!(md.contains("第一句测试。"), "报告里要有逐句参考文本：{md}");
+        eprintln!("报告：{}\n{md}", path.display());
+
+        // 工程里的分数也落了盘（跨会话留存那条）
+        let on_disk = Project::load(&dir).unwrap();
+        assert!(
+            on_disk.sentences.iter().all(|s| s.eval_percent.is_some()),
+            "每句都应写入 eval_percent"
         );
     }
 }
