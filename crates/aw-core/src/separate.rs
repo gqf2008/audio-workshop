@@ -144,6 +144,56 @@ pub fn install_progress_callbacks() {
 }
 
 /// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
+/// 输入音频时长（秒）。**只支持 wav**：mp3/flac 由上游解码器读，我们这边拿不到长度
+/// （那种输入就不裁，产物保持上游原样）。
+fn input_duration_seconds(path: &Path) -> Option<f64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let sr = reader.spec().sample_rate;
+    if sr == 0 {
+        return None;
+    }
+    Some(reader.duration() as f64 / sr as f64)
+}
+
+/// 把 wav 裁到指定时长（原地替换：临时文件 + rename）。比目标短就原样不动。
+///
+/// 只处理 16-bit PCM（该模型的产物就是 16-bit）；其它位深原样返回，不让"裁不了"
+/// 变成"分离失败"。
+fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
+    let reader =
+        hound::WavReader::open(path).map_err(|e| format!("打开 {} 失败：{e}", path.display()))?;
+    let spec = reader.spec();
+    if spec.bits_per_sample != 16 || spec.sample_rate == 0 {
+        return Ok(());
+    }
+    let keep_frames = (seconds * spec.sample_rate as f64).round().max(0.0) as usize;
+    let total_frames = reader.duration() as usize;
+    if total_frames <= keep_frames {
+        return Ok(());
+    }
+    let tmp = path.with_extension("wav.trim");
+    {
+        let mut writer = hound::WavWriter::create(&tmp, spec)
+            .map_err(|e| format!("创建 {} 失败：{e}", tmp.display()))?;
+        let channels = spec.channels as usize;
+        for (i, sample) in reader.into_samples::<i16>().enumerate() {
+            if i / channels >= keep_frames {
+                break;
+            }
+            writer
+                .write_sample(sample.map_err(|e| format!("读 {} 失败：{e}", path.display()))?)
+                .map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| format!("收尾 {} 失败：{e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换 {} 失败：{e}", path.display())
+    })
+}
+
 pub fn output_paths(out_dir: &Path, stem: &str) -> (PathBuf, PathBuf) {
     (
         out_dir.join(format!("{stem}_vocals.wav")),
@@ -262,6 +312,10 @@ pub fn separate_tracks(
 
     // 先写临时名、两个都成了再改名：否则第一步成功、第二步失败会留下"半套结果"
     let (vocals_path, accompaniment_path) = output_paths(&req.out_dir, &req.stem);
+    // 上游按模型分块补齐：产物可能比输入长（本机实测 50.9s 输入 → 55.4s 产物，
+    // 尾巴那 4.5s 是模型为补齐最后一块生成的内容）。输入是 wav 时把两轨裁回输入时长——
+    // 用户拿到的东西该跟他给的音频一样长。mp3/flac 的长度在上游解码器里，我们拿不到，
+    // 这两种输入保持上游产物（文档写明）。裁在 .part 上，再走原来的 rename 发布。
     let vocals_tmp = vocals_path.with_extension("wav.part");
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     stems
@@ -279,6 +333,15 @@ pub fn separate_tracks(
             "写出伴奏轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
             accompaniment_tmp.display()
         ));
+    }
+    if let Some(seconds) = input_duration_seconds(&req.input) {
+        for part in [&vocals_tmp, &accompaniment_tmp] {
+            if let Err(e) = trim_wav_to_seconds(part, seconds) {
+                let _ = std::fs::remove_file(&vocals_tmp);
+                let _ = std::fs::remove_file(&accompaniment_tmp);
+                return Err(format!("裁齐分离产物失败：{e}"));
+            }
+        }
     }
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
@@ -381,5 +444,54 @@ mod tests {
         };
         let err = separate_tracks(&req, |_| {}, || false).unwrap_err();
         assert!(err.contains("输入音频不存在"), "错误要能直接定位：{err}");
+    }
+
+    /// 裁齐：产物比输入长时裁到输入时长；比输入短就原样不动（不能把短的拉长）。
+    /// 这条规则来自真机实测：50.9s 输入 → 55.4s 产物，尾巴 4.5s 是模型补齐最后一块
+    /// 生成的"想象"内容。
+    #[test]
+    fn trim_wav_to_seconds_trims_padding_and_keeps_short_files() {
+        let dir = std::env::temp_dir().join(format!("aw-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        // 1.2s 的"产物"，输入只有 1.0s
+        let long = dir.join("long.wav");
+        {
+            let mut w = hound::WavWriter::create(&long, spec).unwrap();
+            for i in 0..(44_100 * 2 * 12 / 10) {
+                w.write_sample((i % 11) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        trim_wav_to_seconds(&long, 1.0).unwrap();
+        let r = hound::WavReader::open(&long).unwrap();
+        assert_eq!(r.duration(), 44_100, "应裁到 1.0s（44.1kHz）");
+        assert!(
+            r.spec().sample_rate == 44_100 && r.spec().channels == 2,
+            "参数要原样保留"
+        );
+
+        // 0.5s 的"产物"：比目标短，不能被拉长
+        let short = dir.join("short.wav");
+        {
+            let mut w = hound::WavWriter::create(&short, spec).unwrap();
+            for i in 0..(44_100 * 2 / 2) {
+                w.write_sample((i % 7) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        trim_wav_to_seconds(&short, 1.0).unwrap();
+        assert_eq!(
+            hound::WavReader::open(&short).unwrap().duration(),
+            22_050,
+            "比目标短就原样不动"
+        );
     }
 }
