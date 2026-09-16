@@ -374,6 +374,8 @@ export component DubWorkbench inherits Rectangle {
 
     // ── 运行状态 ──
     in property <bool> running: false;
+    /// 批量面板是否展开（面板本身在 app.slint 里画，这里只管入口按钮）
+    in property <bool> batch-open: false;
     in property <bool> busy: false;
     in property <bool> playing: false;
 
@@ -418,6 +420,8 @@ export component DubWorkbench inherits Rectangle {
     callback redo-one(int);
     callback start-run();
     callback stop-run();
+    /// 打开 / 收起批量面板（M4-P1：一次导入 N 篇稿子）
+    callback batch-toggle();
     callback stop-preview();
     callback resplit();
     callback preview-all();
@@ -581,6 +585,12 @@ export component DubWorkbench inherits Rectangle {
                         text: root.show-advanced ? "收起高级" : "高级";
                         Tooltip { text: @markdown("配音独有的参数：重新切句 / 倍速 / 规范化 / 任务 / 导出"); }
                         clicked => { root.show-advanced = !root.show-advanced; }
+                    }
+                    PixelButton { // 首屏
+                        width: 96px;
+                        text: root.batch-open ? "收起批量" : "批量…";
+                        Tooltip { text: @markdown("一次导入 N 篇稿子，依次成片；每条在任务中心里是独立一条任务（M4-P1）"); }
+                        clicked => { root.batch-toggle(); }
                     }
                     PixelButton { // 首屏
                         width: 104px;
