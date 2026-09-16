@@ -146,7 +146,6 @@ pub fn install_progress_callbacks() {
     });
 }
 
-/// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
 /// 写出两轨，并保证**任一失败都不留 `.part`**。
 ///
 /// 为什么必须统一清理：上游 `write_audio` 是"先创建目标文件、再逐样本写"，中途失败
@@ -247,6 +246,7 @@ fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
     })
 }
 
+/// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
 pub fn output_paths(out_dir: &Path, stem: &str) -> (PathBuf, PathBuf) {
     (
         out_dir.join(format!("{stem}_vocals.wav")),
