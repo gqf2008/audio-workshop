@@ -406,6 +406,47 @@ struct AppSettings {
     /// 模型目录：本机模型文件的存放位置（默认 <应用工作目录>/models，用户可选）
     #[serde(default)]
     model_dir: Option<String>,
+    /// BGM 生成的输入（描述 / 压低档位 / 独立生成时长档位）。
+    ///
+    /// 以前这些只活在 UI 内存里：重启回默认值，用户写的描述白写；跨会话也没法判断
+    /// "磁盘上那套 BGM 还算不算当前结果"，只能一律当作过期。落进 settings.json 之后
+    /// 两件事一起解决（判据见 src/export.rs 的产物清单）。
+    #[serde(default)]
+    bgm: BgmSettings,
+}
+
+/// BGM 的默认描述：**与 ui/app.slint 里 `bgm-prompt` 的默认值必须一致**
+/// （有单测用 include_str! 钉住，两边不一致就会红）。
+const DEFAULT_BGM_PROMPT: &str = "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BgmSettings {
+    #[serde(default = "default_bgm_prompt")]
+    prompt: String,
+    /// duck 强度档位（0 弱 / 1 中 / 2 强；换算见 `duck_gain_for`）
+    #[serde(default = "default_bgm_index")]
+    duck_index: i32,
+    /// 独立生成时的目标时长档位
+    #[serde(default = "default_bgm_index")]
+    standalone_index: i32,
+}
+
+fn default_bgm_prompt() -> String {
+    DEFAULT_BGM_PROMPT.to_string()
+}
+
+fn default_bgm_index() -> i32 {
+    1
+}
+
+impl Default for BgmSettings {
+    fn default() -> Self {
+        Self {
+            prompt: default_bgm_prompt(),
+            duck_index: default_bgm_index(),
+            standalone_index: default_bgm_index(),
+        }
+    }
 }
 
 /// 默认模型目录：应用工作目录下的 models/（打包后即应用目录下的 models/）。
@@ -496,11 +537,29 @@ fn settings_path() -> PathBuf {
     documents_dir().join(WORKSHOP_DIR).join("settings.json")
 }
 
+/// 读 settings.json。
+///
+/// **逐字段解析**：某一段坏掉（手改错、版本不兼容）只丢那一段，不要连带把 host/port
+/// 也清掉——整份 `from_str::<AppSettings>` 失败会让用户"设置全没了"。
 fn load_settings() -> AppSettings {
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let Some(raw) = std::fs::read_to_string(settings_path()).ok() else {
+        return AppSettings::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return AppSettings::default();
+    };
+    AppSettings {
+        host: json_field(&v, "host"),
+        port: json_field(&v, "port"),
+        model_dir: json_field(&v, "model_dir"),
+        bgm: json_field(&v, "bgm").unwrap_or_default(),
+    }
+}
+
+/// 取一个字段；缺了或类型不对都返回 None（交给该字段自己的默认值）。
+fn json_field<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str) -> Option<T> {
+    v.get(key)
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
 }
 
 fn save_settings(s: &AppSettings) -> std::io::Result<()> {
@@ -755,6 +814,96 @@ fn refresh_backend_label(ui: &MainWindow) {
     ui.set_backend_label(backend_label(base.as_deref()).into());
 }
 
+/// 启动时把持久化的 BGM 输入灌回界面（描述/两个档位）。
+fn apply_bgm_settings(ui: &MainWindow) {
+    let bgm = settings_snapshot().bgm;
+    ui.set_bgm_prompt(bgm.prompt.into());
+    ui.set_bgm_duck_index(bgm.duck_index);
+    ui.set_bgm_standalone_index(bgm.standalone_index);
+}
+
+/// 把当前界面上的 BGM 输入写回 settings.json。
+///
+/// 触发点：描述编辑（用户可能没生成就退出）、点生成（档位改动没有回调，只能在这里收）。
+/// 写失败只提示、不阻断——丢的是"下次的默认值"，不是这次的任务。
+fn save_bgm_settings(ui: &MainWindow) {
+    let want = BgmSettings {
+        prompt: ui.get_bgm_prompt().to_string(),
+        duck_index: ui.get_bgm_duck_index(),
+        standalone_index: ui.get_bgm_standalone_index(),
+    };
+    let snapshot = {
+        let mut guard = match settings().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard.bgm.prompt == want.prompt
+            && guard.bgm.duck_index == want.duck_index
+            && guard.bgm.standalone_index == want.standalone_index
+        {
+            return; // 值没变就别写盘（打字时每次回调都写一遍是浪费）
+        }
+        guard.bgm = want;
+        guard.clone()
+    };
+    if let Err(e) = save_settings(&snapshot) {
+        ui.set_bgm_status_text(
+            format!("BGM 设置没能保存（{e}）：重启后描述会回到上次保存的值").into(),
+        );
+    }
+}
+
+/// 当前的 BGM 输入 → 导出层要的上下文（UI 认不认这套结果 + 参数摘要）。
+///
+/// 模式（混音 / 独立生成）看当前工程有没有配音成品——与 worker 的判定同源
+/// （有配音成品就混音，没有就独立生成）。
+fn bgm_context(ui: &MainWindow) -> export::BgmContext {
+    export::BgmContext::new(
+        bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
+        has_voice_product(ui),
+        &ui.get_bgm_prompt(),
+        duck_gain_for(ui.get_bgm_duck_index()),
+        bgm_standalone_seconds(ui.get_bgm_standalone_index()),
+    )
+}
+
+/// 配音成品的可用时长（秒）：**worker 与导出侧共用同一个判定**。
+///
+/// 有配音成品（能读出来、时长 > 0）→ BGM 走混音模式；否则独立生成。两边各写一份
+/// "有没有配音成品"迟早漂移——复核抓到的反例就是：`out/final.wav` 存在但损坏时，
+/// worker 按独立生成产出并写下 standalone 摘要，而导出侧只看文件存在就按 mixed 比，
+/// 刚生成的 BGM 立刻被判过期。
+fn usable_voice_seconds(project_dir: &Path) -> Option<f64> {
+    std::fs::read(project_dir.join("out/final.wav"))
+        .ok()
+        .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
+        // `is_finite` 不是多余的：畸形 wav（采样率写成 0）会让时长算成 `inf`，
+        // 只判 `> 0.0` 会把它当可用，随后 BGM 在算段数时炸在一个看不出根因的地方。
+        // 这一类"数值上是正数但不是可用值"的边界，判据要写成"有限且为正"。
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
+/// 当前工程有没有可用的配音成品（决定 BGM 是混音还是独立生成）。
+fn has_voice_product(ui: &MainWindow) -> bool {
+    let name = file_stem(&ui.get_project_name());
+    usable_voice_seconds(&project_dir(&name)).is_some()
+}
+
+/// 写产物清单时用的摘要：模式由**这次实际的生成结果**给（`mixed` 来自 worker 回报），
+/// 比"再看一眼磁盘"更准。
+fn bgm_digest_now(ui: &MainWindow, mixed: bool) -> String {
+    export::bgm_options_digest(
+        &ui.get_bgm_prompt(),
+        if mixed {
+            export::BgmMode::Mixed
+        } else {
+            export::BgmMode::Standalone
+        },
+        bgm_standalone_seconds(ui.get_bgm_standalone_index()),
+        duck_gain_for(ui.get_bgm_duck_index()),
+    )
+}
+
 /// 把「全局设置 + 模型清单」的现状回灌到界面。
 fn refresh_settings_view(ui: &MainWindow) {
     let (host, port, from_env) = server_endpoint();
@@ -913,7 +1062,7 @@ fn pick_audio_blocking() -> Option<String> {
 /// 原因不是"读会读到半截文件"——这些文件都是原子写出来的；而是有两类问题：
 ///   · `assemble` 是**先发布 final.wav、再写 final.srt**：中间那一瞬扫过去会看到
 ///     新 WAV 配旧 SRT（或把新工程误报成"缺字幕"）；
-///   · 分轨导出的源（`out/voice.wav`、`out/mixed.wav`、`bgm/bgm.wav`）是 BGM 混音
+///   · 分轨导出的源（`out/mixed.wav`、`bgm/bgm.wav`）是 BGM 混音
 ///     写出来的，混音跑到一半导出去就是半套。
 /// 写这些产物的动作都有在飞标志：
 ///   · 单篇拼装/导出 / BGM 生成 / 重录 / 试听 → UI 的 `busy`；
@@ -1541,12 +1690,8 @@ fn worker_loop(ctx: WorkerCtx) {
                     None => dir,
                 };
                 let dir = &dir;
-                // 有配音成品 → 按它对齐并混音；没有 → 独立生成（用 UI 选的时长，只出 BGM 轨）。
-                let voice_path = dir.join("out/final.wav");
-                let dub_seconds = std::fs::read(&voice_path)
-                    .ok()
-                    .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
-                    .filter(|d| *d > 0.0);
+                // 有配音成品 → 按它对齐并混音；没有（或读不出时长）→ 独立生成（只出 BGM 轨）。
+                let dub_seconds = usable_voice_seconds(dir);
                 let (target_seconds, mix) = match dub_seconds {
                     Some(v) => (v, true),
                     None => (
@@ -2504,6 +2649,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_engine_discovery(&ui, None);
 
     ui.set_export_dir(export_dir().into());
+    apply_bgm_settings(&ui);
     ui.set_backend_label(backend_label(base.as_deref()).into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
@@ -2886,6 +3032,9 @@ fn wire_theme(ui: &MainWindow) {
     ui.on_scene_changed(move |i| {
         let Some(ui) = weak.upgrade() else { return };
         let note = SCENE_NOTES.get(i.max(0) as usize).copied().unwrap_or("");
+        // 切 Tab 时顺手把 BGM 输入落盘：duck/时长档位没有回调，
+        // 「改了档位但没生成就退出」本来会丢，这里把窗口收窄
+        save_bgm_settings(&ui);
         ui.set_status_text(note.into());
     });
 }
@@ -3328,22 +3477,30 @@ fn restore_bgm_from_disk(ui: &MainWindow, state: &Rc<UiState>, dir: &Path) {
     if !dir.join("bgm/bgm.wav").is_file() {
         return;
     }
-    if !export::mix_is_current(dir) {
-        return;
-    }
+    let ctx = bgm_context(ui);
+    // 参数（已持久化）与配音指纹都对得上 → 这套仍是当前结果，可以直接导分轨；
+    // 对不上（改过描述/改过稿、或老工程没有清单）→ 只能查看/试听。
+    let current = export::bgm_result_is_current(dir, &ctx.options_digest);
     if let Ok(artifacts) = aw_core::bgm_artifacts_from_disk(dir) {
         apply_bgm_artifacts(ui, state, &artifacts);
-        // 恢复出来的这套**只作查看/试听**：上次会话用的是什么描述、什么参数，重开后
-        // 判不出来（BGM 描述还没持久化），那就不能假装它是"当前结果"。
-        // 要导分轨就重新生成并混音——分段有缓存，通常几秒。
-        ui.set_bgm_stale(true);
-        ui.set_bgm_status_text(
-            format!(
-                "上次的 BGM 产物（{} 段 · {:.1}s）仅供查看/试听；要导分轨请重新生成并混音（分段有缓存）",
-                artifacts.segments, artifacts.duration
-            )
-            .into(),
-        );
+        if current {
+            ui.set_bgm_status_text(
+                format!(
+                    "已恢复上次的 BGM 产物：{} 段 · 成品 {:.1}s（参数与配音成品都对得上，可直接导分轨）",
+                    artifacts.segments, artifacts.duration
+                )
+                .into(),
+            );
+        } else {
+            ui.set_bgm_stale(true);
+            ui.set_bgm_status_text(
+                format!(
+                    "上次的 BGM 产物（{} 段 · {:.1}s）与当前参数/配音成品对不上，仅供查看/试听；要导分轨请重新生成并混音（分段有缓存）",
+                    artifacts.segments, artifacts.duration
+                )
+                .into(),
+            );
+        }
     }
 }
 
@@ -4530,12 +4687,7 @@ fn wire_export(
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         // 判据：UI 认为这套 BGM 结果仍是当前结果（改描述会置 stale、从磁盘恢复的也是 stale）。
         // 描述改没改只有 UI 知道，磁盘那层只看"配没配上这份配音成品"。
-        let outcome = export::export_stems(
-            &name,
-            &project_dir(&name),
-            &dir,
-            bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
-        );
+        let outcome = export::export_stems(&name, &project_dir(&name), &dir, &bgm_context(&ui));
         let text = match &outcome {
             export::StemExportOutcome::Done(s) => {
                 if let Some(first) = s.written.first() {
@@ -4582,6 +4734,8 @@ fn wire_bgm(
             ui.set_status_text("先写一段 BGM 描述".into());
             return;
         }
+        // 档位（duck / 独立时长）没有回调，生成时一起把 BGM 输入落盘
+        save_bgm_settings(&ui);
         reset_bgm(&ui, &state1);
         ui.set_busy(true);
         // 清停止位：否则上一轮遗留的 stop 会让新任务在第一次段间检查时立刻停掉
@@ -4642,6 +4796,8 @@ fn wire_bgm(
                 "prompt 已改：当前显示的是旧版本，重新生成后才是当前结果".into(),
             );
         }
+        // 描述是用户写的内容，不能重启就丢：每次真变了就写回 settings.json
+        save_bgm_settings(&ui);
     });
 
     let weak = ui.as_weak();
@@ -4689,13 +4845,7 @@ fn wire_bgm(
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         let name = file_stem(&ui.get_project_name());
         let project = project_dir(&name);
-        match export::export_stem(
-            &name,
-            &project,
-            &dir,
-            stem_for_track(i),
-            bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
-        ) {
+        match export::export_stem(&name, &project, &dir, stem_for_track(i), &bgm_context(&ui)) {
             export::StemExportOutcome::Done(s) => {
                 let Some(path) = s.written.first() else {
                     ui.set_status_text("这一轨没有导出".into());
@@ -5190,23 +5340,23 @@ fn tick(
                 );
                 ui.set_bgm_status_text(note.clone().into());
                 ui.set_status_text(note.into());
-                // 混音成功就把"这次混的是哪份配音成品"记下来：之后改稿/重录再想导分轨时，
-                // 靠它判断这套 mixed/bgm 是不是已经过期（见 src/export.rs::mix_is_current）
-                if artifacts.mixed.is_some() {
-                    if let Some(dir) = artifacts
-                        .mixed
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .and_then(|p| p.parent())
+                // 产物清单：记下"这套 BGM 是哪个参数、配哪份配音成品做出来的"。
+                // 之后改稿/改描述/跨会话恢复都靠它判断还能不能导分轨
+                // （见 src/export.rs::bgm_result_is_current）。
+                let manifest_dir = artifacts
+                    .mixed
+                    .as_ref()
+                    .or(Some(&artifacts.bgm))
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf());
+                if let Some(dir) = manifest_dir {
+                    if let Err(e) = export::write_result_manifest(&dir, &bgm_digest_now(ui, mixed))
                     {
-                        if let Err(e) = export::write_mix_manifest(dir) {
-                            ui.set_status_text(
-                                format!(
-                                    "混音完成，但指纹没记上（{e}）：下次导分轨会提示先重新混音"
-                                )
+                        ui.set_status_text(
+                            format!("BGM 完成，但产物清单没写上（{e}）：下次导出会提示先重新生成")
                                 .into(),
-                            );
-                        }
+                        );
                     }
                 }
                 *state.bgm_artifacts.borrow_mut() = Some(artifacts);
@@ -5838,6 +5988,8 @@ fn wire_global_settings(
             },
             port: if locked { prev.port } else { port },
             model_dir: (!dir.is_empty() && !is_default_dir).then_some(dir.clone()),
+            // BGM 输入不在这里改（有自己的落盘点 save_bgm_settings），原样带上
+            bgm: prev.bgm,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -6419,6 +6571,7 @@ mod tests {
             host: None,
             port: Some(9999),
             model_dir: None,
+            bgm: Default::default(),
         };
         assert_eq!(
             resolve_base(&over_port, &cfg, None).0,
@@ -6430,6 +6583,7 @@ mod tests {
             host: Some("10.0.0.1".into()),
             port: None,
             model_dir: None,
+            bgm: Default::default(),
         };
         assert_eq!(
             resolve_base(&over_host, &cfg, None).0,
@@ -8200,6 +8354,154 @@ mod tests {
             accompaniment.display()
         );
     }
+    /// BGM 的默认描述与两个档位：settings.json 的默认值必须与 ui/app.slint 的
+    /// prop 默认值一致，否则"没设置过的用户"启动后看到的界面与落盘值就是两套。
+    /// 用 include_str! 把 Slint 文件读进来断言，改一边不改另一边就会红。
+    #[test]
+    fn bgm_defaults_match_the_slint_props() {
+        let app = include_str!("../ui/app.slint");
+        assert!(
+            app.contains(&format!("bgm-prompt: \"{DEFAULT_BGM_PROMPT}\"")),
+            "engine/app.slint 与 DEFAULT_BGM_PROMPT 不一致：{DEFAULT_BGM_PROMPT}"
+        );
+        assert!(
+            app.contains("bgm-duck-index: 1") && app.contains("bgm-standalone-index: 1"),
+            "两个档位的默认值也要与 BgmSettings::default 一致"
+        );
+        let d = BgmSettings::default();
+        assert_eq!(d.prompt, DEFAULT_BGM_PROMPT);
+        assert_eq!(d.duck_index, 1);
+        assert_eq!(d.standalone_index, 1);
+    }
+
+    /// 配音成品**损坏**时要按"没有配音成品"处理：worker 会走独立生成并写下
+    /// standalone 摘要，导出侧必须用同一个判定，否则刚生成的 BGM 立刻被判过期
+    /// （复核给的反例）。
+    #[test]
+    fn usable_voice_requires_a_readable_positive_duration() {
+        let dir = std::env::temp_dir().join(format!("aw-voice-usable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+
+        // 没有文件
+        assert_eq!(usable_voice_seconds(&dir), None);
+
+        // 有文件但读不出时长（损坏 / 半截）→ 按没有配音成品处理
+        std::fs::write(dir.join("out/final.wav"), b"not a wav").unwrap();
+        assert_eq!(usable_voice_seconds(&dir), None, "损坏的成品不算可用");
+
+        // 真的 wav（3 秒）→ 可用，并返回时长
+        write_test_tone_wav(&dir.join("out/final.wav"), 3.0);
+        let secs = usable_voice_seconds(&dir).expect("合法 wav 应该可用");
+        assert!((secs - 3.0).abs() < 0.05, "时长要对得上：{secs}");
+
+        // 0 帧的 wav 同样不可用
+        write_test_tone_wav(&dir.join("out/final.wav"), 0.0);
+        assert_eq!(usable_voice_seconds(&dir), None, "0 帧不算可用");
+
+        // 采样率 0 的畸形 wav：时长会算成 inf，只判 `> 0.0` 会把它当可用
+        write_test_tone_wav(&dir.join("out/final.wav"), 1.0);
+        let path = dir.join("out/final.wav");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes()); // fmt 块的采样率字段
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            usable_voice_seconds(&dir),
+            None,
+            "采样率 0（时长 inf）不算可用——否则后面会在算段数时炸"
+        );
+    }
+
+    /// 反例回归（复核给的）：`out/final.wav` 损坏时 worker 走独立生成、清单里写的是
+    /// standalone 摘要；导出侧也必须用"有没有**可用**配音成品"来定模式，两边摘要才一致。
+    /// 只判断文件存在的话，这里算出来的是 mixed 摘要，刚生成的 BGM 立刻被判过期。
+    #[test]
+    fn broken_voice_makes_both_sides_use_standalone_mode() {
+        let dir = std::env::temp_dir().join(format!("aw-broken-voice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::create_dir_all(dir.join("bgm")).unwrap();
+        std::fs::write(dir.join("out/final.wav"), b"broken").unwrap();
+        std::fs::write(dir.join("bgm/bgm.wav"), b"bgm").unwrap();
+
+        let prompt = "口播背景";
+        // worker 侧：没有可用配音成品 → 独立生成 → 写 standalone 摘要
+        let digest = export::bgm_options_digest(prompt, export::BgmMode::Standalone, 30.0, 0.22);
+        export::write_result_manifest(&dir, &digest).unwrap();
+
+        // 导出侧：同一个判定 → 同一个模式 → 摘要必须一致
+        let ctx = export::BgmContext::new(
+            true,
+            usable_voice_seconds(&dir).is_some(),
+            prompt,
+            0.22,
+            30.0,
+        );
+        assert!(
+            export::bgm_result_is_current(&dir, &ctx.options_digest),
+            "两边模式判定必须同源，否则刚生成的 BGM 会被判过期"
+        );
+        assert!(matches!(
+            export::stem_state(&dir, export::Stem::Bgm, &ctx),
+            export::StemState::Ready(_)
+        ));
+    }
+
+    /// 设置文件里某一段坏了（例如 `bgm.duck_index` 被手改成字符串）：
+    /// **只丢那一段**，host/port 必须保住——整份解析失败等于"设置全没了"。
+    #[test]
+    fn broken_bgm_section_does_not_wipe_other_settings() {
+        let v: serde_json::Value = serde_json::from_str(
+            "{\"host\":\"10.0.0.9\",\"port\":9000,\"bgm\":{\"duck_index\":\"中\"}}",
+        )
+        .unwrap();
+        let host: Option<String> = json_field(&v, "host");
+        let port: Option<u16> = json_field(&v, "port");
+        let bgm: Option<BgmSettings> = json_field(&v, "bgm");
+        assert_eq!(
+            host.as_deref(),
+            Some("10.0.0.9"),
+            "坏的是 bgm，不该连 host 一起丢"
+        );
+        assert_eq!(port, Some(9000));
+        let bgm = bgm.unwrap_or_default();
+        assert_eq!(bgm.prompt, DEFAULT_BGM_PROMPT, "坏掉的那段回落默认");
+        assert_eq!(bgm.duck_index, 1);
+    }
+
+    /// settings.json 的 BGM 段要能存能读；老文件没有这一段时回落默认值（不能读失败）。
+    #[test]
+    fn settings_roundtrip_keeps_bgm_inputs() {
+        let mut s = AppSettings {
+            bgm: BgmSettings {
+                prompt: "我的口播背景，钢琴，无人声".into(),
+                duck_index: 2,
+                standalone_index: 0,
+            },
+            ..Default::default()
+        };
+        let raw = serde_json::to_string(&s).unwrap();
+        let back: AppSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.bgm.prompt, "我的口播背景，钢琴，无人声");
+        assert_eq!(back.bgm.duck_index, 2);
+        assert_eq!(back.bgm.standalone_index, 0);
+
+        // 老版本（没有 bgm 段）也能读，回落默认
+        let legacy: AppSettings =
+            serde_json::from_str("{\"host\":\"127.0.0.1\",\"port\":8080}").unwrap();
+        assert_eq!(legacy.bgm.prompt, DEFAULT_BGM_PROMPT);
+        assert_eq!(legacy.bgm.duck_index, 1);
+
+        // 段里只写了半截（例如以后加字段）也不能整份读失败
+        let partial: AppSettings =
+            serde_json::from_str("{\"bgm\":{\"prompt\":\"只写了描述\"}}").unwrap();
+        assert_eq!(partial.bgm.prompt, "只写了描述");
+        assert_eq!(partial.bgm.duck_index, 1, "缺的字段才回落默认");
+
+        s.bgm.prompt = "改过了".into();
+        assert_ne!(s.bgm.prompt, DEFAULT_BGM_PROMPT);
+    }
+
     /// "这套 BGM 结果还算不算当前"：`has_result && !stale`。
     /// 改描述后只置 stale（结果还在、能试听），光看 has_result 会把旧结果当当前导出；
     /// 从磁盘恢复的那套一律 stale（重开后判不出上次用的描述）。

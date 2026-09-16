@@ -105,7 +105,7 @@ impl Stem {
 ///
 /// 光"文件存在"不够：`out/mixed.wav`、`bgm/bgm.wav` 是**混音那一刻**的成品，之后改稿、
 /// 重录、重新拼装都会让配音成品变样——旧混音再导出就成了"新配音配旧 BGM"。
-/// 所以混音成功时会写下 `bgm/mix-manifest.json`（记录当时的配音成品指纹），
+/// 所以生成/混音成功时会写下 `bgm/result-manifest.json`（参数摘要 + 当时的配音成品指纹），
 /// 这里比对着看（复核指出"磁盘来源可能把旧产物当当前产物导出"）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum StemState {
@@ -121,45 +121,139 @@ pub fn voice_fingerprint(project_dir: &Path) -> Option<String> {
     Some(sha256_hex(&bytes))
 }
 
-/// 混音成功后写下"这次混的是哪份配音成品"。**写失败不能装作成功**：
-/// 下一次导出会说"混音记录缺失，可能过期"，用户重新混一次即可。
-pub fn write_mix_manifest(project_dir: &Path) -> std::io::Result<()> {
-    let Some(fp) = voice_fingerprint(project_dir) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "没有 out/final.wav，记不了混音指纹",
-        ));
-    };
-    let path = project_dir.join(MIX_MANIFEST);
+/// BGM 产物的**生成模式**：决定哪些输入真的影响了音频。
+///
+/// 判定与 worker 同源：工程里有配音成品（`out/final.wav`）→ 混音模式；没有 → 独立生成。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BgmMode {
+    Mixed,
+    Standalone,
+}
+
+/// 导出分轨时"当前 BGM 设定"的两件事：UI 认不认这套结果（`current`）＋参数摘要。
+///
+/// 参数摘要是**跨会话**判断"这套产物是不是还配套"的依据：描述改了、压低强度改了、
+/// 独立生成的时长档位改了，旧产物就不该再当当前结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BgmContext {
+    /// UI 是否认为磁盘上这套 BGM 结果仍是当前结果（改描述会置 stale）
+    pub current: bool,
+    /// 当前设定的摘要
+    pub options_digest: String,
+}
+
+impl BgmContext {
+    /// `has_voice`：工程里有没有配音成品（决定模式，与 worker 的判定同源）。
+    pub fn new(
+        current: bool,
+        has_voice: bool,
+        prompt: &str,
+        duck_gain: f32,
+        standalone_seconds: f64,
+    ) -> Self {
+        let mode = if has_voice {
+            BgmMode::Mixed
+        } else {
+            BgmMode::Standalone
+        };
+        Self {
+            current,
+            options_digest: bgm_options_digest(prompt, mode, standalone_seconds, duck_gain),
+        }
+    }
+}
+
+/// BGM 参数摘要：只看**这个模式下真的影响产物内容**的输入。
+///
+/// 为什么不把所有旋钮都塞进来：`duck` 只影响混音轨（它压低的是 BGM），`standalone`
+/// 时长只影响独立生成——多塞进去会造成假过期（改一个与这轨无关的旋钮，好端端的产物
+/// 就被判成旧的）。所以按模式分开取输入：
+///   · 混音模式：描述 + 压低强度（时长由配音成品决定，配音指纹另有一层比对）；
+///   · 独立生成：描述 + 时长档位。
+/// 不把 `current`（UI 标志）算进去——那是"会话内有没有作废"，与"产物是什么参数做出来的"
+/// 是两件事，混在一起就没法跨会话比对了。
+pub fn bgm_options_digest(
+    prompt: &str,
+    mode: BgmMode,
+    standalone_seconds: f64,
+    duck_gain: f32,
+) -> String {
+    // 用固定小数位而不是 Debug 输出 f32/f64：浮点的 Debug 形态会随格式化细节变化
+    let mut body = format!(
+        "mode={}\nprompt={prompt}\n",
+        match mode {
+            BgmMode::Mixed => "mixed",
+            BgmMode::Standalone => "standalone",
+        }
+    );
+    match mode {
+        BgmMode::Mixed => body.push_str(&format!("duck={duck_gain:.4}\n")),
+        BgmMode::Standalone => {
+            body.push_str(&format!("standalone_seconds={standalone_seconds:.1}\n"))
+        }
+    }
+    sha256_hex(body.as_bytes())
+}
+
+/// BGM 产物清单：这次生成/混音**用的什么参数**、混音时配的是哪份配音成品。
+///
+/// 单独一个文件（不塞进 `bgm/manifest.json`）：那个管分段缓存复用，字段与失效规则都不同。
+pub fn write_result_manifest(project_dir: &Path, options_digest: &str) -> std::io::Result<()> {
+    let fp = voice_fingerprint(project_dir);
+    let path = project_dir.join(RESULT_MANIFEST);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = format!("{{\"voice_sha256\":\"{fp}\"}}\n");
+    let voice = match &fp {
+        Some(fp) => format!("\"{fp}\""),
+        None => "null".to_string(),
+    };
+    let body = format!("{{\"bgm_options\":\"{options_digest}\",\"voice_sha256\":{voice}}}\n");
     aw_core::dub::write_atomic_explained(&path, body.as_bytes())
 }
 
-/// 混音记录里那份配音成品的指纹。
-fn read_mix_manifest(project_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(project_dir.join(MIX_MANIFEST)).ok()?;
-    let key = "\"voice_sha256\"";
+/// 清单里的字段（只读原始 JSON 文本：这个文件是我们自己写的，字段少、格式稳定，
+/// 为它引一个 JSON 解析依赖不划算；读不出来一律当"没有清单"）。
+fn read_result_manifest(project_dir: &Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(project_dir.join(RESULT_MANIFEST)).ok()?;
+    let options = json_string_field(&text, "\"bgm_options\"")?;
+    let voice = json_string_field(&text, "\"voice_sha256\"");
+    Some((options, voice))
+}
+
+/// 从一个平铺的 JSON 文本里取字符串字段（`"k":"v"`）；`"k":null` 与缺失都返回 None。
+fn json_string_field(text: &str, key: &str) -> Option<String> {
     let rest = text.split(key).nth(1)?;
-    let value = rest.split('"').nth(1)?;
-    Some(value.to_string())
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with("null") {
+        return None;
+    }
+    let rest = rest.strip_prefix('"')?;
+    Some(rest.split('"').next()?.to_string())
 }
 
-/// 当前 `out/mixed.wav` / `bgm/bgm.wav` 是不是**这一份**配音成品混出来的。
+/// 磁盘上这套 `bgm/bgm.wav`、`out/mixed.wav` 是不是**用当前参数、配当前配音成品**做出来的。
 ///
-/// 没有配音成品时（独立生成的 BGM）不存在"配不上"的问题 → 返回 true。
-pub fn mix_is_current(project_dir: &Path) -> bool {
-    let Some(current) = voice_fingerprint(project_dir) else {
-        return true;
+/// 三件事都要对上：清单存在、参数摘要一致、配音成品指纹一致（没有配音成品时=独立生成，
+/// 不比对指纹）。老工程（这批之前生成的）没有清单 → 返回 false：宁可让用户重新生成一次
+/// （分段有缓存，几秒），也不拿判不出配套关系的产物当当前结果。
+pub fn bgm_result_is_current(project_dir: &Path, options_digest: &str) -> bool {
+    let Some((recorded_options, recorded_voice)) = read_result_manifest(project_dir) else {
+        return false;
     };
-    read_mix_manifest(project_dir).is_some_and(|recorded| recorded == current)
+    if recorded_options != options_digest {
+        return false;
+    }
+    match voice_fingerprint(project_dir) {
+        Some(fp) => recorded_voice.as_deref() == Some(fp.as_str()),
+        // 没有配音成品：独立生成的 BGM，只比参数
+        None => true,
+    }
 }
 
-/// 混音指纹的相对路径（放在 bgm/ 下，与 BGM 的分段 manifest 分开：那个管缓存复用，
-/// 这个管"这份混音配的是哪一版配音"，语义与失效规则都不同）。
-const MIX_MANIFEST: &str = "bgm/mix-manifest.json";
+/// 产物清单的相对路径（放在 bgm/ 下，与 BGM 的分段 manifest 分开：那个管缓存复用，
+/// 这个管"这套产物是哪份参数/哪版配音做出来的"，语义与失效规则都不同）。
+const RESULT_MANIFEST: &str = "bgm/result-manifest.json";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -169,14 +263,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// 一轨**从磁盘**解析出来的状态（不看内存里的 `BgmArtifacts`）：
-/// `bgm_current` 由调用方给：UI 认为"磁盘上的 BGM/混音仍是当前结果"（改稿、改 BGM
-/// 描述后 UI 会清掉这个标志）——描述改没改只有 UI 知道，磁盘这层判断不了。
+/// `ctx` 里的 `current` 由调用方给（UI 认为这套结果还算不算数），`options_digest`
+/// 用来跟产物清单比对——两者合起来才能回答"这套 BGM 是不是当前设定做出来的"。
 /// 只认内存会让"昨天混好的分轨，今天重开应用就导不出来"。
 ///
 /// - 人声轨：`out/final.wav`。混音时那份 `out/voice.wav` 只是它的副本，副本可能是旧的
 ///   （复核指出"优先用 voice.wav 会导出旧人声"），所以直接以配音成品为准。
 /// - BGM 轨：`bgm/bgm.wav`；混音轨：`out/mixed.wav`。两者都要过时效判定。
-pub fn stem_state(project_dir: &Path, stem: Stem, bgm_current: bool) -> StemState {
+pub fn stem_state(project_dir: &Path, stem: Stem, ctx: &BgmContext) -> StemState {
     match stem {
         Stem::Voice => match project_dir.join("out/final.wav") {
             p if p.is_file() => StemState::Ready(p),
@@ -190,15 +284,14 @@ pub fn stem_state(project_dir: &Path, stem: Stem, bgm_current: bool) -> StemStat
             if !path.is_file() {
                 return StemState::Missing;
             }
-            // 两层判断各管一件事：磁盘这层只管"配没配上当前配音成品"，
-            // "描述改过没改过"只有 UI 知道（改描述会清掉它的当前结果标志）。
-            if !bgm_current {
+            // 三层判断各管一件事：UI 认不认这套结果、参数摘要一不一致、配音指纹配不配得上。
+            if !ctx.current {
                 return StemState::Stale(format!(
                     "{}轨已被改稿/改 BGM 描述作废（重新生成并混音后再导）",
                     stem.label()
                 ));
             }
-            if mix_is_current(project_dir) {
+            if bgm_result_is_current(project_dir, &ctx.options_digest) {
                 StemState::Ready(path)
             } else {
                 StemState::Stale(format!(
@@ -237,9 +330,9 @@ pub fn export_stem(
     project_dir: &Path,
     dir: &Path,
     stem: Stem,
-    bgm_current: bool,
+    ctx: &BgmContext,
 ) -> StemExportOutcome {
-    let src = match stem_state(project_dir, stem, bgm_current) {
+    let src = match stem_state(project_dir, stem, ctx) {
         StemState::Ready(p) => p,
         StemState::Stale(reason) => return StemExportOutcome::Stale(vec![reason]),
         StemState::Missing => return StemExportOutcome::NothingToExport,
@@ -265,13 +358,13 @@ pub fn export_stems(
     name: &str,
     project_dir: &Path,
     dir: &Path,
-    bgm_current: bool,
+    ctx: &BgmContext,
 ) -> StemExportOutcome {
     let wanted = [Stem::Voice, Stem::Bgm];
     let mut ready: Vec<(Stem, PathBuf)> = Vec::new();
     let mut summary = StemExportSummary::default();
     for stem in wanted {
-        match stem_state(project_dir, stem, bgm_current) {
+        match stem_state(project_dir, stem, ctx) {
             StemState::Ready(p) => ready.push((stem, p)),
             StemState::Stale(reason) => summary.stale.push(reason),
             StemState::Missing => summary.missing.push(stem.label().to_string()),
@@ -503,6 +596,28 @@ pub fn summary_text(summary: &BatchExportSummary, dir: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// 测试用的参数摘要（真实摘要由 UI 的 prompt + duck 档算出来，见 `bgm_options_digest`）
+    const TEST_DIGEST: &str = "digest-under-test";
+
+    /// 参数摘要（测试用等价物）：按模式取输入，与 `BgmContext::new` 同一口径
+    fn digest(prompt: &str, mode: BgmMode, seconds: f64, duck: f32) -> String {
+        bgm_options_digest(prompt, mode, seconds, duck)
+    }
+
+    fn ctx_current() -> BgmContext {
+        BgmContext {
+            current: true,
+            options_digest: TEST_DIGEST.to_string(),
+        }
+    }
+
+    fn ctx_stale() -> BgmContext {
+        BgmContext {
+            current: false,
+            options_digest: TEST_DIGEST.to_string(),
+        }
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aw-export-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -716,8 +831,110 @@ mod tests {
         std::fs::write(out.join("voice.wav"), b"voice").unwrap();
         std::fs::write(out.join("mixed.wav"), b"mixed").unwrap();
         std::fs::write(bgm.join("bgm.wav"), b"bgm").unwrap();
-        // 真混音时会写下指纹（混音成功那一刻的 out/final.wav）；没有它就算"无法确认配套"
-        write_mix_manifest(&root.join(name)).unwrap();
+        // 真混音时会写下产物清单（参数摘要 + 混音那一刻的 out/final.wav 指纹）；
+        // 没有它就算"无法确认配套"
+        write_result_manifest(&root.join(name), TEST_DIGEST).unwrap();
+    }
+
+    /// 参数摘要按**模式**取输入：混音模式看描述 + duck；独立生成看描述 + 时长档位。
+    /// 多取输入会造成假过期（改一个与这轨无关的旋钮，好端端的产物被判成旧的）。
+    #[test]
+    fn bgm_options_digest_tracks_the_inputs_that_matter() {
+        let mixed = digest("温暖口播背景", BgmMode::Mixed, 0.0, 0.22);
+        assert_eq!(
+            mixed,
+            digest("温暖口播背景", BgmMode::Mixed, 0.0, 0.22),
+            "同样输入要稳定"
+        );
+        assert_ne!(
+            mixed,
+            digest("换成摇滚", BgmMode::Mixed, 0.0, 0.22),
+            "描述变了摘要要变"
+        );
+        assert_ne!(
+            mixed,
+            digest("温暖口播背景", BgmMode::Mixed, 0.0, 0.05),
+            "混音模式下 duck 变了要变"
+        );
+        assert_eq!(
+            mixed,
+            digest("温暖口播背景", BgmMode::Mixed, 30.0, 0.22),
+            "混音模式不该被独立生成的时长档位影响"
+        );
+
+        let alone = digest("温暖口播背景", BgmMode::Standalone, 30.0, 0.22);
+        assert_ne!(
+            alone,
+            digest("温暖口播背景", BgmMode::Standalone, 60.0, 0.22),
+            "独立生成时时长档位变了要变"
+        );
+        assert_eq!(
+            alone,
+            digest("温暖口播背景", BgmMode::Standalone, 30.0, 0.05),
+            "独立生成的 BGM 不受 duck 影响（那是混音那一层的事）"
+        );
+        assert_ne!(mixed, alone, "模式不同，摘要必须不同");
+        assert_eq!(mixed.len(), 64, "sha256 十六进制");
+    }
+
+    /// 产物清单：参数摘要与配音指纹都要对上才算"当前产物"；
+    /// 独立生成（没有配音成品）只比参数；老工程没有清单 → 一律不算当前。
+    #[test]
+    fn result_manifest_checks_options_and_voice() {
+        let root = temp_dir("manifest");
+        make_project(&root, "甲", true); // 只有 out/final.wav/.srt
+        let p = root.join("甲");
+        let digest_a = digest("口播背景", BgmMode::Mixed, 0.0, 0.22);
+        let digest_b = digest("另一个描述", BgmMode::Mixed, 0.0, 0.22);
+
+        // 没有清单（老工程）→ 不算当前
+        assert!(!bgm_result_is_current(&p, &digest_a));
+
+        write_result_manifest(&p, &digest_a).unwrap();
+        assert!(
+            bgm_result_is_current(&p, &digest_a),
+            "参数一致就该是当前产物"
+        );
+        assert!(
+            !bgm_result_is_current(&p, &digest_b),
+            "参数不同就不是当前产物"
+        );
+
+        // 配音成品变了（改稿/重录后重新拼装）→ 即使参数没变也不算
+        std::fs::write(p.join("out/final.wav"), b"final-v2").unwrap();
+        assert!(
+            !bgm_result_is_current(&p, &digest_a),
+            "配音成品变了要判过期"
+        );
+
+        // 独立生成（没有配音成品）：只比参数
+        let only_bgm = root.join("只有BGM");
+        std::fs::create_dir_all(only_bgm.join("bgm")).unwrap();
+        std::fs::write(only_bgm.join("bgm/bgm.wav"), b"bgm").unwrap();
+        write_result_manifest(&only_bgm, &digest_a).unwrap();
+        assert!(bgm_result_is_current(&only_bgm, &digest_a));
+        assert!(!bgm_result_is_current(&only_bgm, &digest_b));
+    }
+
+    /// 参数摘要不一致时，BGM 轨按过期处理（端到端：digest 变了就导不出去）。
+    #[test]
+    fn digest_mismatch_marks_bgm_stale() {
+        let root = temp_dir("digest-mismatch");
+        make_mixed_project(&root, "甲");
+        let p = root.join("甲");
+        let ctx_other = BgmContext {
+            current: true,
+            options_digest: digest("换了个描述", BgmMode::Mixed, 0.0, 0.22),
+        };
+        match stem_state(&p, Stem::Bgm, &ctx_other) {
+            StemState::Stale(reason) => assert!(reason.contains("重新混音"), "{reason}"),
+            other => panic!("参数变了就该判过期：{other:?}"),
+        }
+        assert_eq!(
+            stem_state(&p, Stem::Voice, &ctx_other),
+            StemState::Ready(p.join("out/final.wav")),
+            "人声轨不受 BGM 参数影响"
+        );
     }
 
     /// 人声轨**永远**是当前的配音成品（`out/final.wav`）：混音时那份 `out/voice.wav`
@@ -727,18 +944,18 @@ mod tests {
         let root = temp_dir("stem-src");
         make_mixed_project(&root, "甲");
         let p = root.join("甲");
-        write_mix_manifest(&p).unwrap();
+        write_result_manifest(&p, TEST_DIGEST).unwrap();
         assert_eq!(
-            stem_state(&p, Stem::Voice, true),
+            stem_state(&p, Stem::Voice, &ctx_current()),
             StemState::Ready(p.join("out/final.wav")),
             "别用混音时那份可能过期的 voice.wav 副本"
         );
         assert_eq!(
-            stem_state(&p, Stem::Bgm, true),
+            stem_state(&p, Stem::Bgm, &ctx_current()),
             StemState::Ready(p.join("bgm/bgm.wav"))
         );
         assert_eq!(
-            stem_state(&p, Stem::Mixed, true),
+            stem_state(&p, Stem::Mixed, &ctx_current()),
             StemState::Ready(p.join("out/mixed.wav"))
         );
 
@@ -747,23 +964,47 @@ mod tests {
         std::fs::create_dir_all(old.join("out")).unwrap();
         std::fs::write(old.join("out/final.wav"), b"final").unwrap();
         assert_eq!(
-            stem_state(&old, Stem::Voice, true),
+            stem_state(&old, Stem::Voice, &ctx_current()),
             StemState::Ready(old.join("out/final.wav"))
         );
-        assert_eq!(stem_state(&old, Stem::Bgm, true), StemState::Missing);
-        assert_eq!(stem_state(&old, Stem::Mixed, true), StemState::Missing);
+        assert_eq!(
+            stem_state(&old, Stem::Bgm, &ctx_current()),
+            StemState::Missing
+        );
+        assert_eq!(
+            stem_state(&old, Stem::Mixed, &ctx_current()),
+            StemState::Missing
+        );
     }
 
-    /// 独立生成的 BGM（没有配音成品）：不存在"配不上"的问题，直接可导。
+    /// 独立生成的 BGM（没有配音成品）：不比对配音指纹，但**参数摘要还是要对**——
+    /// 没有清单（老工程）只能算"判不出配套"，按过期处理。
     #[test]
-    fn standalone_bgm_needs_no_mix_manifest() {
+    fn standalone_bgm_is_current_once_the_manifest_matches() {
         let root = temp_dir("stem-standalone");
         let dir = root.join("只有BGM");
         std::fs::create_dir_all(dir.join("bgm")).unwrap();
         std::fs::write(dir.join("bgm/bgm.wav"), b"bgm").unwrap();
+
+        assert!(
+            matches!(
+                stem_state(&dir, Stem::Bgm, &ctx_current()),
+                StemState::Stale(_)
+            ),
+            "没有清单 = 判不出配套，只能算过期"
+        );
+        write_result_manifest(&dir, TEST_DIGEST).unwrap();
         assert_eq!(
-            stem_state(&dir, Stem::Bgm, true),
+            stem_state(&dir, Stem::Bgm, &ctx_current()),
             StemState::Ready(dir.join("bgm/bgm.wav"))
+        );
+        let other = BgmContext {
+            current: true,
+            options_digest: digest("另一个描述", BgmMode::Standalone, 30.0, 0.22),
+        };
+        assert!(
+            matches!(stem_state(&dir, Stem::Bgm, &other), StemState::Stale(_)),
+            "参数变了就不算当前"
         );
     }
 
@@ -774,13 +1015,19 @@ mod tests {
         let root = temp_dir("stem-stale");
         make_mixed_project(&root, "甲");
         let p = root.join("甲");
-        write_mix_manifest(&p).unwrap();
-        assert!(mix_is_current(&p), "刚写完记录时应该是当前版本");
+        write_result_manifest(&p, TEST_DIGEST).unwrap();
+        assert!(
+            bgm_result_is_current(&p, TEST_DIGEST),
+            "刚写完清单时应该是当前版本"
+        );
 
         // 重新拼装（配音成品变了），但没重新混音
         std::fs::write(p.join("out/final.wav"), b"final-v2").unwrap();
-        assert!(!mix_is_current(&p), "配音成品变了就不再是当前混音");
-        match stem_state(&p, Stem::Mixed, true) {
+        assert!(
+            !bgm_result_is_current(&p, TEST_DIGEST),
+            "配音成品变了就不再是当前混音"
+        );
+        match stem_state(&p, Stem::Mixed, &ctx_current()) {
             StemState::Stale(reason) => {
                 assert!(reason.contains("重新混音"), "要给下一步：{reason}");
             }
@@ -789,13 +1036,13 @@ mod tests {
 
         // 人声轨仍是当前的（它就是 final.wav）
         assert_eq!(
-            stem_state(&p, Stem::Voice, true),
+            stem_state(&p, Stem::Voice, &ctx_current()),
             StemState::Ready(p.join("out/final.wav"))
         );
 
         // 一次导出：人声照常出去，混音轨那半边缺；全过期的情况另测
         let dst = temp_dir("stem-stale-dst");
-        match export_stems("甲", &p, &dst, true) {
+        match export_stems("甲", &p, &dst, &ctx_current()) {
             StemExportOutcome::Done(s) => {
                 assert_eq!(s.written.len(), 1, "只有人声能导");
                 assert!(s.missing.is_empty(), "{:?}", s.missing);
@@ -819,9 +1066,9 @@ mod tests {
         let root = temp_dir("stem-bgm-invalid");
         make_mixed_project(&root, "甲");
         let p = root.join("甲");
-        assert!(mix_is_current(&p), "指纹本身还是配套的");
+        assert!(bgm_result_is_current(&p, TEST_DIGEST), "指纹与参数都还配套");
 
-        match stem_state(&p, Stem::Bgm, false) {
+        match stem_state(&p, Stem::Bgm, &ctx_stale()) {
             StemState::Stale(reason) => {
                 assert!(
                     reason.contains("作废") || reason.contains("重新生成"),
@@ -832,7 +1079,7 @@ mod tests {
         }
 
         let dst = temp_dir("stem-bgm-invalid-dst");
-        match export_stems("甲", &p, &dst, false) {
+        match export_stems("甲", &p, &dst, &ctx_stale()) {
             StemExportOutcome::Done(s) => {
                 assert_eq!(s.written.len(), 1, "人声照导");
                 assert_eq!(s.stale.len(), 1, "{:?}", s.stale);
@@ -852,7 +1099,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("bgm")).unwrap();
         std::fs::write(dir.join("bgm/bgm.wav"), b"bgm").unwrap();
         let dst = root.join("不该建");
-        match export_stems("只有BGM", &dir, &dst, false) {
+        match export_stems("只有BGM", &dir, &dst, &ctx_stale()) {
             StemExportOutcome::Stale(reasons) => {
                 assert_eq!(reasons.len(), 1, "{reasons:?}");
                 assert!(reasons[0].contains("重新生成"), "{reasons:?}");
@@ -868,7 +1115,7 @@ mod tests {
         let root = temp_dir("stem-name");
         make_mixed_project(&root, "甲");
         let dst = temp_dir("stem-name-dst");
-        match export_stems("甲", &root.join("甲"), &dst, true) {
+        match export_stems("甲", &root.join("甲"), &dst, &ctx_current()) {
             StemExportOutcome::Done(s) => {
                 assert_eq!(s.written.len(), 2);
                 assert!(s.missing.is_empty(), "{:?}", s.missing);
@@ -883,7 +1130,7 @@ mod tests {
         // 单轨导出走同一套命名（BGM Tab 的按钮就是它）
         let one = temp_dir("stem-name-one");
         assert!(matches!(
-            export_stem("甲", &root.join("甲"), &one, Stem::Mixed, true),
+            export_stem("甲", &root.join("甲"), &one, Stem::Mixed, &ctx_current()),
             StemExportOutcome::Done(_)
         ));
         assert!(one.join("甲_mixed.wav").is_file());
@@ -898,7 +1145,7 @@ mod tests {
         std::fs::write(dir.join("out/final.wav"), b"final-as-voice").unwrap();
         let dst = temp_dir("stem-missing-dst");
 
-        match export_stems("只有人声", &dir, &dst, true) {
+        match export_stems("只有人声", &dir, &dst, &ctx_current()) {
             StemExportOutcome::Done(s) => {
                 assert_eq!(s.written.len(), 1, "人声要导出来");
                 assert_eq!(s.missing, vec!["BGM".to_string()]);
@@ -924,9 +1171,11 @@ mod tests {
         let dir = root.join("只有BGM");
         std::fs::create_dir_all(dir.join("bgm")).unwrap();
         std::fs::write(dir.join("bgm/bgm.wav"), b"bgm-only").unwrap();
+        // 真生成过就有清单（参数一致 → BGM 轨可导；人声轨仍然缺）
+        write_result_manifest(&dir, TEST_DIGEST).unwrap();
         let dst = temp_dir("stem-bgm-only-dst");
 
-        match export_stems("只有BGM", &dir, &dst, true) {
+        match export_stems("只有BGM", &dir, &dst, &ctx_current()) {
             StemExportOutcome::Done(s) => {
                 assert_eq!(s.written.len(), 1);
                 assert_eq!(s.missing, vec!["人声".to_string()]);
@@ -955,7 +1204,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dst = root.join("不该建");
         assert_eq!(
-            export_stems("空工程", &dir, &dst, true),
+            export_stems("空工程", &dir, &dst, &ctx_current()),
             StemExportOutcome::NothingToExport
         );
         assert!(!dst.exists(), "没有可导的轨就别建目录");
