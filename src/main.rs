@@ -12,6 +12,7 @@
 //!   <工程名>.wav / <工程名>.srt          导出（复制自 out/）
 
 mod player;
+mod tasks;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -1275,6 +1276,7 @@ struct AssembledInfo {
     duration: f64,
 }
 
+#[derive(Default)]
 struct UiState {
     /// 最近一次拼装结果（导出复制 / 全篇试听用）
     assembled: RefCell<Option<AssembledInfo>>,
@@ -1290,6 +1292,14 @@ struct UiState {
     bgm_artifacts: RefCell<Option<BgmArtifacts>>,
     /// 最近一次歌曲产物（路径、时长）。
     song_artifact: RefCell<Option<(PathBuf, f64)>>,
+    /// 跨 Tab 任务台账（配音 / BGM / 音乐制作共用一份）。
+    tasks: RefCell<tasks::TaskQueue>,
+    /// 各类任务当前的 id（进度/收尾消息按 id 回填）
+    dub_task: std::cell::Cell<Option<u32>>,
+    bgm_task: std::cell::Cell<Option<u32>>,
+    song_task: std::cell::Cell<Option<u32>>,
+    /// 重录是配音类任务里的独立一条
+    redo_task: std::cell::Cell<Option<u32>>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -1326,13 +1336,10 @@ fn main() -> Result<(), slint::PlatformError> {
     spawn_server_check(msg_tx_ui.clone(), 0);
     let stop = Arc::new(AtomicBool::new(false));
     let state = Rc::new(UiState {
-        assembled: RefCell::new(None),
-        project_dir: RefCell::new(None),
+        // 只有"试听总时长"需要一个非零默认值；其余字段都走 Default，
+        // 这样以后加字段不会再打破这里的构造（以及测试里的构造）
         playing_total: std::cell::Cell::new(1.0),
-        project_ready: std::cell::Cell::new(false),
-        project_revision: std::cell::Cell::new(0),
-        bgm_artifacts: RefCell::new(None),
-        song_artifact: RefCell::new(None),
+        ..UiState::default()
     });
     {
         let stop = Arc::clone(&stop);
@@ -1363,6 +1370,12 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_bgm(&ui, &cmd_tx, &state, &player);
     wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
+    wire_task_center(&ui, &state);
+
+    // 启动就把"任务 · 空闲"画上（状态栏 chip 与任务中心都读同一份台账）
+    refresh_tasks(&ui, &state);
+    #[cfg(debug_assertions)]
+    seed_shot_tasks(&ui, &state);
 
     // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
     apply_shot_state(&ui);
@@ -1618,6 +1631,83 @@ fn invalidate_worker_project(cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let _ = cmd_tx.send(Cmd::InvalidateProject);
 }
 
+/// 把任务台账回灌到界面：状态栏 chip 文案 + 任务中心列表 + 三个计数。
+fn refresh_tasks(ui: &MainWindow, state: &Rc<UiState>) {
+    let q = state.tasks.borrow();
+    let counts = q.counts();
+    let rows: Vec<TaskRow> = q
+        .tasks_newest_first()
+        .map(|t| TaskRow {
+            id: t.id as i32,
+            kind: t.kind.label().into(),
+            title: t.title.clone().into(),
+            state: t.state.label().into(),
+            detail: t.detail.clone().into(),
+            progress: t.progress,
+            tab: t.kind.tab(),
+        })
+        .collect();
+    ui.set_task_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    ui.set_task_running(counts.running as i32);
+    ui.set_task_failed(counts.failed as i32);
+    ui.set_task_finished(counts.finished as i32);
+    ui.set_task_chip(task_chip_text(&q).into());
+}
+
+/// 状态栏那枚 chip 的文案：优先显示"正在跑什么"，其次失败，再次完成。
+fn task_chip_text(q: &tasks::TaskQueue) -> String {
+    if let Some(t) = q.running() {
+        let pct = (t.progress * 100.0).round() as i32;
+        return format!("任务 · {} {}%", t.kind.label(), pct);
+    }
+    let c = q.counts();
+    if let Some(t) = q.last_failed() {
+        return format!("任务 · {} 个失败（{}）", c.failed, t.kind.label());
+    }
+    if c.finished > 0 {
+        return format!("任务 · 已完成 {}", c.finished);
+    }
+    "任务 · 空闲".to_string()
+}
+
+/// 登记一个新任务并立刻刷新界面（三处任务起点共用）。
+fn start_task(
+    ui: &MainWindow,
+    state: &Rc<UiState>,
+    slot: &std::cell::Cell<Option<u32>>,
+    kind: tasks::TaskKind,
+    title: impl Into<String>,
+) {
+    let id = state.tasks.borrow_mut().start(kind, title);
+    slot.set(Some(id));
+    refresh_tasks(ui, state);
+}
+
+/// 收尾一个任务并刷新（slot 里没有 id 时是空操作：例如启动前就失败）。
+fn finish_task(
+    ui: &MainWindow,
+    state: &Rc<UiState>,
+    slot: &std::cell::Cell<Option<u32>>,
+    task_state: tasks::TaskState,
+    detail: impl Into<String>,
+) {
+    let Some(id) = slot.take() else { return };
+    state.tasks.borrow_mut().finish(id, task_state, detail);
+    refresh_tasks(ui, state);
+}
+
+fn progress_task(
+    ui: &MainWindow,
+    state: &Rc<UiState>,
+    slot: &std::cell::Cell<Option<u32>>,
+    progress: f32,
+    detail: impl Into<String>,
+) {
+    let Some(id) = slot.get() else { return };
+    state.tasks.borrow_mut().progress(id, progress, detail);
+    refresh_tasks(ui, state);
+}
+
 fn reset_bgm(ui: &MainWindow, state: &Rc<UiState>) {
     state.bgm_artifacts.borrow_mut().take();
     ui.set_bgm_has_result(false);
@@ -1720,6 +1810,72 @@ fn wire_script(
         let n = rows4.row_count();
         ui.set_status_text(format!("已重新切句：{n} 句").into());
         toast(&ui, &format!("已重新切句：{n} 句"));
+    });
+}
+
+/// 任务中心：跳转到任务所属 Tab、清除已完成。停止 / 重试仍在各 Tab 自己做
+/// （那里已经知道该重试什么参数，任务中心不复制这套状态）。
+/// 截图/演示用：`AW_UI_STATE=tasks` 时灌三条示例任务并打开任务中心
+/// （仅 debug 构建存在，release 被编译掉）。
+#[cfg(debug_assertions)]
+fn seed_shot_tasks(ui: &MainWindow, state: &Rc<UiState>) {
+    if std::env::var("AW_UI_STATE").as_deref() != Ok("tasks") {
+        return;
+    }
+    let running = state
+        .tasks
+        .borrow_mut()
+        .start(tasks::TaskKind::Dub, "配音 · 34 句");
+    state
+        .tasks
+        .borrow_mut()
+        .progress(running, 0.35, "第 12/34 句已完成");
+    let failed = state
+        .tasks
+        .borrow_mut()
+        .start(tasks::TaskKind::Bgm, "BGM · 生成并混音");
+    state.tasks.borrow_mut().finish(
+        failed,
+        tasks::TaskState::Failed,
+        "磁盘不足：目标卷剩余 0.2GB",
+    );
+    let done = state
+        .tasks
+        .borrow_mut()
+        .start(tasks::TaskKind::Song, "音乐制作 · 生成歌曲");
+    state
+        .tasks
+        .borrow_mut()
+        .finish(done, tasks::TaskState::Done, "成品 168.0s");
+    ui.set_task_center_open(true);
+    refresh_tasks(ui, state);
+    ui.set_status_text("任务中心：跨 Tab 任务台账（示例数据，切 Tab 不会取消任务）".into());
+}
+
+fn wire_task_center(ui: &MainWindow, state: &Rc<UiState>) {
+    let weak = ui.as_weak();
+    ui.on_task_jump(move |tab| {
+        let Some(ui) = weak.upgrade() else { return };
+        let tab = tab.clamp(0, ui.get_scenes().row_count() as i32 - 1);
+        ui.set_scene(tab);
+        ui.set_task_center_open(false);
+        let name = ui
+            .get_scenes()
+            .row_data(tab as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        ui.set_status_text(format!("已切到「{name}」：任务在后台继续跑").into());
+    });
+
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_task_clear_finished(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let n = st.tasks.borrow_mut().clear_finished();
+        refresh_tasks(&ui, &st);
+        if n > 0 {
+            ui.set_status_text(format!("已从任务中心清除 {n} 条终态任务").into());
+        }
     });
 }
 
@@ -1884,6 +2040,13 @@ fn wire_sentence_actions(
         }
         ui.set_selected(i);
         ui.set_busy(true);
+        start_task(
+            &ui,
+            &state3,
+            &state3.redo_task,
+            tasks::TaskKind::Dub,
+            format!("重录第 {} 句", idx + 1),
+        );
         if tx3
             .send(Cmd::Redo {
                 revision: state3.project_revision.get(),
@@ -1950,6 +2113,13 @@ fn wire_run(
         }
         reset_bgm(&ui, &state1);
         stop1.store(false, Ordering::Relaxed);
+        start_task(
+            &ui,
+            &state1,
+            &state1.dub_task,
+            tasks::TaskKind::Dub,
+            format!("配音 · {n} 句"),
+        );
         ui.set_running(true);
         ui.set_has_result(false);
         ui.set_progress(ui.get_done_count() as f32 / n.max(1) as f32);
@@ -2112,6 +2282,13 @@ fn wire_bgm(
         }
         reset_bgm(&ui, &state1);
         ui.set_busy(true);
+        start_task(
+            &ui,
+            &state1,
+            &state1.bgm_task,
+            tasks::TaskKind::Bgm,
+            "BGM · 生成并混音",
+        );
         ui.set_bgm_status_text("正在生成 BGM 分段…".into());
         if tx
             .send(Cmd::RunBgm {
@@ -2200,6 +2377,13 @@ fn wire_song(
             return;
         }
         ui.set_busy(true);
+        start_task(
+            &ui,
+            &state1,
+            &state1.song_task,
+            tasks::TaskKind::Song,
+            "音乐制作 · 生成歌曲",
+        );
         ui.set_song_has_result(false);
         ui.set_song_status_text(
             "歌曲生成中（yue2 可能约 8 分钟，ACE-Step 120s 约 6.4 分钟）…".into(),
@@ -2350,6 +2534,13 @@ fn tick(
                 mark_running_rows_failed(rows);
                 ui.set_running(false);
                 ui.set_busy(false);
+                finish_task(
+                    ui,
+                    state,
+                    &state.dub_task,
+                    tasks::TaskState::Failed,
+                    t.clone(),
+                );
                 ui.set_status_text(t.into());
             }
             Msg::Sentence {
@@ -2371,7 +2562,15 @@ fn tick(
                         })
                         .count();
                     ui.set_done_count(done as i32);
-                    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
+                    let p = done as f32 / rows.row_count().max(1) as f32;
+                    ui.set_progress(p);
+                    progress_task(
+                        ui,
+                        state,
+                        &state.dub_task,
+                        p,
+                        format!("{done}/{} 句已完成", rows.row_count()),
+                    );
                 }
             }
             Msg::RunDone {
@@ -2380,15 +2579,48 @@ fn tick(
                 reused,
             } => {
                 ui.set_busy(false);
+                // 任务台账：停下来 = 已停止；有失败句 = 失败；否则完成
+                let (task_state, detail) = if stopped {
+                    (tasks::TaskState::Stopped, "用户停止".to_string())
+                } else if failed > 0 {
+                    (tasks::TaskState::Failed, format!("{failed} 句失败"))
+                } else {
+                    (
+                        tasks::TaskState::Done,
+                        if reused > 0 {
+                            format!("完成（复用 {reused} 句）")
+                        } else {
+                            "完成".to_string()
+                        },
+                    )
+                };
+                finish_task(ui, state, &state.dub_task, task_state, detail);
                 run_finished = Some((failed, stopped, reused));
             }
             Msg::RedoDone { index, error } => {
                 ui.set_busy(false);
-                if let Some(error) = error {
-                    set_status(rows, index, "error");
-                    ui.set_status_text(error.into());
-                } else {
-                    ui.set_status_text(format!("第 {} 句重录完成", index + 1).into());
+                match error {
+                    Some(error) => {
+                        set_status(rows, index, "error");
+                        finish_task(
+                            ui,
+                            state,
+                            &state.redo_task,
+                            tasks::TaskState::Failed,
+                            error.clone(),
+                        );
+                        ui.set_status_text(error.into());
+                    }
+                    None => {
+                        finish_task(
+                            ui,
+                            state,
+                            &state.redo_task,
+                            tasks::TaskState::Done,
+                            format!("第 {} 句已重录", index + 1),
+                        );
+                        ui.set_status_text(format!("第 {} 句重录完成", index + 1).into());
+                    }
                 }
             }
             Msg::AssembleFailed(error) => {
@@ -2433,6 +2665,7 @@ fn tick(
                 let progress = done as f32 / total.max(1) as f32;
                 ui.set_bgm_progress(progress);
                 let note = format!("BGM 生成中：{done}/{total} 段");
+                progress_task(ui, state, &state.bgm_task, progress, note.clone());
                 ui.set_bgm_status_text(note.clone().into());
                 ui.set_status_text(note.into());
             }
@@ -2447,12 +2680,26 @@ fn tick(
                     "BGM 完成：{segments} 段 · 成品 {:.1}s · 已生成 voice/bgm/mixed",
                     artifacts.duration
                 );
+                finish_task(
+                    ui,
+                    state,
+                    &state.bgm_task,
+                    tasks::TaskState::Done,
+                    format!("{segments} 段 · 成品 {:.1}s", artifacts.duration),
+                );
                 ui.set_bgm_status_text(note.clone().into());
                 ui.set_status_text(note.into());
                 *state.bgm_artifacts.borrow_mut() = Some(artifacts);
             }
             Msg::BgmFailed(error) => {
                 ui.set_busy(false);
+                finish_task(
+                    ui,
+                    state,
+                    &state.bgm_task,
+                    tasks::TaskState::Failed,
+                    error.clone(),
+                );
                 ui.set_bgm_has_result(false);
                 ui.set_bgm_progress(0.0);
                 ui.set_bgm_status_text(error.clone().into());
@@ -2460,6 +2707,13 @@ fn tick(
             }
             Msg::SongDone { path, duration } => {
                 ui.set_busy(false);
+                finish_task(
+                    ui,
+                    state,
+                    &state.song_task,
+                    tasks::TaskState::Done,
+                    format!("成品 {duration:.1}s"),
+                );
                 ui.set_song_has_result(true);
                 let note = format!("歌曲完成：{duration:.1}s · {}", path.display());
                 ui.set_song_status_text(note.clone().into());
@@ -2468,6 +2722,13 @@ fn tick(
             }
             Msg::SongFailed(error) => {
                 ui.set_busy(false);
+                finish_task(
+                    ui,
+                    state,
+                    &state.song_task,
+                    tasks::TaskState::Failed,
+                    error.clone(),
+                );
                 ui.set_song_has_result(false);
                 ui.set_song_status_text(error.clone().into());
                 ui.set_status_text(error.into());
@@ -3317,13 +3578,9 @@ mod tests {
     #[test]
     fn invalidation_bumps_revision_and_clears_ready() {
         let state = Rc::new(UiState {
-            assembled: RefCell::new(None),
-            project_dir: RefCell::new(None),
-            playing_total: std::cell::Cell::new(1.0),
             project_ready: std::cell::Cell::new(true),
             project_revision: std::cell::Cell::new(7),
-            bgm_artifacts: RefCell::new(None),
-            song_artifact: RefCell::new(None),
+            ..UiState::default()
         });
         let (tx, rx) = channel();
         invalidate_worker_project(&tx, &state);
