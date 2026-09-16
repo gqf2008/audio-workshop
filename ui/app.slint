@@ -220,7 +220,10 @@ export component MainWindow inherits Window {
     callback sep-stop();
     callback sep-preview-track(int);
     callback sep-export-track(int);
-    callback task-jump(int);
+    // 带状态是为了说对话：失败条目是"去重试"，运行中的是"后台继续跑"——
+    // 无条件说"任务在后台继续跑"会把已经终态的失败任务说成还在跑（复核抓到）
+    callback task-jump(int, string);
+    callback task-stop(int);
     callback task-clear-finished();
     callback apply-server-settings();
     callback rescan-models();
@@ -709,11 +712,23 @@ export component MainWindow inherits Window {
                                     overflow: elide;
                                 }
                             }
-                            PixelButton {
-                                width: 64px;
-                                size: "small";
-                                text: "跳转";
-                                clicked => { root.task-jump(t.tab); }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                // 只有"真的能停"的条目才有这个按钮：种类能力 × 状态 ×
+                                // 是否本 Tab 在飞那条（判定在 src/main.rs 的 can_stop_task）
+                                if t.can-stop : PixelButton {
+                                    width: 56px;
+                                    size: "small";
+                                    text: "停止";
+                                    clicked => { root.task-stop(t.id); }
+                                }
+                                PixelButton {
+                                    width: 64px;
+                                    size: "small";
+                                    // 失败条目是"回去重试"，别把实现词「跳转」摆给用户
+                                    text: t.state == "失败" ? "去重试" : "跳转";
+                                    clicked => { root.task-jump(t.tab, t.state); }
+                                }
                             }
                         }
                     }
@@ -724,7 +739,7 @@ export component MainWindow inherits Window {
                 spacing: 10px;
                 Text {
                     horizontal-stretch: 1;
-                    text: "点「跳转」回该 Tab 停止 / 重试；任务在后台继续跑。";
+                    text: "带「停止」按钮的任务可直接在这里停；失败的点「去重试」回该 Tab。";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     vertical-alignment: center;
