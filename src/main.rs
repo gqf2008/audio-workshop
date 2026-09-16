@@ -2839,6 +2839,8 @@ fn restore_project(
     // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）
     *state.eval_scores.borrow_mut() = scores_from_project(&project);
     apply_eval_labels(rows, &state.eval_scores.borrow());
+    // BGM 产物是落盘的：重开应用也要看到上次那几轨（否则"昨天混好的分轨今天导不出来"）
+    restore_bgm_from_disk(ui, state, &dir);
     let _ = cmd_tx.send(Cmd::OpenProject {
         revision: state.project_revision.get(),
         dir,
@@ -3278,6 +3280,58 @@ fn progress_task(
 /// （含排队中）也要挡住稿件/工程名编辑。质检本身很短（N×0.3s 量级）。
 fn project_editing_blocked(ui: &MainWindow, state: &Rc<UiState>) -> bool {
     ui.get_running() || ui.get_busy() || state.eval_task.get().is_some()
+}
+
+/// 把一套 BGM 产物灌进界面（含"有哪几轨显示哪几轨"）。
+///
+/// 抽出来是为了让**从磁盘恢复**（重开应用打开旧工程）与"刚跑完混音"走同一段界面更新，
+/// 不然两条路径的轨道行/标签迟早不一致。
+fn apply_bgm_artifacts(ui: &MainWindow, state: &Rc<UiState>, artifacts: &BgmArtifacts) {
+    ui.set_bgm_has_result(true);
+    ui.set_bgm_stale(false);
+    ui.set_bgm_progress(1.0);
+    ui.set_bgm_has_voice_track(artifacts.voice.is_some());
+    ui.set_bgm_has_mixed_track(artifacts.mixed.is_some());
+    ui.set_bgm_voice_label(
+        artifacts
+            .voice
+            .as_ref()
+            .map(|p| format!("人声 · {}", file_label(p)))
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_bgm_track_label(format!("BGM · {}", file_label(&artifacts.bgm)).into());
+    ui.set_bgm_mixed_label(
+        artifacts
+            .mixed
+            .as_ref()
+            .map(|p| format!("混音 · {}", file_label(p)))
+            .unwrap_or_default()
+            .into(),
+    );
+    *state.bgm_artifacts.borrow_mut() = Some(artifacts.clone());
+}
+
+/// 从磁盘恢复 BGM 产物（启动打开旧工程时用）：只恢复**仍然配套**的那套——
+/// 独立生成的 BGM（没有配音成品）直接可用；混音过的要过 `mix_is_current`，
+/// 配音成品变过就说明这套混音过期了，宁可不显示也不拿旧结果当当前产物。
+fn restore_bgm_from_disk(ui: &MainWindow, state: &Rc<UiState>, dir: &Path) {
+    if !dir.join("bgm/bgm.wav").is_file() {
+        return;
+    }
+    if !export::mix_is_current(dir) {
+        return;
+    }
+    if let Ok(artifacts) = aw_core::bgm_artifacts_from_disk(dir) {
+        apply_bgm_artifacts(ui, state, &artifacts);
+        ui.set_bgm_status_text(
+            format!(
+                "已恢复上次的 BGM 产物：{} 段 · 成品 {:.1}s",
+                artifacts.segments, artifacts.duration
+            )
+            .into(),
+        );
+    }
 }
 
 fn reset_bgm(ui: &MainWindow, state: &Rc<UiState>) {
@@ -4461,7 +4515,10 @@ fn wire_export(
         }
         let name = file_stem(&ui.get_project_name());
         let dir = PathBuf::from(ui.get_export_dir().to_string());
-        let outcome = export::export_stems(&name, &project_dir(&name), &dir);
+        // `bgm_has_result`：UI 认为磁盘上的 BGM/混音仍是当前结果（改稿、改 BGM 描述后
+        // 会被清掉）。描述改没改只有 UI 知道，磁盘那层只看"配没配上这份配音成品"。
+        let outcome =
+            export::export_stems(&name, &project_dir(&name), &dir, ui.get_bgm_has_result());
         let text = match &outcome {
             export::StemExportOutcome::Done(s) => {
                 if let Some(first) = s.written.first() {
@@ -4472,6 +4529,10 @@ fn wire_export(
             export::StemExportOutcome::NothingToExport => {
                 "分轨导出：这个工程还没有成品（先合成 / 混音）".to_string()
             }
+            export::StemExportOutcome::Stale(reasons) => format!(
+                "分轨导出：磁盘上的混音过期了（{}）；在 BGM 页重新生成并混音后再导",
+                reasons.join("；")
+            ),
             export::StemExportOutcome::Failed(e) => format!("分轨导出失败：{e}"),
         };
         ui.set_status_text(text.into());
@@ -4601,11 +4662,8 @@ fn wire_bgm(
     let st_export = state.clone();
     ui.on_bgm_export_track(move |i| {
         let Some(ui) = weak.upgrade() else { return };
-        // 还没混过音时先给一句更贴近情境的话（下面 export_stem 也会兜底返回"没有可导出的轨"）
-        if st_export.bgm_artifacts.borrow().is_none() {
-            ui.set_status_text("还没有 BGM 成品：先生成并混音".into());
-            return;
-        }
+        // 注意：这里**不**再看 `bgm_artifacts` 在不在内存里——分轨导出的来源是磁盘
+        // （重开应用打开旧工程时内存里没有 artifacts，但 bgm/bgm.wav 一直在）。
         if let Some(refusal) = export_refusal(ui.get_busy(), batch_in_flight(&st_export)) {
             ui.set_status_text(refusal.into());
             return;
@@ -4614,7 +4672,13 @@ fn wire_bgm(
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         let name = file_stem(&ui.get_project_name());
         let project = project_dir(&name);
-        match export::export_stem(&name, &project, &dir, stem_for_track(i)) {
+        match export::export_stem(
+            &name,
+            &project,
+            &dir,
+            stem_for_track(i),
+            ui.get_bgm_has_result(),
+        ) {
             export::StemExportOutcome::Done(s) => {
                 let Some(path) = s.written.first() else {
                     ui.set_status_text("这一轨没有导出".into());
@@ -4626,6 +4690,13 @@ fn wire_bgm(
             export::StemExportOutcome::NothingToExport => {
                 ui.set_status_text("这一轨不存在：本次是独立生成的 BGM（只有 BGM 轨）".into());
             }
+            export::StemExportOutcome::Stale(reasons) => ui.set_status_text(
+                format!(
+                    "这一轨是旧混音，与当前配音成品对不上（{}）；先重新生成并混音",
+                    reasons.join("；")
+                )
+                .into(),
+            ),
             export::StemExportOutcome::Failed(e) => ui.set_status_text(e.into()),
         }
     });
@@ -5081,29 +5152,7 @@ fn tick(
                 mixed,
             } => {
                 ui.set_busy(false);
-                ui.set_bgm_has_result(true);
-                ui.set_bgm_stale(false);
-                ui.set_bgm_progress(1.0);
-                // 有哪几轨就显示哪几轨：独立生成只有 BGM 一轨
-                ui.set_bgm_has_voice_track(artifacts.voice.is_some());
-                ui.set_bgm_has_mixed_track(artifacts.mixed.is_some());
-                ui.set_bgm_voice_label(
-                    artifacts
-                        .voice
-                        .as_ref()
-                        .map(|p| format!("人声 · {}", file_label(p)))
-                        .unwrap_or_default()
-                        .into(),
-                );
-                ui.set_bgm_track_label(format!("BGM · {}", file_label(&artifacts.bgm)).into());
-                ui.set_bgm_mixed_label(
-                    artifacts
-                        .mixed
-                        .as_ref()
-                        .map(|p| format!("混音 · {}", file_label(p)))
-                        .unwrap_or_default()
-                        .into(),
-                );
+                apply_bgm_artifacts(ui, state, &artifacts);
                 let note = if mixed {
                     format!(
                         "BGM 完成：{segments} 段 · 成品 {:.1}s · 已生成 voice/bgm/mixed",
@@ -5124,6 +5173,25 @@ fn tick(
                 );
                 ui.set_bgm_status_text(note.clone().into());
                 ui.set_status_text(note.into());
+                // 混音成功就把"这次混的是哪份配音成品"记下来：之后改稿/重录再想导分轨时，
+                // 靠它判断这套 mixed/bgm 是不是已经过期（见 src/export.rs::mix_is_current）
+                if artifacts.mixed.is_some() {
+                    if let Some(dir) = artifacts
+                        .mixed
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.parent())
+                    {
+                        if let Err(e) = export::write_mix_manifest(dir) {
+                            ui.set_status_text(
+                                format!(
+                                    "混音完成，但指纹没记上（{e}）：下次导分轨会提示先重新混音"
+                                )
+                                .into(),
+                            );
+                        }
+                    }
+                }
                 *state.bgm_artifacts.borrow_mut() = Some(artifacts);
             }
             Msg::BgmStopped { done } => {
