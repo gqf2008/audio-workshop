@@ -564,7 +564,7 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
                 Text {
-                    text: root.task-running + " 运行 · " + root.task-failed + " 失败 · " + root.task-finished + " 完成";
+                    text: root.task-running + " 运行 · " + root.task-failed + " 失败 · " + root.task-finished + " 结束";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     vertical-alignment: center;
@@ -665,7 +665,7 @@ export component MainWindow inherits Window {
                 PixelButton {
                     width: 108px;
                     size: "small";
-                    text: "清除已完成";
+                    text: "清除已结束";
                     enabled: root.task-finished > 0;
                     clicked => { root.task-clear-finished(); }
                 }

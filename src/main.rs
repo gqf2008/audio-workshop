@@ -1665,7 +1665,8 @@ fn task_chip_text(q: &tasks::TaskQueue) -> String {
         return format!("任务 · {} 个失败（{}）", c.failed, t.kind.label());
     }
     if c.finished > 0 {
-        return format!("任务 · 已完成 {}", c.finished);
+        // 「结束」= 完成 + 已停止，不写"完成"以免把用户停掉的任务算成成功
+        return format!("任务 · 已结束 {}", c.finished);
     }
     "任务 · 空闲".to_string()
 }
@@ -1874,7 +1875,7 @@ fn wire_task_center(ui: &MainWindow, state: &Rc<UiState>) {
         let n = st.tasks.borrow_mut().clear_finished();
         refresh_tasks(&ui, &st);
         if n > 0 {
-            ui.set_status_text(format!("已从任务中心清除 {n} 条终态任务").into());
+            ui.set_status_text(format!("已从任务中心清除 {n} 条已结束任务").into());
         }
     });
 }
@@ -2055,7 +2056,16 @@ fn wire_sentence_actions(
             .is_err()
         {
             ui.set_busy(false);
-            ui.set_status_text("工作线程不可用：重录未发出，请重启应用".into());
+            let note = "工作线程不可用：重录未发出，请重启应用";
+            // 收尾台账：命令没发出去，任务不能永远停在"运行中"
+            finish_task(
+                &ui,
+                &state3,
+                &state3.redo_task,
+                tasks::TaskState::Failed,
+                note,
+            );
+            ui.set_status_text(note.into());
             return;
         }
         ui.set_status_text(format!("单句重录中：第 {} 句（换 seed 重跑）", i + 1).into());
@@ -2141,7 +2151,15 @@ fn wire_run(
         {
             ui.set_running(false);
             state1.project_ready.set(false);
-            ui.set_status_text("工作线程不可用：合成未发出，请重启应用".into());
+            let note = "工作线程不可用：合成未发出，请重启应用";
+            finish_task(
+                &ui,
+                &state1,
+                &state1.dub_task,
+                tasks::TaskState::Failed,
+                note,
+            );
+            ui.set_status_text(note.into());
             return;
         }
         ui.set_status_text(
@@ -2299,6 +2317,13 @@ fn wire_bgm(
         {
             ui.set_busy(false);
             let note = "工作线程不可用：BGM 未发出，请重启应用";
+            finish_task(
+                &ui,
+                &state1,
+                &state1.bgm_task,
+                tasks::TaskState::Failed,
+                note,
+            );
             ui.set_bgm_status_text(note.into());
             ui.set_status_text(note.into());
         }
@@ -2405,6 +2430,13 @@ fn wire_song(
         {
             ui.set_busy(false);
             let note = "工作线程不可用：歌曲未发出，请重启应用";
+            finish_task(
+                &ui,
+                &state1,
+                &state1.song_task,
+                tasks::TaskState::Failed,
+                note,
+            );
             ui.set_song_status_text(note.into());
             ui.set_status_text(note.into());
         }
@@ -2966,6 +2998,13 @@ fn wire_global_settings(
     let msg = msg_tx.clone();
     ui.on_apply_server_settings(move || {
         let Some(ui) = weak.upgrade() else { return };
+        // 运行中不许换服务：换服务会让 in-flight 任务的终态消息按 revision 被过滤，
+        // 台账就会永久停在"运行中"。目前 UI 靠 drawer 的 busy 绑定挡住，
+        // 这里再加一道，避免以后把按钮移出抽屉时重新踩坑。
+        if ui.get_running() || ui.get_busy() {
+            ui.set_server_status("任务进行中：等当前任务结束再改服务设置".into());
+            return;
+        }
         let locked = ui.get_server_locked();
         let host = ui.get_server_host().trim().to_string();
         let port_raw = ui.get_server_port().trim().to_string();
@@ -3026,6 +3065,10 @@ fn wire_global_settings(
     let st = state.clone();
     ui.on_rescan_models(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() {
+            ui.set_server_status("任务进行中：等当前任务结束再重新扫描".into());
+            return;
+        }
         apply_engine_discovery(&ui, Some((&tx, &st)));
         ui.set_server_status("已重新扫描模型清单".into());
     });

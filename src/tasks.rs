@@ -73,6 +73,8 @@ pub struct Task {
 pub struct Counts {
     pub running: usize,
     pub failed: usize,
+    /// 终态且非失败：**完成 + 已停止**都算这里。界面文案必须写「结束」而不是「完成」，
+    /// 否则用户主动停止的任务会被显示成"完成"。
     pub finished: usize,
 }
 
@@ -235,6 +237,23 @@ mod tests {
         assert_eq!(t.detail, "磁盘满");
         assert_eq!(q.counts().failed, 1);
         assert_eq!(q.counts().finished, 0);
+    }
+
+    /// 停止属于"结束"而不是"失败"、也不是"完成"这类成功语义——这档分类此前没人守，
+    /// 改坏成 failed 时全绿（审查指出）。
+    #[test]
+    fn stopped_counts_as_finished_not_failed() {
+        let mut q = TaskQueue::default();
+        let id = q.start(TaskKind::Dub, "被停掉的配音");
+        q.finish(id, TaskState::Stopped, "用户停止");
+        let c = q.counts();
+        assert_eq!(c.running, 0);
+        assert_eq!(c.failed, 0, "主动停止不是失败");
+        assert_eq!(c.finished, 1, "停止与完成同属「结束」档");
+        assert!(
+            q.last_failed().is_none(),
+            "停止的任务不该被当成'最近失败'提示"
+        );
     }
 
     #[test]
