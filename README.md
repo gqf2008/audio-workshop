@@ -42,7 +42,8 @@ cargo run --release        # 打开配音工作台
 - **断点续作**：工程逐句落盘（`~/Documents/音频作坊/projects/<工程名>/`），
   重开 / 重跑自动跳过已合成句。
 - **单句重录**：行内「重录」换 seed 只重跑该句；时间轴点击 = 从那句开始听。
-- **音色克隆**：抽屉「音色」填参考 wav 路径（index-tts2 的 voice_ref）。
+- **音色克隆**：配音页旁白块内「换音色 → 参考音频」填参考 wav 路径（index-tts2 的 voice_ref），
+  也可以走「音色设计」Tab。
 - **BGM 三轨**：BGM 场景按当前配音工程时长生成 30s 分段，按句子时间轴自动 duck，
   导出 `<工程>_voice.wav`、`<工程>_bgm.wav`、`<工程>_mixed.wav` 和 SRT。
 - **跨平台配置**：工程/导出目录使用系统 Documents；模型根可用 `AW_MODELS_ROOT` 覆盖；

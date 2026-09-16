@@ -33,7 +33,9 @@ def server_json_path() -> Path:
     env = os.environ.get("AW_SERVER_CONFIG")
     if env:
         return Path(env).expanduser()
-    candidates = [config_dir() / "server.json", legacy_dir() / "server.json"]
+    # 顺序与 Rust 侧 src/main.rs::config_path() **保持一致**：历史路径优先，
+    # 两个都存在时不改变老用户现有的读取目标。
+    candidates = [legacy_dir() / "server.json", config_dir() / "server.json"]
     for path in candidates:
         if path.is_file():
             return path
