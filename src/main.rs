@@ -2855,10 +2855,15 @@ mod tests {
         assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
     }
 
-    /// `resolve_base` 是客户端与回显的**唯一**解析入口：单边覆盖必须两边同样生效。
-    /// （审查抓到的正是"回显改了、客户端没改"→ 同屏显示 A、实连 B。）
+    /// `resolve_base` 的字段级覆盖语义：单边覆盖必须生效。
+    ///
+    /// 注意本用例**测的是纯函数**，钉不住"调用方是否真的用它"——审查复核过：
+    /// 把 `discover_engine` 改回旧的成对逻辑，这条仍绿。那条不变式目前只能靠
+    /// "非测试代码里只有 resolve_base 一处拼 `http://host:port`"这一构造来保证
+    /// （见该函数注释）。要真正钉住得让 `discover_engine` 也吃显式参数（环境变量
+    /// 无法在测试里安全设置，见 LESSON_多线程测试中set_var修改进程环境是UB）。
     #[test]
-    fn resolve_base_is_single_source_for_client_and_echo() {
+    fn resolve_base_handles_field_level_overrides() {
         let cfg = Some(ServerConfig {
             host: Some("manifest-host".into()),
             port: Some(1111),
@@ -2899,16 +2904,24 @@ mod tests {
         assert!(has_endpoint_source(&empty, &None, Some("http://env:2222")));
     }
 
-    /// 扫描条目上限是**整次扫描**的预算：超限就停，不会把 UI 线程扫死。
+    /// 扫描条目上限是**整次扫描的总预算**（不是每个目录各一份）。
+    /// 样本刻意放成 3 个子目录 × 2 个文件：per-dir 上限会数到 6，
+    /// 总预算必须停在 ≤2，这条断言才能真的区分两种实现。
     #[test]
     fn scan_model_dir_stops_at_entry_budget() {
         let dir = temp_dir("scan-cap");
-        for i in 0..5 {
-            std::fs::write(dir.join(format!("m{i}.gguf")), b"x").unwrap();
+        for sub in ["a", "b", "c"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            for i in 0..2 {
+                std::fs::write(dir.join(format!("{sub}/m{i}.gguf")), b"x").unwrap();
+            }
         }
         let (exists, n) = scan_model_dir_with_limit(&dir, 2);
         assert!(exists);
-        assert!(n <= 2, "预算 2 时最多数到 2 个，实得 {n}");
+        assert!(
+            n <= 2,
+            "总预算 2 时最多数到 2 个（per-dir 实现会数到 6），实得 {n}"
+        );
     }
 
     /// 服务地址三档优先级：AW_SERVER 整串优先；全局设置 > 清单；host/port **各自独立**回落

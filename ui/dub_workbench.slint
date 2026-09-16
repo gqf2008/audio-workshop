@@ -288,7 +288,9 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     }
                 }
                 Text {
-                    text: "改的是本应用去连哪个服务；服务自身的监听地址由 audio-service 启动参数 / 清单决定，本应用不改写它。";
+                    text: root.server-locked
+                        ? "⚠ 环境变量 AW_SERVER 正在覆盖这里的地址（输入已锁定）：本应用连的是环境变量给的地址，不是上面显示的。要改请在启动环境里去掉 AW_SERVER。"
+                        : "改的是本应用去连哪个服务；服务自身的监听地址由 audio-service 启动参数 / 清单决定，本应用不改写它。";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;
