@@ -266,12 +266,17 @@ pub fn separate_tracks(
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     stems
         .save(Stem::Vocals, &vocals_tmp.display().to_string())
-        .map_err(|e| format!("写出人声轨失败（{}）：{e}", vocals_tmp.display()))?;
+        .map_err(|e| {
+            format!(
+                "写出人声轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
+                vocals_tmp.display()
+            )
+        })?;
     if let Err(e) = stems.save_mix_except(&[Stem::Vocals], &accompaniment_tmp.display().to_string())
     {
         let _ = std::fs::remove_file(&vocals_tmp);
         return Err(format!(
-            "写出伴奏轨失败（{}）：{e}",
+            "写出伴奏轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
             accompaniment_tmp.display()
         ));
     }

@@ -525,6 +525,28 @@ pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> St
     }
 }
 
+/// 原子复制：同目录临时文件 + fsync + rename。
+///
+/// 导出以前用 `std::fs::copy`，失败时会留下**写了一半的目标文件**——所以
+/// `write_failure_note` 里那句"已写好的文件不会被破坏"对导出并不成立（复核指出）。
+/// 导出是用户交付物，同样值得原子化：要么旧文件不变，要么新文件完整。
+pub fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let tmp = dst.with_file_name(format!(
+        "{}.tmp{}",
+        dst.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
+        std::process::id()
+    ));
+    let result =
+        std::fs::copy(src, &tmp).and_then(|_| std::fs::File::open(&tmp).and_then(|f| f.sync_all()));
+    match result {
+        Ok(()) => std::fs::rename(&tmp, dst),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // 失败不留残渣
+            Err(e)
+        }
+    }
+}
+
 /// hound（wav 读写）的错误 → 可执行文案：`IoError` 能按 io 分类的就分类，
 /// 其余原样带路径透出。拼装的流式写拿不到确切字节数，`bytes` 传 0，文案里就不提"需要多少"。
 pub fn hound_error_note(path: &Path, bytes: usize, err: &hound::Error) -> String {
@@ -854,5 +876,44 @@ mod tests {
             w.write_sample((i % 97) as i16).unwrap();
         }
         w.finalize().unwrap();
+    }
+
+    /// 导出改原子复制后：失败不能留下半截目标文件，旧目标也不能被动过
+    /// （复核指出 `std::fs::copy` 失败会截断目标，而文案声称"已写好的文件不会被破坏"）。
+    #[test]
+    fn copy_atomic_keeps_old_target_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("aw-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src = dir.join("src.wav");
+        std::fs::write(&src, b"new-bytes").unwrap();
+        let dst = dir.join("dst.wav");
+        std::fs::write(&dst, b"old").unwrap();
+
+        copy_atomic(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new-bytes");
+
+        // 源不存在 → 失败，但**旧目标仍是完整内容**，且没有 .tmp 残渣
+        let missing = dir.join("nope.wav");
+        let err = copy_atomic(&missing, &dst).unwrap_err();
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"new-bytes",
+            "失败的复制不该动到已有目标"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不该留下临时文件：{leftovers:?}");
+        // 源不存在 → 走 NotFound 分支：文案要是"重建目录后再重跑"这类动作，而不是裸 errno
+        let note = write_failure_note(&dst, 0, &err);
+        assert!(
+            note.contains("重建目录后再重跑"),
+            "复制失败也要给动作：{note}"
+        );
     }
 }

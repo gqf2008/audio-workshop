@@ -279,16 +279,18 @@ pub fn assemble_bgm(dir: &Path, options: &BgmOptions) -> Result<PathBuf, String>
             for ch in 0..spec.channels as usize {
                 writer
                     .write_sample(samples[base + ch])
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| hound_error_note(&out, 0, &e))?;
             }
             written += 1;
         }
         index += 1;
     }
-    writer.finalize().map_err(|e| e.to_string())?;
+    writer
+        .finalize()
+        .map_err(|e| hound_error_note(&out, 0, &e))?;
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| write_failure_note(&out, 0, &e))?;
     std::fs::rename(&tmp, &out).map_err(|e| write_failure_note(&out, 0, &e))?;
     Ok(out)
 }
@@ -428,14 +430,15 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
         let (bl, br) = read_stereo_frame(&mut bi, bs.channels)?;
         let g = gains[frame as usize];
         out.write_sample(mix_sample(vl, bl, g))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| hound_error_note(&mixed_path, 0, &e))?;
         out.write_sample(mix_sample(vr, br, g))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| hound_error_note(&mixed_path, 0, &e))?;
     }
-    out.finalize().map_err(|e| e.to_string())?;
+    out.finalize()
+        .map_err(|e| hound_error_note(&mixed_path, 0, &e))?;
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| write_failure_note(&mixed_path, 0, &e))?;
     std::fs::rename(&tmp, &mixed_path).map_err(|e| write_failure_note(&mixed_path, 0, &e))?;
     Ok(BgmArtifacts {
         voice: Some(voice_copy),
@@ -470,5 +473,57 @@ mod tests {
             (short_gap[4_800] - 0.2).abs() < 0.01,
             "gap<fade 在下一句活跃时应保持压低"
         );
+    }
+
+    /// 复核要求：光测 helper 不算覆盖，必须走**真实写入路径**。
+    /// 让 `bgm/` 目录不可写，`assemble_bgm` 创建 bgm.wav 时必然失败——
+    /// 用户拿到的必须是可以照着做的文案，而不是裸 `os error 13`。
+    #[test]
+    fn assemble_bgm_write_failure_reports_actionable_note() {
+        let dir = std::env::temp_dir().join(format!("aw-bgm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bgm/segments")).unwrap();
+        write_test_segment(&dir.join("bgm/segments/000.wav"));
+
+        let bgm_dir = dir.join("bgm");
+        let before = std::fs::metadata(&bgm_dir).unwrap().permissions();
+        let mut ro = before.clone();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&bgm_dir, ro).unwrap();
+
+        let options = BgmOptions {
+            prompt: "test prompt".into(),
+            target_seconds: 1.0,
+            ..Default::default()
+        };
+        let err = assemble_bgm(&dir, &options).unwrap_err();
+
+        // 先复原权限，保证测试结束能清理临时目录
+        std::fs::set_permissions(&bgm_dir, before).unwrap();
+
+        assert!(
+            err.contains("没有写入权限") || err.contains("写入失败"),
+            "要给可执行文案，不能是裸 errno：{err}"
+        );
+        assert!(err.contains("bgm.wav"), "要说清写的是哪个文件：{err}");
+        assert!(
+            err.contains("检查该目录权限") || err.contains("请释放空间"),
+            "要给动作：{err}"
+        );
+    }
+
+    /// 24kHz/单声道/16bit 的最小合法分段（能过 assemble_bgm 的头检查）。
+    fn write_test_segment(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..2400 {
+            w.write_sample((i % 89) as i16).unwrap();
+        }
+        w.finalize().unwrap();
     }
 }

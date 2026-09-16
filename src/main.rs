@@ -3068,7 +3068,7 @@ fn wire_bgm(
             "{}_{suffix}.wav",
             file_stem(&ui.get_project_name())
         ));
-        match std::fs::copy(&src, &dst) {
+        match aw_core::dub::copy_atomic(&src, &dst) {
             Ok(_) => {
                 ui.set_status_text(format!("已导出：{}", dst.display()).into());
                 toast(&ui, &format!("已导出 {}", file_label(&dst)));
@@ -3089,7 +3089,7 @@ fn export_song(ui: &MainWindow, state: &Rc<UiState>) {
         return;
     }
     let dst = dir.join(format!("{}_song.wav", stem_of(ui)));
-    if let Err(e) = std::fs::copy(&source, &dst) {
+    if let Err(e) = aw_core::dub::copy_atomic(&source, &dst) {
         ui.set_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into());
         return;
     }
@@ -3792,14 +3792,14 @@ fn export_copies(
     let mut written: Vec<String> = Vec::new();
     if wav_on {
         let t = dir.join(format!("{stem}.wav"));
-        if let Err(e) = std::fs::copy(wav, &t) {
+        if let Err(e) = aw_core::dub::copy_atomic(wav, &t) {
             return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
         }
         written.push(t.display().to_string());
     }
     if srt_on {
         let t = dir.join(format!("{stem}.srt"));
-        if let Err(e) = std::fs::copy(srt, &t) {
+        if let Err(e) = aw_core::dub::copy_atomic(srt, &t) {
             return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
         }
         written.push(t.display().to_string());
@@ -4405,7 +4405,7 @@ fn wire_separation(
             "{}_{suffix}.wav",
             file_stem(&ui.get_project_name())
         ));
-        match std::fs::copy(&src, &dst) {
+        match aw_core::dub::copy_atomic(&src, &dst) {
             Ok(_) => {
                 ui.set_sep_status_text(format!("已导出：{}", dst.display()).into());
                 toast(&ui, &format!("已导出 {}", file_label(&dst)));
