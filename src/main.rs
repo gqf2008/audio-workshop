@@ -11,6 +11,7 @@
 //!   projects/<工程名>/out/final.wav|srt 成品
 //!   <工程名>.wav / <工程名>.srt          导出（复制自 out/）
 
+mod batch;
 mod cancel;
 mod player;
 mod tasks;
@@ -56,6 +57,18 @@ const SECS_PER_CHAR: f32 = 0.18;
 
 // ── 工作线程消息 ──
 
+/// 批量里的一条（`Cmd::RunBatch` 用）。
+///
+/// 稿子在这里是**已读进内存的正文**：导入时的各种失败（读不到 / 非 UTF-8 / 空稿 /
+/// 重名）在 UI 侧已经变成"跳过 + 原因"，worker 不该再去碰文件系统读稿——
+/// 那会把导入期的错误推迟到执行期，用户看到的是"跑到一半才说文件有问题"。
+struct BatchCmdItem {
+    task_id: u32,
+    /// 工程名（已过 `file_stem` 归一）
+    name: String,
+    script: String,
+}
+
 enum Cmd {
     /// 开始/继续合成。script/model/voice_ref/project_name 取自界面当前值。
     ///
@@ -71,6 +84,17 @@ enum Cmd {
     },
     /// 单句重录（换 seed 重合成该句）
     Redo { revision: u64, index: usize },
+    /// 批量配音（M4-P1）：按顺序把 N 篇稿子跑成 N 个工程。
+    ///
+    /// 与单篇共用同一条链路（load_resumable → synthesize → assemble）与同一份
+    /// `projects_root`；每条自带 task_id，所以任务中心里是 N 条独立的配音任务、
+    /// 排队中的那几条也能单独取消（取消登记表按 task_id 定位）。
+    RunBatch {
+        revision: u64,
+        model: String,
+        voice_ref: Option<String>,
+        items: Vec<BatchCmdItem>,
+    },
     /// 拼装成品 + SRT
     Assemble { revision: u64 },
     /// 启动时把已恢复工程交给 worker，保证重开后 Redo/Assemble 仍作用于同一工程。
@@ -163,6 +187,41 @@ enum Msg {
         stopped: bool,
         reused: usize,
     },
+    /// 批量：某一条开始跑了（UI 把这一行切成"合成本"，并显示第 i/N 条）
+    BatchItemStarted {
+        task_id: u32,
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    /// 批量：某一条的句级进度（done = 已完成句数）
+    BatchItemProgress {
+        task_id: u32,
+        index: usize,
+        done: usize,
+        total: usize,
+    },
+    /// 批量：某一条收尾。三种终态各有对应字段——
+    /// 跑完（wav/srt 都在）、失败（error 有值）、排队中被取消（skipped=true）。
+    BatchItemDone {
+        task_id: u32,
+        index: usize,
+        name: String,
+        wav: Option<PathBuf>,
+        srt: Option<PathBuf>,
+        failed: usize,
+        /// 这一篇复用了多少句已合成的音频（断点续作/重跑批量时 > 0）
+        reused: usize,
+        skipped: bool,
+        error: Option<String>,
+    },
+    /// 整批收尾：完成 / 失败 / 跳过各几篇，以及是否被用户停掉
+    BatchDone {
+        done: usize,
+        failed: usize,
+        skipped: usize,
+        stopped: bool,
+    },
     /// 拼装完成（路径给导出用）
     Assembled {
         wav: PathBuf,
@@ -224,6 +283,10 @@ enum Msg {
     SeparationFailed {
         task_id: u32,
         error: String,
+    },
+    /// 批量：系统文件框选完的多篇稿件（取消 = 空表）
+    BatchScriptsPicked {
+        paths: Vec<PathBuf>,
     },
     /// 选择待分离音频的结果
     SeparationInputPicked {
@@ -825,6 +888,96 @@ fn pick_audio_blocking() -> Option<String> {
     pick_output_to_path(out)
 }
 
+/// 批量导入：系统多选文件框，阻塞式，必须放后台线程（与目录/单文件选择器同款）。
+fn spawn_scripts_pick(msg_tx: Sender<WorkerMsg>) {
+    std::thread::spawn(move || {
+        let paths = pick_scripts_blocking();
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::BatchScriptsPicked { paths },
+        });
+    });
+}
+
+/// 多选稿件对话框的输出（按平台各一份实现；见 `pick_scripts_blocking`）。
+#[cfg(target_os = "macos")]
+fn scripts_dialog_output() -> Option<std::process::Output> {
+    std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "set fs to choose file with prompt \"选择稿件（可多选）\" with multiple selections allowed",
+            "-e",
+            "set out to \"\"",
+            "-e",
+            "repeat with f in fs",
+            "-e",
+            "set out to out & (POSIX path of f) & linefeed",
+            "-e",
+            "end repeat",
+            "-e",
+            "return out",
+        ])
+        .output()
+        .ok()
+}
+
+#[cfg(target_os = "windows")]
+fn scripts_dialog_output() -> Option<std::process::Output> {
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+             $d = New-Object System.Windows.Forms.OpenFileDialog; \
+             $d.Multiselect = $true; \
+             $d.Filter = '文本稿件|*.txt;*.md|所有文件|*.*'; \
+             if ($d.ShowDialog() -eq \"OK\") { $d.FileNames | ForEach-Object { Write-Output $_ } }",
+        ])
+        .output()
+        .ok()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn scripts_dialog_output() -> Option<std::process::Output> {
+    std::process::Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--multiple",
+            "--separator=\n",
+            "--title=选择稿件（可多选）",
+        ])
+        .output()
+        .ok()
+}
+
+/// 多选稿件（一次导入 N 篇是 P1 的入口）。
+///
+/// 故意**不**在系统对话框里按扩展名过滤：稿件可能是 .txt / .md / 无扩展名，让用户在
+/// 对话框里"看不到自己的文件"比进来之后告诉他"这个文件不是 UTF-8 文本"更差。
+/// 过滤与跳过理由都在 `batch::import_scripts`，一处判定。
+fn pick_scripts_blocking() -> Vec<PathBuf> {
+    match scripts_dialog_output() {
+        Some(out) => parse_picked_paths(out.status.success(), &out.stdout),
+        None => Vec::new(),
+    }
+}
+
+/// 多选对话框的输出 → 路径表。
+///
+/// 取消（退出码非 0）必须是**空表**而不是"一个空路径"：后者会让导入把一次取消
+/// 记成"跳过了 1 篇（读不到）"。空路径同样过滤掉。
+fn parse_picked_paths(success: bool, stdout: &[u8]) -> Vec<PathBuf> {
+    if !success {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 fn pick_folder_blocking() -> Option<String> {
     #[cfg(target_os = "macos")]
     let out = std::process::Command::new("osascript")
@@ -1113,6 +1266,173 @@ fn worker_loop(ctx: WorkerCtx) {
                         });
                     }
                 }
+            }
+            Cmd::RunBatch {
+                revision,
+                model,
+                voice_ref,
+                items,
+            } => {
+                let total = items.len();
+                let mut done = 0usize;
+                let mut failed = 0usize;
+                let mut skipped = 0usize;
+                let mut stopped = false;
+                for (index, item) in items.into_iter().enumerate() {
+                    // 用户按了停止：当前篇已经在句间停住了，这里不再开下一篇
+                    if ctx.stop.load(Ordering::Relaxed) {
+                        stopped = true;
+                        break;
+                    }
+                    // 排队中就被取消的那篇：不加载、不合成，如实收尾（不消耗算力）
+                    if task_take_started(&ctx, item.task_id) {
+                        skipped += 1;
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: batch_item_done(
+                                item.task_id,
+                                index,
+                                item.name,
+                                BatchItemOutcome::Skipped,
+                            ),
+                        });
+                        continue;
+                    }
+                    let dir = ctx.projects_root.join(file_stem(&item.name));
+                    let loaded = match load_resumable(&dir, &item.script, &model, voice_ref.clone())
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            failed += 1;
+                            let _ = ctx.tx.send(WorkerMsg {
+                                revision: 0,
+                                msg: batch_item_done(
+                                    item.task_id,
+                                    index,
+                                    item.name,
+                                    BatchItemOutcome::Failed {
+                                        failed: 0,
+                                        error: e,
+                                        reused: 0,
+                                    },
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    let reused = loaded.reused;
+                    let mut project = loaded.project;
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::BatchItemStarted {
+                            task_id: item.task_id,
+                            index,
+                            total,
+                            name: item.name.clone(),
+                        },
+                    });
+                    let client = match make_client() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            failed += 1;
+                            let _ = ctx.tx.send(WorkerMsg {
+                                revision: 0,
+                                msg: batch_item_done(
+                                    item.task_id,
+                                    index,
+                                    item.name,
+                                    BatchItemOutcome::Failed {
+                                        failed: 0,
+                                        error: e,
+                                        reused,
+                                    },
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    // 句级进度：批量只用"第几/共几句"，所以走 BatchItemProgress，
+                    // 不套单篇那套 Msg::Sentence（那套按 revision 过滤，会串台）
+                    let sentences_total = project.sentences.len();
+                    let counter = std::cell::Cell::new(0usize);
+                    let progress_tx = ctx.tx.clone();
+                    let task_id = item.task_id;
+                    let stop = Arc::clone(&ctx.stop);
+                    let run = project.synthesize_stoppable(
+                        &client,
+                        &dir,
+                        None,
+                        None,
+                        Some(&stop),
+                        |_, note| {
+                            if note.starts_with("done ") || note.starts_with("error") {
+                                let now = counter.get() + 1;
+                                counter.set(now);
+                                let _ = progress_tx.send(WorkerMsg {
+                                    revision: 0,
+                                    msg: Msg::BatchItemProgress {
+                                        task_id,
+                                        index,
+                                        done: now,
+                                        total: sentences_total,
+                                    },
+                                });
+                            }
+                        },
+                    );
+                    let item_stopped = ctx.stop.load(Ordering::Relaxed);
+                    let outcome = match run {
+                        Ok(failed_sentences) => match project.assemble(&dir) {
+                            Ok(a) => {
+                                done += 1;
+                                BatchItemOutcome::Done {
+                                    wav: a.wav,
+                                    srt: a.srt,
+                                    failed: failed_sentences,
+                                    reused,
+                                }
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                BatchItemOutcome::Failed {
+                                    failed: failed_sentences,
+                                    error: format!("拼装中止: {e}"),
+                                    reused,
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            failed += 1;
+                            BatchItemOutcome::Failed {
+                                failed: usize::MAX,
+                                error: format!("合成中止: {e}"),
+                                reused,
+                            }
+                        }
+                    };
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: batch_item_done(task_id, index, item.name, outcome),
+                    });
+                    if item_stopped {
+                        stopped = true;
+                        break;
+                    }
+                }
+                // 没轮上的那些篇也要有终态：否则任务中心里会永远停在"排队中"，
+                // 用户只能靠退出应用来清掉它
+                if stopped {
+                    skipped += total.saturating_sub(done + failed + skipped);
+                }
+                let _ = ctx.tx.send(WorkerMsg {
+                    revision,
+                    msg: Msg::BatchDone {
+                        done,
+                        failed,
+                        skipped,
+                        stopped,
+                    },
+                });
             }
             Cmd::RunBgm {
                 revision,
@@ -1709,6 +2029,72 @@ fn worker_loop(ctx: WorkerCtx) {
     }
 }
 
+/// 批量里一条稿子的终态（四个出口共用：跳过 / 加载失败 / 合成失败 / 跑完）。
+///
+/// 抽出来是因为 `BatchItemDone` 字段多：四条路径各写一遍字段顺序，早晚会有一条
+/// 把 `failed` 写到 `skipped` 上——而这两种"没跑成"在界面上是完全不同的两件事。
+enum BatchItemOutcome {
+    Done {
+        wav: PathBuf,
+        srt: PathBuf,
+        failed: usize,
+        reused: usize,
+    },
+    Failed {
+        failed: usize,
+        error: String,
+        reused: usize,
+    },
+    Skipped,
+}
+
+fn batch_item_done(task_id: u32, index: usize, name: String, outcome: BatchItemOutcome) -> Msg {
+    match outcome {
+        BatchItemOutcome::Done {
+            wav,
+            srt,
+            failed,
+            reused,
+        } => Msg::BatchItemDone {
+            task_id,
+            index,
+            name,
+            wav: Some(wav),
+            srt: Some(srt),
+            failed,
+            reused,
+            skipped: false,
+            error: None,
+        },
+        BatchItemOutcome::Failed {
+            failed,
+            error,
+            reused,
+        } => Msg::BatchItemDone {
+            task_id,
+            index,
+            name,
+            wav: None,
+            srt: None,
+            failed,
+            reused,
+            skipped: false,
+            error: Some(error),
+        },
+        BatchItemOutcome::Skipped => Msg::BatchItemDone {
+            task_id,
+            index,
+            name,
+            wav: None,
+            srt: None,
+            failed: 0,
+            reused: 0,
+            skipped: true,
+            error: None,
+        },
+    }
+}
+
 /// progress 回调 → Msg::Sentence。用 started 集区分「句首回调（note=spoken）」
 /// 与「结果回调（done/error）」——不能靠文本前缀判断：spoken 本身可能以
 /// "done"/"error" 开头。
@@ -1959,6 +2345,21 @@ struct AssembledInfo {
     duration: f64,
 }
 
+/// 批量列表里的一行（Rust 侧真相）。
+struct BatchRowState {
+    name: String,
+    /// 稿件正文（提交时随命令一起进 worker；ui 不持有）
+    script: String,
+    /// 切句后的句数：只有这一行真的跑起来才知道（导入时还没切句）
+    sentences: usize,
+    /// 提交后拿到任务台账 id；用来把进度/终态消息按 id 对回这一行
+    task_id: Option<u32>,
+    state: batch::ItemState,
+    detail: String,
+    /// 出片后的 (成品 wav, 字幕 srt)：批量收尾时用它告诉用户文件落在哪
+    out: Option<(PathBuf, PathBuf)>,
+}
+
 #[derive(Default)]
 struct UiState {
     /// 最近一次拼装结果（导出复制 / 全篇试听用）
@@ -1993,6 +2394,13 @@ struct UiState {
     redo_task: std::cell::Cell<Option<u32>>,
     /// 排队任务的取消登记表（UI 侧登记，worker 侧取走；见 src/cancel.rs）
     cancel: cancel::CancelRegistry,
+    /// 批量队列（M4-P1）：导入的稿件行。真相在 Rust 侧（每行带着自己的 task_id 与
+    /// 脚本正文），ui 里的 BatchRow 只是投影——ui 不该存正文，也不该自己算状态。
+    batch_rows: RefCell<Vec<BatchRowState>>,
+    /// 整批在跑（决定面板按钮文案与"能不能再导入/清空"）
+    batch_running: std::cell::Cell<bool>,
+    /// 导入时被跳过的稿件（原因文案）：批量结束后要如实带出来，不能只报成功的篇数
+    batch_skipped_notes: RefCell<Vec<String>>,
     /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
     last_task_refresh: std::cell::Cell<Option<Instant>>,
     /// 截图/演示态（`AW_UI_STATE=tasks`）。演示任务只是给任务中心摆样子、没有对应的
@@ -2087,6 +2495,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
     wire_task_center(&ui, &state, &stop, &sep_stop, &eval_stop);
+    wire_batch(&ui, &cmd_tx, &msg_tx_ui, &state, &stop);
     wire_separation(&ui, &msg_tx_ui, &cmd_tx, &state, &player, &sep_stop);
     wire_quality_check(&ui, &cmd_tx, &state, &eval_stop);
 
@@ -2094,6 +2503,7 @@ fn main() -> Result<(), slint::PlatformError> {
     refresh_tasks(&ui, &state);
     #[cfg(debug_assertions)]
     seed_shot_tasks(&ui, &state);
+    seed_shot_batch(&ui, &state);
     #[cfg(debug_assertions)]
     seed_shot_bgm_artifacts(&ui, &state);
 
@@ -2417,6 +2827,80 @@ fn invalidate_worker_project(cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
 }
 
 /// 把任务台账回灌到界面：状态栏 chip 文案 + 任务中心列表 + 三个计数。
+/// 把 Rust 侧的批量行投影成 ui 模型。
+///
+/// 与任务中心一样：ui 只拿投影，真相在这里——否则"任务中心说失败、批量面板说合成本"
+/// 这类两套状态源的分叉迟早会出现。
+fn refresh_batch_rows(ui: &MainWindow, state: &Rc<UiState>) {
+    let rows: Vec<BatchRow> = state
+        .batch_rows
+        .borrow()
+        .iter()
+        .map(|r| BatchRow {
+            name: r.name.clone().into(),
+            sentences: r.sentences as i32,
+            state: r.state.label().into(),
+            detail: r.detail.clone().into(),
+        })
+        .collect();
+    ui.set_batch_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+/// 批量面板上那一句汇总：导入被跳过的原因 + 本次跑批的结果都要能看见。
+fn refresh_batch_summary(ui: &MainWindow, state: &Rc<UiState>, tail: &str) {
+    let skipped = state.batch_skipped_notes.borrow();
+    let count = state.batch_rows.borrow().len();
+    let mut text = if count == 0 {
+        "还没导入稿件".to_string()
+    } else {
+        format!("{count} 篇待跑")
+    };
+    if !skipped.is_empty() {
+        text.push_str(&format!(
+            "（导入时跳过 {} 篇：{}）",
+            skipped.len(),
+            skipped.join("；")
+        ));
+    }
+    if !tail.is_empty() {
+        text.push_str(" · ");
+        text.push_str(tail);
+    }
+    ui.set_batch_summary(text.into());
+}
+
+/// 批量某条收尾：台账里按 **id** 收，不走单篇那个 dub_task 槽位——
+/// 批量有 N 条同时在台账里，槽位表达不了"哪一条"。
+fn finish_task_by_id(
+    ui: &MainWindow,
+    state: &Rc<UiState>,
+    id: u32,
+    task_state: tasks::TaskState,
+    detail: impl Into<String>,
+) {
+    state.tasks.borrow_mut().finish(id, task_state, detail);
+    refresh_tasks(ui, state);
+}
+
+/// 这一行稿件在批量列表里的下标（按任务 id 找）。
+fn batch_row_index_for_task(state: &Rc<UiState>, task_id: u32) -> Option<usize> {
+    state
+        .batch_rows
+        .borrow()
+        .iter()
+        .position(|r| r.task_id == Some(task_id))
+}
+
+/// 批量任务在飞时，提交守卫要挡住单篇合成与编辑（它们会改同一批工程目录）。
+fn batch_in_flight(state: &Rc<UiState>) -> bool {
+    state.batch_running.get()
+        || state
+            .batch_rows
+            .borrow()
+            .iter()
+            .any(|r| matches!(r.state, batch::ItemState::Running))
+}
+
 fn refresh_tasks(ui: &MainWindow, state: &Rc<UiState>) {
     let q = state.tasks.borrow();
     let counts = q.counts();
@@ -2434,13 +2918,16 @@ fn refresh_tasks(ui: &MainWindow, state: &Rc<UiState>) {
 /// 各类任务当前在飞的 id。任务中心给「停止」按钮的判据要用它：
 /// 停止位是**按类**的（配音/BGM 共用一个、分离一个、歌曲只有排队期），
 /// 光看台账里的 kind 会把"重录（也是 Dub 类）"误判成可以停。
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct TaskSlots {
     dub: Option<u32>,
     bgm: Option<u32>,
     sep: Option<u32>,
     song: Option<u32>,
     eval: Option<u32>,
+    /// 批量队列里各条的 id。批量有 N 条同时挂在台账上，槽位（Option<u32>）表达不了，
+    /// 所以单独一张表：排队中的那些要能在任务中心**逐条**取消（硬取消、不消耗算力）。
+    batch: Vec<u32>,
 }
 
 impl TaskSlots {
@@ -2451,6 +2938,12 @@ impl TaskSlots {
             sep: state.sep_task.get(),
             song: state.song_task.get(),
             eval: state.eval_task.get(),
+            batch: state
+                .batch_rows
+                .borrow()
+                .iter()
+                .filter_map(|r| r.task_id)
+                .collect(),
         }
     }
 }
@@ -2470,6 +2963,9 @@ fn can_stop_task(t: &tasks::Task, slots: &TaskSlots) -> bool {
         Some(StopTarget::Song) => t.state == tasks::TaskState::Pending,
         // 质检：排队中硬取消、运行中协作停止（句间检查）
         Some(StopTarget::Eval) => !t.state.is_final(),
+        // 批量：只有**排队中**能在这里停（硬取消那一条）。正在跑的那条要停就是停整批，
+        // 那个动作在批量面板的「停止批量」里，这里不摆一个语义不同的同名按钮。
+        Some(StopTarget::Batch) => t.state == tasks::TaskState::Pending,
         None => false,
     }
 }
@@ -2849,6 +3345,49 @@ fn artifacts_like(sample: &Path) -> BgmArtifacts {
     }
 }
 
+/// 截图/演示：`AW_UI_STATE=batch` 时给批量面板灌三行示例稿子并展开面板。
+///
+/// 与 `AW_UI_STATE=tasks` 同理：这些行**没有**对应的 worker 命令，所以不登记任务、
+/// 也不置 `batch_running`——否则启动守卫会把真实的"开始批量"挡下来。
+#[cfg(debug_assertions)]
+fn seed_shot_batch(ui: &MainWindow, state: &Rc<UiState>) {
+    if std::env::var("AW_UI_STATE").as_deref() != Ok("batch") {
+        return;
+    }
+    {
+        let mut rows = state.batch_rows.borrow_mut();
+        for (name, sentences, st, detail) in [
+            (
+                "第一集 · 开场",
+                42,
+                batch::ItemState::Done,
+                "已出片 · 复用 8 句",
+            ),
+            (
+                "第二集 · 正片",
+                57,
+                batch::ItemState::Running,
+                "第 12/57 句",
+            ),
+            ("第三集 · 彩蛋", 0, batch::ItemState::Waiting, "排队中"),
+        ] {
+            rows.push(BatchRowState {
+                name: name.to_string(),
+                script: String::new(),
+                sentences,
+                task_id: None,
+                state: st,
+                detail: detail.to_string(),
+                out: None,
+            });
+        }
+    }
+    ui.set_batch_open(true);
+    refresh_batch_rows(ui, state);
+    refresh_batch_summary(ui, state, "示例数据：批量队列一次导入 N 篇稿子");
+    ui.set_status_text("批量队列（示例数据）：每篇 = 一个工程，逐条成片".into());
+}
+
 #[cfg(debug_assertions)]
 fn seed_shot_tasks(ui: &MainWindow, state: &Rc<UiState>) {
     if std::env::var("AW_UI_STATE").as_deref() != Ok("tasks") {
@@ -3125,12 +3664,16 @@ enum StopTarget {
     Separation,
     Song,
     Eval,
+    /// 批量队列里的**排队中**那一条：硬取消（worker 轮到它时不会执行）
+    Batch,
 }
 
 /// 判定 (task_id, kind) 对应哪个停止位。**必须同时匹配槽位**——列表里更早的那条
 /// 任务 id 不等于该 Tab 槽位里的 id，那种点击什么都不该发生。
 fn stop_target(task_id: u32, kind: tasks::TaskKind, slots: &TaskSlots) -> Option<StopTarget> {
     match kind {
+        // 批量条目也是 Dub 类，先按批量表认领（它不在 dub 槽位里）
+        tasks::TaskKind::Dub if slots.batch.contains(&task_id) => Some(StopTarget::Batch),
         tasks::TaskKind::Dub if slots.dub == Some(task_id) => Some(StopTarget::Dub),
         tasks::TaskKind::Bgm if slots.bgm == Some(task_id) => Some(StopTarget::Bgm),
         tasks::TaskKind::Separation if slots.sep == Some(task_id) => Some(StopTarget::Separation),
@@ -3138,6 +3681,22 @@ fn stop_target(task_id: u32, kind: tasks::TaskKind, slots: &TaskSlots) -> Option
         tasks::TaskKind::Eval if slots.eval == Some(task_id) => Some(StopTarget::Eval),
         _ => None,
     }
+}
+
+/// 取消批量里**排队中**的一条：登记取消（worker 轮到它时直接跳过、不消耗算力），
+/// 列表行与台账同时收尾——两处都要动，否则界面说已取消、任务中心还挂着"排队中"。
+fn stop_batch_item(ui: &MainWindow, state: &Rc<UiState>, task_id: u32) {
+    state.cancel.cancel(task_id);
+    if let Some(i) = batch_row_index_for_task(state, task_id) {
+        let mut rows = state.batch_rows.borrow_mut();
+        rows[i].state = batch::ItemState::Skipped;
+        rows[i].detail = "排队中被取消，没有跑".into();
+    }
+    let note = "已从队列中移除（还没开始跑，没有消耗算力）".to_string();
+    ui.set_status_text(note.clone().into());
+    finish_task_by_id(ui, state, task_id, tasks::TaskState::Stopped, &note);
+    refresh_batch_rows(ui, state);
+    refresh_batch_summary(ui, state, &note);
 }
 
 fn stop_task_from_center(
@@ -3161,8 +3720,146 @@ fn stop_task_from_center(
         Some(StopTarget::Separation) => stop_separation(ui, state, sep_stop),
         Some(StopTarget::Song) => stop_song(ui, state),
         Some(StopTarget::Eval) => stop_eval(ui, state, eval_stop),
+        Some(StopTarget::Batch) => stop_batch_item(ui, state, task_id),
         None => {}
     }
+}
+
+/// 批量队列（M4-P1）：导入 → 提交 → 停止 → 清空。
+///
+/// 提交走的是 `Cmd::RunBatch`（与单篇同一条 worker 链路），每条在任务台账里
+/// 各登记一条配音任务——所以任务中心能看到 N 条、排队中的那些也能单独取消。
+fn wire_batch(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
+    state: &Rc<UiState>,
+    stop: &Arc<AtomicBool>,
+) {
+    // ① 导入稿件（系统多选文件框，后台线程回消息）
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    let st = state.clone();
+    ui.on_batch_import(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if st.batch_running.get() {
+            ui.set_status_text("批量正在跑：先停止或等它跑完，再换稿件".into());
+            return;
+        }
+        ui.set_batch_summary("正在打开文件选择框（可多选）…".into());
+        spawn_scripts_pick(msg.clone());
+    });
+
+    // ② 开始批量
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    let stop1 = Arc::clone(stop);
+    ui.on_batch_start(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if batch_in_flight(&st) {
+            ui.set_status_text("批量已经在跑了".into());
+            return;
+        }
+        // 与单篇同一套提交守卫：正在跑别的长任务时不提交，否则用户此刻看的进度
+        // 会与批量里那一条串在一起
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&st) {
+            ui.set_status_text("有任务正在进行：等它结束或先停止，再开始批量".into());
+            return;
+        }
+        let idx = ui.get_voice_index();
+        let Some(v) = (idx >= 0)
+            .then(|| ui.get_voices().row_data(idx as usize))
+            .flatten()
+        else {
+            ui.set_batch_summary("没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型".into());
+            return;
+        };
+        let model = v.name.to_string();
+        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+
+        // 每条先登记成一条配音任务（排队中），worker 轮到它时用 TaskStarted 抬成运行中
+        let mut items = Vec::new();
+        {
+            let mut rows = st.batch_rows.borrow_mut();
+            let mut q = st.tasks.borrow_mut();
+            for row in rows.iter_mut() {
+                let id = q.enqueue(tasks::TaskKind::Dub, format!("配音 · {}（批量）", row.name));
+                row.task_id = Some(id);
+                row.sentences = 0;
+                row.state = batch::ItemState::Waiting;
+                row.detail = "排队中".into();
+                items.push(BatchCmdItem {
+                    task_id: id,
+                    name: row.name.clone(),
+                    script: row.script.clone(),
+                });
+            }
+        }
+        if items.is_empty() {
+            return;
+        }
+        let total = items.len();
+        stop1.store(false, Ordering::Relaxed);
+        st.batch_running.set(true);
+        ui.set_batch_running(true);
+        ui.set_status_text(
+            format!("批量已提交：{total} 篇按顺序跑（任务中心能看到每一条）").into(),
+        );
+        refresh_tasks(&ui, &st);
+        refresh_batch_rows(&ui, &st);
+        refresh_batch_summary(&ui, &st, "已提交，按顺序跑");
+        if tx
+            .send(Cmd::RunBatch {
+                revision: st.project_revision.get(),
+                model,
+                voice_ref,
+                items,
+            })
+            .is_err()
+        {
+            st.batch_running.set(false);
+            ui.set_batch_running(false);
+            for row in st.batch_rows.borrow_mut().iter_mut() {
+                if row.state == batch::ItemState::Waiting {
+                    row.state = batch::ItemState::Failed;
+                    row.detail = "工作线程不可用，没有提交".into();
+                }
+            }
+            refresh_batch_rows(&ui, &st);
+            refresh_batch_summary(&ui, &st, "工作线程不可用：一篇都没提交，请重启应用");
+            ui.set_status_text("工作线程不可用：批量未提交，请重启应用".into());
+        }
+    });
+
+    // ③ 停止整批：当前句合成完就停，后面的不再开
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let stop2 = Arc::clone(stop);
+    ui.on_batch_stop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if !batch_in_flight(&st) {
+            return;
+        }
+        stop2.store(true, Ordering::Relaxed);
+        ui.set_status_text("正在停止批量：当前句合成完就停，后面的篇目不再开".into());
+        refresh_batch_summary(&ui, &st, "停止中：当前句合成完就停");
+    });
+
+    // ④ 清空列表（跑批中不允许：那会把进度写到已经不在的行上）
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_batch_clear(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if batch_in_flight(&st) {
+            ui.set_status_text("批量正在跑：先停止再清空".into());
+            return;
+        }
+        st.batch_rows.borrow_mut().clear();
+        st.batch_skipped_notes.borrow_mut().clear();
+        refresh_batch_rows(&ui, &st);
+        refresh_batch_summary(&ui, &st, "");
+    });
 }
 
 fn wire_task_center(
@@ -4442,6 +5139,155 @@ fn tick(
                 ui.set_song_has_result(false);
                 ui.set_song_status_text(error.clone().into());
                 ui.set_status_text(error.into());
+            }
+            Msg::BatchScriptsPicked { paths } => {
+                // 一次导入 N 篇：读文件、跳过有问题的、按顺序建行（纯逻辑在 batch.rs）
+                let outcome = batch::import_scripts(&paths, file_stem);
+                {
+                    let mut rows = state.batch_rows.borrow_mut();
+                    rows.clear();
+                    for item in &outcome.items {
+                        rows.push(BatchRowState {
+                            name: item.name.clone(),
+                            script: item.script.clone(),
+                            sentences: 0,
+                            task_id: None,
+                            state: batch::ItemState::Waiting,
+                            detail: "待跑".into(),
+                            out: None,
+                        });
+                    }
+                }
+                *state.batch_skipped_notes.borrow_mut() = outcome.skipped.clone();
+                refresh_batch_rows(ui, state);
+                let tail = if outcome.items.is_empty() {
+                    if outcome.skipped.is_empty() {
+                        "没有选文件".to_string()
+                    } else {
+                        "一篇都没能导入：看上面的原因".to_string()
+                    }
+                } else {
+                    format!("已导入 {} 篇，点「开始批量」按顺序跑", outcome.items.len())
+                };
+                refresh_batch_summary(ui, state, &tail);
+                ui.set_status_text(tail.into());
+            }
+            Msg::BatchItemStarted {
+                task_id,
+                index,
+                total,
+                name,
+            } => {
+                if let Some(i) = batch_row_index_for_task(state, task_id) {
+                    let mut rows = state.batch_rows.borrow_mut();
+                    rows[i].state = batch::ItemState::Running;
+                    rows[i].detail = format!("第 {}/{} 篇 · 正在合成", index + 1, total);
+                }
+                ui.set_status_text(
+                    format!("批量：正在合成第 {}/{} 篇「{name}」", index + 1, total).into(),
+                );
+                refresh_batch_rows(ui, state);
+            }
+            Msg::BatchItemProgress {
+                task_id,
+                index,
+                done,
+                total,
+            } => {
+                let detail = format!("第 {done}/{total} 句");
+                if let Some(i) = batch_row_index_for_task(state, task_id) {
+                    let mut rows = state.batch_rows.borrow_mut();
+                    rows[i].sentences = total;
+                    rows[i].detail = detail.clone();
+                }
+                state.tasks.borrow_mut().progress(
+                    task_id,
+                    done as f32 / total.max(1) as f32,
+                    detail,
+                );
+                refresh_batch_rows(ui, state);
+                refresh_tasks(ui, state);
+                ui.set_status_text(
+                    format!("批量：第 {} 篇 · {}", index + 1, "正在逐句合成").into(),
+                );
+            }
+            Msg::BatchItemDone {
+                task_id,
+                index,
+                name,
+                wav,
+                srt,
+                failed,
+                reused,
+                skipped,
+                error,
+            } => {
+                let (item_state, detail, task_state) = if skipped {
+                    (
+                        batch::ItemState::Skipped,
+                        "排队中被取消，没有跑".to_string(),
+                        tasks::TaskState::Stopped,
+                    )
+                } else if let Some(e) = error {
+                    (
+                        batch::ItemState::Failed,
+                        e.clone(),
+                        tasks::TaskState::Failed,
+                    )
+                } else {
+                    // 续跑复用是这条能力的卖点之一：说清楚这次跑实际合成了几句
+                    let reuse_note = if reused > 0 {
+                        format!(" · 复用 {reused} 句")
+                    } else {
+                        String::new()
+                    };
+                    let failed_note = if failed > 0 {
+                        format!(" · {failed} 句失败")
+                    } else {
+                        String::new()
+                    };
+                    (
+                        batch::ItemState::Done,
+                        format!("已出片{failed_note}{reuse_note}"),
+                        tasks::TaskState::Done,
+                    )
+                };
+                if let Some(i) = batch_row_index_for_task(state, task_id) {
+                    let mut rows = state.batch_rows.borrow_mut();
+                    rows[i].state = item_state;
+                    rows[i].detail = detail.clone();
+                    if let (Some(wav), Some(srt)) = (wav, srt) {
+                        rows[i].out = Some((wav, srt));
+                    }
+                }
+                finish_task_by_id(ui, state, task_id, task_state, detail.clone());
+                refresh_batch_rows(ui, state);
+                ui.set_status_text(format!("批量：第 {} 篇「{name}」{}", index + 1, detail).into());
+            }
+            Msg::BatchDone {
+                done,
+                failed,
+                skipped,
+                stopped,
+            } => {
+                state.batch_running.set(false);
+                ui.set_batch_running(false);
+                let summary = batch::summary_text(done, failed, skipped, stopped);
+                // 出片的目录要说出来：批量跑完最实际的问题是"我的文件在哪"
+                let tail = match state
+                    .batch_rows
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find_map(|r| r.out.as_ref())
+                    .and_then(|(wav, _)| wav.parent())
+                {
+                    Some(dir) => format!("{summary} · 成品目录 {}", dir.display()),
+                    None => summary.clone(),
+                };
+                refresh_batch_summary(ui, state, &tail);
+                refresh_batch_rows(ui, state);
+                ui.set_status_text(format!("批量结束：{summary}").into());
             }
             Msg::Assembled {
                 wav,
@@ -6084,6 +6930,7 @@ mod tests {
             sep: Some(sep),
             song: Some(song),
             eval: None,
+            batch: Vec::new(),
         };
         let by_id = |id: u32| {
             task_rows(&q, &slots)
@@ -6152,6 +6999,111 @@ mod tests {
         assert!(!task_rows(&q4, &slots4)[0].can_stop, "失败条目不能停");
     }
 
+    /// 批量条目在任务中心的可停性：**只有排队中**能停那一条（硬取消、不消耗算力）。
+    /// 正在跑的那条要停就等于停整批——语义不同，不在任务中心摆一个同名按钮。
+    #[test]
+    fn batch_rows_are_stoppable_only_while_pending() {
+        let mut q = tasks::TaskQueue::default();
+        let pending = q.enqueue(tasks::TaskKind::Dub, "配音 · 甲（批量）");
+        let running = q.enqueue(tasks::TaskKind::Dub, "配音 · 乙（批量）");
+        q.promote(running);
+        let slots = TaskSlots {
+            batch: vec![pending, running],
+            ..Default::default()
+        };
+        let rows = task_rows(&q, &slots);
+        let by_id = |id: u32| rows.iter().find(|r| r.id == id as i32).unwrap();
+        assert!(by_id(pending).can_stop, "排队中的批量条目要能单独取消");
+        assert!(
+            !by_id(running).can_stop,
+            "运行中的批量条目不在任务中心停（那是停整批，按钮在批量面板）"
+        );
+        assert_eq!(
+            stop_target(pending, tasks::TaskKind::Dub, &slots),
+            Some(StopTarget::Batch),
+            "批量条目要先按批量表认领，不能落进普通配音槽位"
+        );
+    }
+
+    /// 排队中就被取消的批量条目：worker 轮到它时**不加载模型、不合成**，
+    /// 直接回报 skipped，并且整批继续往下跑。这条不需要服务端（压根不该发出请求）。
+    #[test]
+    fn cancelled_queued_batch_items_are_skipped_without_work() {
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let cancel = cancel::CancelRegistry::new();
+        cancel.cancel(41);
+        let worker_cancel = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: std::env::temp_dir(),
+                cancel: worker_cancel,
+            })
+        });
+
+        cmd_tx
+            .send(Cmd::RunBatch {
+                revision: 1,
+                model: "audio8-tts".into(),
+                voice_ref: None,
+                items: vec![
+                    BatchCmdItem {
+                        task_id: 41,
+                        name: "被取消的甲".into(),
+                        script: "第一句。".into(),
+                    },
+                    BatchCmdItem {
+                        task_id: 42,
+                        name: "也被取消的乙".into(),
+                        script: "第二句。".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        cancel.cancel(42);
+
+        let mut skipped_ids = Vec::new();
+        let summary = loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::TaskStarted { task_id } => skipped_ids.push(("started", task_id)),
+                Msg::BatchItemProgress { .. } => {
+                    panic!("取消过的条目不该产生任何进度（没加载模型就对了）")
+                }
+                Msg::BatchItemDone {
+                    task_id,
+                    skipped,
+                    error,
+                    ..
+                } => {
+                    assert!(skipped, "取消过的条目必须报 skipped：{error:?}");
+                    skipped_ids.push(("skipped", task_id));
+                }
+                Msg::BatchDone {
+                    done,
+                    failed,
+                    skipped,
+                    stopped,
+                } => break (done, failed, skipped, stopped),
+                _ => {}
+            }
+        };
+        drop(cmd_tx);
+        handle.join().unwrap();
+
+        assert!(
+            skipped_ids.contains(&("started", 41)) && skipped_ids.contains(&("skipped", 41)),
+            "TaskStarted 之后直接收尾（队列靠前者把条目抬成运行中）：{skipped_ids:?}"
+        );
+        assert_eq!(summary, (0, 0, 2, false), "两条都被取消，整批没有失败");
+        assert_eq!(cancel.len(), 0, "取走过的登记项不能留在表里（表要有界）");
+    }
+
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。
     /// 列表里可能同时有更早的同类任务（例如上一条已停止的配音），点它必须什么都不做。
     #[test]
@@ -6162,6 +7114,7 @@ mod tests {
             sep: Some(30),
             song: Some(40),
             eval: None,
+            batch: Vec::new(),
         };
         assert_eq!(
             stop_target(10, tasks::TaskKind::Dub, &slots),
@@ -6809,5 +7762,175 @@ mod tests {
             vocals.display(),
             accompaniment.display()
         );
+    }
+    /// 多选文件框的输出解析：取消（退出码非 0）必须是空表，空行要滤掉——
+    /// 否则一次"取消"会被批量导入记成"跳过了 1 篇（读不到）"。
+    #[test]
+    fn picked_paths_drop_cancellations_and_blank_lines() {
+        let picked = "/a/第一集.txt\n\n/b/第二集.txt\n".as_bytes();
+        assert_eq!(
+            parse_picked_paths(true, picked),
+            vec![
+                PathBuf::from("/a/第一集.txt"),
+                PathBuf::from("/b/第二集.txt")
+            ]
+        );
+        assert!(
+            parse_picked_paths(true, b"").is_empty(),
+            "没选到文件就是空表"
+        );
+        assert!(
+            parse_picked_paths(false, "/a/不该出现.txt\n".as_bytes()).is_empty(),
+            "用户取消时不能把任何路径当成选中"
+        );
+    }
+
+    /// 真机（默认 ignored）：**批量配音走 worker 的命令通道**——N 篇稿子依次成片，
+    /// 每篇落到自己的工程目录，第二次跑同一批时已合成的句子要被复用。
+    ///
+    /// 批量比单篇多两件必须钉住的事：① 每篇都有自己的 task_id（任务中心靠它对条目）
+    /// 与自己的工程目录（不能互相覆盖）；② 重跑同一批要复用已合成的句子——
+    /// 不然"批量重跑"就等于把算力再烧一遍。
+    /// 一批跑完，测试里要看的东西（写成结构体而不是四元组：clippy 的
+    /// type_complexity 不是在挑刺——四个匿名字段的元组确实读到调用点就没人认得了）
+    struct BatchRunResult {
+        summary: (usize, usize, usize, bool),
+        started: Vec<u32>,
+        outputs: Vec<(PathBuf, PathBuf, usize)>,
+        progress_events: usize,
+    }
+
+    #[test]
+    #[ignore = "需要本机 audiocpp_server + audio8-tts"]
+    fn worker_batch_runs_two_scripts_end_to_end() {
+        let root = std::env::temp_dir().join(format!("aw-worker-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: root,
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+
+        // 跑一批（两篇），返回 (汇总, 见过的 task_id, 每篇产物, 句级进度回调次数)
+        //
+        // 进度回调次数是"这次到底合成没有"的证据：`synthesize` 对 status == "done"
+        // 的句子是 `continue`（先跳过、后回调），所以重跑同一批时回调次数必须是 0——
+        // 那才是断点续作，而不是"又烧了一遍算力、只是结果一样"。
+        let run_batch = |first_task_id: u32| -> BatchRunResult {
+            cmd_tx
+                .send(Cmd::RunBatch {
+                    revision: 1,
+                    model: "audio8-tts".into(),
+                    voice_ref: None,
+                    items: vec![
+                        BatchCmdItem {
+                            task_id: first_task_id,
+                            name: "批量甲".into(),
+                            script: "第一句。第二句。".into(),
+                        },
+                        BatchCmdItem {
+                            task_id: first_task_id + 1,
+                            name: "批量乙".into(),
+                            script: "第三句。第四句。".into(),
+                        },
+                    ],
+                })
+                .unwrap();
+            let mut out: Vec<(PathBuf, PathBuf, usize)> = Vec::new();
+            let mut started: Vec<u32> = Vec::new();
+            let mut progress_events = 0usize;
+            let summary = loop {
+                let m = msg_rx.recv().expect("worker 应有消息");
+                match m.msg {
+                    Msg::BatchItemStarted { task_id, .. } => started.push(task_id),
+                    Msg::BatchItemProgress { .. } => progress_events += 1,
+                    Msg::BatchItemDone {
+                        task_id,
+                        wav,
+                        srt,
+                        skipped,
+                        error,
+                        reused,
+                        ..
+                    } => {
+                        assert!(!skipped, "没登记取消，不该跳过");
+                        assert!(error.is_none(), "批量某一篇失败：{error:?}");
+                        assert_eq!(
+                            task_id,
+                            first_task_id + out.len() as u32,
+                            "消息要带对各自的 task_id"
+                        );
+                        out.push((wav.expect("成品路径"), srt.expect("字幕路径"), reused));
+                    }
+                    Msg::BatchDone {
+                        done,
+                        failed,
+                        skipped,
+                        stopped,
+                    } => break (done, failed, skipped, stopped),
+                    _ => {}
+                }
+            };
+            BatchRunResult {
+                summary,
+                started,
+                outputs: out,
+                progress_events,
+            }
+        };
+
+        let first = run_batch(21);
+        assert_eq!(first.summary, (2, 0, 0, false), "两篇都要成");
+        assert_eq!(
+            first.started,
+            vec![21, 22],
+            "每一篇都要有自己的 TaskStarted"
+        );
+        assert!(
+            first.progress_events >= 4,
+            "第一次跑每篇两句都要有进度回调（实得 {} 次）",
+            first.progress_events
+        );
+        assert_eq!(first.outputs.len(), 2);
+        for (wav, srt, reused) in &first.outputs {
+            assert_eq!(*reused, 0, "第一次跑不该有复用");
+            assert!(wav.exists(), "成品不存在：{}", wav.display());
+            assert!(srt.exists(), "字幕不存在：{}", srt.display());
+            let secs = aw_core::dub::wav_duration(&std::fs::read(wav).unwrap()).unwrap();
+            assert!(secs > 0.0, "成品时长为 0：{}", wav.display());
+        }
+        assert_ne!(
+            first.outputs[0].0, first.outputs[1].0,
+            "两篇要落两个工程目录"
+        );
+
+        // 再跑同一批：已经合成好的句子必须被跳过（断点续作在批量里的同一条保证）
+        let second = run_batch(31);
+        assert_eq!(second.summary, (2, 0, 0, false));
+        assert_eq!(
+            second.progress_events, 0,
+            "重跑没有该重做的句子：零进度回调才说明一句都没再合成"
+        );
+        for (wav, _, reused) in &second.outputs {
+            assert_eq!(
+                *reused,
+                0,
+                "稿件没变时是「整篇原样载入」，不走逐句继承：{}",
+                wav.display()
+            );
+        }
+
+        drop(cmd_tx);
+        handle.join().unwrap();
     }
 }
