@@ -933,6 +933,10 @@ struct WorkerCtx {
     sep_stop: Arc<AtomicBool>,
     /// 质检单独的停止位（与 sep_stop 同理：分开才不会互相吃掉停止请求）
     eval_stop: Arc<AtomicBool>,
+    /// 工程根目录。生产走 `projects_root()`（`~/Documents/音频作坊/projects`）；
+    /// 测试注入临时目录——`Cmd::Run` 会在 worker 内部按工程名拼路径，
+    /// 没有这条缝就没法在不碰用户真实数据的前提下做 worker 级 e2e。
+    projects_root: PathBuf,
     /// 排队任务的取消登记表（与 UI 线程共享同一张表）。
     /// 采纳自 gqf2008/Xmusic-splitter 的 per-job registry：取消按 task_id 定位，
     /// 执行方取走时摘除，表因此有界。
@@ -1044,7 +1048,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
-                let dir = project_dir(&file_stem(&project_name));
+                let dir = ctx.projects_root.join(file_stem(&project_name));
                 let loaded = match load_resumable(&dir, &script, &model, voice_ref) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1530,7 +1534,10 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
-                let dir = project_dir(&file_stem(&project_name)).join("song");
+                let dir = ctx
+                    .projects_root
+                    .join(file_stem(&project_name))
+                    .join("song");
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     let _ = ctx.tx.send(WorkerMsg {
                         revision: 0,
@@ -2055,6 +2062,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 stop,
                 sep_stop,
                 eval_stop,
+                projects_root: projects_root(),
                 cancel: cancel_worker,
             })
         });
@@ -5783,6 +5791,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 sep_stop: Arc::new(AtomicBool::new(false)),
                 eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: std::env::temp_dir(),
                 cancel,
             })
         });
@@ -5832,6 +5841,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 sep_stop: Arc::new(AtomicBool::new(false)),
                 eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: std::env::temp_dir(),
                 cancel: worker_cancel,
             })
         });
@@ -5979,6 +5989,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             sep_stop: Arc::new(AtomicBool::new(false)),
             eval_stop: Arc::new(AtomicBool::new(false)),
+            projects_root: std::env::temp_dir(),
             cancel: cancel::CancelRegistry::new(),
         };
 
@@ -6422,6 +6433,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 sep_stop: Arc::new(AtomicBool::new(false)),
                 eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: std::env::temp_dir(),
                 cancel: cancel::CancelRegistry::new(),
             })
         });
@@ -6481,5 +6493,124 @@ mod tests {
         assert!(note.contains("未能评分"), "{note}");
         assert!(note.contains("质检报告未写入"), "告警不能被吞：{note}");
         assert!(note.contains("qa-report.md"), "报告路径不能被吞：{note}");
+    }
+
+    /// 真机（默认 ignored）：**配音主链路走真实 worker**，覆盖 GUI 用的那条命令通道
+    /// （Cmd::Run → ProjectLoaded → Sentence(done)… → RunDone → Cmd::Assemble → Assembled → wav+srt 落盘）。
+    ///
+    /// 与 eval 那条真机测试不同：这里不必先手工合成再塞工程——worker 自己按工程名拼路径，
+    /// 只要把 `projects_root` 注入临时目录，就能真的跑一次"开始配音"而不碰
+    /// `~/Documents/音频作坊/projects`（注入缝见 `WorkerCtx::projects_root`）。
+    #[test]
+    #[ignore = "需要本机 audiocpp_server + audio8-tts"]
+    fn worker_dub_writes_final_and_srt() {
+        let root = std::env::temp_dir().join(format!("aw-worker-dub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let base = std::env::var("AW_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+        assert!(Client::new(&base).healthy(), "服务不可用：{base}");
+
+        // 1) 起 worker（与 GUI 同一条命令通道），工程根目录指向临时目录
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: root,
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+
+        // 2) 点"开始配音"
+        cmd_tx
+            .send(Cmd::Run {
+                revision: 1,
+                task_id: 9,
+                script: "第一句测试。第二句测试。".into(),
+                model: "audio8-tts".into(),
+                voice_ref: None,
+                project_name: "worker-dub-e2e".into(),
+            })
+            .unwrap();
+
+        let mut loaded_reused = None;
+        let mut done_durations = Vec::new();
+        let run_done = loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::ProjectLoaded { reused, .. } => loaded_reused = Some(reused),
+                Msg::Sentence {
+                    index,
+                    status,
+                    duration,
+                } if status == "done" => done_durations.push((index, duration)),
+                Msg::RunDone {
+                    failed,
+                    stopped,
+                    reused,
+                } => break (failed, stopped, reused),
+                Msg::Fatal(e) => panic!("合成中止：{e}"),
+                _ => {}
+            }
+        };
+        assert_eq!(loaded_reused, Some(0), "全新工程不该复用旧句");
+        assert_eq!(run_done, (0, false, 0), "实得 {run_done:?}");
+        assert_eq!(
+            done_durations.len(),
+            2,
+            "两句都要报终态：{done_durations:?}"
+        );
+        assert!(
+            done_durations
+                .iter()
+                .all(|(_, d)| matches!(d, Some(d) if *d > 0.0)),
+            "done 必须带真实时长：{done_durations:?}"
+        );
+
+        // 3) 点"导出"：拼装成品 + SRT
+        cmd_tx.send(Cmd::Assemble { revision: 1 }).unwrap();
+        let (wav, srt, duration, done, skipped) = loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::Assembled {
+                    wav,
+                    srt,
+                    duration,
+                    done,
+                    skipped,
+                } => break (wav, srt, duration, done, skipped),
+                Msg::AssembleFailed(e) => panic!("拼装失败：{e}"),
+                _ => {}
+            }
+        };
+        drop(cmd_tx);
+        handle.join().unwrap();
+
+        assert_eq!((done, skipped), (2, 0), "两句都该进成品");
+        assert!(wav.exists(), "成品不存在：{}", wav.display());
+        assert!(srt.exists(), "SRT 不存在：{}", srt.display());
+        let bytes = std::fs::read(&wav).unwrap();
+        let measured = aw_core::dub::wav_duration(&bytes).expect("成品应是可解析的 wav");
+        assert!(measured > 0.0, "成品时长为 0");
+        assert!(
+            (measured - duration).abs() < 0.05,
+            "回报时长与文件对不上：{measured} vs {duration}"
+        );
+        let subs = std::fs::read_to_string(&srt).unwrap();
+        assert_eq!(
+            subs.matches(" --> ").count(),
+            2,
+            "SRT 该有两条字幕：\n{subs}"
+        );
+        eprintln!(
+            "成品：{}（{measured:.2}s）\nSRT：{}\n{subs}",
+            wav.display(),
+            srt.display()
+        );
     }
 }
