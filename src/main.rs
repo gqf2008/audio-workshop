@@ -46,6 +46,8 @@ const VOICE_PREVIEW_TEXT: &str = "你好，这是当前音色的试听。";
 
 /// 与 Python `tools/audio_dub.py` 同款链路参数。
 const GAP_MS: u64 = 250;
+/// 句间停顿的上限（毫秒）：再长多半是误输入，夹住比报错好
+const MAX_GAP_MS: u64 = 2000;
 const MAX_CHARS: usize = 80;
 const BASE_SEED: u64 = 831001;
 /// 工程目录与导出目录的根目录名（`~/Documents/音频作坊/`）。
@@ -82,6 +84,10 @@ enum Cmd {
         model: String,
         voice_ref: Option<String>,
         project_name: String,
+        /// 句间静音（毫秒）：只影响拼装出来的时间轴，不影响逐句音频
+        gap_ms: u64,
+        /// 文本兜底（数字/年份规范化）开关：影响 spoken 文本 → 变了要重录
+        auto_normalize: bool,
     },
     /// 单句重录（换 seed 重合成该句）
     Redo { revision: u64, index: usize },
@@ -94,10 +100,14 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
+        /// 与单篇同一套：句间静音 + 文本兜底开关（批量产物也受它们影响）
+        gap_ms: u64,
+        auto_normalize: bool,
         items: Vec<BatchCmdItem>,
     },
-    /// 拼装成品 + SRT
-    Assemble { revision: u64 },
+    /// 拼装成品 + SRT。`gap_ms` 是当前的句间静音：停顿改了只要重新导出就能应用，
+    /// 不必把已合成的句子再跑一遍。
+    Assemble { revision: u64, gap_ms: u64 },
     /// 启动时把已恢复工程交给 worker，保证重开后 Redo/Assemble 仍作用于同一工程。
     OpenProject {
         revision: u64,
@@ -1056,6 +1066,52 @@ fn pick_audio_blocking() -> Option<String> {
     pick_output_to_path(out)
 }
 
+/// 界面上那个「数字 / 年份规范化」开关被切换时：作废当前工程。
+///
+/// 它改的是 **spoken 文本**（数字/年份怎么念），所以旧音频一律不能复用——
+/// 与换模型/换音色是同一类作废（重录），不是"重新拼装就行"。
+/// PixelSwitch 没有回调，只能在 tick 里比对；任务在飞时不让改（把开关拨回去）。
+fn sync_auto_normalize_toggle(ui: &MainWindow, state: &Rc<UiState>) {
+    let now = ui.get_auto_normalize();
+    let seen = state.auto_normalize_seen.get();
+    if now == seen {
+        return;
+    }
+    if project_editing_blocked(ui, state) {
+        // 拨回去（下一次 tick 就与 seen 一致了），并说清为什么不让改
+        ui.set_auto_normalize(seen);
+        ui.set_status_text("任务进行中：兜底规则暂不可改".into());
+        return;
+    }
+    state.auto_normalize_seen.set(now);
+    state.project_ready.set(false);
+    state
+        .project_revision
+        .set(state.project_revision.get().wrapping_add(1));
+    state.assembled.borrow_mut().take();
+    reset_bgm(ui, state);
+    ui.set_has_result(false);
+    ui.set_status_text(if now {
+        "兜底规则已开：重新合成后生效（数字/年份按规则念）".into()
+    } else {
+        "兜底规则已关：重新合成后生效（数字交给引擎自己念）".into()
+    });
+}
+
+/// 界面上「停顿」输入 → 毫秒。留空 / 非数字回落默认 `GAP_MS`；夹在 0..=2000
+/// （2000ms 已经长到能听出明显断句，再往上多半是误输入）。
+fn normalize_gap_ms(text: &str) -> u64 {
+    text.trim()
+        .parse::<u64>()
+        .map(|v| v.min(MAX_GAP_MS))
+        .unwrap_or(GAP_MS)
+}
+
+/// 当前界面的句间停顿（毫秒）。
+fn gap_ms_from_ui(ui: &MainWindow) -> u64 {
+    normalize_gap_ms(&ui.get_gap_ms_text())
+}
+
 /// 所有导出（批量导出 / 分轨导出 / BGM 逐轨导出）共用的互斥判据：
 /// **有别的动作正在写这些成品时不导**。
 ///
@@ -1397,6 +1453,8 @@ fn worker_loop(ctx: WorkerCtx) {
                 model,
                 voice_ref,
                 project_name,
+                gap_ms,
+                auto_normalize,
             } => {
                 if task_take_started(&ctx, task_id) {
                     // 排队期间被停掉：不载入、不合成，按"用户停止"收尾
@@ -1411,7 +1469,14 @@ fn worker_loop(ctx: WorkerCtx) {
                     continue;
                 }
                 let dir = ctx.projects_root.join(file_stem(&project_name));
-                let loaded = match load_resumable(&dir, &script, &model, voice_ref) {
+                let loaded = match load_resumable(
+                    &dir,
+                    &script,
+                    &model,
+                    voice_ref,
+                    gap_ms,
+                    auto_normalize,
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = ctx.tx.send(WorkerMsg {
@@ -1480,6 +1545,8 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision,
                 model,
                 voice_ref,
+                gap_ms,
+                auto_normalize,
                 items,
             } => {
                 let total = items.len();
@@ -1525,8 +1592,14 @@ fn worker_loop(ctx: WorkerCtx) {
                         continue;
                     }
                     let dir = ctx.projects_root.join(file_stem(&item.name));
-                    let loaded = match load_resumable(&dir, &item.script, &model, voice_ref.clone())
-                    {
+                    let loaded = match load_resumable(
+                        &dir,
+                        &item.script,
+                        &model,
+                        voice_ref.clone(),
+                        gap_ms,
+                        auto_normalize,
+                    ) {
                         Ok(p) => p,
                         Err(e) => {
                             failed += 1;
@@ -2210,7 +2283,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     }
                 }
             }
-            Cmd::Assemble { revision } => {
+            Cmd::Assemble { revision, gap_ms } => {
                 let Some((current_revision, dir, project)) = current.as_mut() else {
                     let _ = ctx.tx.send(WorkerMsg {
                         revision,
@@ -2224,6 +2297,17 @@ fn worker_loop(ctx: WorkerCtx) {
                         msg: Msg::AssembleFailed("工程版本已变更：先开始合成再导出".into()),
                     });
                     continue;
+                }
+                // 停顿是拼装参数：这里应用当前值（改了停顿的用户点「导出」即可生效）
+                if project.gap_ms != gap_ms {
+                    project.gap_ms = gap_ms;
+                    if let Err(e) = project.save(dir) {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::AssembleFailed(format!("保存工程失败: {e}")),
+                        });
+                        continue;
+                    }
                 }
                 match project.assemble(dir) {
                     Ok(a) => {
@@ -2515,6 +2599,8 @@ fn load_resumable(
     script: &str,
     model: &str,
     voice_ref: Option<String>,
+    gap_ms: u64,
+    auto_normalize: bool,
 ) -> Result<LoadedProject, String> {
     let voice_ref_hash = match voice_ref.as_deref() {
         Some(path) => Some(sha256_file(Path::new(path))?),
@@ -2524,30 +2610,49 @@ fn load_resumable(
     // 随后第一次落盘还会覆盖掉损坏文件（现场丢失）。见 Project::load_if_present。
     let saved = Project::load_if_present(dir)?;
     if let Some(saved) = saved.as_ref() {
+        // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
+        // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
         if saved.model == model
+            && saved.auto_normalize == auto_normalize
             && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
             && sentence_texts_match(saved, script)
         {
-            return Ok(LoadedProject {
-                project: saved.clone(),
-                reused: 0,
-            });
+            let mut project = saved.clone();
+            if project.gap_ms != gap_ms {
+                project.gap_ms = gap_ms;
+                project
+                    .save(dir)
+                    .map_err(|e| format!("工程落盘失败: {e}"))?;
+            }
+            return Ok(LoadedProject { project, reused: 0 });
         }
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("建工程目录失败: {e}"))?;
     let mut project = Project::new(
         script,
         model,
-        GAP_MS,
+        gap_ms,
         BASE_SEED,
         voice_ref.clone(),
         DEFAULT_PUNCTUATION,
         MAX_CHARS,
-        |t| aw_core::normalize(t, &Default::default()),
+        |t| {
+            if auto_normalize {
+                aw_core::normalize(t, &Default::default())
+            } else {
+                // 关掉兜底 = 原文照念（数字/年份交给引擎自己处理）
+                t.to_string()
+            }
+        },
     );
     project.voice_ref_hash = voice_ref_hash.clone();
+    project.auto_normalize = auto_normalize;
     let reused = if let Some(saved) = saved.as_ref() {
-        if saved.model == model && voice_ref_matches(saved, &voice_ref, &voice_ref_hash) {
+        // 与快路径同一条判据：开关变了就不能逐句继承（旧音频念的是另一套文本）
+        if saved.model == model
+            && saved.auto_normalize == auto_normalize
+            && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
+        {
             reuse_done_sentences(&mut project, saved, dir)?
         } else {
             0
@@ -2628,6 +2733,9 @@ struct UiState {
     batch_skipped_notes: RefCell<Vec<String>>,
     /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
     batch_export_running: std::cell::Cell<bool>,
+    /// 「数字/年份规范化」开关上次被 tick 看到的值。PixelSwitch 没有回调，
+    /// 靠它发现"用户切换了"→ 作废工程（spoken 文本会变，旧音频不能算数）。
+    auto_normalize_seen: std::cell::Cell<bool>,
     /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
     last_task_refresh: std::cell::Cell<Option<Instant>>,
     /// 截图/演示态（`AW_UI_STATE=tasks`）。演示任务只是给任务中心摆样子、没有对应的
@@ -2981,6 +3089,10 @@ fn restore_project(
     }
     ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
     refresh_voice_labels(ui);
+    // 工程里记着的两个输入回灌界面：兜底开关（决定怎么念）与句间停顿（决定拼装）
+    ui.set_auto_normalize(project.auto_normalize);
+    state.auto_normalize_seen.set(project.auto_normalize);
+    ui.set_gap_ms_text(project.gap_ms.to_string().into());
     let done = apply_project_to_rows(ui, rows, &project);
     // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）
     *state.eval_scores.borrow_mut() = scores_from_project(&project);
@@ -4120,6 +4232,8 @@ fn wire_batch(
                 revision: st.project_revision.get(),
                 model,
                 voice_ref,
+                gap_ms: gap_ms_from_ui(&ui),
+                auto_normalize: ui.get_auto_normalize(),
                 items,
             })
             .is_err()
@@ -4532,6 +4646,8 @@ fn wire_run(
                 model: model_name.clone(),
                 voice_ref,
                 project_name: stem,
+                gap_ms: gap_ms_from_ui(&ui),
+                auto_normalize: ui.get_auto_normalize(),
             })
             .is_err()
         {
@@ -4632,6 +4748,7 @@ fn wire_export(
         if tx
             .send(Cmd::Assemble {
                 revision: state.project_revision.get(),
+                gap_ms: gap_ms_from_ui(&ui),
             })
             .is_err()
         {
@@ -5145,6 +5262,11 @@ fn tick(
                 refresh_tasks(ui, state);
             }
             Msg::ProjectLoaded { project, reused } => {
+                // worker 载入的工程才是执行事实：把开关/停顿同步成它记着的值，
+                // 免得界面上显示 A、实际按 B 合成
+                ui.set_auto_normalize(project.auto_normalize);
+                state.auto_normalize_seen.set(project.auto_normalize);
+                ui.set_gap_ms_text(project.gap_ms.to_string().into());
                 // 工程里的质检分数回灌（跨会话留存：重开应用不用重跑 ASR）
                 *state.eval_scores.borrow_mut() = scores_from_project(&project);
                 apply_project_to_rows(ui, rows, &project);
@@ -5826,6 +5948,9 @@ fn tick(
         ui.set_playing(false);
         ui.set_status_text("试听结束".into());
     }
+
+    // ── 兜底规则开关（PixelSwitch 没有回调，只能比对上一次的值）──
+    sync_auto_normalize_toggle(ui, state);
 
     // ── 任务中心的"已排队 / 已运行 N"走字（按秒节流）──
     maybe_refresh_task_times(ui, state);
@@ -6708,6 +6833,96 @@ mod tests {
         format!("wav-{}-{}", sentence.index, sentence.text)
     }
 
+    /// 停顿输入的归一：留空/非法回落默认，越界夹住（不做数值输入报错，界面上两句话写清）。
+    #[test]
+    fn gap_input_normalizes_and_clamps() {
+        assert_eq!(normalize_gap_ms("250"), 250);
+        assert_eq!(normalize_gap_ms(" 500 "), 500);
+        assert_eq!(normalize_gap_ms("0"), 0, "0 = 不留静音，是合法值");
+        assert_eq!(normalize_gap_ms(""), GAP_MS, "留空 = 默认");
+        assert_eq!(normalize_gap_ms("abc"), GAP_MS, "非数字 = 默认（不阻断）");
+        assert_eq!(normalize_gap_ms("9999"), MAX_GAP_MS, "越界夹到上限");
+        assert_eq!(normalize_gap_ms("-5"), GAP_MS, "负数不是合法毫秒，回落默认");
+    }
+
+    /// 停顿改了**不需要重录**：已合成句照样复用，只是工程里的 gap 更新成新值。
+    #[test]
+    fn gap_change_reuses_done_sentences_and_updates_project() {
+        let dir = temp_dir("gap-change");
+        let mut old = saved_project("第一句。第二句。", None);
+        save_done_project(&dir, &mut old);
+
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS + 250,
+            true,
+        )
+        .unwrap();
+        assert_eq!(loaded.reused, 0, "不改文本时走快路径，不报「继承」");
+        assert_eq!(loaded.project.gap_ms, GAP_MS + 250);
+        assert!(
+            loaded.project.sentences.iter().all(|s| s.status == "done"),
+            "停顿只影响拼装，已合成的句子不该作废"
+        );
+        assert_eq!(
+            Project::load(&dir).unwrap().gap_ms,
+            GAP_MS + 250,
+            "新停顿要落盘，重开工程后仍是它"
+        );
+    }
+
+    /// 兜底规则开关变了 → 旧音频一律不复用（spoken 文本变了，念的是另一套）。
+    #[test]
+    fn normalize_toggle_change_invalidates_reuse() {
+        let dir = temp_dir("normalize-change");
+        let mut old = saved_project("2024年第一句。第二句。", None);
+        old.auto_normalize = false; // 旧工程是"原文照念"
+        save_done_project(&dir, &mut old);
+
+        // 开关打开 → 不能复用（spoken 文本会从"2024年"变成"二零二四年"）
+        let loaded = load_resumable(
+            &dir,
+            "2024年第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+        )
+        .unwrap();
+        assert_eq!(loaded.reused, 0);
+        assert!(
+            loaded
+                .project
+                .sentences
+                .iter()
+                .all(|s| s.status == "pending"),
+            "开关变了就要重录，不能把旧读法留在成品里"
+        );
+        assert!(loaded.project.auto_normalize, "新工程要记上新开关");
+
+        // 开关没变（还是 false）→ 快路径复用，句子仍是 done
+        let mut old2 = saved_project("2024年第一句。第二句。", None);
+        old2.auto_normalize = false;
+        save_done_project(&dir, &mut old2);
+        let same = load_resumable(
+            &dir,
+            "2024年第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            false,
+        )
+        .unwrap();
+        assert!(
+            same.project.sentences.iter().all(|s| s.status == "done"),
+            "开关没变就照旧续作"
+        );
+        assert!(!same.project.auto_normalize);
+    }
+
     /// 评审 MUST-1：稿件改一句后，未变句必须按文本复用，而不是整工程重录。
     #[test]
     fn edited_script_reuses_unchanged_done_sentences() {
@@ -6715,8 +6930,15 @@ mod tests {
         let mut old = saved_project("第一句。第二句。第三句。", None);
         save_done_project(&dir, &mut old);
 
-        let loaded =
-            load_resumable(&dir, "第一句。改过的第二句。第三句。", "audio8-tts", None).unwrap();
+        let loaded = load_resumable(
+            &dir,
+            "第一句。改过的第二句。第三句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+        )
+        .unwrap();
         let loaded = loaded.project;
         assert_eq!(loaded.sentences.len(), 3);
 
@@ -6739,7 +6961,8 @@ mod tests {
         let mut old = saved_project("甲句。乙句。丙句。", None);
         save_done_project(&dir, &mut old);
 
-        let loaded = load_resumable(&dir, "丙句。甲句。丁句。", "audio8-tts", None).unwrap();
+        let loaded =
+            load_resumable(&dir, "丙句。甲句。丁句。", "audio8-tts", None, GAP_MS, true).unwrap();
         assert_eq!(loaded.reused, 2);
         let loaded = loaded.project;
         assert_eq!(loaded.sentences[0].status, "done");
@@ -6761,7 +6984,15 @@ mod tests {
         let mut old = saved_project("重复句。不同句。重复句。", None);
         save_done_project(&dir, &mut old);
 
-        let loaded = load_resumable(&dir, "重复句。重复句。不同句。", "audio8-tts", None).unwrap();
+        let loaded = load_resumable(
+            &dir,
+            "重复句。重复句。不同句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+        )
+        .unwrap();
         assert_eq!(loaded.reused, 3);
         let loaded = loaded.project;
         assert!(loaded.sentences.iter().all(|s| s.status == "done"));
@@ -6793,6 +7024,8 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(new_voice.display().to_string()),
+            GAP_MS,
+            true,
         )
         .unwrap();
         assert_eq!(loaded.reused, 0);
@@ -6810,8 +7043,15 @@ mod tests {
         assert_eq!(old.voice_ref_hash, None, "模拟旧工程尚无内容哈希");
         save_done_project(&dir, &mut old);
 
-        let err =
-            load_resumable(&dir, "第一句。第二句。", "audio8-tts", Some(missing_path)).unwrap_err();
+        let err = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            Some(missing_path),
+            GAP_MS,
+            true,
+        )
+        .unwrap_err();
         assert!(err.contains("参考音频不可读"), "应明确报错: {err}");
         let on_disk = Project::load(&dir).unwrap();
         assert_eq!(on_disk.sentences[0].status, "done", "旧工程不得被覆盖");
@@ -6915,7 +7155,8 @@ mod tests {
         let mut old = saved_project("第一句。第二句。", None);
         save_done_project(&dir, &mut old);
 
-        let loaded = load_resumable(&dir, "第一句。第二句。", "index-tts2", None).unwrap();
+        let loaded =
+            load_resumable(&dir, "第一句。第二句。", "index-tts2", None, GAP_MS, true).unwrap();
         assert_eq!(loaded.reused, 0);
         assert!(loaded
             .project
@@ -6935,8 +7176,15 @@ mod tests {
         save_done_project(&dir, &mut old);
 
         std::fs::write(&voice, b"voice-b").unwrap();
-        let loaded =
-            load_resumable(&dir, "第一句。第二句。", "audio8-tts", Some(voice_path)).unwrap();
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            Some(voice_path),
+            GAP_MS,
+            true,
+        )
+        .unwrap();
         assert_eq!(loaded.reused, 0);
         assert!(loaded
             .project
@@ -7326,7 +7574,8 @@ mod tests {
         let broken = br#"{"sentences": [{"index": 1,"#;
         std::fs::write(dir.join("project.json"), broken).unwrap();
 
-        let err = load_resumable(&dir, "第一句。第二句。", "audio8-tts", None).unwrap_err();
+        let err =
+            load_resumable(&dir, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap_err();
         assert!(err.contains("工程文件损坏"), "实得 {err}");
         assert!(err.contains("project.json"), "要说清哪个文件：{err}");
         assert!(err.contains("没有自动重建"), "要明确不替用户做决定：{err}");
@@ -7338,7 +7587,8 @@ mod tests {
 
         // 回归：没有 project.json 的目录仍然按全新工程走，不能被这条守卫误伤
         let fresh = temp_dir("fresh-project");
-        let loaded = load_resumable(&fresh, "第一句。第二句。", "audio8-tts", None).unwrap();
+        let loaded =
+            load_resumable(&fresh, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap();
         assert_eq!(loaded.project.sentences.len(), 2);
     }
 
@@ -7479,6 +7729,8 @@ mod tests {
                 revision: 1,
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                gap_ms: GAP_MS,
+                auto_normalize: true,
                 items: vec![
                     BatchCmdItem {
                         task_id: 41,
@@ -7558,6 +7810,8 @@ mod tests {
                 revision: 1,
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                gap_ms: GAP_MS,
+                auto_normalize: true,
                 items: vec![
                     BatchCmdItem {
                         task_id: 51,
@@ -8079,6 +8333,8 @@ mod tests {
                 model: "audio8-tts".into(),
                 voice_ref: None,
                 project_name: "worker-dub-e2e".into(),
+                gap_ms: GAP_MS,
+                auto_normalize: true,
             })
             .unwrap();
 
@@ -8117,7 +8373,12 @@ mod tests {
         );
 
         // 3) 点"导出"：拼装成品 + SRT
-        cmd_tx.send(Cmd::Assemble { revision: 1 }).unwrap();
+        cmd_tx
+            .send(Cmd::Assemble {
+                revision: 1,
+                gap_ms: GAP_MS,
+            })
+            .unwrap();
         let (wav, srt, duration, done, skipped) = loop {
             let m = msg_rx.recv().expect("worker 应有消息");
             match m.msg {
@@ -8603,6 +8864,8 @@ mod tests {
                     revision: 1,
                     model: "audio8-tts".into(),
                     voice_ref: None,
+                    gap_ms: GAP_MS,
+                    auto_normalize: true,
                     items: vec![
                         BatchCmdItem {
                             task_id: first_task_id,

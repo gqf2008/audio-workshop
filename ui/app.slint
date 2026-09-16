@@ -71,6 +71,8 @@ export component MainWindow inherits Window {
     in-out property <float> speed: 1.0;
     in property <string> speed-label: "1.00x";
     in-out property <bool> auto-normalize: true;
+    /// 句间停顿（毫秒）：配音独有，放本页「高级」
+    in-out property <string> gap-ms-text: "250";
 
     // ── 旁白块头（配音首屏一等元素）：当前音色 + 来源 + 为什么不能用 ──
     in property <string> voice-label: "未选择";
@@ -205,6 +207,7 @@ export component MainWindow inherits Window {
     callback preview-one(int);
     callback redo-one(int);
     callback speed-changed(float);
+    callback gap-edited();
     callback start-run();
     callback stop-run();
     callback batch-import();
@@ -351,6 +354,8 @@ export component MainWindow inherits Window {
                     speed <=> root.speed;
                     speed-label: root.speed-label;
                     auto-normalize <=> root.auto-normalize;
+                    gap-ms-text <=> root.gap-ms-text;
+
                     progress: root.progress;
                     has-result: root.has-result;
                     export-dir: root.export-dir;
@@ -377,6 +382,7 @@ export component MainWindow inherits Window {
                     resplit => { root.resplit(); }
                     preview-all => { root.preview-all(); }
                     speed-changed(v) => { root.speed-changed(v); }
+                    gap-edited => { root.gap-edited(); }
                     export-requested => { root.export-requested(); }
                     batch-export => { root.batch-export(); }
                     export-stems => { root.export-stems(); }

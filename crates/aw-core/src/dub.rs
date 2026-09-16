@@ -132,8 +132,17 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_ref_hash: Option<String>,
     pub gap_ms: u64,
+    /// 文本兜底（数字/年份规范化）开关。**要持久化**：它是"这句该念什么"的一部分，
+    /// 续作时开关变了而句子文本没变的话，不复用旧音频就会把旧读法留在成品里。
+    /// 旧工程没有这个字段时按"开"处理（与历史行为一致）。
+    #[serde(default = "default_auto_normalize")]
+    pub auto_normalize: bool,
     pub base_seed: u64,
     pub sentences: Vec<Sentence>,
+}
+
+fn default_auto_normalize() -> bool {
+    true
 }
 
 /// 拼装结果。`skipped` 是**必须报出来的数**：失败句此前被静默跳过，
@@ -161,6 +170,8 @@ impl Project {
         max_chars: usize,
         normalize: impl Fn(&str) -> String,
     ) -> Self {
+        // 兜底开关由调用方在构造后按同一份输入设置（与 voice_ref_hash 同一模式）；
+        // 这里给"开"是与历史行为一致的默认（旧工程/老调用点不受影响）。
         let sentences = split_sentences(script, punctuation, max_chars)
             .into_iter()
             .enumerate()
@@ -180,6 +191,7 @@ impl Project {
             voice_ref,
             voice_ref_hash: None,
             gap_ms,
+            auto_normalize: true,
             base_seed,
             sentences,
         }
@@ -1005,6 +1017,46 @@ mod tests {
                 .contains("工程.wav.tmp"),
             "临时名要能看出是哪个目标的：{}",
             a.display()
+        );
+    }
+
+    /// 句间停顿真的进了成品：同样两句（各 0.1s），gap 0 与 200ms 的成品时长差 0.2s。
+    /// 这条是"停顿设置真的生效"的可执行证据（不是只看字段被赋值）。
+    #[test]
+    fn assemble_gap_changes_product_duration() {
+        let dir = std::env::temp_dir().join(format!("aw-assemble-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::new(
+            "第一句。第二句。",
+            "audio8-tts",
+            0,
+            831001,
+            None,
+            DEFAULT_PUNCTUATION,
+            80,
+            |t| crate::normalize(t, &Default::default()),
+        );
+        for (i, s) in project.sentences.iter_mut().enumerate() {
+            write_valid_sentence_wav(&dir, i, 2400); // 2400 帧 @24k = 0.1s
+            s.status = "done".into();
+            s.duration = Some(0.1);
+        }
+
+        project.gap_ms = 0;
+        let tight = project.assemble(&dir).unwrap();
+        project.gap_ms = 200;
+        let loose = project.assemble(&dir).unwrap();
+
+        assert!(
+            (tight.duration - 0.2).abs() < 0.02,
+            "gap=0 时成品应≈0.2s，实得 {}",
+            tight.duration
+        );
+        assert!(
+            (loose.duration - 0.4).abs() < 0.02,
+            "gap=200ms 时成品应≈0.4s，实得 {}",
+            loose.duration
         );
     }
 
