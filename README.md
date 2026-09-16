@@ -28,7 +28,9 @@
 ### 桌面壳（主入口）
 
 前置：`audiocpp_server` 在跑（默认 `http://127.0.0.1:8080`，可用 `AW_SERVER` 覆盖），
-音色清单从 `~/.local/opt/audio.cpp/server.json` 发现（可用 `AW_SERVER_CONFIG` 覆盖）。
+音色清单优先从 `AW_SERVER_CONFIG` 读取；否则按平台查找
+（macOS 保留 `~/.local/opt/audio.cpp/server.json`，Linux 用 `~/.config/audio.cpp/server.json`，
+Windows 用 `%APPDATA%\\audio.cpp\\server.json`）。
 
 ```bash
 cargo run --release        # 打开配音工作台
@@ -43,6 +45,8 @@ cargo run --release        # 打开配音工作台
 - **音色克隆**：抽屉「音色」填参考 wav 路径（index-tts2 的 voice_ref）。
 - **BGM 三轨**：BGM 场景按当前配音工程时长生成 30s 分段，按句子时间轴自动 duck，
   导出 `<工程>_voice.wav`、`<工程>_bgm.wav`、`<工程>_mixed.wav` 和 SRT。
+- **跨平台配置**：工程/导出目录使用系统 Documents；模型根可用 `AW_MODELS_ROOT` 覆盖；
+  推理后端 `auto` 探测（macOS→metal / `nvidia-smi`→cuda / 其它→cpu），也可用 `AW_BACKEND` 强制。
 - 校听倍速即时生效（回放层，不动合成产物）；合成语速是模型参数，属配置层。
 
 ### 命令行（M0 链路，仍然可用）

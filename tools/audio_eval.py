@@ -2,7 +2,7 @@
 """audio.cpp 本地质量评估台（配音/歌曲）
 
 对每个模型跑固定测试文本，用 ASR 回测可懂度，并记录耗时与峰值内存。
-结果写入 ~/.local/opt/audio.cpp/eval/，每次运行与上一次对比（回归检测）。
+结果写入平台配置目录下的 audio.cpp/eval（AW_EVAL_DIR 可覆盖），每次运行与上一次对比（回归检测）。
 
 用法:
   audio-eval                      # 默认：全部已注册 TTS 模型 × 中文/英文各 2 轮
@@ -11,6 +11,8 @@
   audio-eval --repeats 1          # 减少轮次（默认 2：首轮含加载，次轮为稳态）
 """
 import argparse, base64, json, os, re, subprocess, sys, threading, time, urllib.request, wave, io, difflib
+
+from platform_paths import eval_dir_path
 
 
 # 与框架 src/framework/text/chinese_normalization.cpp 同一套规则：
@@ -27,8 +29,8 @@ def verbalize_zh(text):
     """
     import audio_config as _cfg
     return _cfg.verbalize(text)
-SERVER = "http://127.0.0.1:8080"
-OUTDIR = os.path.expanduser("~/.local/opt/audio.cpp/eval")
+SERVER = os.environ.get("AW_SERVER", "http://127.0.0.1:8080")
+OUTDIR = os.environ.get("AW_EVAL_DIR") or str(eval_dir_path())
 
 TEXTS = {
     # 配音场景：中文长句（含数字、多音字、专名）
