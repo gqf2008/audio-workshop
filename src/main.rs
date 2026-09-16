@@ -1563,16 +1563,23 @@ fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<
             new.sentences[i].index,
             std::process::id()
         )));
+        // 复用 = 把旧工程的 wav 复制进新工程：失败文案要说清是哪一句、哪个文件、做什么
         std::fs::copy(&src, &temp.0).map_err(|e| {
             format!(
-                "复用第 {} 句失败（{}）: {e}",
+                "复用第 {} 句失败：{}",
                 old_sentence.index,
-                src.display()
+                aw_core::dub::write_failure_note(&temp.0, 0, &e)
             )
         })?;
         std::fs::File::open(&temp.0)
             .and_then(|f| f.sync_all())
-            .map_err(|e| format!("复用第 {} 句落盘失败: {e}", old_sentence.index))?;
+            .map_err(|e| {
+                format!(
+                    "复用第 {} 句落盘失败：{}",
+                    old_sentence.index,
+                    aw_core::dub::write_failure_note(&temp.0, 0, &e)
+                )
+            })?;
         staged.push(StagedReuse {
             new_index: i,
             temp,
@@ -1583,8 +1590,12 @@ fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<
 
     let mut reused = 0;
     for staged in staged {
-        std::fs::rename(&staged.temp.0, &staged.dst)
-            .map_err(|e| format!("复用句落到 {} 失败: {e}", staged.dst.display()))?;
+        std::fs::rename(&staged.temp.0, &staged.dst).map_err(|e| {
+            format!(
+                "复用句落盘失败：{}",
+                aw_core::dub::write_failure_note(&staged.dst, 0, &e)
+            )
+        })?;
         let sentence = &mut new.sentences[staged.new_index];
         sentence.seed = staged.old_sentence.seed;
         sentence.duration = staged.old_sentence.duration;
@@ -3050,7 +3061,7 @@ fn wire_bgm(
         };
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            ui.set_status_text(format!("导出目录不可写（{}）：{e}", dir.display()).into());
+            ui.set_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
             return;
         }
         let dst = dir.join(format!(
@@ -3062,7 +3073,7 @@ fn wire_bgm(
                 ui.set_status_text(format!("已导出：{}", dst.display()).into());
                 toast(&ui, &format!("已导出 {}", file_label(&dst)));
             }
-            Err(e) => ui.set_status_text(format!("导出失败：{e}").into()),
+            Err(e) => ui.set_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into()),
         }
     });
 }
@@ -3074,12 +3085,12 @@ fn export_song(ui: &MainWindow, state: &Rc<UiState>) {
     };
     let dir = PathBuf::from(ui.get_export_dir().to_string());
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        ui.set_status_text(format!("导出目录不可写（{}）: {e}", dir.display()).into());
+        ui.set_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
         return;
     }
     let dst = dir.join(format!("{}_song.wav", stem_of(ui)));
     if let Err(e) = std::fs::copy(&source, &dst) {
-        ui.set_status_text(format!("导出 {} 失败: {e}", dst.display()).into());
+        ui.set_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into());
         return;
     }
     toast(ui, &format!("已导出 {}", dst.display()));
@@ -3465,7 +3476,13 @@ fn tick(
                         Err(e) => ui.set_status_text(format!("试听失败：{e}").into()),
                     },
                     Err(e) => {
-                        ui.set_status_text(format!("试听临时文件写入失败：{e}").into());
+                        ui.set_status_text(
+                            format!(
+                                "试听临时文件写入失败：{}",
+                                aw_core::dub::write_failure_note(&path, wav.len(), &e)
+                            )
+                            .into(),
+                        );
                     }
                 }
             }
@@ -3770,20 +3787,20 @@ fn export_copies(
         return ExportOutcome::NoneSelected;
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
-        return ExportOutcome::Failed(format!("导出目录不可写（{}）: {e}", dir.display()));
+        return ExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
     }
     let mut written: Vec<String> = Vec::new();
     if wav_on {
         let t = dir.join(format!("{stem}.wav"));
         if let Err(e) = std::fs::copy(wav, &t) {
-            return ExportOutcome::Failed(format!("复制 {} 失败: {e}", t.display()));
+            return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
         }
         written.push(t.display().to_string());
     }
     if srt_on {
         let t = dir.join(format!("{stem}.srt"));
         if let Err(e) = std::fs::copy(srt, &t) {
-            return ExportOutcome::Failed(format!("复制 {} 失败: {e}", t.display()));
+            return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
         }
         written.push(t.display().to_string());
     }
@@ -4381,7 +4398,7 @@ fn wire_separation(
         };
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            ui.set_sep_status_text(format!("导出目录不可写（{}）：{e}", dir.display()).into());
+            ui.set_sep_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
             return;
         }
         let dst = dir.join(format!(
@@ -4393,7 +4410,7 @@ fn wire_separation(
                 ui.set_sep_status_text(format!("已导出：{}", dst.display()).into());
                 toast(&ui, &format!("已导出 {}", file_label(&dst)));
             }
-            Err(e) => ui.set_sep_status_text(format!("导出失败：{e}").into()),
+            Err(e) => ui.set_sep_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into()),
         }
     });
 }

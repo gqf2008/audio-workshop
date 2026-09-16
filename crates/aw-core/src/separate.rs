@@ -266,23 +266,33 @@ pub fn separate_tracks(
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     stems
         .save(Stem::Vocals, &vocals_tmp.display().to_string())
-        .map_err(|e| format!("写出人声轨失败：{e}"))?;
+        .map_err(|e| format!("写出人声轨失败（{}）：{e}", vocals_tmp.display()))?;
     if let Err(e) = stems.save_mix_except(&[Stem::Vocals], &accompaniment_tmp.display().to_string())
     {
         let _ = std::fs::remove_file(&vocals_tmp);
-        return Err(format!("写出伴奏轨失败：{e}"));
+        return Err(format!(
+            "写出伴奏轨失败（{}）：{e}",
+            accompaniment_tmp.display()
+        ));
     }
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
+        // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
         let _ = std::fs::remove_file(&vocals_tmp);
         let _ = std::fs::remove_file(&accompaniment_tmp);
-        return Err(format!("收尾人声轨失败：{e}"));
+        return Err(format!(
+            "收尾人声轨失败：{}",
+            crate::dub::write_failure_note(&vocals_path, 0, &e)
+        ));
     }
     if let Err(e) = std::fs::rename(&accompaniment_tmp, &accompaniment_path) {
         // 人声已经落到最终名了：把它一起删掉，不留半套
         let _ = std::fs::remove_file(&vocals_path);
         let _ = std::fs::remove_file(&accompaniment_tmp);
-        return Err(format!("收尾伴奏轨失败：{e}"));
+        return Err(format!(
+            "收尾伴奏轨失败：{}",
+            crate::dub::write_failure_note(&accompaniment_path, 0, &e)
+        ));
     }
 
     let _ = local_model;

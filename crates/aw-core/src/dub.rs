@@ -253,7 +253,10 @@ impl Project {
             // 顺序必须是「先落盘、再回调」：回调里（UI 刷新/测试断言）读到的状态
             // 必须是磁盘上已持久化的状态。
             if let Err(e) = self.save(dir) {
-                on_progress(index, &format!("工程落盘失败（续作仍可重跑）: {e}"));
+                // 这里**不能**只回调一句就继续：那句会被报成 done，但 project.json 没有
+                // 持久化，重跑时它又会重合成——"逐句落盘、重跑跳过已完成句"的不变式破了。
+                // 直接中止，让调用方拿到同一条可执行文案。
+                return Err(ClientError::Local(e.to_string()));
             }
             on_progress(index, &outcome);
         }
@@ -298,7 +301,7 @@ impl Project {
         // 先落盘再合成（Python cmd_redo 修过的坑：synthesize 从磁盘重载工程时，
         // 未保存的文本/seed 修改会被静默丢弃，"重录"回来还是旧文本）。
         self.save(dir)
-            .map_err(|e| ClientError::Http(format!("重录前落盘失败: {e}")))?;
+            .map_err(|e| ClientError::Local(format!("重录前落盘失败: {e}")))?;
         self.synthesize(client, dir, Some(&[index]), instruction, on_progress)
     }
 
@@ -318,8 +321,9 @@ impl Project {
         // ── 拼装前逐句校验（Python cmd_assemble 同款）：任何一句有问题都中止并列出全部，
         // 不在拼到一半时才发现第 N 句是噪声。截断文件的证据不在 WAV 头里
         // （头仍合法、头里的帧数也不被截断改写），唯一可信判据是**实际字节数**。
-        let spec = hound::WavReader::open(dir.join(format!("sentences/{:03}.wav", done[0])))
-            .map_err(|e| e.to_string())?
+        let first_path = dir.join(format!("sentences/{:03}.wav", done[0]));
+        let spec = hound::WavReader::open(&first_path)
+            .map_err(|e| sentence_read_note(&first_path, &e))?
             .spec();
         let mut bad: Vec<String> = Vec::new();
         for &idx in &done {
@@ -327,7 +331,8 @@ impl Project {
             let r = match hound::WavReader::open(&path) {
                 Ok(r) => r,
                 Err(e) => {
-                    bad.push(format!("[{idx}] 不可读: {e}"));
+                    // 走同一套文案：说清是哪一句的哪个文件、该做什么（裸 os error 2 定位不到句）
+                    bad.push(sentence_read_note(&path, &e));
                     continue;
                 }
             };
@@ -499,8 +504,10 @@ pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> St
         // 这条错误发生在临时文件阶段（write_atomic），目标文件与旧内容都还在。
         // 文案顺序是有意的：界面（状态栏 / 任务中心）都是 overflow: elide，
         // 先说"发生了什么 + 该做什么"，完整路径放最后——被截断时丢的是路径而不是动作。
+        // 注意别在这里写 dub 专属的承诺（"已完成的句子会自动跳过"）：这个 helper 也被
+        // BGM 分段 / 歌曲 / 分离复用，那些场景的续作语义各不相同。
         std::io::ErrorKind::StorageFull => format!(
-            "磁盘空间不足{need}：请释放空间后重跑，已完成的句子会自动跳过。路径：{}（原文件未受损）",
+            "磁盘空间不足{need}：请释放空间后重跑（已写好的文件不会被破坏）。路径：{}",
             path.display()
         ),
         std::io::ErrorKind::PermissionDenied => format!(
@@ -511,7 +518,10 @@ pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> St
             "路径不存在（父目录可能被删除或移动）：重建目录后再重跑。路径：{}",
             path.display()
         ),
-        _ => format!("写入失败：{err}。路径：{}", path.display()),
+        _ => format!(
+            "写入失败：{err}。请检查磁盘与目录权限后重跑。路径：{}",
+            path.display()
+        ),
     }
 }
 
@@ -520,7 +530,10 @@ pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> St
 pub fn hound_error_note(path: &Path, bytes: usize, err: &hound::Error) -> String {
     match err {
         hound::Error::IoError(io) => write_failure_note(path, bytes, io),
-        other => format!("音频写入失败：{}（{other}）", path.display()),
+        other => format!(
+            "音频写入失败：{other}。请检查磁盘与目录权限后重跑。完整路径：{}",
+            path.display()
+        ),
     }
 }
 
@@ -551,7 +564,11 @@ fn sentence_read_note(path: &Path, err: &hound::Error) -> String {
             file_label(path),
             path.display()
         ),
-        other => format!("句子音频读不了：{}（{other}）。完整路径：{}", file_label(path), path.display()),
+        other => format!(
+            "句子音频读不了：{}（{other}）。请重录该句。完整路径：{}",
+            file_label(path),
+            path.display()
+        ),
     }
 }
 
@@ -656,8 +673,8 @@ mod tests {
         assert!(note.contains("sentences/012.wav"), "要说清路径：{note}");
         assert!(note.contains("0.6 MB"), "要说清需要多少：{note}");
         assert!(
-            note.contains("已完成的句子会自动跳过"),
-            "要给出下一步：{note}"
+            note.contains("请释放空间后重跑") && note.contains("不会被破坏"),
+            "要给出下一步与数据安全结论：{note}"
         );
         // 动作必须排在完整路径前面：状态栏/任务中心都是 elide，截断时丢的是尾巴
         let action_at = note.find("请释放空间").expect("要有动作");
@@ -783,5 +800,59 @@ mod tests {
             note.contains("句子音频读不了") && note.contains("007.wav"),
             "{note}"
         );
+    }
+
+    /// 复核抓到的漏洞：`assemble` 的**逐句预校验**会先打开句子文件，缺文件时旧实现只给
+    /// 裸 `No such file or directory (os error 2)`，下面那条带文案的读取分支根本走不到。
+    /// 这条走**真实 assemble 路径**（不直接调 helper），钉住"用户看到的到底是哪条文案"。
+    #[test]
+    fn assemble_reports_which_sentence_wav_is_missing() {
+        let dir = std::env::temp_dir().join(format!("aw-assemble-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut project = Project::new(
+            "第一句。第二句。",
+            "audio8-tts",
+            250,
+            831001,
+            None,
+            DEFAULT_PUNCTUATION,
+            80,
+            |t| crate::normalize(t, &Default::default()),
+        );
+        for (i, s) in project.sentences.iter_mut().enumerate() {
+            write_valid_sentence_wav(&dir, i, 2400);
+            s.status = "done".into();
+            s.duration = Some(0.1);
+        }
+        // 第一句的 wav 被外部删掉（工程里状态仍是 done）
+        std::fs::remove_file(dir.join("sentences/000.wav")).unwrap();
+
+        let err = project.assemble(&dir).unwrap_err();
+        assert!(err.contains("句子音频丢失"), "不能是裸 os error：{err}");
+        assert!(err.contains("sentences/000.wav"), "要指名哪一句：{err}");
+        assert!(err.contains("请重录该句"), "要给出动作：{err}");
+        assert!(
+            !err.contains("os error 2"),
+            "不该再把裸 errno 摆在用户面前：{err}"
+        );
+    }
+
+    /// 写一个能被 assemble 预校验接受的句子 wav（24kHz/单声道/16bit，字节数与头声明一致）。
+    fn write_valid_sentence_wav(dir: &Path, index: usize, frames: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let path = dir.join(format!("sentences/{index:03}.wav"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..frames {
+            w.write_sample((i % 97) as i16).unwrap();
+        }
+        w.finalize().unwrap();
     }
 }

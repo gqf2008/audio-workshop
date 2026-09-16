@@ -21,10 +21,10 @@
 
 | 场景 | 用户看到什么 | 证据 |
 |---|---|---|
-| 写句子 wav / srt / `project.json` / BGM manifest / 歌曲 wav / 导出拷贝时空间不足 | `磁盘空间不足（需要 0.6 MB）：请释放空间后重跑，已完成的句子会自动跳过。路径：<完整路径>（原文件未受损）` | `aw_core::dub::write_failure_note` + 测试 `write_failure_note_is_actionable_per_error_kind` |
+| 写句子 wav / srt / `project.json` / BGM manifest / 歌曲 wav / 导出拷贝时空间不足 | `磁盘空间不足（需要 0.6 MB）：请释放空间后重跑（已写好的文件不会被破坏）。路径：<完整路径>` | `aw_core::dub::write_failure_note` + 测试 `write_failure_note_is_actionable_per_error_kind` |
 | 拼装 `final.wav`（hound 流式写）空间不足 | 同上，但因为拿不到确切字节数，文案**不提**"需要多少"（不会写"需要 0.0 MB"） | `hound_error_note` + 测试 `zero_byte_write_note_omits_size_and_hound_errors_are_classified` |
 | 权限不足 / 路径不存在 | `没有写入权限：检查该目录权限，或把工程/导出目录换到有权限的位置。路径：<路径>` / `路径不存在（父目录可能被删除或移动）：重建目录后再重跑。路径：<路径>` | 同上 |
-| 工程状态是「已合成」但句子 wav 丢了 | `句子音频丢失：sentences/007.wav（工程里这句状态是「已合成」）。请重录该句，或把工程目录恢复回来。完整路径：<绝对路径>` | `sentence_read_note` + 测试 `missing_sentence_wav_says_which_file_is_gone` |
+| 工程状态是「已合成」但句子 wav 丢了（**拼装时会先逐句预校验，所以这条在拼装里也必须命中**） | `句子音频丢失：sentences/007.wav（工程里这句状态是「已合成」）。请重录该句，或把工程目录恢复回来。完整路径：<绝对路径>` | `sentence_read_note` + 测试 `missing_sentence_wav_says_which_file_is_gone`、**走真实 `assemble` 路径**的 `assemble_reports_which_sentence_wav_is_missing` |
 | `project.json` 读不了（截断 / 半截 JSON / 权限） | 启动时与开跑时都明确报 `工程文件损坏：没有自动重建，也没有覆盖它——请把 project.json 改名或移走后重开…完整路径：<路径>。解析错误：…`；**开跑会中止，不覆盖现场** | `Project::load_if_present` + 测试 `load_if_present_separates_missing_from_corrupt_project`、main 侧 `corrupt_project_aborts_the_run_and_keeps_the_file` |
 | `project.json` 不存在 | 照旧按全新工程从零开始（这一条是回归守卫，不能被上面那条误伤） | 同上两条测试 |
 
@@ -37,6 +37,15 @@
 目标文件要么还是旧内容、要么是新内容，不会留下写了一半的成品——
 所以"原文件未被破坏"这句写在文案里是有依据的，不是安抚。
 
+### 2.1 覆盖到的写入点（复核要求逐个可查）
+
+句子 wav / `final.srt` / `project.json`（逐句落盘与重录前落盘）/ 拼装 `final.wav`（hound 流式写 +
+fsync + rename）/ BGM manifest / BGM 分段 wav / BGM 混音 wav / 歌曲 wav / 分离两轨的 rename /
+句子复用（复制 + fsync + rename）/ 导出拷贝（wav、srt、导出目录）/ 试听临时 wav。
+
+工程损坏的**读取**侧：`restore_project`（启动恢复）与 `load_resumable`（开跑前）都走
+`Project::load_if_present`。
+
 ## 3. 本轮**没有**做的（别按已实现宣传）
 
 - **写前用 `statvfs` 预检剩余空间**：需要新依赖，而且"失败后给出准确字节数"已经覆盖了
@@ -45,6 +54,8 @@
   工程里那句仍是「待合成」，所以释放空间后重跑会跳过已完成句、只重做没做完的部分——
   结果等价，但工程文件里不会留下 `error: ENOSPC` 这条记录。
 - **`settings.json` 的原子写**：损坏时回落默认值，损失可忽略，本批不动。
+- **`tools/audio_dub.py`（M0 的 Python CLI）**：它自己那份 `write_atomic` 仍抛原始异常，
+  不经过本批文案。本批范围是桌面应用（Rust 侧）的用户可见行为；CLI 属于 M0 工具链，未改。
 
 ## 4. 复现命令
 

@@ -1,7 +1,7 @@
 //! BGM 链路：文本生成分段 → 拼接/循环到配音时长 → 按句时间轴 duck → 三轨导出。
 
 use crate::audio_client::{Client, ClientError};
-use crate::dub::{write_atomic_explained, Project};
+use crate::dub::{hound_error_note, write_atomic_explained, write_failure_note, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -168,7 +168,7 @@ pub fn generate_segments_stoppable(
         let pending = serde_json::to_vec(&BgmManifest::pending(options))
             .map_err(|e| ClientError::Decode(e.to_string()))?;
         write_atomic_explained(&manifest_path(dir), &pending)
-            .map_err(|e| ClientError::Http(e.to_string()))?;
+            .map_err(|e| ClientError::Local(e.to_string()))?;
     }
     for i in 0..total {
         if should_stop() {
@@ -250,7 +250,8 @@ pub fn assemble_bgm(dir: &Path, options: &BgmOptions) -> Result<PathBuf, String>
     let target_frames = (options.target_seconds * spec.sample_rate as f64).round() as u64;
     let out = dir.join("bgm/bgm.wav");
     let tmp = dir.join(format!("bgm/bgm.wav.tmp{}", std::process::id()));
-    let mut writer = hound::WavWriter::create(&tmp, spec).map_err(|e| e.to_string())?;
+    let mut writer =
+        hound::WavWriter::create(&tmp, spec).map_err(|e| hound_error_note(&out, 0, &e))?;
     let mut written = 0u64;
     let mut index = 0usize;
     while written < target_frames {
@@ -288,7 +289,7 @@ pub fn assemble_bgm(dir: &Path, options: &BgmOptions) -> Result<PathBuf, String>
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &out).map_err(|e| write_failure_note(&out, 0, &e))?;
     Ok(out)
 }
 
@@ -414,7 +415,8 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut out = hound::WavWriter::create(&tmp, spec).map_err(|e| e.to_string())?;
+    let mut out =
+        hound::WavWriter::create(&tmp, spec).map_err(|e| hound_error_note(&mixed_path, 0, &e))?;
     let frames = voice.duration() as u64 / vs.channels as u64;
     let mut vi = voice.samples::<i16>();
     let mut bi = bgm.samples::<i16>();
@@ -434,7 +436,7 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &mixed_path).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &mixed_path).map_err(|e| write_failure_note(&mixed_path, 0, &e))?;
     Ok(BgmArtifacts {
         voice: Some(voice_copy),
         bgm: bgm_path,
