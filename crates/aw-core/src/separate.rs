@@ -147,6 +147,32 @@ pub fn install_progress_callbacks() {
 }
 
 /// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
+/// 写出两轨，并保证**任一失败都不留 `.part`**。
+///
+/// 为什么必须统一清理：上游 `write_audio` 是"先创建目标文件、再逐样本写"，中途失败
+/// （磁盘满/权限变化）会留下半截文件。复核用 8MB 受限卷复现过：人声轨 ENOSPC 后留下
+/// 8.1MB 的 `cli_vocals.wav.part`——原来的代码在人声失败分支直接 `?` 返回，没清。
+fn write_stems_with_cleanup(
+    vocals_tmp: &Path,
+    accompaniment_tmp: &Path,
+    write_vocals: impl FnOnce(&Path) -> Result<(), String>,
+    write_accompaniment: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let cleanup = || {
+        let _ = std::fs::remove_file(vocals_tmp);
+        let _ = std::fs::remove_file(accompaniment_tmp);
+    };
+    if let Err(e) = write_vocals(vocals_tmp) {
+        cleanup();
+        return Err(e);
+    }
+    if let Err(e) = write_accompaniment(accompaniment_tmp) {
+        cleanup();
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// 输入音频时长（秒）。三态，别把三种情况揉成一个 `None`：
 ///
 /// - `Ok(Some(secs))`：能裁（wav 且读得动）；
@@ -345,22 +371,30 @@ pub fn separate_tracks(
     // 这两种输入保持上游产物（文档写明）。裁在 .part 上，再走原来的 rename 发布。
     let vocals_tmp = vocals_path.with_extension("wav.part");
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
-    stems
-        .save(Stem::Vocals, &vocals_tmp.display().to_string())
-        .map_err(|e| {
-            format!(
-                "写出人声轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
-                vocals_tmp.display()
-            )
-        })?;
-    if let Err(e) = stems.save_mix_except(&[Stem::Vocals], &accompaniment_tmp.display().to_string())
-    {
-        let _ = std::fs::remove_file(&vocals_tmp);
-        return Err(format!(
-            "写出伴奏轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
-            accompaniment_tmp.display()
-        ));
-    }
+    write_stems_with_cleanup(
+        &vocals_tmp,
+        &accompaniment_tmp,
+        |path| {
+            stems
+                .save(Stem::Vocals, &path.display().to_string())
+                .map_err(|e| {
+                    format!(
+                        "写出人声轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
+                        path.display()
+                    )
+                })
+        },
+        |path| {
+            stems
+                .save_mix_except(&[Stem::Vocals], &path.display().to_string())
+                .map_err(|e| {
+                    format!(
+                        "写出伴奏轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
+                        path.display()
+                    )
+                })
+        },
+    )?;
     let trim_note = match input_duration_seconds(&req.input) {
         Ok(Some(seconds)) => {
             for part in [&vocals_tmp, &accompaniment_tmp] {
@@ -570,5 +604,63 @@ mod tests {
         let err = input_duration_seconds(&broken).unwrap_err();
         assert!(err.contains("wav") && err.contains("broken.wav"), "{err}");
         assert!(err.contains("损坏") || err.contains("权限"), "{err}");
+    }
+
+    /// 两轨写出：**任一失败都不留 `.part`**（上游是先建文件再逐样本写，中途失败会留半截）。
+    /// 复核用 8MB 受限卷复现过"人声轨 ENOSPC 后留下 8.1MB .part"。
+    #[test]
+    fn stem_write_failure_leaves_no_part_files() {
+        let dir = std::env::temp_dir().join(format!("aw-parts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("v.wav.part");
+        let a = dir.join("a.wav.part");
+
+        // 1. 人声轨失败（上游已经写了半截）：两个都不留
+        let err = write_stems_with_cleanup(
+            &v,
+            &a,
+            |p| {
+                std::fs::write(p, b"half").unwrap();
+                Err("磁盘空间不足（模拟）".to_string())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains("磁盘空间不足"), "{err}");
+        assert!(!v.exists() && !a.exists(), "人声失败也要清干净");
+
+        // 2. 伴奏轨失败：人声已经写成，也要一起清掉（不留半套）
+        let err = write_stems_with_cleanup(
+            &v,
+            &a,
+            |p| {
+                std::fs::write(p, b"ok").unwrap();
+                Ok(())
+            },
+            |p| {
+                std::fs::write(p, b"half").unwrap();
+                Err("权限不足（模拟）".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("权限"), "{err}");
+        assert!(!v.exists() && !a.exists(), "伴奏失败要把人声也清掉");
+
+        // 3. 成功路径：两个文件都在（别把清理写成"总是删"）
+        write_stems_with_cleanup(
+            &v,
+            &a,
+            |p| {
+                std::fs::write(p, b"v").unwrap();
+                Ok(())
+            },
+            |p| {
+                std::fs::write(p, b"a").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(v.is_file() && a.is_file());
     }
 }
