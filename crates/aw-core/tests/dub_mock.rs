@@ -259,3 +259,72 @@ fn stoppable_synthesize_keeps_done_and_stops() {
     assert_eq!(prj.sentences[2].status, "pending");
     assert_eq!(mock.hit_count(), 1, "取消后不得再发请求");
 }
+
+/// 质检分数要能跨会话留存（写进工程），而**重新合成那一句必须把它清掉**——
+/// 否则界面会拿旧分数描述新音频。
+#[test]
+fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let dir = temp_dir("eval-persist");
+    let mut prj = project();
+    // 假装上一轮质检给第 0 句打了 91.5 分
+    prj.sentences[0].status = "done".into();
+    prj.sentences[0].duration = Some(0.1);
+    prj.sentences[0].eval_percent = Some(91.5);
+    prj.save(&dir).unwrap();
+
+    // 跨会话：重新读回来分数还在（没有这个字段的旧工程按 None 处理，`#[serde(default)]`）
+    let loaded = Project::load(&dir).unwrap();
+    assert_eq!(loaded.sentences[0].eval_percent, Some(91.5));
+    assert_eq!(loaded.sentences[1].eval_percent, None);
+
+    // 重新合成第 1 句 → 它的旧分数作废
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let mut prj = loaded;
+    prj.sentences[1].eval_percent = Some(50.0);
+    let failed = prj
+        .synthesize(&client(&mock.base), &dir, Some(&[1]), None, |_, _| {})
+        .unwrap();
+    assert_eq!(failed, 0);
+    assert_eq!(
+        prj.sentences[1].eval_percent, None,
+        "音频换了，旧质检分数必须清掉"
+    );
+    assert_eq!(
+        prj.sentences[0].eval_percent,
+        Some(91.5),
+        "没重合成的句子分数要保留"
+    );
+}
+
+/// 重新合成**失败**时这句没有分数：aw-core 在**开始重做**时就把旧分作废并落盘
+/// （先清后写，磁盘上不会出现"新音频 + 旧分数"），失败后两边都没有分数——
+/// 丢一个分数比显示一个错的分数好，重跑质检可补（复核两轮后收敛到这个语义）。
+#[test]
+fn failed_resynthesis_leaves_no_score_on_disk() {
+    let dir = temp_dir("eval-fail-clear");
+    let mut prj = project();
+    prj.sentences[0].status = "done".into();
+    prj.sentences[0].duration = Some(0.1);
+    prj.sentences[0].eval_percent = Some(88.0);
+    prj.save(&dir).unwrap();
+
+    // mock 返回 500：这一句合成失败
+    let mock = support::Mock::start(vec![(500, r#"{"error":"模型没加载"}"#.into())]);
+    let failed = prj
+        .synthesize(&client(&mock.base), &dir, Some(&[0]), None, |_, _| {})
+        .unwrap();
+    assert_eq!(failed, 1);
+    assert_eq!(prj.sentences[0].eval_percent, None, "内存里要清");
+
+    let on_disk = Project::load(&dir).unwrap();
+    assert_eq!(
+        on_disk.sentences[0].eval_percent, None,
+        "磁盘上也要清（旧分已经作废并落盘）"
+    );
+    assert!(
+        on_disk.sentences[0].status.starts_with("error"),
+        "状态应记为失败：{}",
+        on_disk.sentences[0].status
+    );
+}

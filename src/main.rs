@@ -281,6 +281,8 @@ struct EvalSummary {
     worst: Vec<EvalIssue>,
     /// 全部评上的分数（句 index → 可懂度%），给句子行展示用
     scores: Vec<(usize, f64)>,
+    /// 分数没能写进工程时的说明（写成功为 None）——分数仍然有效，但要如实告诉你它没落盘
+    persist_warning: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1344,6 +1346,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     continue;
                 }
                 let total = done.len();
+                let mut project = project;
                 let mut issues: Vec<EvalIssue> = Vec::new();
                 let mut scores: Vec<(usize, f64)> = Vec::new();
                 let mut sum = 0.0f64;
@@ -1359,29 +1362,38 @@ fn worker_loop(ctx: WorkerCtx) {
                     let wav = dir.join(format!("sentences/{idx:03}.wav"));
                     match client.asr(&wav) {
                         Ok(hypothesis) => {
+                            // clone 一份参考文本：下面还要 mut 借 project.sentences 写分数
                             let reference = project
                                 .sentences
                                 .iter()
                                 .find(|s| s.index == *idx)
-                                .map(|s| s.text.as_str())
-                                .unwrap_or("");
-                            let score = aw_core::intelligibility(reference, &hypothesis);
+                                .map(|s| s.text.clone())
+                                .unwrap_or_default();
+                            let score = aw_core::intelligibility(&reference, &hypothesis);
                             sum += score.percent;
                             scored += 1;
                             scores.push((*idx, score.percent));
+                            // 顺手写进工程：质检结果要能跨会话留存（否则每次开都要重跑 N 句 ASR）
+                            if let Some(sen) =
+                                project.sentences.iter_mut().find(|s| s.index == *idx)
+                            {
+                                sen.eval_percent = Some(score.percent);
+                            }
                             // 只收"有差异"的句子：worst 为空就等于全部一致
                             // （否则满分句也会被列成"最差 第 1 句 100%"，复核指出过）
                             if score.distance > 0 {
                                 issues.push(EvalIssue {
                                     index: *idx,
                                     percent: score.percent,
-                                    snippet: aw_core::diff_snippet(reference, &hypothesis)
+                                    snippet: aw_core::diff_snippet(&reference, &hypothesis)
                                         .unwrap_or_default(),
                                 });
                             }
                         }
                         Err(e) => {
-                            // 单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分
+                            // 单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分。
+                            // 这句的旧分数（如果有）**保留**——它描述的是磁盘上那段音频，
+                            // 而这次只是没测到；保留的分数要一起回给 UI，否则 UI 与磁盘不一致。
                             asr_failed += 1;
                             let _ = e;
                         }
@@ -1402,6 +1414,27 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
+                // 把"这次没评上、但旧分仍在工程里"的句子也纳入 scores：UI 之后是整体替换，
+                // 少给就会让磁盘有分、界面没分（复核抓到的不一致）。
+                for sen in &project.sentences {
+                    if let Some(percent) = sen.eval_percent {
+                        if sen.status == "done" && !scores.iter().any(|(i, _)| *i == sen.index) {
+                            scores.push((sen.index, percent));
+                        }
+                    }
+                }
+                // 分数落盘：失败不算质检失败（分数本身有效），但要如实报出来
+                let saved = project.save(&dir);
+                let persist_warning = saved.as_ref().err().map(|e| e.to_string());
+                // 落盘成功后把 worker 手里的 current 一起更新：否则后续 Redo/Assemble
+                // 用旧 Project 再 save 一次，会把刚写下的分数刷掉（复核抓到的阻塞项）
+                if saved.is_ok() {
+                    if let Some((_rev, cur_dir, cur_project)) = current.as_mut() {
+                        if *cur_dir == dir {
+                            *cur_project = project.clone();
+                        }
+                    }
+                }
                 issues.sort_by(|a, b| a.percent.partial_cmp(&b.percent).unwrap());
                 issues.truncate(3);
                 let percent = if scored == 0 {
@@ -1419,6 +1452,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             asr_failed,
                             worst: issues,
                             scores,
+                            persist_warning,
                         },
                     },
                 });
@@ -2245,6 +2279,9 @@ fn restore_project(
     ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
     refresh_voice_labels(ui);
     let done = apply_project_to_rows(ui, rows, &project);
+    // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）
+    *state.eval_scores.borrow_mut() = scores_from_project(&project);
+    apply_eval_labels(rows, &state.eval_scores.borrow());
     let _ = cmd_tx.send(Cmd::OpenProject {
         revision: state.project_revision.get(),
         dir,
@@ -2839,6 +2876,28 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
     ui.set_sep_status_text("停止中：本轮分离跑完才会丢弃结果（上游没有取消接口）…".into());
 }
 
+/// 合成消息到达时，该不该作废这一句的质检分数。
+///
+/// 语义 = **开始重做就作废**（aw-core 在同一时刻清并把"已作废"落盘，保证磁盘上不会出现
+/// "新音频 + 旧分数"）。所以 running / done / error 都要清，只有 pending 例外。
+/// 抽成函数是为了让这条语义有单测钉住（复核抓过"两边说法不一"）。
+fn sentence_message_invalidates_score(status: &str) -> bool {
+    matches!(status, "running" | "done" | "error")
+}
+
+/// 从工程里取质检分数：**只接受状态是「已合成」的句子**。
+///
+/// 失败/待合成的句子即使文件里还留着旧分数也不贴出来——那种分数描述的不是当前这句
+/// 可用的音频（复核建议：回灌要按状态过滤）。
+fn scores_from_project(project: &Project) -> HashMap<usize, f64> {
+    project
+        .sentences
+        .iter()
+        .filter(|s| s.status == "done")
+        .filter_map(|s| s.eval_percent.map(|p| (s.index, p)))
+        .collect()
+}
+
 /// 质检分数在句子行上的标签。低于阈值加 ⚠ 前缀提醒看一眼。
 ///
 /// 95% 是**启发式**（不是质量门槛）：CHARTER 记的基线是 98.5~100%，留一段余量；
@@ -2895,6 +2954,9 @@ fn eval_summary_note(summary: &EvalSummary) -> String {
             worst.snippet
         )),
         None => note.push_str("·全部一致"),
+    }
+    if let Some(warn) = &summary.persist_warning {
+        note.push_str(&format!("·（分数未写入工程：{warn}）"));
     }
     note
 }
@@ -3836,7 +3898,10 @@ fn tick(
                 refresh_tasks(ui, state);
             }
             Msg::ProjectLoaded { project, reused } => {
+                // 工程里的质检分数回灌（跨会话留存：重开应用不用重跑 ASR）
+                *state.eval_scores.borrow_mut() = scores_from_project(&project);
                 apply_project_to_rows(ui, rows, &project);
+                apply_eval_labels(rows, &state.eval_scores.borrow());
                 state.project_ready.set(true);
                 if reused > 0 {
                     ui.set_status_text(
@@ -3862,8 +3927,9 @@ fn tick(
                 status,
                 duration,
             } => {
-                // 这句要重录/正在重跑：旧分数立刻失效（否则界面会拿旧分骗人）
-                if status == "running" || status == "done" || status == "error" {
+                // 与磁盘同一个触发点：aw-core 在**开始重做**时就把旧分作废并落盘，
+                // 所以 UI 在 running（以及随后的 done/error）都清——两边不会说法不一。
+                if sentence_message_invalidates_score(&status) {
                     let had = state.eval_scores.borrow_mut().remove(&index).is_some();
                     if had {
                         apply_eval_labels(rows, &state.eval_scores.borrow());
@@ -4157,6 +4223,8 @@ fn tick(
                 if state.eval_task.get() != Some(task_id) {
                     continue;
                 }
+                // summary.scores 是**这次跑完之后工程里的完整分数集**（本次评上的 +
+                // ASR 失败但保留的旧分），所以这里是整体替换，与磁盘一致。
                 {
                     let mut scores = state.eval_scores.borrow_mut();
                     scores.clear();
@@ -4165,7 +4233,13 @@ fn tick(
                     }
                 }
                 apply_eval_labels(rows, &state.eval_scores.borrow());
-                let note = eval_summary_note(&summary);
+                let mut note = eval_summary_note(&summary);
+                // 质检是用户主动发起的"找问题"动作：跑完直接把最差那句选中，
+                // 用户当场就能点旁边的「重录」（列表不滚动，长稿还要自己滚一下）
+                if let Some(worst) = summary.worst.first() {
+                    ui.set_selected(worst.index as i32);
+                    note.push_str(&format!("·已选中第 {} 句", worst.index + 1));
+                }
                 // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
                 let outcome = if summary.scored == 0 {
                     tasks::TaskState::Failed
@@ -6026,6 +6100,7 @@ mod tests {
             asr_failed: 5,
             worst: Vec::new(),
             scores: Vec::new(),
+            persist_warning: None,
         };
         let note = eval_summary_note(&all_failed);
         assert!(note.contains("未能评分"), "{note}");
@@ -6039,6 +6114,7 @@ mod tests {
             asr_failed: 0,
             worst: Vec::new(),
             scores: vec![(0, 100.0), (1, 100.0), (2, 100.0)],
+            persist_warning: None,
         };
         let note = eval_summary_note(&clean);
         assert!(note.contains("100.0%") && note.contains("3 句"), "{note}");
@@ -6049,6 +6125,7 @@ mod tests {
             scored: 57,
             asr_failed: 2,
             scores: vec![(0, 100.0), (11, 92.3)],
+            persist_warning: Some("磁盘空间不足：…".into()),
             worst: vec![EvalIssue {
                 index: 11,
                 percent: 92.3,
@@ -6071,5 +6148,71 @@ mod tests {
         assert_eq!(eval_label(95.0), "可懂度 95.0%", "正好等于阈值不加警告");
         assert_eq!(eval_label(94.9), "⚠ 可懂度 94.9%");
         assert_eq!(eval_label(0.0), "⚠ 可懂度 0.0%");
+    }
+
+    /// 分数写不进工程时要如实说（分数有效但没落盘），别让用户以为下次打开还在。
+    #[test]
+    fn eval_summary_note_reports_persist_warning() {
+        let summary = EvalSummary {
+            percent: 96.4,
+            scored: 57,
+            asr_failed: 0,
+            worst: vec![EvalIssue {
+                index: 11,
+                percent: 92.3,
+                snippet: "…【应为 例，读到 力】…".into(),
+            }],
+            scores: vec![(11, 92.3)],
+            persist_warning: Some("磁盘空间不足（需要 0.1 MB）".into()),
+        };
+        let note = eval_summary_note(&summary);
+        assert!(note.contains("92.3%"), "{note}");
+        assert!(
+            note.contains("分数未写入工程") && note.contains("磁盘空间不足"),
+            "要如实报出没落盘：{note}"
+        );
+    }
+
+    /// 从工程取质检分数：只接受「已合成」的句子（失败句即使文件里留着旧分也不贴）。
+    #[test]
+    fn scores_from_project_keeps_only_done_sentences() {
+        let mut prj = Project::new(
+            "第一句。第二句。第三句。",
+            "audio8-tts",
+            GAP_MS,
+            BASE_SEED,
+            None,
+            DEFAULT_PUNCTUATION,
+            MAX_CHARS,
+            |t| t.to_string(),
+        );
+        prj.sentences[0].status = "done".into();
+        prj.sentences[0].eval_percent = Some(99.0);
+        prj.sentences[1].status = "error: 模型没加载".into();
+        prj.sentences[1].eval_percent = Some(50.0); // 脏数据：失败句不该贴出来
+        prj.sentences[2].status = "done".into();
+        prj.sentences[2].eval_percent = None;
+
+        let scores = scores_from_project(&prj);
+        assert_eq!(scores.get(&0), Some(&99.0));
+        assert_eq!(scores.get(&1), None, "失败句的旧分数不能贴");
+        assert_eq!(scores.get(&2), None, "没测过的句子没有分数");
+        assert_eq!(scores.len(), 1);
+    }
+
+    /// UI 只在 `done`（新 wav 已落盘）作废质检分数；running/error 时音频没变，分数仍成立。
+    /// 这条与 aw-core 的"音频真的换了才清"是同一个语义，两边必须一致（复核抓过不一致）。
+    #[test]
+    fn redoing_a_sentence_invalidates_the_score() {
+        assert!(
+            sentence_message_invalidates_score("running"),
+            "开始重做就作废"
+        );
+        assert!(sentence_message_invalidates_score("done"));
+        assert!(sentence_message_invalidates_score("error"));
+        assert!(
+            !sentence_message_invalidates_score("pending"),
+            "没开始做就不动"
+        );
     }
 }

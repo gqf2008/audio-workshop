@@ -111,6 +111,14 @@ pub struct Sentence {
     pub start: Option<f64>,
     #[serde(default)]
     pub status: String, // pending | done | error:...
+    /// 最近一次质检的可懂度（0..=100）。`None` = 没测过 / 已失效。
+    ///
+    /// 失效规则（UI 侧维护内存副本，两边要一致）：
+    /// · 这句被重新合成（合成/重录都走 `synthesize_stoppable`）→ 清空；
+    /// · 稿件改了 → `load_resumable` 判定文本不一致会重建工程，旧分数自然丢；
+    /// · 只改工程名、续跑时跳过已完成的句子 → 保留（音频没变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +171,7 @@ impl Project {
                 duration: None,
                 start: None,
                 status: "pending".into(),
+                eval_percent: None,
             })
             .collect();
         Self {
@@ -224,6 +233,16 @@ impl Project {
                 }
                 (s.index, s.spoken.clone(), s.seed)
             };
+            // 这一句要重做：先把旧质检分数作废并**立刻落盘**，再做（可能失败的）重合成。
+            //
+            // 顺序是这条不变式的全部：先清后写 ⇒ 磁盘上永远不会出现"新音频 + 旧分数"。
+            // 若反过来（先写 wav 再清分），进程在换 wav 与逐句 save 之间退出就会留下那个组合，
+            // 重启后旧分会被贴到新音频上（复核指出）。代价是失败后这句没有分数——丢一个分数
+            // 比显示一个错的分数好，重跑一次质检即可补回来。
+            if self.sentences[i].eval_percent.take().is_some() {
+                self.save(dir)
+                    .map_err(|e| ClientError::Local(e.to_string()))?;
+            }
             on_progress(index, &spoken);
             let outcome = match client.synth(
                 &self.model,
