@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>音频作坊· UI Redesign v1 线框</title>
+<style>
+  :root {
+    --page: #eef0f3;
+    --ink: #20252c;
+    --muted: #6f7782;
+    --line: #cfd4da;
+    --panel: #ffffff;
+    --panel-2: #f7f8fa;
+    --soft: #e8ebef;
+    --accent: #d86d32;
+    --accent-soft: #fff0e6;
+    --success: #3d8b63;
+    --danger: #c54b4b;
+    --focus: #315f9b;
+    --shadow: 0 14px 34px rgba(24, 30, 38, .10);
+    --radius: 16px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.5;
+  }
+
+  .wrap {
+    width: min(1500px, calc(100% - 40px));
+    margin: 0 auto;
+    padding: 32px 0 56px;
+  }
+
+  .intro {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+    margin-bottom: 22px;
+  }
+
+  .eyebrow {
+    margin: 0 0 4px;
+    color: var(--accent);
+    font: 700 12px/1.3 var(--mono);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(24px, 3vw, 40px);
+    letter-spacing: -.035em;
+  }
+
+  .intro p {
+    max-width: 720px;
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
+  .legend span,
+  .metric {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 9px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: rgba(255,255,255,.72);
+    color: var(--muted);
+    font: 600 11px/1.2 var(--mono);
+    white-space: nowrap;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 22px;
+  }
+
+  .screen {
+    min-width: 0;
+    overflow: hidden;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+
+  .screen-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 13px 15px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .screen-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .screen-title strong {
+    font-size: 14px;
+    letter-spacing: -.01em;
+  }
+
+  .screen-title small {
+    color: var(--muted);
+    font: 600 11px/1.2 var(--mono);
+  }
+
+  .screen-body { padding: 14px; }
+
+  .chrome {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: #f0f2f5;
+    border: 1px solid var(--line);
+    border-bottom: 0;
+    border-radius: 10px 10px 0 0;
+    color: var(--muted);
+    font: 600 11px/1.2 var(--mono);
+  }
+
+  .chrome .dot {
+    width: 8px;
+    height: 8px;
+    border: 1px solid #9aa2ad;
+    border-radius: 50%;
+    background: #fff;
+  }
+
+  .chrome .grow { flex: 1; }
+
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+    padding: 7px 8px;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-bottom: 0;
+  }
+
+  .tab {
+    overflow: hidden;
+    padding: 8px 4px;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    text-align: center;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .tab.active {
+    background: var(--accent-soft);
+    color: #9a4317;
+    box-shadow: inset 0 0 0 1px rgba(216,109,50,.28);
+  }
+
+  .projectbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-bottom: 0;
+    background: #fafbfc;
+  }
+
+  .projectbar .grow { flex: 1; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 7px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: #fff;
+    color: var(--muted);
+    font: 600 10px/1.2 var(--mono);
+    white-space: nowrap;
+  }
+
+  .pill.ok { color: var(--success); border-color: #bdd8c8; background: #f2fbf6; }
+  .pill.warn { color: #9a5d13; border-color: #ebd2a8; background: #fff9ee; }
+  .pill.bad { color: var(--danger); border-color: #e8bcbc; background: #fff5f5; }
+
+  .canvas {
+    min-height: 210px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    background:
+      linear-gradient(180deg, rgba(247,248,250,.8), rgba(255,255,255,.95)),
+      repeating-linear-gradient(0deg, transparent 0 27px, rgba(48, 55, 66, .035) 27px 28px);
+  }
+
+  .canvas.tight { min-height: 176px; }
+  .canvas.center { display: grid; place-items: center; }
+
+  .split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    height: 100%;
+  }
+
+  .subpane {
+    min-width: 0;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: rgba(255,255,255,.86);
+  }
+
+  .subpane h4,
+  .mini-label {
+    margin: 0 0 7px;
+    color: var(--muted);
+    font: 700 10px/1.2 var(--mono);
+    letter-spacing: .06em;
+    text-transform: uppercase;
+  }
+
+  .segment {
+    display: inline-flex;
+    gap: 3px;
+    margin-bottom: 8px;
+    padding: 3px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #f4f5f7;
+  }
+
+  .segment span {
+    padding: 4px 7px;
+    border-radius: 5px;
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  .segment span.on {
+    background: #fff;
+    color: var(--ink);
+    box-shadow: 0 1px 3px rgba(24,30,38,.12);
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 30px;
+    padding: 5px 7px;
+    border-bottom: 1px solid #e6e9ed;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .row:last-child { border-bottom: 0; }
+  .row .idx { width: 18px; color: #9098a2; font: 600 10px/1 var(--mono); }
+  .row .text { flex: 1; overflow: hidden; color: var(--ink); white-space: nowrap; text-overflow: ellipsis; }
+  .dotstatus { width: 8px; height: 8px; border-radius: 50%; background: #b6bdc6; }
+  .dotstatus.done { background: var(--success); }
+  .dotstatus.work { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .dotstatus.fail { background: var(--danger); }
+
+  .field {
+    min-height: 68px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #fff;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .field.small { min-height: 42px; }
+  .field.big { min-height: 112px; }
+
+  .field strong {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--ink);
+    font-size: 12px;
+  }
+
+  .drop {
+    min-height: 128px;
+    display: grid;
+    place-items: center;
+    border: 2px dashed #bcc3cb;
+    border-radius: 12px;
+    background: #fbfcfd;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  .drop strong {
+    display: block;
+    color: var(--ink);
+    font-size: 13px;
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding-top: 10px;
+  }
+
+  .controls .grow { flex: 1; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 36px;
+    padding: 7px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fff;
+    color: var(--ink);
+    font-size: 11px;
+    font-weight: 750;
+    white-space: nowrap;
+  }
+
+  .btn.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .btn.ghost {
+    border-style: dashed;
+    color: var(--muted);
+  }
+
+  .btn:disabled {
+    color: #9aa2ad;
+    background: #f2f3f5;
+    border-color: #e1e4e8;
+  }
+
+  .statusline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+    margin-top: 9px;
+    padding: 6px 8px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 7px 7px 0;
+    background: #f8f9fb;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .statusline .grow { flex: 1; }
+  .statusline strong { color: var(--ink); }
+
+  .result {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: center;
+    margin-top: 9px;
+    padding: 8px 9px;
+    border: 1px solid #d7dfe8;
+    border-radius: 8px;
+    background: #f7f9fb;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .tracklist {
+    display: grid;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .track {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fff;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .track strong { color: var(--ink); }
+  .track .grow { flex: 1; }
+
+  .drawer-preview {
+    position: relative;
+    min-height: 300px;
+    overflow: hidden;
+    background: #222831;
+  }
+
+  .dark-shell {
+    position: absolute;
+    inset: 0;
+    background: #1e242c;
+    color: #e9edf2;
+  }
+
+  .dark-shell .chrome {
+    margin: 0;
+    border-color: #3b444f;
+    border-radius: 0;
+    background: #171c23;
+    color: #9ba6b4;
+  }
+
+  .dark-shell .tabs {
+    border-color: #3b444f;
+    background: #232a33;
+  }
+
+  .dark-shell .tab { color: #9ba6b4; }
+  .dark-shell .tab.active { background: #462f25; color: #f0ad83; box-shadow: inset 0 0 0 1px #815137; }
+  .dark-shell .projectbar { border-color: #3b444f; background: #252d37; }
+  .dark-shell .pill { border-color: #48525f; background: #1d242c; color: #aeb8c5; }
+  .dark-shell .canvas { border-color: #3b444f; background: #1f262f; }
+  .dark-shell .field { border-color: #48525f; background: #29313b; color: #aeb8c5; }
+  .dark-shell .field strong { color: #edf1f5; }
+  .dark-shell .btn { border-color: #515c69; background: #29313b; color: #e9edf2; }
+  .dark-shell .btn.primary { border-color: #d97845; background: #d97845; color: #fff; }
+  .dark-shell .statusline { background: #252d37; color: #aeb8c5; }
+  .dark-shell .statusline strong { color: #edf1f5; }
+  .dark-shell .controls { padding-top: 10px; }
+
+  .dark-content { padding: 14px; padding-right: 178px; }
+
+  .drawer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 168px;
+    padding: 12px 10px;
+    border-left: 1px solid #515c69;
+    background: #171c23;
+    color: #c9d1dc;
+    font-size: 10px;
+  }
+
+  .drawer h4 {
+    margin: 0 0 3px;
+    color: #f0ad83;
+    font: 700 10px/1.2 var(--mono);
+    letter-spacing: .05em;
+  }
+
+  .drawer .group {
+    margin-bottom: 11px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid #333c48;
+  }
+
+  .drawer-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    min-height: 23px;
+    color: #aeb8c5;
+  }
+
+  .drawer-line span:last-child {
+    padding: 3px 5px;
+    border: 1px solid #475362;
+    border-radius: 5px;
+    color: #dfe6ee;
+    font-family: var(--mono);
+    font-size: 9px;
+  }
+
+  .note {
+    margin-top: 10px;
+    padding: 9px 10px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: #fff;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .note strong { color: var(--ink); }
+
+  .footer {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 24px;
+  }
+
+  .footer .card {
+    padding: 13px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(255,255,255,.78);
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .footer strong {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--ink);
+    font-size: 12px;
+  }
+
+  @media (max-width: 1050px) {
+    .grid { grid-template-columns: 1fr; }
+    .intro { align-items: flex-start; flex-direction: column; }
+    .legend { justify-content: flex-start; }
+    .footer { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 620px) {
+    .wrap { width: min(100% - 20px, 1500px); padding-top: 18px; }
+    .split { grid-template-columns: 1fr; }
+    .footer { grid-template-columns: 1fr; }
+    .dark-content { padding-right: 14px; padding-bottom: 340px; }
+    .drawer { top: auto; width: auto; height: 315px; }
+  }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header class="intro">
+    <div>
+      <p class="eyebrow">Audio Workshop / UI Redesign v1</p>
+      <h1>四个主 Tab，一屏一件事</h1>
+      <p>低密度线框：顶部四场景始终可见；每屏只突出一个主任务；参数进入当前 Tab 的高级抽屉；任务可跨 Tab、可恢复。</p>
+    </div>
+    <div class="legend" aria-label="图例">
+      <span>1 个主操作</span>
+      <span>首屏 ≤ 8 个语义元素</span>
+      <span>高级参数默认隐藏</span>
+      <span>状态：空 / 运行 / 完成 / 失败 / 恢复</span>
+    </div>
+  </header>
+
+  <section class="grid" aria-label="四个主 Tab 的线框">
+    <article class="screen">
+      <div class="screen-head">
+        <div class="screen-title"><strong>01 · 配音</strong><small>编辑/运行态 · 首屏 7/8</small></div>
+        <span class="metric">主操作 1</span>
+      </div>
+      <div class="screen-body">
+        <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
+        <nav class="tabs" aria-label="主 Tab">
+          <span class="tab active">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span>
+        </nav>
+        <div class="projectbar"><span class="pill">0921 开箱口播</span><span class="pill ok">已保存</span><span class="grow"></span><span class="pill">断点 19/34</span></div>
+        <div class="canvas">
+          <div class="split">
+            <div class="subpane">
+              <div class="segment"><span>稿件</span><span class="on">句子</span></div>
+              <div class="mini-label">校听列表 · 默认行 3 元素</div>
+              <div class="row"><span class="idx">01</span><span class="text">欢迎来到今天的开箱视频。</span><span class="dotstatus done"></span></div>
+              <div class="row"><span class="idx">02</span><span class="text">这次我把三个版本都带来了。</span><span class="dotstatus work"></span></div>
+              <div class="row"><span class="idx">03</span><span class="text">先看最轻的那一款。</span><span class="dotstatus done"></span></div>
+              <div class="row"><span class="idx">04</span><span class="text">它的重量只有 420 克。</span><span class="dotstatus fail"></span></div>
+              <div class="row"><span class="idx">05</span><span class="text">我们继续往后看。</span><span class="dotstatus"></span></div>
+            </div>
+            <div class="subpane">
+              <div class="mini-label">选中后才展开</div>
+              <div class="field small"><strong>第 04 句 · 需重听</strong>它的重量只有 <b>420</b> 克。</div>
+              <div class="controls">
+                <span class="btn">试听</span><span class="btn primary">重录</span><span class="grow"></span><span class="pill bad">失败可重试</span>
+              </div>
+              <div class="note"><strong>渐进披露：</strong>文本修正、试听、重录只在当前句出现；seed 和精确起止时间进入任务详情。</div>
+            </div>
+          </div>
+        </div>
+        <div class="controls">
+          <span class="btn ghost">高级：音色与输出</span><span class="grow"></span><span class="btn primary">停止</span>
+        </div>
+        <div class="statusline"><span>正在合成</span><strong>第 12 / 34 句</strong><span>· 可切换到其他 Tab</span><span class="grow"></span><span>35%</span></div>
+        <div class="result"><span>完成后出现：成品 03:42 · 导出</span><span class="btn">结果条</span></div>
+      </div>
+    </article>
+
+    <article class="screen">
+      <div class="screen-head">
+        <div class="screen-title"><strong>02 · BGM</strong><small>空态/生成态 · 首屏 6/8</small></div>
+        <span class="metric">主操作 1</span>
+      </div>
+      <div class="screen-body">
+        <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
+        <nav class="tabs" aria-label="主 Tab">
+          <span class="tab">配音</span><span class="tab active">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span>
+        </nav>
+        <div class="projectbar"><span class="pill">当前工程：0921 开箱口播</span><span class="pill ok">混音源就绪</span><span class="grow"></span><span class="pill">BGM 独立</span></div>
+        <div class="canvas tight">
+          <div class="field big"><strong>音乐描述</strong>温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好。</div>
+          <div class="controls">
+            <span class="btn ghost">高级：时长 / duck / 模型</span><span class="grow"></span><span class="btn primary">生成并混音</span>
+          </div>
+          <div class="statusline"><span>等待输入</span><span>· 没有配音成品时仍可先只生成 BGM</span></div>
+        </div>
+        <div class="result"><span>完成后出现：BGM / 混音两轨结果与试听</span><span class="btn ghost">结果区</span></div>
+      </div>
+    </article>
+
+    <article class="screen">
+      <div class="screen-head">
+        <div class="screen-title"><strong>03 · 人声分离</strong><small>空态/能力门控 · 首屏 6/8</small></div>
+        <span class="metric">需后端能力</span>
+      </div>
+      <div class="screen-body">
+        <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
+        <nav class="tabs" aria-label="主 Tab">
+          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab active">人声分离</span><span class="tab">音乐制作</span>
+        </nav>
+        <div class="projectbar"><span class="pill">保存到当前工程</span><span class="grow"></span><span class="pill warn">模型/端点未接入</span></div>
+        <div class="canvas tight">
+          <div class="drop"><div><strong>拖入音频，或点击选择</strong><span>wav / mp3 / flac · 原文件保留</span></div></div>
+          <div class="controls">
+            <span class="btn ghost">高级：模型 / 阈值 / 输出</span><span class="grow"></span><span class="btn primary">选择音频</span>
+          </div>
+          <div class="statusline"><span>能力未就绪时不显示假模型、假阈值，也不创建伪任务。</span></div>
+        </div>
+        <div class="result"><span>结果后：人声轨 + 伴奏轨，分别试听 / 下载</span><span class="btn ghost">两轨列表</span></div>
+      </div>
+    </article>
+
+    <article class="screen">
+      <div class="screen-head">
+        <div class="screen-title"><strong>04 · 音乐制作</strong><small>编辑态 · 首屏 7/8</small></div>
+        <span class="metric">模型收进高级</span>
+      </div>
+      <div class="screen-body">
+        <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
+        <nav class="tabs" aria-label="主 Tab">
+          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab active">音乐制作</span>
+        </nav>
+        <div class="projectbar"><span class="pill">当前工程 · 未生成</span><span class="pill warn">实验性</span><span class="grow"></span><span class="pill">本地模型</span></div>
+        <div class="canvas">
+          <div class="field big"><strong>歌词</strong>[Verse]<br>凌晨的厨房还亮着灯<br>[Chorus]<br>别让我一个人悬在那句也许</div>
+          <div style="height:8px"></div>
+          <div class="field small"><strong>风格</strong>Mandarin Chinese R&amp;B slow jam, warm male lead vocal</div>
+          <div class="controls">
+            <span class="btn ghost">高级：模型 / 步数 / 时长</span><span class="grow"></span><span class="btn primary">生成音乐</span>
+          </div>
+          <div class="statusline"><span>填写歌词和风格后开始 · 生成可切 Tab</span></div>
+        </div>
+        <div class="result"><span>完成后出现：试听 · 导出 · 再生成一版</span><span class="btn ghost">结果条</span></div>
+      </div>
+    </article>
+  </section>
+
+  <section class="screen" style="margin-top:22px">
+    <div class="screen-head">
+      <div class="screen-title"><strong>Variant · 深色 / 顶部选中态 / 高级抽屉展开</strong><small>BGM 高级参数</small></div>
+      <span class="metric">首屏主操作仍只有 1 个</span>
+    </div>
+    <div class="screen-body" style="padding:0">
+      <div class="drawer-preview">
+        <div class="dark-shell">
+          <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
+          <nav class="tabs" aria-label="深色主 Tab">
+            <span class="tab">配音</span><span class="tab active">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span>
+          </nav>
+          <div class="dark-content">
+            <div class="projectbar"><span class="pill">当前工程：0921 开箱口播</span><span class="pill">混音源就绪</span><span class="grow"></span><span class="pill">BGM 运行中</span></div>
+            <div class="canvas tight">
+              <div class="field big"><strong>音乐描述</strong>温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好。</div>
+              <div class="controls"><span class="grow"></span><span class="btn primary">停止</span></div>
+              <div class="statusline"><span>生成第 2 / 5 段</span><span>· 已完成段保留</span><span class="grow"></span><span>38%</span></div>
+            </div>
+          </div>
+          <aside class="drawer" aria-label="BGM 高级抽屉">
+            <h4>BGM 高级</h4>
+            <div class="group">
+              <div class="drawer-line"><span>时长</span><span>跟着配音</span></div>
+              <div class="drawer-line"><span>分段</span><span>30s</span></div>
+              <div class="drawer-line"><span>模型</span><span>本地</span></div>
+            </div>
+            <div class="group">
+              <div class="drawer-line"><span>混入配音</span><span>开</span></div>
+              <div class="drawer-line"><span>Duck</span><span>中</span></div>
+              <div class="drawer-line"><span>保留分轨</span><span>是</span></div>
+            </div>
+            <div>
+              <div class="drawer-line"><span>导出</span><span>统一面板</span></div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="footer" aria-label="设计规则摘要">
+    <div class="card"><strong>密度</strong>默认首屏语义元素 ≤ 8；列表多行只计一个对象；抽屉默认不计。</div>
+    <div class="card"><strong>层级</strong>顶部四 Tab 是唯一一级导航；工程、任务、导出、设置都是从属结构。</div>
+    <div class="card"><strong>渐进披露</strong>配音参数、BGM 参数、分离阈值、音乐模型全部藏在当前 Tab 的高级抽屉。</div>
+    <div class="card"><strong>恢复</strong>切换 Tab 不取消任务；失败可重试；重启后恢复工程、任务和上次选中对象。</div>
+  </section>
+</main>
+</body>
+</html>
