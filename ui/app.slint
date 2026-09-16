@@ -135,13 +135,18 @@ export component MainWindow inherits Window {
     in-out property <string> bgm-prompt: "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好";
     in-out property <float> bgm-progress: 0.0;
     in property <bool> bgm-has-result: false;
-    in property <string> bgm-status-text: "先完成配音，再用当前工程生成 BGM。";
+    in property <string> bgm-status-text: "写清楚氛围、乐器和是否要人声；没有配音成品时可先生成独立 BGM。";
     // BGM 结果区 / 高级 / stale（见 screens.md §3）
     in property <string> bgm-voice-label: "";
     in property <string> bgm-track-label: "";
     in property <string> bgm-mixed-label: "";
     in property <bool> bgm-stale: false;
     in-out property <int> bgm-duck-index: 1;
+    // 独立生成 BGM 的时长档位（0=30s 1=60s 2=120s 3=180s）；有配音成品时按配音时长对齐
+    in-out property <int> bgm-standalone-index: 1;
+    // 结果区里哪几轨真的存在（独立生成只有 BGM 轨）
+    in property <bool> bgm-has-voice-track: false;
+    in property <bool> bgm-has-mixed-track: false;
     in property <string> status-text: "就绪";
     // 配音**成品**是否就绪（out/final.wav 已拼装）——BGM 的混音依赖它。
     // 不能用 has-result 代替：那是「任意一句合成成功」，不足以做混音。
@@ -373,6 +378,9 @@ export component MainWindow inherits Window {
                     bgm-label: root.bgm-track-label;
                     mixed-label: root.bgm-mixed-label;
                     duck-index <=> root.bgm-duck-index;
+                    standalone-index <=> root.bgm-standalone-index;
+                    has-voice-track: root.bgm-has-voice-track;
+                    has-mixed-track: root.bgm-has-mixed-track;
                     generate => { root.bgm-generate(); }
                     stop => { root.bgm-stop(); }
                     prompt-edited => { root.bgm-prompt-edited(); }

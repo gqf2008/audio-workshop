@@ -31,6 +31,10 @@ fn main() {
     println!(
         "BGM done: segments={segments} duration={:.1}s mixed={}",
         artifacts.duration,
-        artifacts.mixed.display()
+        artifacts
+            .mixed
+            .as_ref()
+            .expect("混音成功必然有 mixed 轨")
+            .display()
     );
 }

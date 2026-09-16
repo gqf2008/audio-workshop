@@ -26,8 +26,8 @@ use std::time::Duration;
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use aw_core::{
-    assemble_bgm, generate_segments_stoppable, generate_song, mix_project, BgmArtifacts,
-    BgmOptions, BgmRun, Client, Project, SongModel, SongOptions, DEFAULT_PUNCTUATION,
+    assemble_bgm, bgm_only_artifacts, generate_segments_stoppable, generate_song, mix_project,
+    BgmArtifacts, BgmOptions, BgmRun, Client, Project, SongModel, SongOptions, DEFAULT_PUNCTUATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -47,6 +47,8 @@ const MAX_CHARS: usize = 80;
 const BASE_SEED: u64 = 831001;
 /// 工程目录与导出目录的根目录名（`~/Documents/音频作坊/`）。
 const WORKSHOP_DIR: &str = "音频作坊";
+/// 独立生成 BGM（没有配音成品）时的默认时长。
+const DEFAULT_BGM_STANDALONE_SECONDS: f64 = 60.0;
 const DEFAULT_PROJECT: &str = "示例工程 · 频道口播";
 /// 中文口播时长估算：秒/字（未合成句的展示用估值；合成后由真实时长覆盖）。
 const SECS_PER_CHAR: f32 = 0.18;
@@ -80,6 +82,11 @@ enum Cmd {
         revision: u64,
         prompt: String,
         duck_gain: f32,
+        /// 没有配音成品时用的目标时长（独立生成 BGM）；有配音成品时忽略，按配音时长对齐。
+        standalone_seconds: Option<f64>,
+        /// 产物落点：全新机器上 worker 里还没有 current（没载入过工程），
+        /// 独立生成 BGM 也要有地方写 bgm/segments 与 bgm/bgm.wav。
+        dir: PathBuf,
     },
     /// 音色试听：用指定音色合成一句固定短句，只播不落工程、不改 current。
     PreviewVoice {
@@ -152,6 +159,8 @@ enum Msg {
     BgmDone {
         artifacts: BgmArtifacts,
         segments: usize,
+        /// true = 跟配音同框并混音（有 voice/mixed 轨）；false = 独立生成，只有 BGM 轨
+        mixed: bool,
     },
     BgmFailed(String),
     /// BGM 在段间被用户停止（已完成 `done` 段）；与失败区分开，不说成"完成"。
@@ -549,11 +558,24 @@ pub fn duck_gain_for(index: i32) -> f32 {
     }
 }
 
+/// 独立生成 BGM 的时长档位（秒）：30 / 60 / 120 / 180，越界回落 60。
+pub fn bgm_standalone_seconds(index: i32) -> f64 {
+    match index {
+        0 => 30.0,
+        2 => 120.0,
+        3 => 180.0,
+        _ => DEFAULT_BGM_STANDALONE_SECONDS,
+    }
+}
+
 /// 三轨结果区里的行号 → 产物路径（0 人声 / 1 BGM / 2 混音）。
-pub fn bgm_track_path(artifacts: &BgmArtifacts, index: i32) -> PathBuf {
+///
+/// 独立生成的 BGM 没有 voice / mixed 两轨 → 返回 None（UI 侧那一行不显示，
+/// 而不是给一个不存在的路径让用户点了报错）。
+pub fn bgm_track_path(artifacts: &BgmArtifacts, index: i32) -> Option<PathBuf> {
     match index {
         0 => artifacts.voice.clone(),
-        1 => artifacts.bgm.clone(),
+        1 => Some(artifacts.bgm.clone()),
         _ => artifacts.mixed.clone(),
     }
 }
@@ -949,42 +971,39 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision,
                 prompt,
                 duck_gain,
+                standalone_seconds,
+                dir,
             } => {
-                let Some((current_revision, dir, _)) = current.as_ref() else {
-                    let _ = ctx.tx.send(WorkerMsg {
-                        revision,
-                        msg: Msg::BgmFailed("先完成配音并载入工程，再生成 BGM".into()),
-                    });
-                    continue;
+                // 有已载入工程就用它的目录（与配音同一份）；没有就用命令里带来的目录
+                // （独立生成 BGM 不该因为"没跑过配音"而被拒）。
+                let dir = match current.as_ref() {
+                    Some((current_revision, loaded_dir, _)) => {
+                        if *current_revision != revision {
+                            let _ = ctx.tx.send(WorkerMsg {
+                                revision,
+                                msg: Msg::BgmFailed("工程版本已变更：先重新载入配音工程".into()),
+                            });
+                            continue;
+                        }
+                        loaded_dir.clone()
+                    }
+                    None => dir,
                 };
-                if *current_revision != revision {
-                    let _ = ctx.tx.send(WorkerMsg {
-                        revision,
-                        msg: Msg::BgmFailed("工程版本已变更：先重新载入配音工程".into()),
-                    });
-                    continue;
-                }
+                let dir = &dir;
+                // 有配音成品 → 按它对齐并混音；没有 → 独立生成（用 UI 选的时长，只出 BGM 轨）。
                 let voice_path = dir.join("out/final.wav");
-                let target_seconds = std::fs::read(&voice_path)
+                let dub_seconds = std::fs::read(&voice_path)
                     .ok()
                     .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
-                    .ok_or_else(|| "还没有配音成品：先合成并拼装".to_string())
-                    .and_then(|duration| {
-                        if duration > 0.0 {
-                            Ok(duration)
-                        } else {
-                            Err("配音成品时长为 0".to_string())
-                        }
-                    });
-                let target_seconds = match target_seconds {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = ctx.tx.send(WorkerMsg {
-                            revision,
-                            msg: Msg::BgmFailed(e),
-                        });
-                        continue;
-                    }
+                    .filter(|d| *d > 0.0);
+                let (target_seconds, mix) = match dub_seconds {
+                    Some(v) => (v, true),
+                    None => (
+                        standalone_seconds
+                            .filter(|v| *v > 0.0)
+                            .unwrap_or(DEFAULT_BGM_STANDALONE_SECONDS),
+                        false,
+                    ),
                 };
                 let client = match make_client() {
                     Ok(c) => c,
@@ -1042,20 +1061,30 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
-                match mix_project(dir, &options) {
+                let finished = if mix {
+                    mix_project(dir, &options)
+                } else {
+                    // 独立生成：只有 BGM 一轨（voice/mixed/srt 都是 None）
+                    bgm_only_artifacts(dir, &options)
+                };
+                match finished {
                     Ok(artifacts) => {
                         let _ = ctx.tx.send(WorkerMsg {
                             revision,
                             msg: Msg::BgmDone {
                                 artifacts,
                                 segments,
+                                mixed: mix,
                             },
                         });
                     }
                     Err(e) => {
                         let _ = ctx.tx.send(WorkerMsg {
                             revision,
-                            msg: Msg::BgmFailed(format!("BGM 混音失败: {e}")),
+                            msg: Msg::BgmFailed(format!(
+                                "{}失败: {e}",
+                                if mix { "BGM 混音" } else { "BGM 收尾" }
+                            )),
                         });
                     }
                 }
@@ -1732,11 +1761,21 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_scene(1);
             ui.set_bgm_has_result(true);
             ui.set_bgm_stale(false);
+            // 三轨都存在（这个态就是用来核对三轨结果区的）
+            ui.set_bgm_has_voice_track(true);
+            ui.set_bgm_has_mixed_track(true);
             ui.set_bgm_voice_label("人声 · 示例工程 · 频道口播_voice.wav".into());
             ui.set_bgm_track_label("BGM · 示例工程 · 频道口播_bgm.wav".into());
             ui.set_bgm_mixed_label("混音 · 示例工程 · 频道口播_mixed.wav".into());
             ui.set_bgm_status_text("5 段 · 混音 03:42 · 已完成（示例数据）".into());
             ui.set_status_text("BGM：结果就绪态（示例数据，用于核对三轨结果区）".into());
+        }
+        "bgm-standalone-run" => {
+            // 真跑：无配音成品 → 用「高级」里的 30 秒档独立生成 BGM（只出 BGM 一轨）
+            ui.set_scene(1);
+            ui.set_bgm_prompt("轻快的木吉他循环，无人声，适合口播背景".into());
+            ui.set_bgm_standalone_index(0);
+            ui.invoke_bgm_generate();
         }
         "song" => {
             ui.set_scene(3);
@@ -2124,10 +2163,10 @@ fn seed_shot_bgm_artifacts(_ui: &MainWindow, _state: &Rc<UiState>) {}
 #[cfg(debug_assertions)]
 fn artifacts_like(sample: &Path) -> BgmArtifacts {
     BgmArtifacts {
-        voice: sample.to_path_buf(),
+        voice: Some(sample.to_path_buf()),
         bgm: sample.to_path_buf(),
-        mixed: sample.to_path_buf(),
-        srt: sample.with_extension("srt"),
+        mixed: Some(sample.to_path_buf()),
+        srt: Some(sample.with_extension("srt")),
         duration: 4.27,
         segments: 5,
     }
@@ -2576,10 +2615,8 @@ fn wire_bgm(
             ui.set_status_text("任务进行中：等当前任务结束再生成 BGM".into());
             return;
         }
-        if !state1.project_ready.get() {
-            ui.set_status_text("先完成配音并载入当前工程，再生成 BGM".into());
-            return;
-        }
+        // 注意：这里**不要求** project_ready —— 没有配音成品时可以独立生成 BGM
+        // （worker 会用命令带来的工程目录当落点，且只出 BGM 一轨）。
         let prompt = ui.get_bgm_prompt().to_string();
         if prompt.trim().is_empty() {
             ui.set_status_text("先写一段 BGM 描述".into());
@@ -2604,6 +2641,8 @@ fn wire_bgm(
                 revision: state1.project_revision.get(),
                 prompt,
                 duck_gain: duck_gain_for(ui.get_bgm_duck_index()),
+                standalone_seconds: Some(bgm_standalone_seconds(ui.get_bgm_standalone_index())),
+                dir: project_dir(&file_stem(&ui.get_project_name())),
             })
             .is_err()
         {
@@ -2658,7 +2697,10 @@ fn wire_bgm(
             ui.set_status_text("还没有 BGM 成品：先生成并混音".into());
             return;
         };
-        let path = bgm_track_path(&artifacts, i);
+        let Some(path) = bgm_track_path(&artifacts, i) else {
+            ui.set_status_text("这一轨不存在：本次是独立生成的 BGM（只有 BGM 轨）".into());
+            return;
+        };
         let what = match i {
             0 => "人声",
             1 => "BGM",
@@ -2685,7 +2727,10 @@ fn wire_bgm(
             ui.set_status_text("还没有 BGM 成品：先生成并混音".into());
             return;
         };
-        let src = bgm_track_path(&artifacts, i);
+        let Some(src) = bgm_track_path(&artifacts, i) else {
+            ui.set_status_text("这一轨不存在：本次是独立生成的 BGM（只有 BGM 轨）".into());
+            return;
+        };
         let suffix = match i {
             0 => "voice",
             1 => "bgm",
@@ -3061,18 +3106,43 @@ fn tick(
             Msg::BgmDone {
                 artifacts,
                 segments,
+                mixed,
             } => {
                 ui.set_busy(false);
                 ui.set_bgm_has_result(true);
                 ui.set_bgm_stale(false);
                 ui.set_bgm_progress(1.0);
-                ui.set_bgm_voice_label(format!("人声 · {}", file_label(&artifacts.voice)).into());
-                ui.set_bgm_track_label(format!("BGM · {}", file_label(&artifacts.bgm)).into());
-                ui.set_bgm_mixed_label(format!("混音 · {}", file_label(&artifacts.mixed)).into());
-                let note = format!(
-                    "BGM 完成：{segments} 段 · 成品 {:.1}s · 已生成 voice/bgm/mixed",
-                    artifacts.duration
+                // 有哪几轨就显示哪几轨：独立生成只有 BGM 一轨
+                ui.set_bgm_has_voice_track(artifacts.voice.is_some());
+                ui.set_bgm_has_mixed_track(artifacts.mixed.is_some());
+                ui.set_bgm_voice_label(
+                    artifacts
+                        .voice
+                        .as_ref()
+                        .map(|p| format!("人声 · {}", file_label(p)))
+                        .unwrap_or_default()
+                        .into(),
                 );
+                ui.set_bgm_track_label(format!("BGM · {}", file_label(&artifacts.bgm)).into());
+                ui.set_bgm_mixed_label(
+                    artifacts
+                        .mixed
+                        .as_ref()
+                        .map(|p| format!("混音 · {}", file_label(p)))
+                        .unwrap_or_default()
+                        .into(),
+                );
+                let note = if mixed {
+                    format!(
+                        "BGM 完成：{segments} 段 · 成品 {:.1}s · 已生成 voice/bgm/mixed",
+                        artifacts.duration
+                    )
+                } else {
+                    format!(
+                        "BGM 完成（独立生成）：{segments} 段 · 成品 {:.1}s · 只生成 BGM 轨",
+                        artifacts.duration
+                    )
+                };
                 finish_task(
                     ui,
                     state,
@@ -4256,21 +4326,49 @@ mod tests {
         assert!(strong > 0.0, "压到 0 等于把人声段 BGM 静音，不算「强」");
     }
 
+    /// 独立生成 BGM 的时长档位：与 UI 的 ["30 秒","60 秒","120 秒","180 秒"] 同序，越界回落 60。
+    #[test]
+    fn standalone_bgm_seconds_follow_the_ui_options() {
+        assert_eq!(bgm_standalone_seconds(0), 30.0);
+        assert_eq!(bgm_standalone_seconds(1), 60.0);
+        assert_eq!(bgm_standalone_seconds(2), 120.0);
+        assert_eq!(bgm_standalone_seconds(3), 180.0);
+        assert_eq!(bgm_standalone_seconds(99), 60.0);
+        assert_eq!(
+            bgm_standalone_seconds(-1),
+            60.0,
+            "负索引（未初始化）也回落默认"
+        );
+    }
+
     /// 结果区三行索引 → 三轨产物；越界按混音处理（与 UI 三行定义一致）。
     #[test]
     fn bgm_track_path_maps_rows_to_artifacts() {
         let a = BgmArtifacts {
-            voice: PathBuf::from("/x/voice.wav"),
+            voice: Some(PathBuf::from("/x/voice.wav")),
             bgm: PathBuf::from("/x/bgm.wav"),
-            mixed: PathBuf::from("/x/mixed.wav"),
-            srt: PathBuf::from("/x/a.srt"),
+            mixed: Some(PathBuf::from("/x/mixed.wav")),
+            srt: Some(PathBuf::from("/x/a.srt")),
             duration: 12.0,
             segments: 1,
         };
         assert_eq!(bgm_track_path(&a, 0), a.voice);
-        assert_eq!(bgm_track_path(&a, 1), a.bgm);
+        assert_eq!(bgm_track_path(&a, 1), Some(a.bgm.clone()));
         assert_eq!(bgm_track_path(&a, 2), a.mixed);
-        assert_eq!(bgm_track_path(&a, 7), a.mixed);
+        assert_eq!(bgm_track_path(&a, 7), a.mixed, "越界按混音处理");
+
+        // 独立生成：只有 BGM 轨 → 另外两行返回 None（UI 不显示，不给假路径）
+        let only = BgmArtifacts {
+            voice: None,
+            bgm: PathBuf::from("/x/bgm.wav"),
+            mixed: None,
+            srt: None,
+            duration: 60.0,
+            segments: 2,
+        };
+        assert_eq!(bgm_track_path(&only, 0), None);
+        assert_eq!(bgm_track_path(&only, 1), Some(only.bgm.clone()));
+        assert_eq!(bgm_track_path(&only, 2), None);
     }
 
     #[test]

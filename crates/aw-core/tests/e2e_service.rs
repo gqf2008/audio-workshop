@@ -137,13 +137,15 @@ fn bgm_pipeline_end_to_end() {
     assert_eq!(segments, 1, "2s 目标只需 1 个 30s 段");
     let bgm = aw_core::assemble_bgm(&dir, &options).expect("BGM 对齐失败");
     let artifacts = aw_core::mix_project(&dir, &options).expect("BGM 混音失败");
-    assert!(bgm.is_file() && artifacts.mixed.is_file() && artifacts.voice.is_file());
-    let mixed = hound::WavReader::open(&artifacts.mixed).unwrap();
+    let mixed_path = artifacts.mixed.as_ref().expect("混音成功必然有 mixed 轨");
+    let voice_path = artifacts.voice.as_ref().expect("混音成功必然有 voice 轨");
+    assert!(bgm.is_file() && mixed_path.is_file() && voice_path.is_file());
+    let mixed = hound::WavReader::open(mixed_path).unwrap();
     assert_eq!(mixed.spec().channels, 2);
     assert!((artifacts.duration - 2.0).abs() < 0.01);
     eprintln!(
         "  BGM 成品 {:.2}s → {}",
         artifacts.duration,
-        artifacts.mixed.display()
+        mixed_path.display()
     );
 }

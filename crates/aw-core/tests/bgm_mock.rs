@@ -1,8 +1,8 @@
 mod support;
 
 use aw_core::{
-    assemble_bgm, generate_segments, generate_segments_stoppable, mix_project, BgmOptions, BgmRun,
-    Client, Project,
+    assemble_bgm, bgm_only_artifacts, generate_segments, generate_segments_stoppable, mix_project,
+    BgmOptions, BgmRun, Client, Project,
 };
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -187,7 +187,8 @@ fn ducking_lowers_bgm_only_around_voice_timeline() {
     project.save(&dir).unwrap();
 
     let artifacts = mix_project(&dir, &options).unwrap();
-    let mut mixed = hound::WavReader::open(artifacts.mixed).unwrap();
+    let mut mixed =
+        hound::WavReader::open(artifacts.mixed.as_ref().expect("混音成功必然有 mixed 轨")).unwrap();
     assert_eq!(mixed.spec().channels, 2);
     let samples: Vec<i16> = mixed.samples::<i16>().collect::<Result<_, _>>().unwrap();
     // 帧 4000 位于人声段正中：1000 × 0.2 = 200（左右声道相同）
@@ -288,4 +289,36 @@ fn stoppable_keeps_finished_segments_and_reports_where_it_stopped() {
         "已完成段要保留（下次可复用）"
     );
     assert!(!dir.join("bgm/segments/001.wav").exists());
+}
+
+/// 独立生成（没有配音工程）：只产出 BGM 一轨，另两轨是 None（不伪造路径）。
+#[test]
+fn standalone_bgm_produces_only_the_bgm_track() {
+    let mock = support::Mock::start(vec![
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![100; 8000]))),
+    ]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("standalone");
+    let options = BgmOptions {
+        prompt: "独立生成的 BGM".into(),
+        segment_seconds: 1.0,
+        target_seconds: 2.0,
+        base_seed: 5,
+        ..Default::default()
+    };
+
+    generate_segments(&client, &dir, &options, |_, _, _| {}).unwrap();
+    assemble_bgm(&dir, &options).unwrap();
+    let artifacts = bgm_only_artifacts(&dir, &options).unwrap();
+
+    assert!(artifacts.bgm.is_file(), "BGM 轨必须存在");
+    assert_eq!(artifacts.voice, None, "没有配音源就不该有 voice 轨");
+    assert_eq!(artifacts.mixed, None, "没有配音源就不该有混音轨");
+    assert_eq!(artifacts.segments, 2);
+    assert!((artifacts.duration - 2.0).abs() < 0.01);
+
+    // 缺 bgm/bgm.wav 时要明确报错，不能给出一个不存在的路径
+    let empty = temp_dir("standalone-missing");
+    assert!(bgm_only_artifacts(&empty, &options).is_err());
 }
