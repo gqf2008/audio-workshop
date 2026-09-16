@@ -81,6 +81,15 @@ export component MainWindow inherits Window {
     // ── 音色选择器（默认收起，从「换音色」打开） ──
     // 配音页内的「音色」区展开态（与「高级」同款，默认收起）
     in-out property <bool> dub-voice: false;
+
+    // ── 全局设置：服务与模型（跨 Tab 的基础设施，放右上角抽屉）──
+    in-out property <string> server-host: "";
+    in-out property <string> server-port: "";
+    in property <string> server-status: "还没测过连接";
+    in property <bool> server-ok: false;
+    in-out property <string> model-config-path: "";
+    in property <string> model-root: "";
+    in property <int> model-count: 0;
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
@@ -144,6 +153,9 @@ export component MainWindow inherits Window {
     // ── 音色选择器 / 音色设计事件出口 ──
     callback preview-voice();
     callback clear-voice-reference();
+    callback apply-server-settings();
+    callback rescan-models();
+    callback check-server();
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
@@ -287,6 +299,7 @@ export component MainWindow inherits Window {
                 prompt <=> root.bgm-prompt;
                 progress: root.bgm-progress;
                 busy: root.busy || root.running;
+
                 has-result: root.bgm-has-result;
                 status-text: root.bgm-status-text;
                 generate => { root.bgm-generate(); }
@@ -391,6 +404,16 @@ export component MainWindow inherits Window {
             theme-picked(s) => { root.theme-picked(s); }
 
             busy: root.busy || root.running;
+            server-host <=> root.server-host;
+            server-port <=> root.server-port;
+            server-status: root.server-status;
+            server-ok: root.server-ok;
+            model-config-path <=> root.model-config-path;
+            model-root: root.model-root;
+            model-count: root.model-count;
+            apply-server-settings => { root.apply-server-settings(); }
+            rescan-models => { root.rescan-models(); }
+            check-server => { root.check-server(); }
         }
     }
 

@@ -131,6 +131,11 @@ enum Msg {
         wav: Vec<u8>,
         label: String,
     },
+    /// 全局设置里「测试连接」的结果
+    ServerHealth {
+        ok: bool,
+        detail: String,
+    },
     /// 音色试听失败（保留音色名，便于在状态栏说清是哪个音色挂了）
     VoicePreviewFailed {
         label: String,
@@ -153,6 +158,69 @@ fn worker_message_is_current(worker_msg: &WorkerMsg, revision: u64) -> bool {
 // 服务发现：server.json → 音色清单 + 服务地址
 // ===========================================================================
 
+/// 全局设置（跨 Tab 的基础设施）：本应用连哪个服务、从哪份清单读模型。
+///
+/// 只覆盖**本应用的行为**，不改写 audio.cpp 自己的配置：
+///   · host/port 覆盖清单里的服务地址（服务自身的监听地址由 audio-service 启动参数决定）
+///   · config_path 指向要读的 server.json（模型清单）
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AppSettings {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    config_path: Option<String>,
+}
+
+/// 设置文件：与工程产物同目录，便于用户找到与备份。
+fn settings_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Documents")
+        .join(WORKSHOP_DIR)
+        .join("settings.json")
+}
+
+fn load_settings() -> AppSettings {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(s: &AppSettings) -> std::io::Result<()> {
+    let path = settings_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let raw = serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".into());
+    std::fs::write(path, raw)
+}
+
+static SETTINGS: std::sync::OnceLock<std::sync::Mutex<AppSettings>> = std::sync::OnceLock::new();
+
+fn settings() -> &'static std::sync::Mutex<AppSettings> {
+    SETTINGS.get_or_init(|| std::sync::Mutex::new(load_settings()))
+}
+
+fn settings_snapshot() -> AppSettings {
+    settings().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn default_config_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".local/opt/audio.cpp/server.json")
+}
+
+/// 模型清单路径：AW_SERVER_CONFIG > 全局设置 > 默认路径
+fn config_path() -> PathBuf {
+    std::env::var("AW_SERVER_CONFIG")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| settings_snapshot().config_path.map(PathBuf::from))
+        .unwrap_or_else(default_config_path)
+}
+
 #[derive(serde::Deserialize)]
 struct ServerConfig {
     host: Option<String>,
@@ -174,21 +242,24 @@ struct ServerModel {
 /// 读取 server.json：音色 = task=="tts" 的模型；地址取 AW_SERVER，否则 host:port。
 /// 文件缺失/解析失败返回空清单 + 原因说明（不 panic：服务没配时界面也可打开）。
 fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
-    let cfg_path = std::env::var("AW_SERVER_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/opt/audio.cpp/server.json")
-        });
+    let cfg_path = config_path();
     let raw = std::fs::read_to_string(&cfg_path).ok();
+    let over = settings_snapshot();
+    // 地址优先级：AW_SERVER（临时覆盖）> 全局设置 > 清单里的 host:port
     let base = std::env::var("AW_SERVER").ok().or_else(|| {
-        raw.as_deref().and_then(|r| {
-            let cfg: ServerConfig = serde_json::from_str(r).ok()?;
-            Some(format!(
-                "http://{}:{}",
-                cfg.host.unwrap_or_else(|| "127.0.0.1".into()),
-                cfg.port.unwrap_or(8080)
-            ))
+        let from_settings = match (over.host.clone(), over.port) {
+            (Some(h), Some(p)) => Some(format!("http://{h}:{p}")),
+            _ => None,
+        };
+        from_settings.or_else(|| {
+            raw.as_deref().and_then(|r| {
+                let cfg: ServerConfig = serde_json::from_str(r).ok()?;
+                Some(format!(
+                    "http://{}:{}",
+                    cfg.host.unwrap_or_else(|| "127.0.0.1".into()),
+                    cfg.port.unwrap_or(8080)
+                ))
+            })
         })
     });
     let Some(raw) = raw else {
@@ -210,6 +281,151 @@ fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
         })
         .collect();
     (voices, base, String::new())
+}
+
+/// 清单里所有模型的公共父目录：一眼确认模型盘挂上了没。
+fn model_root(paths: &[String]) -> String {
+    let dirs: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| Path::new(p).parent().map(|d| d.to_path_buf()))
+        .collect();
+    let Some(first) = dirs.first() else {
+        return "—".into();
+    };
+    if dirs.iter().all(|d| d == first) {
+        return first.display().to_string();
+    }
+    let mut common = first.to_string_lossy().into_owned();
+    for d in &dirs[1..] {
+        let other = d.to_string_lossy();
+        let mut n = 0;
+        for (a, b) in common.chars().zip(other.chars()) {
+            if a != b {
+                break;
+            }
+            n += a.len_utf8();
+        }
+        common.truncate(n);
+    }
+    match common.rfind('/') {
+        Some(i) => common[..i].to_string(),
+        None => common,
+    }
+}
+
+/// 清单摘要：模型总数 + 模型根目录。
+fn config_summary() -> (usize, String) {
+    let cfg = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
+    match cfg {
+        Some(c) => {
+            let paths: Vec<String> = c.models.iter().map(|m| m.path.clone()).collect();
+            (c.models.len(), model_root(&paths))
+        }
+        None => (0, "—".into()),
+    }
+}
+
+/// 服务地址回显：全局设置里的覆盖值优先，否则用清单里的 host:port。
+fn server_endpoint() -> (String, String) {
+    let over = settings_snapshot();
+    if let (Some(h), Some(p)) = (over.host, over.port) {
+        return (h, p.to_string());
+    }
+    let cfg = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
+    match cfg {
+        Some(c) => (
+            c.host.unwrap_or_else(|| "127.0.0.1".into()),
+            c.port.unwrap_or(8080).to_string(),
+        ),
+        None => ("127.0.0.1".into(), "8080".into()),
+    }
+}
+
+/// 把「全局设置 + 模型清单」的现状回灌到界面。
+fn refresh_settings_view(ui: &MainWindow) {
+    let (host, port) = server_endpoint();
+    ui.set_server_host(host.into());
+    ui.set_server_port(port.into());
+    ui.set_model_config_path(config_path().display().to_string().into());
+    let (count, root) = config_summary();
+    ui.set_model_count(count as i32);
+    ui.set_model_root(root.into());
+}
+
+/// 重新发现引擎（模型清单）并刷新界面。
+///
+/// `invalidate` 为 Some 时同时作废旧工程（换服务/换清单后旧产物不可信）；
+/// 启动阶段还没有 worker 工程，传 None。
+fn apply_engine_discovery(ui: &MainWindow, invalidate: Option<(&Sender<Cmd>, &Rc<UiState>)>) {
+    let keep = (ui.get_voice_index() >= 0)
+        .then(|| ui.get_voice_names().row_data(ui.get_voice_index() as usize))
+        .flatten()
+        .map(|n| n.to_string());
+    let (voices, _, note) = discover_engine();
+    let names: Vec<SharedString> = voices.iter().map(|v| v.name.clone()).collect();
+    ui.set_voice_names(ModelRc::from(Rc::new(VecModel::from(names))));
+    ui.set_voices(ModelRc::from(Rc::new(VecModel::from(voices))));
+
+    let pick = keep
+        .and_then(|name| {
+            (0..ui.get_voice_names().row_count()).find(|&i| {
+                ui.get_voice_names()
+                    .row_data(i)
+                    .map(|n| n == name.as_str())
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| {
+            (0..ui.get_voice_names().row_count()).find(|&i| {
+                ui.get_voice_names()
+                    .row_data(i)
+                    .map(|n| n == "audio8-tts")
+                    .unwrap_or(false)
+            })
+        })
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    let changed = pick != ui.get_voice_index();
+    ui.set_voice_index(pick);
+    refresh_settings_view(ui);
+    refresh_voice_labels(ui);
+
+    if changed {
+        if let Some((tx, st)) = invalidate {
+            invalidate_worker_project(tx, st);
+            reset_bgm(ui, st);
+            ui.set_has_result(false);
+        }
+    }
+    if !note.is_empty() {
+        ui.set_status_text(format!("模型清单：{note}").into());
+    }
+}
+
+/// 「测试连接」：健康检查是阻塞 HTTP（最长 5s），放后台线程，结果回消息通道。
+fn spawn_server_check(msg_tx: Sender<WorkerMsg>, revision: u64) {
+    std::thread::spawn(move || {
+        let (_, base, note) = discover_engine();
+        let (ok, detail) = match base {
+            Some(b) => {
+                if Client::new(b.clone()).healthy() {
+                    (true, format!("已连接 {b}"))
+                } else {
+                    (false, format!("连不上 {b}：服务没起或端口不对"))
+                }
+            }
+            None => (false, format!("没有服务地址。{note}")),
+        };
+        let _ = msg_tx.send(WorkerMsg {
+            revision,
+            msg: Msg::ServerHealth { ok, detail },
+        });
+    });
 }
 
 fn short_path(p: &str) -> String {
@@ -813,26 +1029,12 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::default());
 
-    // ── 引擎发现 → 音色清单 ──
-    let (voices, base, discover_note) = discover_engine();
+    // ── 引擎发现 → 模型清单（默认优先 audio8-tts）──
+    let (_, base, discover_note) = discover_engine();
     if !discover_note.is_empty() {
         ui.set_status_text(format!("引擎发现: {discover_note}").into());
     }
-    let names: Vec<SharedString> = voices.iter().map(|v| v.name.clone()).collect();
-    ui.set_voice_names(ModelRc::from(Rc::new(VecModel::from(names))));
-    ui.set_voices(ModelRc::from(Rc::new(VecModel::from(voices))));
-    // 默认音色：优先 audio8-tts
-    let default_voice = (0..ui.get_voice_names().row_count())
-        .find(|&i| {
-            ui.get_voice_names()
-                .row_data(i)
-                .map(|n| n == "audio8-tts")
-                .unwrap_or(false)
-        })
-        .map(|i| i as i32)
-        .unwrap_or(-1);
-    ui.set_voice_index(default_voice);
-    refresh_voice_labels(&ui);
+    apply_engine_discovery(&ui, None);
 
     ui.set_export_dir(export_dir().into());
     ui.set_project_name(DEFAULT_PROJECT.into());
@@ -850,6 +1052,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // ── 线程通道 + 停止位（UI 与工作线程共享同一个 stop）──
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+    // UI 侧留一份 sender：worker 线程拿走 msg_tx 后，健康检查还要用它回消息
+    let msg_tx_ui = msg_tx.clone();
+    // 启动即探一次服务：状态栏 / 全局设置里立刻能看到连不连得上
+    spawn_server_check(msg_tx_ui.clone(), 0);
     let stop = Arc::new(AtomicBool::new(false));
     let state = Rc::new(UiState {
         assembled: RefCell::new(None),
@@ -881,6 +1087,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_script(&ui, &rows, &cmd_tx, &state);
     wire_engine_changes(&ui, &cmd_tx, &state);
     wire_voice_panel(&ui, &cmd_tx, &state);
+    wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &state);
@@ -933,7 +1140,9 @@ fn apply_shot_state(ui: &MainWindow) {
         }
         "drawer" => {
             ui.set_drawer_open(true);
-            ui.set_status_text("全局设置：外观 + 工程；各 Tab 独有的参数放它们自己页面".into());
+            ui.set_status_text(
+                "全局设置：外观 / 工程 / 服务 / 模型；各 Tab 独有的参数放它们自己页面".into(),
+            );
         }
         "dark" => {
             ui.set_theme_scheme("dark".into());
@@ -1722,7 +1931,9 @@ fn tick(
     loop {
         let worker_msg = msg_rx.borrow_mut().try_recv();
         let Ok(worker_msg) = worker_msg else { break };
-        if !worker_message_is_current(&worker_msg, state.project_revision.get()) {
+        // 服务健康检查与工程版本无关：不过滤，否则刚改完设置的结果会被静默丢掉
+        let is_health = matches!(worker_msg.msg, Msg::ServerHealth { .. });
+        if !is_health && !worker_message_is_current(&worker_msg, state.project_revision.get()) {
             continue;
         }
         match worker_msg.msg {
@@ -1783,6 +1994,10 @@ fn tick(
             Msg::AssembleFailed(error) => {
                 ui.set_busy(false);
                 ui.set_status_text(error.into());
+            }
+            Msg::ServerHealth { ok, detail } => {
+                ui.set_server_status(detail.into());
+                ui.set_server_ok(ok);
             }
             Msg::VoicePreview { wav, label } => {
                 // 试听只写临时文件，不落工程目录：不参与导出、不污染断点续作
@@ -2049,6 +2264,81 @@ fn play_all(
     }
 }
 
+/// 全局设置：服务地址 / 端口 / 模型清单路径。
+///
+/// 只改**本应用**连哪个服务、从哪份清单读模型；不改写 audio.cpp 自己的配置
+/// （服务监听地址由 audio-service 的启动参数 / 清单决定）。
+fn wire_global_settings(
+    ui: &MainWindow,
+    msg_tx: &Sender<WorkerMsg>,
+    cmd_tx: &Sender<Cmd>,
+    state: &Rc<UiState>,
+) {
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    let msg = msg_tx.clone();
+    ui.on_apply_server_settings(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let host = ui.get_server_host().trim().to_string();
+        let port_raw = ui.get_server_port().trim().to_string();
+        let cfg = ui.get_model_config_path().trim().to_string();
+
+        let port = if port_raw.is_empty() {
+            None
+        } else {
+            match port_raw.parse::<u16>() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    ui.set_server_ok(false);
+                    ui.set_server_status("端口要是 1–65535 的数字".into());
+                    return;
+                }
+            }
+        };
+        if !cfg.is_empty() && !Path::new(&cfg).is_file() {
+            ui.set_server_ok(false);
+            ui.set_server_status(format!("模型清单不存在：{cfg}").into());
+            return;
+        }
+
+        let next = AppSettings {
+            host: (!host.is_empty()).then_some(host),
+            port,
+            config_path: (!cfg.is_empty()).then_some(cfg),
+        };
+        if let Err(e) = save_settings(&next) {
+            ui.set_server_ok(false);
+            ui.set_server_status(format!("设置保存失败：{e}").into());
+            return;
+        }
+        if let Ok(mut g) = settings().lock() {
+            *g = next;
+        }
+        apply_engine_discovery(&ui, Some((&tx, &st)));
+        ui.set_server_status("设置已保存，正在测试连接…".into());
+        spawn_server_check(msg.clone(), st.project_revision.get());
+    });
+
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_rescan_models(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        apply_engine_discovery(&ui, Some((&tx, &st)));
+        ui.set_server_status("已重新扫描模型清单".into());
+    });
+
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let msg = msg_tx.clone();
+    ui.on_check_server(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_server_status("正在测试连接…".into());
+        spawn_server_check(msg.clone(), st.project_revision.get());
+    });
+}
+
 // ===========================================================================
 // 行模型 / 数据构造
 // ===========================================================================
@@ -2249,6 +2539,28 @@ fn toast(ui: &MainWindow, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 模型根目录：全在同一父目录 → 直接给那个目录；否则给公共前缀且不截断到半截目录名。
+    #[test]
+    fn model_root_handles_mixed_and_shared_parents() {
+        // 同一父目录
+        let same = vec![
+            "/Volumes/DataExt/models/A/x.gguf".to_string(),
+            "/Volumes/DataExt/models/B/y.gguf".to_string(),
+        ];
+        assert_eq!(model_root(&same), "/Volumes/DataExt/models");
+
+        // 不同父目录：公共前缀要退到目录边界，不能给出 ".../mode" 这种半截名
+        let mixed = vec![
+            "/Volumes/DataExt/models/A/x.gguf".to_string(),
+            "/Volumes/DataExt/models-2/B/y.gguf".to_string(),
+        ];
+        assert_eq!(model_root(&mixed), "/Volumes/DataExt");
+
+        // 没有 path 时不假装知道根目录
+        assert_eq!(model_root(&[]), "—");
+        assert_eq!(model_root(&["".to_string()]), "—");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =

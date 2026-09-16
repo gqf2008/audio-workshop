@@ -173,6 +173,18 @@ export component WorkbenchDrawer inherits VerticalLayout {
 
     in property <bool> busy: false;
 
+    // ── 全局设置：服务与模型（跨 Tab 的基础设施）──
+    in-out property <string> server-host: "";
+    in-out property <string> server-port: "";
+    in property <string> server-status: "还没测过连接";
+    in property <bool> server-ok: false;
+    in-out property <string> model-config-path: "";
+    in property <string> model-root: "";
+    in property <int> model-count: 0;
+    callback apply-server-settings();
+    callback rescan-models();
+    callback check-server();
+
     // 细分隔线：比面板边框轻，只做分组不制造方框
     property <color> hairline: PixelTheme.hover;
 
@@ -214,6 +226,132 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     text: "工程名决定落盘目录；配音 / BGM / 分离 / 音乐共用这一份工程。";
                     color: PixelTheme.dim;
                     font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            Rectangle { height: 2px; background: root.hairline; }
+
+            // ── 服务：本应用连哪个 audiocpp_server ──
+            VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 12px;
+                SectionLabel { text: "服务"; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "地址";
+                        width: 64px;
+                        color: PixelTheme.text;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    PixelTextInput {
+                        horizontal-stretch: 1;
+                        text <=> root.server-host;
+                        placeholder: "127.0.0.1";
+                        enabled: !root.busy;
+                    }
+                    Text {
+                        text: "端口";
+                        width: 36px;
+                        color: PixelTheme.text;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    PixelTextInput {
+                        width: 84px;
+                        text <=> root.server-port;
+                        placeholder: "8080";
+                        enabled: !root.busy;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.server-status;
+                        color: root.server-ok ? PixelTheme.text : PixelTheme.danger;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                    }
+                    PixelButton {
+                        width: 96px;
+                        text: "测试连接";
+                        enabled: !root.busy;
+                        clicked => { root.check-server(); }
+                    }
+                }
+                Text {
+                    text: "改的是本应用去连哪个服务；服务自身的监听地址由 audio-service 启动参数 / 清单决定，本应用不改写它。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+
+            Rectangle { height: 2px; background: root.hairline; }
+
+            // ── 模型：从哪份清单读、模型放在哪 ──
+            VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 12px;
+                SectionLabel { text: "模型"; }
+                Text {
+                    text: "模型清单（server.json）";
+                    color: PixelTheme.text;
+                    font-size: 12px;
+                }
+                PixelTextInput {
+                    text <=> root.model-config-path;
+                    placeholder: "模型清单路径，如 ~/.local/opt/audio.cpp/server.json";
+                    enabled: !root.busy;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "模型根目录";
+                        width: 80px;
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.model-root;
+                        color: PixelTheme.text;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: "共 " + root.model-count + " 个模型";
+                        color: PixelTheme.dim;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    PixelButton {
+                        width: 100px;
+                        variant: "primary";
+                        text: "应用并重连";
+                        enabled: !root.busy;
+                        clicked => { root.apply-server-settings(); }
+                    }
+                    PixelButton {
+                        width: 96px;
+                        text: "重新扫描";
+                        enabled: !root.busy;
+                        clicked => { root.rescan-models(); }
+                    }
+                }
+                Text {
+                    text: "根目录取清单里各模型 path 的公共父目录，用来确认模型盘挂上没；单个模型的实际路径仍以清单为准。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
                     wrap: word-wrap;
                 }
             }
