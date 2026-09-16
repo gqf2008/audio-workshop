@@ -2876,6 +2876,14 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
     ui.set_sep_status_text("停止中：本轮分离跑完才会丢弃结果（上游没有取消接口）…".into());
 }
 
+/// 合成消息到达时，该不该作废这一句的质检分数。
+///
+/// 只有 `done`（新 wav 已经落盘）才算"音频换了"；`running` / `error` 时磁盘上还是旧音频，
+/// 旧分数仍然成立。抽成函数是为了让这条语义有单测钉住（复核抓过"两边说法不一"）。
+fn sentence_message_invalidates_score(status: &str) -> bool {
+    status == "done"
+}
+
 /// 从工程里取质检分数：**只接受状态是「已合成」的句子**。
 ///
 /// 失败/待合成的句子即使文件里还留着旧分数也不贴出来——那种分数描述的不是当前这句
@@ -3918,8 +3926,9 @@ fn tick(
                 status,
                 duration,
             } => {
-                // 这句要重录/正在重跑：旧分数立刻失效（否则界面会拿旧分骗人）
-                if status == "running" || status == "done" || status == "error" {
+                // 只有 done（新 wav 已落盘、音频真的换了）才作废旧分数；running/error
+                // 时音频没变，分数仍然成立——否则界面清了、磁盘还留着，重开又冒出来。
+                if sentence_message_invalidates_score(&status) {
                     let had = state.eval_scores.borrow_mut().remove(&index).is_some();
                     if had {
                         apply_eval_labels(rows, &state.eval_scores.borrow());
@@ -6188,5 +6197,15 @@ mod tests {
         assert_eq!(scores.get(&1), None, "失败句的旧分数不能贴");
         assert_eq!(scores.get(&2), None, "没测过的句子没有分数");
         assert_eq!(scores.len(), 1);
+    }
+
+    /// UI 只在 `done`（新 wav 已落盘）作废质检分数；running/error 时音频没变，分数仍成立。
+    /// 这条与 aw-core 的"音频真的换了才清"是同一个语义，两边必须一致（复核抓过不一致）。
+    #[test]
+    fn only_done_invalidates_the_score() {
+        assert!(sentence_message_invalidates_score("done"));
+        assert!(!sentence_message_invalidates_score("running"));
+        assert!(!sentence_message_invalidates_score("error"));
+        assert!(!sentence_message_invalidates_score("pending"));
     }
 }
