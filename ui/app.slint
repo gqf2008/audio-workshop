@@ -394,12 +394,20 @@ export component MainWindow inherits Window {
     }
 
     // ── 右侧抽屉：默认收起（渐进披露），点标题栏开关展开 ──
-    PixelDrawer {
-        x: 2px; y: 2px;
-        width: root.width - 4px;
-        // 底部让开 30px 状态栏：抽屉是浮层，但不该把全局状态栏盖掉
-        height: root.height - 4px - 30px;
-        open: root.drawer-open;
+    //     外面包一层「圆角 + 裁剪」：抽屉自带的面板是直角，直接铺到窗口边会盖住
+    //     根 Rectangle 的 10px 圆角（表现为「开着抽屉时窗口变方」）。
+    Rectangle {
+        x: 0px; y: 0px;
+        width: 100%; height: 100%;
+        border-radius: 10px;
+        clip: true;
+
+        PixelDrawer {
+            x: 2px; y: 2px;
+            width: root.width - 4px;
+            // 底部让开 30px 状态栏：抽屉是浮层，但不该把全局状态栏盖掉
+            height: root.height - 4px - 30px;
+            open: root.drawer-open;
         title: "全局设置";
         drawer-width: 380px;
         close => { root.drawer-open = false; }
@@ -424,6 +432,7 @@ export component MainWindow inherits Window {
             rescan-models => { root.rescan-models(); }
             check-server => { root.check-server(); }
             pick-model-dir => { root.pick-model-dir(); }
+            }
         }
     }
 

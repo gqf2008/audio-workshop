@@ -541,6 +541,20 @@ export component DubWorkbench inherits Rectangle {
                     }
                 }
 
+                // ①b 音色区：与「高级」同款——整行盒子，就地自然展开（不遮内容）
+                if root.show-voice : VoicePanel {
+                    voice-label: root.voice-label;
+                    voice-source: root.voice-source;
+                    engine-label: root.engine-label;
+                    reference-path <=> root.voice-ref-path;
+                    busy: root.running || root.busy;
+                    reference-exists: root.reference-exists;
+                    edited => { root.voice-ref-changed(); }
+                    clear-reference => { root.clear-reference(); }
+                    preview => { root.audition-voice(); }
+                    open-design => { root.new-voice(); }
+                }
+
                 // ② 一行状态 + 高级入口 + 主操作（同级 3 个）
                 HorizontalLayout {
                     spacing: 16px;
@@ -774,24 +788,4 @@ export component DubWorkbench inherits Rectangle {
 
     }
 
-        // ①c 音色浮层：锚在「换音色」按钮正下方，浮在内容之上（不把下面的内容顶下去）。
-        //     声明在最后 → 画在最上层；只占浮层，不参与排版、不把下面内容顶下去。
-        //     坐标按版心算：内容列恒定 880px 居中，旁白块内边距 12px，
-        //     「换音色」是块头最后一个控件 → 浮层右缘对齐到块右内缘。
-        if root.show-voice : VoicePanel {
-            width: 560px;
-            x: Math.max(8px, (root.width - 880px) / 2 + 880px - 12px - self.width);
-            y: 64px;
-
-            voice-label: root.voice-label;
-            voice-source: root.voice-source;
-            engine-label: root.engine-label;
-            reference-path <=> root.voice-ref-path;
-            busy: root.running || root.busy;
-            reference-exists: root.reference-exists;
-            edited => { root.voice-ref-changed(); }
-            clear-reference => { root.clear-reference(); }
-            preview => { root.audition-voice(); }
-            open-design => { root.new-voice(); }
-        }
 }

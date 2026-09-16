@@ -100,14 +100,13 @@ export component VoicePanel inherits Rectangle {
 
     property <bool> cloning: root.reference-path != "";
 
-    // 宽度由调用方给（锚在「换音色」按钮下面的浮层）；高度按内容自适应，
-    // 否则浮层会被父容器拉满整屏、内容被摊开。
+    // 与「高级」同款：整行宽、自然高度，跟着页面排版展开（不做浮层）
+    width: 100%;
     background: PixelTheme.bg;
     border-width: 2px;
     border-color: PixelTheme.edge;
-    height: voice-body.preferred-height + 24px;   // 24px = 上下 padding
 
-    voice-body := VerticalLayout {
+    VerticalLayout {
         padding: 12px;
         spacing: 12px;
         alignment: start;
