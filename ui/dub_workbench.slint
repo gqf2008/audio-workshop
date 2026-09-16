@@ -421,6 +421,9 @@ export component DubWorkbench inherits Rectangle {
     callback preview-all();
     callback speed-changed(float);
     callback export-requested();
+    // 质检：把已合成句逐句交给 ASR 回读、算可懂度。入口放「高级」里
+    // （配音页首屏元素已有 5 个，加一个就破 ≤8 的密度红线；导出也在这个盒子里）
+    callback quality-check();
 
     VerticalLayout {
         // ═══ 首屏上半：稿件 + 句子列表（限宽 880px 居中，行长可控） ═══
@@ -742,6 +745,13 @@ export component DubWorkbench inherits Rectangle {
                                 enabled: false;
                                 text: root.export-dir;
                                 placeholder: "输出目录";
+                            }
+                            PixelButton {
+                                width: 72px;
+                                text: "质检";
+                                Tooltip { text: @markdown("逐句 ASR 回读，算可懂度并指出最差几句（首次会加载 ASR 模型）"); }
+                                enabled: root.has-result && !root.busy;
+                                clicked => { root.quality-check(); }
                             }
                             PixelButton {
                                 width: 84px;
