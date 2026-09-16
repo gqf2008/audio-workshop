@@ -115,7 +115,8 @@ HTDemucs-ORT，M4/16GB）：
   （上游自己就用 symphonia 解码，这里复用同一套，不另造解码逻辑）。真机复验（flac 输入 48000Hz /
   2ch / 50.919s）：两轨同样是 **48000Hz / 2444096 帧 / 50.919s**，RMS 0.07688 / 0.08068；
 - **探测放在进模型之前**（复核指出的关键顺序）：拿不到采样率就在**花算力之前**返回可执行错误，
-  例如 m4a/aac（上游与我们都只开了 mp3/wav/flac —— symphonia 默认不含 aac/isomp4）会得到
+  例如 m4a/aac（我们的 symphonia 至少覆盖 wav/mp3/flac，另有默认特性带来的 adpcm/mkv/ogg/pcm/
+  vorbis，但没有 aac/isomp4；上游声明的特性也是 mp3+wav+默认集）会得到
   「探测 … 的音频格式失败：…（目前支持 wav / mp3 / flac；可以先转成 wav 再试）」，
   而不是白跑一轮模型再抛一句「分离失败：end of stream」；
 - 因为"要么修正成功、要么提前报错"，`SeparatedTracks` 不再有 `note` 字段（那条"跳过修正"的

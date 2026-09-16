@@ -395,7 +395,8 @@ pub fn separate_tracks(
     let (vocals_path, accompaniment_path) = output_paths(&req.out_dir, &req.stem);
     // 上游把产物**一律声明成 44.1kHz**（同帧数），48kHz 输入因此被拉慢 1.0884 倍、时长 +8.84%。
     // 输入是 wav 时把两轨标签改回输入的采样率（样本不动）→ 时长与速度 1:1 还原；
-    // mp3/flac 拿不到输入采样率，保持上游产物并在说明里讲清（文档 §2.7 有实测相关系数）。
+    // 输入采样率在上面的进门处就探好了：能探到就直接把两轨标签改回去（wav 走 hound、
+    // mp3/flac 走 symphonia probe）；探不到则那时已经返回可执行错误，不存在"保持上游产物"这条路径。
     let vocals_tmp = vocals_path.with_extension("wav.part");
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     write_stems_with_cleanup(
@@ -581,7 +582,9 @@ mod tests {
         );
     }
 
-    /// 三态分类：wav 读得出采样率、非 wav（跳过）、后缀是 wav 但读不出来（要报错）。
+    /// 采样率探测的三条路径：wav 走 hound 读头、非 wav 走 symphonia probe（flac 夹具）、
+    /// 探测失败（垃圾 .mp3）要报错；另外 `separate_tracks` 对上游同样不支持的 m4a
+    /// 必须在**进模型之前**失败。
     #[test]
     fn input_sample_rate_classifies_wav_non_wav_and_broken_wav() {
         let dir = std::env::temp_dir().join(format!("aw-rate-{}", std::process::id()));
