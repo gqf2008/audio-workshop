@@ -913,7 +913,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
 fn ready_note(base: Option<&str>) -> String {
     match base {
-        Some(b) => format!("就绪：示例稿已切句 · 服务 {b} · 合成 / 音色 / 导出在右上角抽屉"),
+        Some(b) => format!(
+            "就绪：示例稿已切句 · 服务 {b} · 配音的切句/倍速/导出在本页「高级」，全局设置在右上角"
+        ),
         None => "就绪：未发现服务（server.json），合成会失败——先启动 audiocpp_server".into(),
     }
 }
@@ -932,7 +934,7 @@ fn apply_shot_state(ui: &MainWindow) {
         }
         "drawer" => {
             ui.set_drawer_open(true);
-            ui.set_status_text("抽屉：工程 / 视图 / 音色 / 任务 / 导出都在这儿".into());
+            ui.set_status_text("全局设置：外观 + 工程；各 Tab 独有的参数放它们自己页面".into());
         }
         "dark" => {
             ui.set_theme_scheme("dark".into());
@@ -947,6 +949,12 @@ fn apply_shot_state(ui: &MainWindow) {
         "design" => {
             ui.set_scene(4);
             ui.set_status_text("音色设计：参考音频克隆可用；文本生成音色未接入".into());
+        }
+        "advanced" => {
+            ui.set_dub_advanced(true);
+            ui.set_status_text(
+                "高级：重新切句 / 倍速 / 规范化 / 任务 / 导出（配音独有，放本页）".into(),
+            );
         }
         "bgm" => {
             ui.set_scene(1);
