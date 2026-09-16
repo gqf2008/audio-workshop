@@ -10,6 +10,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 hound = "3.5"
+# 非 wav 输入的采样率探测（mp3/flac）：上游自己就用 symphonia 解码，这里复用它读头，
+# 不另造解码逻辑。特性与上游对齐（上游声明 ["mp3","wav"]，默认特性里已含 flac/wav）。
+symphonia = { version = "0.5", features = ["mp3"] }
 # 人声分离：纯 Rust + ONNX Runtime 的 htdemucs 实现（见 docs/vocal-separation-backend.md）。
 # 用 git rev 而不是 crates.io 1.2.0：**1.2.0 的 API 少一大截**——没有 Separator /
 # mix_except（内置伴奏轨）/ model_path（离线模型）/ chunk_seconds，上游 App 自己也是

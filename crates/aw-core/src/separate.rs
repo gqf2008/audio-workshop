@@ -53,9 +53,6 @@ pub struct Progress {
 pub struct SeparatedTracks {
     pub vocals: PathBuf,
     pub accompaniment: PathBuf,
-    /// 采样率修正相关的说明（None = 已按输入采样率修正或无需修正）。
-    /// 例：输入不是 wav（跳过修正）、wav 读不出采样率（未修正）。
-    pub note: Option<String>,
 }
 
 /// 结果：正常完成，或用户在过程中按了停止（此时**不落盘**）。
@@ -172,18 +169,19 @@ fn write_stems_with_cleanup(
     Ok(())
 }
 
-/// 输入音频的**采样率**。三态，别把三种情况揉成一个 `None`：
+/// 输入音频的**采样率**：拿得到就返回，拿不到就给出可执行的报错（不再有"静默跳过"这一态）。
 ///
-/// - `Ok(Some(rate))`：能修标签（wav 且读得动）；
-/// - `Ok(None)`：**不是 wav**（mp3/flac 由上游解码器读，采样率我们拿不到）→ 跳过，并在说明里讲清；
-/// - `Err(note)`：扩展名是 wav 却读不出来（损坏/权限）→ 如实报出去，不静默跳过。
+/// - wav：用 hound 读头（快，不解码）；
+/// - mp3/flac…：用 symphonia 探测音轨参数（上游自己就用它解码，这里复用同一套）；
+/// - 读不出（损坏/权限/不支持的格式）：`Err(note)` → **在进模型之前**返回可执行错误（带上
+///   支持的格式与转换建议），既不静默跳过，也不白烧一轮算力。
 ///
 /// 为什么需要它（2026-09-17 实测）：上游**不做重采样、保留输入的帧数/时间轴**，但把输出标签
 /// 写成**模型自己的采样率 44100**。48kHz 输入因此得到一个"同帧数、44.1kHz"的产物——
 /// **时长 +8.84%、播放被拉慢 1.0884 倍**。
 /// 把两轨按输入采样率重新打标签（样本不动）就能 1:1 还原：实测按输入采样率读时，
 /// 伴奏/人声与输入的包络相关系数 0.822 / 0.800（按 44.1kHz 读只有 0.268）。
-fn input_sample_rate(path: &Path) -> Result<Option<u32>, String> {
+fn input_sample_rate(path: &Path) -> Result<u32, String> {
     let looks_like_wav = path
         .extension()
         .map(|e| e.eq_ignore_ascii_case("wav"))
@@ -194,14 +192,43 @@ fn input_sample_rate(path: &Path) -> Result<Option<u32>, String> {
             if rate == 0 {
                 return Err(format!("输入 wav 的采样率为 0：{}", path.display()));
             }
-            Ok(Some(rate))
+            Ok(rate)
         }
         Err(e) if looks_like_wav => Err(format!(
             "输入是 wav 但读不出采样率（{}）：{e}。请确认文件没损坏/有权限后重跑。",
             path.display()
         )),
-        Err(_) => Ok(None),
+        // 非 wav（mp3/flac…）：交给 symphonia 读头拿采样率——上游自己就用它解码，
+        // 这里复用同一套，不另造解码逻辑。
+        Err(_) => probe_sample_rate(path),
     }
+}
+
+/// 用 symphonia 探测非 wav 输入的采样率。
+///
+/// 只读容器头/音轨参数，不解码样本——分离本身仍由上游完成。
+fn probe_sample_rate(path: &Path) -> Result<u32, String> {
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("打开 {} 失败：{e}", path.display()))?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, stream, &Default::default(), &Default::default())
+        .map_err(|e| format!("探测 {} 的音频格式失败：{e}", path.display()))?;
+    let track = probed
+        .format
+        .default_track()
+        .ok_or_else(|| format!("{} 里没有可用音轨", path.display()))?;
+    track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| format!("{} 的音轨没带采样率信息", path.display()))
 }
 
 /// 把 wav 的采样率标签改成 `rate`（样本一个不动、帧数不变）。
@@ -303,6 +330,11 @@ pub fn separate_tracks(
     if !req.input.is_file() {
         return Err(format!("输入音频不存在：{}", req.input.display()));
     }
+    // 先探输入采样率：① 拿到才知道产物该标什么采样率（上游一律标模型采样率 44100）；
+    // ② 拿不到就**在花算力之前**报错——上游不支持的容器（如 m4a/aac）会先失败，
+    //    只留一句「分离失败：end of stream」，用户既不知道原因也不知道下一步（复核指出）。
+    let input_rate = input_sample_rate(&req.input)
+        .map_err(|note| format!("{note}（目前支持 wav / mp3 / flac；可以先转成 wav 再试）"))?;
     install_progress_callbacks();
 
     let model_path = req
@@ -363,7 +395,8 @@ pub fn separate_tracks(
     let (vocals_path, accompaniment_path) = output_paths(&req.out_dir, &req.stem);
     // 上游把产物**一律声明成 44.1kHz**（同帧数），48kHz 输入因此被拉慢 1.0884 倍、时长 +8.84%。
     // 输入是 wav 时把两轨标签改回输入的采样率（样本不动）→ 时长与速度 1:1 还原；
-    // mp3/flac 拿不到输入采样率，保持上游产物并在说明里讲清（文档 §2.7 有实测相关系数）。
+    // 输入采样率在上面的进门处就探好了：能探到就直接把两轨标签改回去（wav 走 hound、
+    // mp3/flac 走 symphonia probe）；探不到则那时已经返回可执行错误，不存在"保持上游产物"这条路径。
     let vocals_tmp = vocals_path.with_extension("wav.part");
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     write_stems_with_cleanup(
@@ -390,26 +423,16 @@ pub fn separate_tracks(
                 })
         },
     )?;
-    let rate_note = match input_sample_rate(&req.input) {
-        Ok(Some(rate)) => {
-            for part in [&vocals_tmp, &accompaniment_tmp] {
-                if let Err(e) = relabel_wav_sample_rate(part, rate) {
-                    let _ = std::fs::remove_file(&vocals_tmp);
-                    let _ = std::fs::remove_file(&accompaniment_tmp);
-                    let _ = std::fs::remove_file(part.with_extension("rate"));
-                    return Err(format!("修正分离产物采样率失败：{e}"));
-                }
-            }
-            None
+    // 把两轨标签改回输入采样率（样本不动）：上游不重采样、保留输入帧数，但把标签写成模型
+    // 采样率 44100 —— 48kHz 输入会因此被拉慢 1.0884 倍。采样率上面已经探过，这里只做改写。
+    for part in [&vocals_tmp, &accompaniment_tmp] {
+        if let Err(e) = relabel_wav_sample_rate(part, input_rate) {
+            let _ = std::fs::remove_file(&vocals_tmp);
+            let _ = std::fs::remove_file(&accompaniment_tmp);
+            let _ = std::fs::remove_file(part.with_extension("rate"));
+            return Err(format!("修正分离产物采样率失败：{e}"));
         }
-        // 非 wav：按文档跳过，但把这件事**说出来**（用户可能拿到速度/时长与源不一致的产物）
-        Ok(None) => Some(
-            "输入不是 wav：采样率未知，产物沿用上游的 44100Hz 标签——时长与速度可能与源不一致"
-                .to_string(),
-        ),
-        // wav 却读不出采样率：不静默跳过，如实报出来
-        Err(note) => Some(format!("产物采样率未修正：{note}")),
-    };
+    }
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
         // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
@@ -434,7 +457,6 @@ pub fn separate_tracks(
     Ok(SeparationOutcome::Done(SeparatedTracks {
         vocals: vocals_path,
         accompaniment: accompaniment_path,
-        note: rate_note,
     }))
 }
 
@@ -560,7 +582,9 @@ mod tests {
         );
     }
 
-    /// 三态分类：wav 读得出采样率、非 wav（跳过）、后缀是 wav 但读不出来（要报错）。
+    /// 采样率探测的三条路径：wav 走 hound 读头、非 wav 走 symphonia probe（flac 夹具）、
+    /// 探测失败（垃圾 .mp3）要报错；另外 `separate_tracks` 对上游同样不支持的 m4a
+    /// 必须在**进模型之前**失败。
     #[test]
     fn input_sample_rate_classifies_wav_non_wav_and_broken_wav() {
         let dir = std::env::temp_dir().join(format!("aw-rate-{}", std::process::id()));
@@ -581,11 +605,42 @@ mod tests {
             }
             w.finalize().unwrap();
         }
-        assert_eq!(input_sample_rate(&good).unwrap(), Some(8_000));
+        assert_eq!(input_sample_rate(&good).unwrap(), 8_000);
 
-        let mp3 = dir.join("song.mp3");
-        std::fs::write(&mp3, b"not really an mp3").unwrap();
-        assert_eq!(input_sample_rate(&mp3).unwrap(), None, "非 wav 按约定跳过");
+        // 2. 非 wav 但格式可探测（flac fixture，0.2s 8kHz 单声道）：拿到真实采样率
+        let flac = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-0.2s.flac");
+        assert_eq!(
+            input_sample_rate(&flac).unwrap(),
+            8_000,
+            "flac 也要能拿到采样率（否则 mp3/flac 输入的产物修不了标签）"
+        );
+
+        // 2b. 非 wav 且探测不了：报错（不静默跳过）
+        let junk = dir.join("song.mp3");
+        std::fs::write(&junk, b"not really an mp3").unwrap();
+        let err = input_sample_rate(&junk).unwrap_err();
+        assert!(err.contains("song.mp3") && err.contains("探测"), "{err}");
+
+        // 2c. 上游同样不支持的容器（m4a/aac：symphonia 默认不含 aac/isomp4，上游也没开）
+        //     —— 必须在**进模型之前**失败，并给出"支持哪些格式"的动作提示
+        let m4a = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-0.2s.m4a");
+        let err = separate_tracks(
+            &SeparationRequest {
+                input: m4a,
+                out_dir: dir.join("m4a-out"),
+                stem: "x".into(),
+                model_dir: None,
+                chunk_seconds: None,
+            },
+            |_| {},
+            || false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("wav") && err.contains("mp3") && err.contains("flac"),
+            "要告诉用户支持哪些格式：{err}"
+        );
+        assert!(err.contains("probe-0.2s.m4a"), "要带上路径：{err}");
 
         let broken = dir.join("broken.wav");
         std::fs::write(&broken, b"definitely not a wav").unwrap();
