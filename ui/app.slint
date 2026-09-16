@@ -17,7 +17,8 @@
 // ============================================================================
 
 import {
-    PixelDrawer, PixelEmpty, PixelTheme, PixelTitleBar, PixelToast, PixelWindowResize,
+    PixelDrawer, PixelEmpty, PixelSegmentedControl, PixelTheme, PixelTitleBar, PixelToast,
+    PixelWindowResize,
 } from "@slint_pixel";
 
 import { Sentence, Voice } from "model.slint";
@@ -41,7 +42,7 @@ export component MainWindow inherits Window {
 
     // ── 场景导航（首屏只显示当前场景，切换在抽屉里） ──
     in-out property <int> scene: 0;
-    in property <[string]> scenes: ["配音", "BGM", "歌曲", "素材库"];
+    in property <[string]> scenes: ["配音", "BGM"];
 
     // ── 右侧抽屉（工程 / 场景 / 主题 / 音色 / 任务 / 导出）：默认收起 ──
     in-out property <bool> drawer-open: false;
@@ -169,21 +170,33 @@ export component MainWindow inherits Window {
             }
         }
 
+        // ── 场景 tab：主界面可见，抽屉不重复放场景切换 ──
+        Rectangle { // 首屏
+            height: 38px;
+            background: PixelTheme.panel;
+            HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                PixelSegmentedControl {
+                    width: 220px;
+                    options: root.scenes;
+                    index: root.scene;
+                    selected(i) => {
+                        root.scene = i;
+                        root.scene-changed(i);
+                    }
+                }
+            }
+        }
+
         if root.scene == 0 : DubWorkbench {
             vertical-stretch: 1;
             horizontal-stretch: 1;
 
             script-text <=> root.script-text;
-            char-count: root.char-count;
-            est-duration: root.est-duration;
-
             sentences <=> root.sentences;
             selected <=> root.selected;
             done-count: root.done-count;
-            total-duration: root.total-duration;
-            total-label: root.total-label;
-
-            playhead <=> root.playhead;
             running: root.running;
             busy: root.busy;
             playing: root.playing;
@@ -191,14 +204,12 @@ export component MainWindow inherits Window {
             script-edited => { root.script-edited(); }
             use-sample => { root.use-sample(); }
             clear-script => { root.clear-script(); }
-            resplit => { root.resplit(); }
             select-sentence(i) => { root.select-sentence(i); }
             preview-one(i) => { root.preview-one(i); }
             redo-one(i) => { root.redo-one(i); }
             start-run => { root.start-run(); }
             stop-run => { root.stop-run(); }
             stop-preview => { root.stop-preview(); }
-            seek(p) => { root.seek(p); }
         }
 
         if root.scene == 1 : BgmWorkbench {
@@ -212,7 +223,7 @@ export component MainWindow inherits Window {
             export-tracks => { root.bgm-export-tracks(); }
         }
 
-        if root.scene != 0 && root.scene != 1 : Rectangle {
+        if root.scene > 1 : Rectangle {
             vertical-stretch: 1;
             background: PixelTheme.bg;
 
@@ -270,10 +281,7 @@ export component MainWindow inherits Window {
 
             project-name <=> root.project-name;
             project-edited => { root.project-edited(); }
-
-            scene-names: root.scenes;
-            scene <=> root.scene;
-            scene-changed(i) => { root.scene-changed(i); }
+            resplit => { root.resplit(); }
 
             theme-scheme: root.theme-scheme;
             theme-picked(s) => { root.theme-picked(s); }

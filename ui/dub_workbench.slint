@@ -122,7 +122,7 @@ component SentenceRow inherits Rectangle {
 
             Text {
                 horizontal-stretch: 1;
-                text: "时长 " + root.item.duration-label + " · 起始 " + root.item.start-label + " · " + root.item.status;
+                text: root.item.status;
                 color: PixelTheme.dim;
                 font-size: 12px;
                 overflow: elide;
@@ -156,17 +156,14 @@ component SentenceRow inherits Rectangle {
 }
 
 // ---------------------------------------------------------------------------
-// 右侧抽屉内容：工程 / 视图（场景 + 主题）/ 音色 / 任务 / 导出
+// 右侧抽屉内容：工程 / 视图（主题）/ 音色 / 任务 / 导出
 // 低频操作全部集中在这里，首屏不为它们留位置（默认收起，点标题栏按钮展开）。
 // 抽屉内区块间距 20px、区块内 16px。
 // ---------------------------------------------------------------------------
 export component WorkbenchDrawer inherits VerticalLayout {
     in-out property <string> project-name: "";
     callback project-edited();
-
-    in property <[string]> scene-names: [];
-    in-out property <int> scene: 0;
-    callback scene-changed(int);
+    callback resplit();
 
     in property <string> theme-scheme: "light";
     callback theme-picked(string);
@@ -223,20 +220,21 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     enabled: !root.running && !root.busy;
                     edited => { root.project-edited(); }
                 }
+                PixelButton {
+                    width: 110px;
+                    text: "重新切句";
+                    enabled: !root.running && !root.busy;
+                    clicked => { root.resplit(); }
+                }
             }
 
             Rectangle { height: 2px; background: root.hairline; }
 
-            // ── 视图：场景 + 主题 ──
+            // ── 视图：主题 ──
             VerticalLayout {
                 vertical-stretch: 0;
                 spacing: 16px;
                 SectionLabel { text: "视图"; }
-                PixelSegmentedControl {
-                    options: root.scene-names;
-                    index <=> root.scene;
-                    selected(i) => { root.scene-changed(i); }
-                }
                 PixelSegmentedControl {
                     options: ["浅色", "暗色"];
                     // 组件库的选中项固定用白字：暗色下把选中面压成深灰，否则白字压白面看不见
@@ -389,18 +387,13 @@ export component WorkbenchDrawer inherits VerticalLayout {
 export component DubWorkbench inherits Rectangle {
     // ── 稿件 ──
     in-out property <string> script-text: "";
-    in property <int> char-count: 0;
-    in property <string> est-duration: "--";
 
     // ── 句子 ──
     in-out property <[Sentence]> sentences: [];
     in-out property <int> selected: -1;
     in property <int> done-count: 0;
-    in property <float> total-duration: 1.0;
-    in property <string> total-label: "0:00";
 
-    // ── 运行状态（首屏主按钮要按状态换文案；playhead 给时间轴画播放头） ──
-    in-out property <float> playhead: 0.0;
+    // ── 运行状态 ──
     in property <bool> running: false;
     in property <bool> busy: false;
     in property <bool> playing: false;
@@ -409,14 +402,12 @@ export component DubWorkbench inherits Rectangle {
     callback script-edited();
     callback use-sample();
     callback clear-script();
-    callback resplit();
     callback select-sentence(int);
     callback preview-one(int);
     callback redo-one(int);
     callback start-run();
     callback stop-run();
     callback stop-preview();
-    callback seek(float);
 
     VerticalLayout {
         // ═══ 首屏上半：稿件 + 句子列表（限宽 880px 居中，行长可控） ═══
@@ -473,22 +464,16 @@ export component DubWorkbench inherits Rectangle {
                     }
                 }
 
-                // ② 一行状态 + 两个动作（字数与句数合并到这一行）
+                // ② 一行状态 + 主操作
                 HorizontalLayout {
                     spacing: 16px;
                     Text { // 首屏
-                        text: "\{root.char-count} 字 · 预计 " + root.est-duration + " · 共 \{root.sentences.length} 句 · 已合成 \{root.done-count} 句";
+                        text: "共 \{root.sentences.length} 句 · 已合成 \{root.done-count} 句";
                         color: PixelTheme.dim;
                         font-size: 12px;
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    PixelButton { // 首屏
-                        width: 92px;
-                        text: "重新切句";
-                        enabled: root.script-text != "" && !root.running && !root.busy;
-                        clicked => { root.resplit(); }
-                    }
                     PixelButton { // 首屏
                         width: 104px;
                         variant: "primary";
@@ -540,65 +525,5 @@ export component DubWorkbench inherits Rectangle {
             Rectangle { horizontal-stretch: 1; }
         }
 
-        // ═══ 底部时间轴细条（≤48px，无播放器控件；播放随选中行走） ═══
-        Rectangle {
-            height: 1px;
-            background: PixelTheme.hover;
-        }
-        HorizontalLayout {
-            horizontal-stretch: 1;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 12px;
-            padding-bottom: 12px;
-            spacing: 16px;
-
-            Rectangle { // 首屏
-                horizontal-stretch: 1;
-                height: 22px;
-                background: PixelTheme.panel;
-                border-width: 2px;
-                border-color: PixelTheme.edge;
-                clip: true;
-
-                // 每句一块，宽度 = 时长占比；选中句高亮
-                for s[i] in root.sentences : Rectangle {
-                    x: 2px + (parent.width - 4px) * (s.start / root.total-duration);
-                    y: 2px;
-                    width: Math.max(2px, (parent.width - 4px) * (s.duration / root.total-duration) - 2px);
-                    height: parent.height - 4px;
-                    background: root.selected == i ? PixelTheme.accent : PixelTheme.dim;
-                }
-
-                // 播放头
-                Rectangle {
-                    x: 2px + (parent.width - 4px) * root.playhead;
-                    y: 0px;
-                    width: 2px; height: 100%;
-                    background: PixelTheme.danger;
-                }
-
-                // 点一下（或按住拖）定位
-                TouchArea {
-                    width: 100%; height: 100%;
-                    mouse-cursor: pointer;
-                    Tooltip { text: @markdown("点一下定位到该处"); }
-                    pointer-event(ev) => {
-                        if ev.button != PointerEventButton.left { return; }
-                        if ev.kind == PointerEventKind.down || ev.kind == PointerEventKind.move {
-                            root.seek(Math.max(0.0, Math.min(1.0, (self.mouse-x - 2px) / Math.max(self.width - 4px, 1px))));
-                        }
-                    }
-                }
-            }
-            Text { // 首屏
-                width: 58px;
-                text: "共 " + root.total-label;
-                color: PixelTheme.dim;
-                font-size: 11px;
-                horizontal-alignment: right;
-                vertical-alignment: center;
-            }
-        }
     }
 }
