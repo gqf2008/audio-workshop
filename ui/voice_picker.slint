@@ -1,0 +1,245 @@
+// ============================================================================
+// 音频作坊 · 音色选择器（配音 Tab 的「换音色」入口）
+//
+// 模式来自竞品调研（见 docs/ui/redesign-v1/competitive-analysis.md）：
+//   · Murf Studio「Find Your Perfect Voice」：搜索 + 筛选 + 音色卡片 + 试听
+//   · 试听与选择分离：点行 = 选中待用；再点「试听」= 播放；底部「使用此音色」才提交
+//
+// 默认收起，只从配音首屏的「换音色」打开。只显示后端真实存在的音色
+// （来自 server.json 的 tts 模型）；没有的筛选/音色一律不伪造。
+// ============================================================================
+import { PixelButton, PixelScrollPanel, PixelTextInput, PixelTheme } from "@slint_pixel";
+import { VoiceRow } from "model.slint";
+
+// ---------------------------------------------------------------------------
+// 一行音色：色点 + 名称 + 引擎/描述 + 试听；整行可点（选中），试听是行内独立动作
+// ---------------------------------------------------------------------------
+component VoiceCardRow inherits Rectangle {
+    in property <VoiceRow> item;
+    in property <bool> is-current: false;
+    in property <bool> is-pending: false;
+    in property <bool> enabled: true;
+    callback pick();
+    callback preview();
+
+    height: 60px;
+    background: root.is-pending ? PixelTheme.hover : transparent;
+    border-width: 2px;
+    border-color: root.is-pending ? PixelTheme.accent : PixelTheme.edge;
+
+    // 整行点击 = 选中（放下层，右上的试听按钮在上层优先）
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.pick(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 10px;
+
+        // 色点：当前音色实心、待选空心；不靠颜色单独承载信息（旁边有文字）
+        Rectangle {
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: root.is-current ? PixelTheme.accent : transparent;
+            border-width: 2px;
+            border-color: root.is-current ? PixelTheme.accent : PixelTheme.dim;
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.item.name + (root.is-current ? "   ✓ 当前" : "");
+                color: PixelTheme.text;
+                font-size: 13px;
+                font-weight: root.is-pending || root.is-current ? 700 : 400;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Text {
+                text: root.item.engine + " · " + root.item.note;
+                color: PixelTheme.dim;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        PixelButton {
+            width: 64px;
+            size: "small";
+            text: "试听";
+            enabled: root.enabled;
+            clicked => { root.preview(); }
+        }
+    }
+}
+
+export component VoicePicker inherits Rectangle {
+    in property <bool> open: false;
+    // 过滤后的可见行（Rust 侧按 search 算好，Slint 不再做二次过滤，保证下标一致）
+    in property <[VoiceRow]> rows: [];
+    in property <int> match-count: 0;
+    in property <int> total: 0;
+    // 当前工程正在用的音色（voices 原始下标，-1 = 未选）
+    in property <int> current: -1;
+    // 待选音色（未提交）
+    in-out property <int> pending: -1;
+    in-out property <string> search: "";
+    in property <bool> busy: false;
+    in property <bool> playing: false;
+
+    callback close();
+    callback apply(int);
+    callback preview(int);
+    callback stop-preview();
+    callback new-voice();
+    callback search-edited();
+
+    visible: root.open;
+
+    Rectangle {
+        width: 100%; height: 100%;
+        background: #00000080;
+        // 点遮罩关闭 = 取消待选变更，当前音色不变（不触发 stale）
+        TouchArea {
+            width: 100%; height: 100%;
+            clicked => { root.close(); }
+        }
+
+        Rectangle {
+            x: parent.width - 460px;
+            y: 0px;
+            width: 460px;
+            height: parent.height;
+            background: PixelTheme.panel;
+
+            // 与遮罩隔开的左描边（点击落在面板上不穿透到遮罩）
+            Rectangle {
+                x: 0px; y: 0px;
+                width: 2px; height: parent.height;
+                background: PixelTheme.edge;
+            }
+            TouchArea { width: 100%; height: 100%; }
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                // ── 标题行 ──
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "选择音色";
+                        color: PixelTheme.text;
+                        font-weight: 800;
+                        font-size: 15px;
+                        vertical-alignment: center;
+                    }
+                    close-ta := TouchArea {
+                        width: 26px;
+                        height: 26px;
+                        mouse-cursor: pointer;
+                        clicked => { root.close(); }
+                        Text {
+                            width: 100%; height: 100%;
+                            text: "×";
+                            color: close-ta.has-hover ? PixelTheme.text : PixelTheme.dim;
+                            font-size: 15px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // ── 搜索 ──
+                PixelTextInput {
+                    width: 100%;
+                    enabled: !root.busy;
+                    text <=> root.search;
+                    placeholder: "搜索音色名 / 引擎";
+                    edited => { root.search-edited(); }
+                }
+
+                // ── 命中数（不显示假筛选：只有真实存在的音色）──
+                Text {
+                    text: root.total == 0
+                        ? "没有可用的音色：请先在本机 audio.cpp 服务里配置 tts 模型"
+                        : (root.match-count + " / " + root.total + " 个音色");
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { height: 2px; background: PixelTheme.edge; }
+
+                // ── 音色列表 ──
+                if root.match-count == 0 && root.total > 0 : Text {
+                    text: "没有匹配的音色";
+                    color: PixelTheme.dim;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    vertical-stretch: 1;
+                }
+
+                if root.match-count > 0 : PixelScrollPanel {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: 100%;
+                        spacing: 6px;
+                        for r in root.rows : VoiceCardRow {
+                            item: r;
+                            is-current: r.index == root.current;
+                            is-pending: r.index == root.pending;
+                            enabled: !root.busy;
+                            pick => { root.pending = r.index; }
+                            preview => { root.preview(r.index); }
+                        }
+                    }
+                }
+
+                // ── 底部动作：试听与选择分离，提交是显式动作 ──
+                Rectangle { height: 2px; background: PixelTheme.edge; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    PixelButton {
+                        horizontal-stretch: 1;
+                        variant: "primary";
+                        text: root.busy
+                            ? "任务进行中…"
+                            : (root.pending < 0 || root.pending == root.current
+                                ? "使用此音色" : "使用此音色");
+                        enabled: !root.busy && root.pending >= 0 && root.pending != root.current;
+                        clicked => { root.apply(root.pending); }
+                    }
+                    PixelButton {
+                        width: 120px;
+                        text: "新建音色 →";
+                        enabled: !root.busy;
+                        clicked => { root.new-voice(); }
+                    }
+                }
+                Text {
+                    text: root.busy
+                        ? "任务运行中，音色不可更换"
+                        : (root.pending >= 0 && root.pending == root.current
+                            ? "这就是当前音色"
+                            : "点一行选中，「试听」只播放，不改变工程音色");
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

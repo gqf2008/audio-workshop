@@ -1,63 +1,68 @@
 // ============================================================================
-// 音频作坊 · 主窗口（低密度 / 渐进披露版）
+// 音频作坊 · 主窗口（v1.4 五 Tab / 一屏一事）
 //
-// 一屏一事：首屏只有「稿件输入 + 一句话状态行 + 句子列表 + 底部时间轴细条」，
-// 外壳只剩标题栏与状态栏（场景导航并入抽屉；主题切换也在抽屉里）。
-// 工程 / 视图（场景 + 主题）/ 音色 / 任务 / 导出 全部在右侧抽屉，默认收起，
-// 点标题栏的抽屉开关展开。
+// 设计依据：docs/ui/redesign-v1/（information-architecture / screens /
+// interaction-spec / competitive-analysis / implementation-notes）。
+//   · 顶部 5 个主 Tab：配音 / BGM / 人声分离 / 音乐制作 / 音色设计，常驻可见
+//   · 每屏一个主任务，恰好 1 个主操作
+//   · 参数进当前 Tab 的高级抽屉；默认 0 个高级参数
+//   · 能力没接的地方（人声分离 / 音乐制作 / 文本生成音色）显示“未接入 + 缺什么”，
+//     不放假按钮（诚实原则见 competitive-analysis.md「不采用清单」）
 //
-// 首屏元素逐个用 `// 首屏` 标在声明行上；计数口径与可复现命令见
-// docs/ui/首屏清单.md：
-//   grep -c '// 首屏$' ui/*.slint           # 默认态首屏可见元素（外壳标题栏/状态栏各计 1）
-//   grep -c '// 首屏-空态$' ui/*.slint      # 空稿态额外出现的元素（此时列表消失）
+// 窗口边框：no-frame 自绘窗，参考 ../abb 的做法——贴窗口边 2px 纯黑描边 +
+//   10px 圆角；根 Rectangle 圆角外透出桌面（Window background: transparent），
+//   贴边的标题栏 / 状态栏各加 10px − 2px = 8px 内圈圆角，否则子元素直角会盖住圆角。
+//   VerticalLayout 留 2px padding：Slint 的 Rectangle 不会为子元素让开 border-width，
+//   铺满的子元素会把描边整个盖掉（abb 实测，同坑）。
 //
-// 间距约定：块间 20px、块内与抽屉内 ≥16px、同级并列元素 ≤3 个。
-// 主题：PixelTheme.scheme 一键换肤（light / dark），全部组件同时生效。
-// 本文件只做「组装 + 转发」：状态与动作都在 src/main.rs（桩数据）。
+// 本文件只做「组装 + 转发」：状态与动作都在 src/main.rs。
 // ============================================================================
 
 import {
-    PixelDrawer, PixelEmpty, PixelSegmentedControl, PixelTheme, PixelTitleBar, PixelToast,
+    PixelDrawer, PixelEmpty, PixelTabs, PixelTheme, PixelTitleBar, PixelToast,
     PixelWindowResize,
 } from "@slint_pixel";
 
-import { Sentence, Voice } from "model.slint";
+import { Sentence, Voice, VoiceRow } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
+import { GatedTab, VoiceDesignTab } from "extra_tabs.slint";
+import { VoicePicker } from "voice_picker.slint";
 
-export { Sentence, Voice } from "model.slint";
+export { Sentence, Voice, VoiceRow } from "model.slint";
+
+// 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
+export global UiTokens {
+    in property <color> window-frame: #000000;
+}
 
 export component MainWindow inherits Window {
-    title: "音频作坊 · 配音工作台";
+    title: "音频作坊";
     no-frame: true;
     preferred-width: 1200px;
     preferred-height: 880px;
-    // 内容列定宽 880px + 两侧留白：窗口再窄也不会挤坏版面
     min-width: 960px;
     min-height: 640px;
-    background: PixelTheme.bg;
+    // 透明：根 Rectangle 带圆角，圆角外必须透出桌面，否则四角露出方块
+    background: transparent;
 
     // ── 主题（改 theme-scheme 即换肤；Rust 侧 set_theme_scheme） ──
     in property <string> theme-scheme: "light";
 
-    // ── 场景导航（首屏只显示当前场景，切换在抽屉里） ──
+    // ── 五个主 Tab（首屏常驻） ──
     in-out property <int> scene: 0;
-    in property <[string]> scenes: ["配音", "BGM"];
+    in property <[string]> scenes: ["配音", "BGM", "人声分离", "音乐制作", "音色设计"];
 
-    // ── 右侧抽屉（工程 / 场景 / 主题 / 音色 / 任务 / 导出）：默认收起 ──
+    // ── 右侧抽屉（工程 / 视图 / 音色细节 / 任务 / 导出）：默认收起 ──
     in-out property <bool> drawer-open: false;
 
     // ── 工作台状态（转发给 DubWorkbench / WorkbenchDrawer，见下） ──
     in-out property <string> project-name: "";
     in-out property <string> script-text: "";
-    in property <int> char-count: 0;
-    in property <string> est-duration: "--";
 
     in-out property <[Sentence]> sentences: [];
     in-out property <int> selected: -1;
     in property <int> done-count: 0;
-    in property <float> total-duration: 1.0;
-    in property <string> total-label: "0:00";
 
     in property <[string]> voice-names: [];
     in property <[Voice]> voices: [];
@@ -66,8 +71,19 @@ export component MainWindow inherits Window {
     in property <string> speed-label: "1.00x";
     in-out property <bool> auto-normalize: true;
 
+    // ── 旁白块头（配音首屏一等元素）：当前音色 + 来源 + 为什么不能用 ──
+    in property <string> voice-label: "未选择";
+    in property <string> voice-source: "请先选择音色";
+    in property <string> voice-hint: "";
+
+    // ── 音色选择器（默认收起，从「换音色」打开） ──
+    in-out property <bool> picker-open: false;
+    in-out property <string> picker-search: "";
+    in property <[VoiceRow]> picker-rows: [];
+    in property <int> picker-match-count: 0;
+    in-out property <int> picker-pending: -1;
+
     in-out property <float> progress: 0.0;
-    in-out property <float> playhead: 0.0;
     in-out property <bool> playing: false;
     in-out property <bool> running: false;
     in-out property <bool> busy: false;
@@ -81,6 +97,9 @@ export component MainWindow inherits Window {
 
     in-out property <bool> export-wav-on: true;
     in-out property <bool> export-srt-on: true;
+
+    // 音色设计 Tab
+    in-out property <string> voice-ref-path: "";
 
     // ── 通知 ──
     in property <string> toast-text: "";
@@ -115,162 +134,250 @@ export component MainWindow inherits Window {
     callback stop-run();
     callback stop-preview();
     callback export-requested();
-    callback seek(float);
     // 键盘翻句（FocusScope 转发）：上一句 / 下一句 / 播放·停止
     callback key-prev();
     callback key-next();
     callback key-toggle();
 
-    // ── 引擎 / 音色 ──
-    // 参考音频路径（可选）：填了就走 voice_ref 克隆（index-tts2），留空用模型默认音色
-    in-out property <string> voice-ref-path: "";
+    // ── 音色选择器 / 音色设计事件出口 ──
+    callback open-voice-picker();
+    callback picker-search-edited();
+    callback picker-apply(int);
+    callback picker-preview(int);
+    callback picker-new-voice();
+    callback clear-voice-reference();
 
-    property <string> scene-name: root.scenes[Math.max(0, Math.min(root.scene, root.scenes.length - 1))];
+    property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
     init => { PixelTheme.scheme = root.theme-scheme; }
     changed theme-scheme => { PixelTheme.scheme = root.theme-scheme; }
 
-    VerticalLayout {
-        spacing: 0px;
+    // ═══ 根：贴窗口的 2px 纯黑描边 + 10px 圆角（参考 ../abb） ═══
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: PixelTheme.bg;
+        border-width: 2px;
+        border-color: UiTokens.window-frame;
+        border-radius: 10px;
 
-        // ── 标题栏（含当前场景名、窗口按钮与抽屉开关） ──
-        Rectangle { // 首屏
-            height: 34px;
+        VerticalLayout {
+            // 留 2px = 描边宽度：不让铺满的子元素盖掉边框（abb 踩过的坑）
+            padding: 2px;
+            spacing: 0px;
 
-            PixelTitleBar {
-                width: 100%;
-                height: 100%;
-                title: "音频作坊 · " + root.scene-name;
-                drag-start => { root.drag-start(); }
-                minimize => { root.minimize(); }
-                toggle-maximize => { root.toggle-maximize(); }
-                close-window => { root.close-window(); }
-            }
-            // 抽屉开关：像素风三横条（自绘，不依赖字体字形——☰ 这类符号本机字体缺失会变方块）
+            // ── 标题栏：内圈圆角 10 − 2 = 8px ──
             Rectangle { // 首屏
-                x: parent.width - 176px;
-                y: 4px;
-                width: 26px;
-                height: 26px;
-                background: drawer-ta.pressed ? PixelTheme.shadow : (drawer-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
-                border-width: 2px;
-                border-color: root.drawer-open ? PixelTheme.accent : PixelTheme.edge;
+                height: 34px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                clip: true;
 
-                Rectangle { x: 5px; y: 7px; width: 12px; height: 2px; background: PixelTheme.text; }
-                Rectangle { x: 5px; y: 11px; width: 12px; height: 2px; background: PixelTheme.text; }
-                Rectangle { x: 5px; y: 15px; width: 12px; height: 2px; background: PixelTheme.text; }
-
-                drawer-ta := TouchArea {
+                PixelTitleBar {
                     width: 100%;
                     height: 100%;
-                    mouse-cursor: pointer;
-                    clicked => { root.drawer-open = !root.drawer-open; }
+                    title: root.project-name == ""
+                        ? "音频作坊 · " + root.scenes[Math.max(0, Math.min(root.scene, root.scenes.length - 1))]
+                        : "音频作坊 · " + root.project-name;
+                    drag-start => { root.drag-start(); }
+                    minimize => { root.minimize(); }
+                    toggle-maximize => { root.toggle-maximize(); }
+                    close-window => { root.close-window(); }
                 }
-                Tooltip { text: @markdown("工作台设置：工程 / 视图 / 音色 / 任务 / 导出"); }
-            }
-        }
+                // 抽屉开关：像素风三横条（自绘，不依赖字体字形——☰ 这类符号本机字体缺失会变方块）
+                Rectangle { // 首屏
+                    x: parent.width - 176px;
+                    y: 4px;
+                    width: 26px;
+                    height: 26px;
+                    background: drawer-ta.pressed ? PixelTheme.shadow : (drawer-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
+                    border-width: 2px;
+                    border-color: root.drawer-open ? PixelTheme.accent : PixelTheme.edge;
 
-        // ── 场景 tab：主界面可见，抽屉不重复放场景切换 ──
-        Rectangle { // 首屏
-            height: 38px;
-            background: PixelTheme.panel;
-            HorizontalLayout {
-                padding-left: 24px;
-                padding-right: 24px;
-                PixelSegmentedControl {
-                    width: 220px;
-                    options: root.scenes;
-                    index: root.scene;
-                    selected(i) => {
-                        root.scene = i;
-                        root.scene-changed(i);
+                    Rectangle { x: 5px; y: 7px; width: 12px; height: 2px; background: PixelTheme.text; }
+                    Rectangle { x: 5px; y: 11px; width: 12px; height: 2px; background: PixelTheme.text; }
+                    Rectangle { x: 5px; y: 15px; width: 12px; height: 2px; background: PixelTheme.text; }
+
+                    drawer-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: pointer;
+                        clicked => { root.drawer-open = !root.drawer-open; }
                     }
+                    Tooltip { text: @markdown("工作台设置：工程 / 视图 / 音色 / 任务 / 导出"); }
                 }
             }
-        }
 
-        if root.scene == 0 : DubWorkbench {
-            vertical-stretch: 1;
-            horizontal-stretch: 1;
-
-            script-text <=> root.script-text;
-            sentences <=> root.sentences;
-            selected <=> root.selected;
-            done-count: root.done-count;
-            running: root.running;
-            busy: root.busy;
-            playing: root.playing;
-
-            script-edited => { root.script-edited(); }
-            use-sample => { root.use-sample(); }
-            clear-script => { root.clear-script(); }
-            select-sentence(i) => { root.select-sentence(i); }
-            preview-one(i) => { root.preview-one(i); }
-            redo-one(i) => { root.redo-one(i); }
-            start-run => { root.start-run(); }
-            stop-run => { root.stop-run(); }
-            stop-preview => { root.stop-preview(); }
-        }
-
-        if root.scene == 1 : BgmWorkbench {
-            prompt <=> root.bgm-prompt;
-            progress: root.bgm-progress;
-            busy: root.busy || root.running;
-            has-result: root.bgm-has-result;
-            status-text: root.bgm-status-text;
-            generate => { root.bgm-generate(); }
-            preview => { root.bgm-preview(); }
-            export-tracks => { root.bgm-export-tracks(); }
-        }
-
-        if root.scene > 1 : Rectangle {
-            vertical-stretch: 1;
-            background: PixelTheme.bg;
-
-            PixelEmpty {
-                icon: "♪";
-                title: root.scene == 1 ? "BGM 场景（M2）" : (root.scene == 2 ? "歌曲场景（M4）" : "素材库（M4）");
-                title-color: PixelTheme.text;
-                description: "三场景共用一个工作台：素材库与导出复用配音这一套。配音先行，成熟一个上一个。";
-            }
-        }
-
-        // ── 状态栏 ──
-        Rectangle { // 首屏
-            height: 30px;
-            background: PixelTheme.panel;
-
-            Rectangle {
-                x: 0px; y: 0px;
-                width: 100%; height: 2px;
-                background: PixelTheme.edge;
-            }
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                spacing: 16px;
-                Text {
-                    horizontal-stretch: 1;
-                    text: root.status-text;
-                    color: PixelTheme.dim;
-                    font-size: 12px;
-                    overflow: elide;
-                    vertical-alignment: center;
+            // ── 顶部 5 个主 Tab（首屏常驻；菜单改 tab）──
+            Rectangle { // 首屏
+                height: 38px;
+                background: PixelTheme.bg;
+                PixelTabs {
+                    width: 100%;
+                    height: 36px;
+                    tabs: root.scenes;
+                    active <=> root.scene;
+                    changed(i) => { root.scene-changed(i); }
                 }
-                Text {
-                    text: "audio.cpp · Metal";
-                    color: PixelTheme.dim;
-                    font-size: 12px;
-                    vertical-alignment: center;
+            }
+
+            // ── 当前 Tab 主画布（一屏一事）──
+            if root.scene == 0 : DubWorkbench {
+                vertical-stretch: 1;
+                horizontal-stretch: 1;
+
+                script-text <=> root.script-text;
+
+                sentences <=> root.sentences;
+                selected <=> root.selected;
+                done-count: root.done-count;
+
+                running: root.running;
+                busy: root.busy;
+                playing: root.playing;
+
+                // 旁白块头：当前音色 + 来源 + 禁用原因
+                voice-label: root.voice-label;
+                voice-source: root.voice-source;
+                voice-hint: root.voice-hint;
+                voice-ready: root.voice-index >= 0;
+
+                script-edited => { root.script-edited(); }
+                use-sample => { root.use-sample(); }
+                clear-script => { root.clear-script(); }
+                select-sentence(i) => { root.select-sentence(i); }
+                preview-one(i) => { root.preview-one(i); }
+                redo-one(i) => { root.redo-one(i); }
+                start-run => { root.start-run(); }
+                stop-run => { root.stop-run(); }
+                stop-preview => { root.stop-preview(); }
+                change-voice => { root.open-voice-picker(); }
+                new-voice => {
+                    root.scene = 4;
+                    root.scene-changed(4);
+                }
+                audition-voice => { root.picker-preview(root.voice-index); }
+            }
+
+            if root.scene == 1 : BgmWorkbench {
+                vertical-stretch: 1;
+                horizontal-stretch: 1;
+                prompt <=> root.bgm-prompt;
+                progress: root.bgm-progress;
+                busy: root.busy || root.running;
+                has-result: root.bgm-has-result;
+                status-text: root.bgm-status-text;
+                generate => { root.bgm-generate(); }
+                preview => { root.bgm-preview(); }
+                export-tracks => { root.bgm-export-tracks(); }
+            }
+
+            if root.scene == 2 : GatedTab {
+                vertical-stretch: 1;
+                title: "人声分离";
+                summary: "把一首歌拆成人声与伴奏两轨。本分支还没接入分离后端，先用占位页把位置留给它。";
+                requirements: [
+                    "audio.cpp 侧新增人声/伴奏分离任务（当前只有 tts / gen）",
+                    "两轨结果的试听与导出路径",
+                    "源文件更换后的 stale 规则（旧两轨默认禁止导出）",
+                ];
+            }
+
+            if root.scene == 3 : GatedTab {
+                vertical-stretch: 1;
+                title: "音乐制作";
+                summary: "写歌 / 文生音乐。yue2、ace-step、S2 翻唱的链路在 feat/m4-song 分支开发，尚未合入本分支。";
+                requirements: [
+                    "合并 feat/m4-song 的歌曲链路",
+                    "生成中可切 Tab、失败按当前版本重试",
+                    "改歌词/风格只标草稿有新修改，旧版本仍可导出",
+                ];
+            }
+
+            if root.scene == 4 : VoiceDesignTab {
+                vertical-stretch: 1;
+                reference-path <=> root.voice-ref-path;
+                busy: root.busy || root.running;
+                edited => { root.voice-ref-changed(); }
+                clear-reference => { root.clear-voice-reference(); }
+                use-in-dubbing => {
+                    root.scene = 0;
+                    root.scene-changed(0);
+                    root.open-voice-picker();
+                }
+            }
+
+            // ── 状态栏：内圈圆角 10 − 2 = 8px ──
+            Rectangle { // 首屏
+                height: 30px;
+                background: PixelTheme.panel;
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
+                clip: true;
+
+                Rectangle {
+                    x: 0px; y: 0px;
+                    width: 100%; height: 2px;
+                    background: PixelTheme.edge;
+                }
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.status-text;
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.voice-label + " · " + root.voice-source;
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "audio.cpp · Metal";
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
     }
 
+    // ── 音色选择器：全窗遮罩 + 右侧面板，默认收起 ──
+    VoicePicker {
+        x: 2px; y: 2px;
+        width: root.width - 4px;
+        height: root.height - 4px;
+
+        open: root.picker-open;
+        rows: root.picker-rows;
+        match-count: root.picker-match-count;
+        total: root.voices.length;
+        current: root.voice-index;
+        pending <=> root.picker-pending;
+        search <=> root.picker-search;
+        busy: root.running || root.busy;
+        playing: root.playing;
+
+        close => { root.picker-open = false; }
+        search-edited => { root.picker-search-edited(); }
+        apply(i) => { root.picker-apply(i); }
+        preview(i) => { root.picker-preview(i); }
+        stop-preview => { root.stop-preview(); }
+        new-voice => { root.picker-new-voice(); }
+    }
+
     // ── 右侧抽屉：默认收起（渐进披露），点标题栏开关展开 ──
     PixelDrawer {
-        x: 0px; y: 0px;
-        width: 100%; height: 100%;
+        x: 2px; y: 2px;
+        width: root.width - 4px;
+        height: root.height - 4px;
         open: root.drawer-open;
         title: "工作台设置";
         drawer-width: 380px;
@@ -281,7 +388,6 @@ export component MainWindow inherits Window {
 
             project-name <=> root.project-name;
             project-edited => { root.project-edited(); }
-            resplit => { root.resplit(); }
 
             theme-scheme: root.theme-scheme;
             theme-picked(s) => { root.theme-picked(s); }
@@ -292,6 +398,7 @@ export component MainWindow inherits Window {
             voice-ref-path <=> root.voice-ref-path;
             model-changed => { root.model-changed(); }
             voice-ref-changed => { root.voice-ref-changed(); }
+            change-voice => { root.open-voice-picker(); }
             speed <=> root.speed;
             speed-label: root.speed-label;
             speed-changed(v) => { root.speed-changed(v); }
@@ -313,16 +420,30 @@ export component MainWindow inherits Window {
 
     // 四边 / 四角缩放热区（install_window_resize 接 winit 的系统级缩放）
     PixelWindowResize {
+        x: 0px; y: 0px;
+        width: 100%; height: 100%;
+
         begin-resize(dir) => { root.begin-resize(dir); }
     }
 
-    // 键盘翻句：↑/↓ 选句、空格 播放/停止。FocusScope 不抢鼠标（无 TouchArea），
-    // 焦点在输入框里时按键归输入框，这是预期行为。
+    // 键盘：↑/↓ 选句、空格 播放/停止；配音 Tab 下 V 开音色选择器、Esc 关闭。
+    // FocusScope 不抢鼠标（无 TouchArea），焦点在输入框里时按键归输入框，这是预期行为。
     FocusScope {
         width: root.width;
         height: root.height;
         key-pressed(event) => {
-            if (event.text == Key.UpArrow) {
+            if (event.text == Key.Escape && root.picker-open) {
+                root.picker-open = false;
+                return accept;
+            }
+            if (event.text == Key.UpArrow || event.text == Key.V) {
+                if (event.text == Key.V) {
+                    if (root.scene == 0 && !root.picker-open) {
+                        root.open-voice-picker();
+                        return accept;
+                    }
+                    return reject;
+                }
                 root.key-prev();
                 return accept;
             }

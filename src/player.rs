@@ -10,7 +10,6 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub struct Player {
     /// 流必须活到播放结束：留在这里别动（下划线是刻意的）
@@ -78,11 +77,6 @@ impl Player {
 
     pub fn is_playing(&self) -> bool {
         self.sink.as_ref().map(|s| !s.empty()).unwrap_or(false)
-    }
-
-    /// 当前播放头（队列累计秒数）
-    pub fn position(&self) -> Duration {
-        self.sink.as_ref().map(|s| s.get_pos()).unwrap_or_default()
     }
 
     /// 倍速即时生效（rodio 0.20 `Sink::set_speed`）

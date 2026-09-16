@@ -37,6 +37,9 @@ slint_pixel::impl_resize_ui!(MainWindow);
 
 /// 主循环节拍：40ms（消息泵 + 播放头推进）。
 const TICK_MS: u64 = 40;
+/// 音色试听用的固定短句（只播不落工程；改文案不用动链路）。
+const VOICE_PREVIEW_TEXT: &str = "你好，这是当前音色的试听。";
+
 /// 与 Python `tools/audio_dub.py` 同款链路参数。
 const GAP_MS: u64 = 250;
 const MAX_CHARS: usize = 80;
@@ -72,6 +75,13 @@ enum Cmd {
     InvalidateProject,
     /// 基于当前配音工程生成并混合 BGM。
     RunBgm { revision: u64, prompt: String },
+    /// 音色试听：用指定音色合成一句固定短句，只播不落工程、不改 current。
+    PreviewVoice {
+        revision: u64,
+        model: String,
+        voice_ref: Option<String>,
+        text: String,
+    },
 }
 
 enum Msg {
@@ -116,6 +126,16 @@ enum Msg {
         segments: usize,
     },
     BgmFailed(String),
+    /// 音色试听合成完成（wav 字节 + 展示用音色名）
+    VoicePreview {
+        wav: Vec<u8>,
+        label: String,
+    },
+    /// 音色试听失败（保留音色名，便于在状态栏说清是哪个音色挂了）
+    VoicePreviewFailed {
+        label: String,
+        error: String,
+    },
     /// 工作线程无法继续的错误
     Fatal(String),
 }
@@ -223,6 +243,38 @@ fn worker_loop(ctx: WorkerCtx) {
             }
             Cmd::InvalidateProject => {
                 current = None;
+            }
+            Cmd::PreviewVoice {
+                revision,
+                model,
+                voice_ref,
+                text,
+            } => {
+                let msg = match make_client() {
+                    Ok(client) => {
+                        match client.synth(
+                            &model,
+                            &text,
+                            Some(BASE_SEED),
+                            voice_ref.as_deref(),
+                            None,
+                        ) {
+                            Ok(wav) => Msg::VoicePreview {
+                                wav,
+                                label: model.clone(),
+                            },
+                            Err(e) => Msg::VoicePreviewFailed {
+                                label: model.clone(),
+                                error: e.to_string(),
+                            },
+                        }
+                    }
+                    Err(e) => Msg::VoicePreviewFailed {
+                        label: model.clone(),
+                        error: e,
+                    },
+                };
+                let _ = ctx.tx.send(WorkerMsg { revision, msg });
             }
             Cmd::Run {
                 revision,
@@ -777,8 +829,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 .map(|n| n == "audio8-tts")
                 .unwrap_or(false)
         })
-        .unwrap_or(0) as i32;
+        .map(|i| i as i32)
+        .unwrap_or(-1);
     ui.set_voice_index(default_voice);
+    refresh_voice_labels(&ui);
+    refresh_picker_rows(&ui);
 
     ui.set_export_dir(export_dir().into());
     ui.set_project_name(DEFAULT_PROJECT.into());
@@ -826,6 +881,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_theme(&ui);
     wire_script(&ui, &rows, &cmd_tx, &state);
     wire_engine_changes(&ui, &cmd_tx, &state);
+    wire_voice_picker(&ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &state);
@@ -882,6 +938,24 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_theme_scheme("dark".into());
             ui.set_status_text("主题已切换：暗色".into());
         }
+        "picker" => {
+            ui.set_picker_pending(ui.get_voice_index());
+            refresh_picker_rows(ui);
+            ui.set_picker_open(true);
+            ui.set_status_text("换音色：搜索 / 卡片 / 试听，「使用此音色」才真正切换".into());
+        }
+        "design" => {
+            ui.set_scene(4);
+            ui.set_status_text("音色设计：参考音频克隆可用；文本生成音色未接入".into());
+        }
+        "bgm" => {
+            ui.set_scene(1);
+            ui.set_status_text("BGM：按描述生成，自动对齐配音时长并 ducking".into());
+        }
+        "gated" => {
+            ui.set_scene(2);
+            ui.set_status_text("人声分离：后端未接入，占位".into());
+        }
         _ => {}
     }
 }
@@ -911,7 +985,7 @@ fn apply_project_to_rows(
             set_status(rows, i, "pending");
         }
     }
-    recompute_total(ui, rows);
+    recompute_total(rows);
     ui.set_done_count(done as i32);
     ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
     ui.set_has_result(done > 0);
@@ -970,6 +1044,7 @@ fn restore_project(
         ui.set_voice_index(-1);
     }
     ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+    refresh_voice_labels(ui);
     let done = apply_project_to_rows(ui, rows, &project);
     let _ = cmd_tx.send(Cmd::OpenProject {
         revision: state.project_revision.get(),
@@ -1073,7 +1148,7 @@ fn wire_script(
         ui.set_status_text(
             format!(
                 "稿件已更新：{} 字 / {} 句 · 状态已重置（重跑合成时自动续作未变句）",
-                ui.get_char_count(),
+                text.chars().count(),
                 rows1.row_count()
             )
             .into(),
@@ -1147,6 +1222,7 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
         invalidate_worker_project(&tx, &state1);
         reset_bgm(&ui, &state1);
         ui.set_has_result(false);
+        refresh_voice_labels(&ui);
         ui.set_status_text("音色已变更：请重新开始合成，旧工程音频暂不可导出".into());
     });
 
@@ -1162,7 +1238,100 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
         invalidate_worker_project(&tx2, &state2);
         reset_bgm(&ui, &state2);
         ui.set_has_result(false);
+        refresh_voice_labels(&ui);
         ui.set_status_text("参考音已变更：请重新开始合成，旧工程音频暂不可导出".into());
+    });
+}
+
+/// 音色选择器：打开 / 搜索 / 试听 / 提交 / 新建音色 / 清除参考音。
+fn wire_voice_picker(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+    let weak = ui.as_weak();
+    ui.on_open_voice_picker(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：音色暂不可更换".into());
+            return;
+        }
+        if ui.get_voice_names().row_count() == 0 {
+            ui.set_status_text("没有发现可用音色：先在本机 audio.cpp 服务里配置 tts 模型".into());
+            return;
+        }
+        ui.set_picker_search("".into());
+        ui.set_picker_pending(ui.get_voice_index());
+        refresh_picker_rows(&ui);
+        ui.set_picker_open(true);
+    });
+
+    let weak = ui.as_weak();
+    ui.on_picker_search_edited(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        refresh_picker_rows(&ui);
+    });
+
+    // 使用此音色：与抽屉里换音色走同一套失效逻辑（旧成品标旧版本、BGM 复位）
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_picker_apply(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        if i < 0 || i == ui.get_voice_index() {
+            ui.set_picker_open(false);
+            return;
+        }
+        ui.set_voice_index(i);
+        ui.set_picker_open(false);
+        invalidate_worker_project(&tx, &st);
+        reset_bgm(&ui, &st);
+        ui.set_has_result(false);
+        refresh_voice_labels(&ui);
+        ui.set_status_text("音色已更换：请重新开始合成，旧成品已标为旧版本".into());
+    });
+
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_picker_preview(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() {
+            return;
+        }
+        let Some(v) = ui.get_voices().row_data(i as usize) else {
+            ui.set_status_text("没有这个音色".into());
+            return;
+        };
+        let model = v.name.to_string();
+        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        ui.set_status_text(format!("正在合成试听：{model}…").into());
+        let _ = tx.send(Cmd::PreviewVoice {
+            revision: st.project_revision.get(),
+            model,
+            voice_ref,
+            text: VOICE_PREVIEW_TEXT.to_string(),
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_picker_new_voice(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_picker_open(false);
+        ui.set_scene(4);
+        ui.set_status_text("音色设计：填参考音频路径，回到配音即可试听".into());
+    });
+
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_clear_voice_reference(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() || ui.get_voice_ref_path().is_empty() {
+            return;
+        }
+        ui.set_voice_ref_path("".into());
+        invalidate_worker_project(&tx, &st);
+        reset_bgm(&ui, &st);
+        ui.set_has_result(false);
+        refresh_voice_labels(&ui);
+        ui.set_status_text("参考音已清除：请重新开始合成".into());
     });
 }
 
@@ -1252,24 +1421,6 @@ fn wire_sentence_actions(
     });
 
     // 时间轴点击 = 从那句话开始听（M1 不做拖动定位，逐句跳转即定位）
-    let weak = ui.as_weak();
-    let model4 = rows.clone();
-    let player4 = player.clone();
-    let state4 = state.clone();
-    ui.on_seek(move |p| {
-        let Some(ui) = weak.upgrade() else { return };
-        let total = ui.get_total_duration().max(0.001);
-        let at = p.clamp(0.0, 1.0) * total;
-        let hit = (0..model4.row_count()).find(|&i| {
-            let r = model4.row_data(i).unwrap();
-            r.start <= at && at < r.start + r.duration.max(0.01)
-        });
-        if let Some(i) = hit {
-            ui.set_selected(i as i32);
-            let r = model4.row_data(i).unwrap();
-            play_sentence(&ui, &model4, &player4, &state4, i, r.duration);
-        }
-    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1516,7 +1667,6 @@ fn wire_bgm(
             Ok(()) => {
                 state2.playing_total.set(duration as f32);
                 ui.set_playing(true);
-                ui.set_playhead(0.0);
                 ui.set_status_text("试听 BGM 混音".into());
             }
             Err(e) => ui.set_status_text(e.into()),
@@ -1628,7 +1778,7 @@ fn tick(
             } => {
                 if let Some(d) = duration {
                     set_row_duration(rows, index, d as f32);
-                    recompute_total(ui, rows);
+                    recompute_total(rows);
                 }
                 set_status(rows, index, &status);
                 if status == "done" || status == "error" {
@@ -1663,6 +1813,25 @@ fn tick(
             Msg::AssembleFailed(error) => {
                 ui.set_busy(false);
                 ui.set_status_text(error.into());
+            }
+            Msg::VoicePreview { wav, label } => {
+                // 试听只写临时文件，不落工程目录：不参与导出、不污染断点续作
+                let path = std::env::temp_dir().join("audio-workshop-voice-preview.wav");
+                match std::fs::write(&path, &wav) {
+                    Ok(()) => match player.play_wav(&path) {
+                        Ok(()) => {
+                            ui.set_playing(true);
+                            ui.set_status_text(format!("试听音色：{label}").into());
+                        }
+                        Err(e) => ui.set_status_text(format!("试听失败：{e}").into()),
+                    },
+                    Err(e) => {
+                        ui.set_status_text(format!("试听临时文件写入失败：{e}").into());
+                    }
+                }
+            }
+            Msg::VoicePreviewFailed { label, error } => {
+                ui.set_status_text(format!("试听失败（{label}）：{error}").into());
             }
             Msg::BgmProgress { done, total } => {
                 let progress = done as f32 / total.max(1) as f32;
@@ -1760,16 +1929,10 @@ fn tick(
         }
     }
 
-    // ── 播放头 ──
-    if ui.get_playing() {
-        if !player.is_playing() {
-            ui.set_playing(false);
-            ui.set_playhead(0.0);
-            ui.set_status_text("试听结束".into());
-        } else {
-            let total = state.playing_total.get().max(0.01);
-            ui.set_playhead((player.position().as_secs_f32() / total).clamp(0.0, 1.0));
-        }
+    // ── 试听结束：rodio 队列播空 → 复位 playing ──
+    if ui.get_playing() && !player.is_playing() {
+        ui.set_playing(false);
+        ui.set_status_text("试听结束".into());
     }
 }
 
@@ -1854,7 +2017,6 @@ fn play_sentence(
         Ok(()) => {
             state.playing_total.set(duration.max(0.01));
             ui.set_playing(true);
-            ui.set_playhead(0.0);
             let text = rows
                 .row_data(i)
                 .map(|r| r.text.to_string())
@@ -1879,7 +2041,6 @@ fn play_all(
                 Ok(()) => {
                     state.playing_total.set(info.duration as f32);
                     ui.set_playing(true);
-                    ui.set_playhead(0.0);
                     ui.set_status_text("试听全篇成品".into());
                 }
                 Err(e) => ui.set_status_text(e.into()),
@@ -1912,7 +2073,6 @@ fn play_all(
             let total: f32 = done.iter().map(|(_, d)| d).sum();
             state.playing_total.set(total.max(0.01));
             ui.set_playing(true);
-            ui.set_playhead(0.0);
             ui.set_status_text(format!("试听全篇（{} 句连播，未拼间隙）", done.len()).into());
         }
         Err(e) => ui.set_status_text(e.into()),
@@ -1922,6 +2082,71 @@ fn play_all(
 // ===========================================================================
 // 行模型 / 数据构造
 // ===========================================================================
+
+/// 旁白块头：当前音色名 + 来源 + 阻断原因。只反映“能不能开始配音”这一件事，
+/// 不把“稿件为空”等其它原因混进来（那由主按钮与空态承担）。
+fn refresh_voice_labels(ui: &MainWindow) {
+    let idx = ui.get_voice_index();
+    if idx < 0 {
+        ui.set_voice_label("未选择".into());
+        ui.set_voice_source("请先选择音色".into());
+        ui.set_voice_hint("选择音色后才能开始配音".into());
+        return;
+    }
+    let name = ui
+        .get_voice_names()
+        .row_data(idx as usize)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| format!("音色 #{idx}"));
+    ui.set_voice_label(name.into());
+    ui.set_voice_source(if ui.get_voice_ref_path().trim().is_empty() {
+        "内置".into()
+    } else {
+        "克隆 · 参考音".into()
+    });
+    ui.set_voice_hint("".into());
+}
+
+/// 音色选择器的可见行：按搜索词过滤音色名 / 引擎 / 备注。
+/// index 始终指回 voices 原始下标——过滤后下标会漂移，绝不能拿过滤下标当音色下标。
+fn refresh_picker_rows(ui: &MainWindow) {
+    let voices = ui.get_voices();
+    let rows: Vec<VoiceRow> = filter_voices(&voices, &ui.get_picker_search())
+        .into_iter()
+        .map(|(i, name, engine, note)| VoiceRow {
+            index: i,
+            name,
+            engine,
+            note,
+        })
+        .collect();
+    ui.set_picker_match_count(rows.len() as i32);
+    ui.set_picker_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+/// 音色过滤（纯函数）：按搜索词过滤音色名 / 引擎 / 备注，返回可见行的
+/// `(原始下标, 名称, 引擎, 备注)`。
+///
+/// **不变式**：下标必须是 `voices` 里的**原始下标**。过滤会改变可见顺序与长度，
+/// 若拿过滤后的下标当音色下标回传，`试听` / `使用此音色` 会作用到别的音色上。
+fn filter_voices(
+    voices: &ModelRc<Voice>,
+    query: &str,
+) -> Vec<(i32, SharedString, SharedString, SharedString)> {
+    // 大小写不敏感由本函数自己保证，不依赖调用方先 to_lowercase（调用方忘了就会静默搜不到）
+    let query = query.to_lowercase();
+    let mut rows = Vec::new();
+    for i in 0..voices.row_count() {
+        let Some(v) = voices.row_data(i) else {
+            continue;
+        };
+        let haystack = format!("{} {} {}", v.name, v.engine, v.note).to_lowercase();
+        if query.is_empty() || haystack.contains(&query) {
+            rows.push((i as i32, v.name, v.engine, v.note));
+        }
+    }
+    rows
+}
 
 fn selected_model(ui: &MainWindow) -> String {
     let index = ui.get_voice_index();
@@ -1979,7 +2204,7 @@ fn split_for_preview(text: &str) -> Vec<String> {
 }
 
 /// 按当前各行时长重排起始时间与总时长（合成拿到真实时长后调用）
-fn recompute_total(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
+fn recompute_total(rows: &Rc<VecModel<Sentence>>) {
     let mut start = 0.0_f32;
     for i in 0..rows.row_count() {
         let Some(mut row) = rows.row_data(i) else {
@@ -1990,8 +2215,6 @@ fn recompute_total(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>) {
         start += row.duration;
         rows.set_row_data(i, row);
     }
-    ui.set_total_duration(if start > 0.0 { start } else { 1.0 });
-    ui.set_total_label(clock_label(start).into());
 }
 
 const SAMPLE_SCRIPT: &str = "大家好，欢迎回到音频作坊。今天聊三件事。\
@@ -1999,11 +2222,12 @@ const SAMPLE_SCRIPT: &str = "大家好，欢迎回到音频作坊。今天聊三
 第二，不按字收费，想生成多少就生成多少。\
 第三，配音先行，BGM 和歌曲排在后面，成熟一个上一个。";
 
-const SCENE_NOTES: [&str; 4] = [
-    "配音工作台",
-    "BGM 场景：M2 接入（与配音同框，自动 ducking）",
-    "歌曲场景：M4 接入（yue2 / ace-step，降级为彩蛋）",
-    "素材库：M4 接入（工程版本 / 音色库 / 发音词典库）",
+const SCENE_NOTES: [&str; 5] = [
+    "配音：先选音色，再开始配音",
+    "BGM：按描述生成，自动对齐配音时长并 ducking",
+    "人声分离：后端未接入，占位",
+    "音乐制作：链路在 feat/m4-song，未合入本分支",
+    "音色设计：参考音频克隆可用；文本生成音色未接入",
 ];
 
 fn export_dir() -> String {
@@ -2013,21 +2237,13 @@ fn export_dir() -> String {
 
 fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
     let built = build_rows(&split_for_preview(text));
-    let chars = text.chars().count();
 
     rows.set_vec(built);
-    ui.set_char_count(chars as i32);
-    ui.set_est_duration(if chars == 0 {
-        "--".into()
-    } else {
-        clock_label(chars as f32 * SECS_PER_CHAR).into()
-    });
-    recompute_total(ui, rows);
+    recompute_total(rows);
     ui.set_selected(-1);
     ui.set_done_count(0);
     ui.set_has_result(false);
     ui.set_progress(0.0);
-    ui.set_playhead(0.0);
     ui.set_playing(false);
 }
 
@@ -2088,6 +2304,49 @@ fn toast(ui: &MainWindow, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn voice(name: &str, engine: &str, note: &str) -> Voice {
+        Voice {
+            name: name.into(),
+            engine: engine.into(),
+            note: note.into(),
+            license: "仅自用".into(),
+        }
+    }
+
+    fn voice_model(items: Vec<Voice>) -> ModelRc<Voice> {
+        ModelRc::from(Rc::new(VecModel::from(items)))
+    }
+
+    /// 过滤后回传的下标必须仍是原始下标：拿过滤下标当音色下标会选错音色。
+    #[test]
+    fn voice_filter_keeps_original_indices() {
+        let voices = voice_model(vec![
+            voice("audio8-tts", "audio8_tts · 本地", "a.gguf"),
+            voice("index-tts2", "index_tts2 · 本地", "b.gguf"),
+            voice("audio8-tts-01b", "audio8_tts · 本地", "c.gguf"),
+        ]);
+
+        // 全量：下标就是 0,1,2
+        let all = filter_voices(&voices, "");
+        assert_eq!(all.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        // 命中第 2、3 个：下标必须是 1、2，不能变成 0、1
+        let hits = filter_voices(&voices, "index");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 1);
+        assert_eq!(hits[0].1.as_str(), "index-tts2");
+
+        let hits = filter_voices(&voices, "01b");
+        assert_eq!(hits.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2]);
+
+        // 大小写不敏感（引擎名里是大写 Q8）
+        let hits = filter_voices(&voices, "audio8-TTS");
+        assert_eq!(hits.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 2]);
+
+        // 无命中：空结果，不是“退化成全量”
+        assert!(filter_voices(&voices, "不存在的音色").is_empty());
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =

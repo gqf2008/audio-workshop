@@ -2,6 +2,9 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/app.slint");
     println!("cargo:rerun-if-changed=ui/dub_workbench.slint");
     println!("cargo:rerun-if-changed=ui/model.slint");
+    println!("cargo:rerun-if-changed=ui/voice_picker.slint");
+    println!("cargo:rerun-if-changed=ui/extra_tabs.slint");
+    println!("cargo:rerun-if-changed=ui/bgm_workbench.slint");
 
     // 下游消费者标准写法：注册 `@slint_pixel` 库路径（组件库内所有 .slint 也会被监听）。
     let library_paths = slint_pixel::library_paths();
