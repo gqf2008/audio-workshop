@@ -1,8 +1,9 @@
-# 音频作坊 · UI Redesign v1.1 信息架构
+# 音频作坊 · UI Redesign v1.2 信息架构
 
 > 设计输入：`CHARTER.md`、`docs/product-plan.md`、`docs/ui/首屏清单.md`、当前 `ui/app.slint` / `ui/dub_workbench.slint` / `ui/bgm_workbench.slint`，以及 `feat/m4-song` 分支的 `ui/song_workbench.slint`。
 > 范围：只定义产品、交互和信息架构，不修改 Rust / Slint 实现，不提交代码。
 > v1.1 变更：主功能导航由 4 Tab 扩展为 5 Tab，新增“音色设计”。
+> v1.2 变更：补充逐 Tab 交互规范，新增可点击原型 `interactive-prototype.html`。
 > 核心目标：顶部五场景导航清晰；每屏只有一个主任务；参数渐进披露；主画布低密度；状态和任务可恢复。
 
 ## 1. 一级信息架构
@@ -91,7 +92,7 @@ WorkspaceProject
 
 ### 3.3 与现有实现的边界
 
-当前 `project.json` 主要承载配音句子和逐句合成状态；BGM 产物在运行时对象中管理。Redesign v1.1 要求 UI 把它们统一成“工程资产 + 任务记录”的产品模型，但**不要求这一轮设计直接决定后端存储格式**。实现阶段可以选择：
+当前 `project.json` 主要承载配音句子和逐句合成状态；BGM 产物在运行时对象中管理。Redesign v1.2 要求 UI 把它们统一成“工程资产 + 任务记录”的产品模型，但**不要求这一轮设计直接决定后端存储格式**。实现阶段可以选择：
 
 - 扩展同一个工程 manifest；或
 - 保留各链路现有 manifest，在 UI 层维护统一的 `ProjectView`。

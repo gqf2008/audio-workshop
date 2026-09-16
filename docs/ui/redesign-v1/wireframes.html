@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>音频作坊· UI Redesign v1.1 线框</title>
+<title>音频作坊· UI Redesign v1.2 线框</title>
 <style>
   :root {
     --page: #eef0f3;
@@ -521,6 +521,20 @@
 
   .note strong { color: var(--ink); }
 
+  .interaction-notes {
+    margin-top: 10px;
+    padding: 9px 10px;
+    border: 1px dashed #b9c4d1;
+    border-radius: 9px;
+    background: #f7f9fb;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .interaction-notes strong { color: var(--ink); }
+  .proto-link { color: #315f9b; font-weight: 800; text-decoration: none; }
+  .proto-link:hover { text-decoration: underline; }
+
   .footer {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -564,11 +578,12 @@
 <main class="wrap">
   <header class="intro">
     <div>
-      <p class="eyebrow">Audio Workshop / UI Redesign v1.1</p>
+      <p class="eyebrow">Audio Workshop / UI Redesign v1.2</p>
       <h1>五个主 Tab，一屏一件事</h1>
       <p>低密度线框：顶部五场景始终可见；每屏只突出一个主任务；参数进入当前 Tab 的高级抽屉；任务可跨 Tab、可恢复。</p>
     </div>
     <div class="legend" aria-label="图例">
+      <a class="proto-link" href="interactive-prototype.html">打开可点击原型 →</a>
       <span>1 个主操作</span>
       <span>首屏 ≤ 8 个语义元素</span>
       <span>高级参数默认隐藏</span>
@@ -614,6 +629,7 @@
         </div>
         <div class="statusline"><span>正在合成</span><strong>第 12 / 34 句</strong><span>· 可切换到其他 Tab</span><span class="grow"></span><span>35%</span></div>
         <div class="result"><span>完成后出现：成品 03:42 · 导出</span><span class="btn">结果条</span></div>
+        <div class="interaction-notes"><strong>交互：</strong>点击开始后变停止；运行中切 Tab 不取消；停止后已完成句保留；编辑文稿后旧成品 stale；单句失败只重录该句。</div>
       </div>
     </article>
 
@@ -636,6 +652,7 @@
           <div class="statusline"><span>等待输入</span><span>· 没有配音成品时仍可先只生成 BGM</span></div>
         </div>
         <div class="result"><span>完成后出现：BGM / 混音两轨结果与试听</span><span class="btn ghost">结果区</span></div>
+        <div class="interaction-notes"><strong>交互：</strong>生成中可停止；高级 duck 应用后只重新混音；分段失败重试失败段，混音失败只重试混音。</div>
       </div>
     </article>
 
@@ -658,6 +675,7 @@
           <div class="statusline"><span>能力未就绪时不显示假模型、假阈值，也不创建伪任务。</span></div>
         </div>
         <div class="result"><span>结果后：人声轨 + 伴奏轨，分别试听 / 下载</span><span class="btn ghost">两轨列表</span></div>
+        <div class="interaction-notes"><strong>交互：</strong>拖入 → 校验 → 分离；unsupported 时按钮 disabled 且不创建任务；失败重试整任务，源文件保留。</div>
       </div>
     </article>
 
@@ -682,6 +700,7 @@
           <div class="statusline"><span>填写歌词和风格后开始 · 生成可切 Tab</span></div>
         </div>
         <div class="result"><span>完成后出现：试听 · 导出 · 再生成一版</span><span class="btn ghost">结果条</span></div>
+        <div class="interaction-notes"><strong>交互：</strong>每次生成创建 vN；第一次点版本选中，第二次试听；修改歌词 / 风格后旧版本仍可导出。</div>
       </div>
     </article>
 
@@ -706,6 +725,7 @@
           <div class="statusline"><span>试听文本已填写</span><span>· 选择基础音色或参考音频后开始</span></div>
         </div>
         <div class="result"><span>完成后：试听 · 保存为音色 · 预设菜单（导出/导入）</span><span class="btn ghost">结果条</span></div>
+        <div class="interaction-notes"><strong>交互：</strong>生成试听完成后主按钮变创建音色；P4 unsupported 时保存、用于配音、预设全部 disabled；P4 ready 保存后点击用于配音跳转配音并预选该音色。</div>
         <div class="note"><strong>能力边界：</strong>单条 voice_ref 克隆已有基础；保存为音色、多音色库、参考文本、风格/情绪和预设互操作未完整实现，必须能力门控。</div>
       </div>
     </article>

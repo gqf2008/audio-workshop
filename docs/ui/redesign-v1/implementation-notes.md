@@ -1,7 +1,8 @@
-# 音频作坊 · UI Redesign v1.1 实现说明
+# 音频作坊 · UI Redesign v1.2 实现说明
 
 > 本文只给出从设计到 Rust / Slint 的映射、callback/属性增删建议、迁移步骤与验收标准，不修改实现、不提交代码。
-> 实施基线：当前 `feat/ui-simplify` 实际是“配音 + BGM”两 Tab；`feat/m4-song` 另有 `SongWorkbench`，但主界面模型与命名不符合本轮设计。v1.1 目标导航为“配音 / BGM / 人声分离 / 音乐制作 / 音色设计”五 Tab。实施时应先把两条线对齐，再做壳层重构。
+> v1.2 的逐 Tab 交互契约见 `interaction-spec.md`；可点击状态演示见 `interactive-prototype.html`。
+> 实施基线：当前 `feat/ui-simplify` 实际是“配音 + BGM”两 Tab；`feat/m4-song` 另有 `SongWorkbench`，但主界面模型与命名不符合本轮设计。v1.2 目标导航为“配音 / BGM / 人声分离 / 音乐制作 / 音色设计”五 Tab。实施时应先把两条线对齐，再做壳层重构。
 
 ## 1. 现状事实
 
@@ -577,7 +578,40 @@ cargo test --workspace
 
 另外增加 UI 状态截图基线和五个 Tab 的尺寸快照；每个状态至少覆盖 960×640 窄窗。若新增 capability gate 或任务恢复路径，按仓库规则补阳性/阴性测试，确保未就绪态和失败态真实可达。
 
-## 9. 实施风险
+- [ ] 逐条执行 `interaction-spec.md` §8 的 `INT-*` 验收项；每项都必须在 Slint 中可操作或可断言状态，而不是只检查静态截图。
+
+## 9. 交互到 Slint 的实现映射
+
+本节把 `interaction-spec.md` 中的交互行为映射到 Slint / Rust 状态，不引入新的后端假设。
+
+| 交互 | Slint / Rust 状态 | 实现要求 |
+|---|---|---|
+| 顶部 Tab 点击 | `scene`、`scene-changed(int)`、`tab-busy` 派生状态 | 切 Tab 只更新视图；不得调用 stop/cancel |
+| 主按钮点击 / 二次点击 | `active-task-id`、`active-task-scene`、任务状态 | 第一次启动 / 继续，第二次停止；文案由状态派生 |
+| 高级抽屉 | `drawer-open`、`drawer-scope` | 启动主任务时自动关闭；`Esc` / 遮罩关闭后焦点回到触发按钮 |
+| 任务中心 | `[TaskSummary] tasks`、`active-task-id` | 显示来源 Tab、状态、进度、结果、取消 / 重试 / 打开来源 |
+| 取消任务 | `task-cancel-requested(task_id)` | 任务二次点击确认；取消后状态为 recoverable，不删除已完成结果 |
+| 失败重试 | `task-retry-requested(task_id)`、单句 / 分段 retry callback | 配音支持单句，BGM 支持失败段，分离使用整任务，音乐支持单版本 |
+| stale | `input-revision`、`result-revision`、`result-stale: bool` | 输入变化后比较 revision；不自动删除旧结果；导出按钮按 stale 禁用或进入旧版本确认 |
+| 焦点 | `FocusScope` / Rust 侧 focus 请求 | `用于配音` 后切到配音、打开高级抽屉、聚焦音色选择器；关闭抽屉后回到触发点。具体聚焦调用以 Slint 1.17 API 验证为准 |
+| 确认 / 撤销 | `confirm-requested(kind)`、`undo-token` | 清空、覆盖音色、删除版本、替换源文件需确认；软删除支持 5 秒撤销 |
+| 文件校验 | `file-pick-requested()`、`file-dropped(path)`、`file-validation-state` | 分离音频和音色参考音频共用校验状态；后端限制由服务返回，不在 UI 写死 |
+| “用于配音” | `voice-asset-id`、`preselected-voice-id` | 保存成功后写入工程资产；点击后只预选，不自动触发合成 |
+| 能力门控 | `capability-separation`、`capability-voice-library` | unsupported 时主按钮 disabled、状态行解释、任务中心不新增伪任务 |
+
+交互状态与视觉状态的绑定必须单源：
+
+```text
+task.status       → 主按钮文案 / disabled / tab badge / 任务中心
+input-revision    ≠ result-revision → stale
+task.error_code   → 状态行文案 / 重试粒度 / 错误类型
+selected-object   → 行选中态 / 二次点击试听目标
+drawer-scope      → 抽屉标题 / 内容 / 允许的 callback
+```
+
+未来 Slint 验收除了静态截图，还要增加状态回调测试：点击 / 二次点击 / 切 Tab / 取消 / 重试 / stale / 恢复 / 用于配音 / 能力门控都必须能独立触发并断言状态变化。
+
+## 10. 实施风险
 
 | 风险 | 说明 | 处理 |
 |---|---|---|
