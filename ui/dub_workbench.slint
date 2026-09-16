@@ -431,6 +431,8 @@ export component DubWorkbench inherits Rectangle {
     callback export-requested();
     /// 批量导出：projects/ 下所有有成品的工程 → 导出目录（P6 的一部分）
     callback batch-export();
+    /// 分轨导出：当前工程的人声 + BGM 两轨 → 导出目录（P6 的另一半）
+    callback export-stems();
     // 质检：把已合成句逐句交给 ASR 回读、算可懂度。入口放「高级」里
     // （配音页首屏元素已有 5 个，加一个就破 ≤8 的密度红线；导出也在这个盒子里）
     callback quality-check();
@@ -751,7 +753,7 @@ export component DubWorkbench inherits Rectangle {
                                 vertical-alignment: center;
                             }
                             PixelSegmentedControl {
-                                width: 280px;
+                                width: 240px;
                                 options: ["整段 WAV", "逐句 SRT", "两者", "仅生成"];
                                 face-active: PixelTheme.accent;
                                 index <=> root.export-index;
@@ -779,9 +781,16 @@ export component DubWorkbench inherits Rectangle {
                             PixelButton {
                                 width: 92px;
                                 text: "批量导出";
-                                Tooltip { text: @markdown("把 projects/ 下所有有成品的工程按上面的格式导到导出目录（正在合成也能导：成品是原子写出来的）"); }
+                                Tooltip { text: @markdown("把 projects/ 下所有有成品的工程按上面的格式导到导出目录"); }
                                 enabled: (root.export-wav-on || root.export-srt-on) && !root.busy && !root.batch-running;
                                 clicked => { root.batch-export(); }
+                            }
+                            PixelButton {
+                                width: 92px;
+                                text: "分轨导出";
+                                Tooltip { text: @markdown("当前工程的人声（<工程名>_voice.wav）与 BGM（<工程名>_bgm.wav）导到导出目录，给后期用"); }
+                                enabled: !root.busy && !root.batch-running;
+                                clicked => { root.export-stems(); }
                             }
                         }
                     }

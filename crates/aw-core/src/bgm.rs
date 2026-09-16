@@ -75,6 +75,40 @@ pub fn bgm_only_artifacts(dir: &Path, options: &BgmOptions) -> Result<BgmArtifac
     })
 }
 
+/// 从磁盘恢复一套 BGM 产物（重开应用打开旧工程时用）。
+///
+/// 与 [`bgm_only_artifacts`] 的区别：那个是"只有 BGM 一轨"的独立生成口径，这个按
+/// **文件在不在**把 voice / mixed / srt 都填上——用户重开应用后该看到的正是上次那几轨。
+/// 段数按 `bgm/segments/` 里现有的段文件数（拿不到就 0，界面只把它当描述）。
+pub fn bgm_artifacts_from_disk(dir: &Path) -> Result<BgmArtifacts, String> {
+    let bgm = dir.join("bgm/bgm.wav");
+    if !bgm.is_file() {
+        return Err("缺少 bgm/bgm.wav".into());
+    }
+    let duration = wav_duration_seconds(&bgm)
+        .filter(|d| *d > 0.0)
+        .ok_or_else(|| "bgm/bgm.wav 读不出时长（文件损坏？）".to_string())?;
+    let voice = dir.join("out/voice.wav");
+    let mixed = dir.join("out/mixed.wav");
+    let srt = dir.join("out/final.srt");
+    let segments = std::fs::read_dir(dir.join("bgm/segments"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "wav"))
+                .count()
+        })
+        .unwrap_or(0);
+    Ok(BgmArtifacts {
+        voice: voice.is_file().then_some(voice),
+        bgm,
+        mixed: mixed.is_file().then_some(mixed),
+        srt: srt.is_file().then_some(srt),
+        duration,
+        segments,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct BgmManifest {
     version: u32,
@@ -529,6 +563,35 @@ mod tests {
             w.write_sample((i % 89) as i16).unwrap();
         }
         w.finalize().unwrap();
+    }
+
+    /// 从磁盘恢复一套产物：按文件在不在填 voice/mixed/srt，段数按目录里的段文件数。
+    /// 重开应用打开旧工程要靠它把 BGM 页的轨道行显示回来（复核指出只认内存
+    /// `BgmArtifacts` 会让"昨天混好的分轨今天导不出来"）。
+    #[test]
+    fn bgm_artifacts_from_disk_fills_tracks_by_presence() {
+        let dir = std::env::temp_dir().join(format!("aw-bgm-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bgm/segments")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        write_test_segment(&dir.join("bgm/bgm.wav"));
+        write_test_segment(&dir.join("bgm/segments/000.wav"));
+        write_test_segment(&dir.join("bgm/segments/001.wav"));
+        std::fs::write(dir.join("out/voice.wav"), b"voice").unwrap();
+        std::fs::write(dir.join("out/final.srt"), b"srt").unwrap();
+
+        let a = bgm_artifacts_from_disk(&dir).expect("有 bgm/bgm.wav 就该恢复出来");
+        assert_eq!(a.bgm, dir.join("bgm/bgm.wav"));
+        assert_eq!(a.voice, Some(dir.join("out/voice.wav")));
+        assert!(a.mixed.is_none(), "没混音就没有 mixed 轨");
+        assert_eq!(a.srt, Some(dir.join("out/final.srt")));
+        assert_eq!(a.segments, 2, "段数按目录里现有的段文件数");
+        assert!(a.duration > 0.0, "时长要从 wav 读出来");
+
+        // 没有 bgm/bgm.wav 就不能凭空造一套
+        let empty = dir.join("空的");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(bgm_artifacts_from_disk(&empty).is_err());
     }
 
     /// 分段时长也走 `hound::duration()`，而它**已经是每声道帧数**。

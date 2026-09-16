@@ -248,7 +248,7 @@ export component BgmWorkbench inherits Rectangle {
                         padding: 12px;
                         spacing: 8px;
                         Text {
-                            text: root.stale ? "旧版本（prompt 已改）：试听可用，重新生成后才作为当前结果" : root.status-text;
+                            text: root.stale ? "旧版本：试听可用；重新生成并混音后才作为当前结果（分轨导出只认当前结果）" : root.status-text;
                             color: root.stale ? PixelTheme.danger : PixelTheme.dim;
                             font-size: 12px;
                             overflow: elide;
