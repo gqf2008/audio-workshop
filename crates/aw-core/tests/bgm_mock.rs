@@ -1,6 +1,9 @@
 mod support;
 
-use aw_core::{assemble_bgm, generate_segments, mix_project, BgmOptions, Client, Project};
+use aw_core::{
+    assemble_bgm, generate_segments, generate_segments_stoppable, mix_project, BgmOptions, BgmRun,
+    Client, Project,
+};
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("aw-bgm-{tag}-{}", std::process::id()));
@@ -228,4 +231,61 @@ fn mix_requires_existing_srt() {
     project.save(&dir).unwrap();
     let err = mix_project(&dir, &options).unwrap_err();
     assert!(err.contains("final.srt"), "应指出 SRT 缺失: {err}");
+}
+
+/// 段间可停：谓词一开始就为真 → 一段都不生成，直接返回 Stopped(0)，且不发任何请求。
+#[test]
+fn stoppable_returns_stopped_before_any_request() {
+    let mock = support::Mock::start(vec![]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("stop-before");
+    let options = BgmOptions {
+        prompt: "任意".into(),
+        segment_seconds: 1.0,
+        target_seconds: 3.0,
+        base_seed: 7,
+        ..Default::default()
+    };
+
+    let out = generate_segments_stoppable(&client, &dir, &options, |_, _, _| {}, || true).unwrap();
+    assert_eq!(out, BgmRun::Stopped(0));
+    assert!(mock.bodies().is_empty(), "停止后不该再向服务发请求");
+    assert!(!dir.join("bgm/segments/000.wav").exists(), "不该落任何段");
+}
+
+/// 中途停止：第一段照常生成，第二段开始前停止 → Stopped(1)，只落一段。
+#[test]
+fn stoppable_keeps_finished_segments_and_reports_where_it_stopped() {
+    let mock = support::Mock::start(vec![(
+        200,
+        support::audio_response(&mono_8k(&vec![100; 8000])),
+    )]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("stop-after-one");
+    let options = BgmOptions {
+        prompt: "任意".into(),
+        segment_seconds: 1.0,
+        target_seconds: 3.0,
+        base_seed: 7,
+        ..Default::default()
+    };
+
+    let seen = std::cell::Cell::new(0usize);
+    let out = generate_segments_stoppable(
+        &client,
+        &dir,
+        &options,
+        |_, _, _| {
+            seen.set(seen.get() + 1);
+        },
+        || seen.get() >= 1,
+    )
+    .unwrap();
+    assert_eq!(out, BgmRun::Stopped(1));
+    assert_eq!(mock.bodies().len(), 1, "只应请求第一段");
+    assert!(
+        dir.join("bgm/segments/000.wav").exists(),
+        "已完成段要保留（下次可复用）"
+    );
+    assert!(!dir.join("bgm/segments/001.wav").exists());
 }

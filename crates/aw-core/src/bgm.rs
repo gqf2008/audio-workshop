@@ -112,24 +112,37 @@ fn wav_duration_seconds(path: &Path) -> Option<f64> {
 
 /// 逐段生成 BGM；已存在且时长足够的段自动跳过，支持中断续跑。
 /// `on_progress(done, total, note)`。
-pub fn generate_segments(
+/// 生成结果：跑完 or 用户停止（停止发生在**段与段之间**——单段的合成请求不可中断）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BgmRun {
+    Done(usize),
+    Stopped(usize),
+}
+
+/// 可停止的生成：`should_stop` 在每段开始前检查一次。
+///
+/// 为什么只能段间停：单段是发给 audiocpp_server 的一次请求，客户端没有取消接口；
+/// 但 BGM 往往是 5~10 段，段间停能把"等全部跑完"缩短到一个段的时长。
+pub fn generate_segments_stoppable(
     client: &Client,
     dir: &Path,
     options: &BgmOptions,
     mut on_progress: impl FnMut(usize, usize, &str),
-) -> Result<usize, ClientError> {
+    should_stop: impl Fn() -> bool,
+) -> Result<BgmRun, ClientError> {
     let total = segment_count(options).map_err(ClientError::Http)?;
     std::fs::create_dir_all(dir.join("bgm/segments")).ok();
     let reuse_cache = manifest_matches(dir, options);
     if !reuse_cache {
-        // 一旦开始覆盖旧分段，旧 manifest 就不能再保持“有效”：否则中途失败后
-        // 切回旧 prompt 会把已经覆盖的新段错误当成旧 prompt 的缓存。
         let pending = serde_json::to_vec(&BgmManifest::pending(options))
             .map_err(|e| ClientError::Decode(e.to_string()))?;
         write_atomic(&manifest_path(dir), &pending)
             .map_err(|e| ClientError::Http(e.to_string()))?;
     }
     for i in 0..total {
+        if should_stop() {
+            return Ok(BgmRun::Stopped(i));
+        }
         let path = segment_path(dir, i);
         if reuse_cache
             && wav_duration_seconds(&path)
@@ -139,31 +152,58 @@ pub fn generate_segments(
             on_progress(i + 1, total, "cached");
             continue;
         }
-        let request = json!({
-            "text": options.prompt,
-            "options": {
-                "duration_seconds": options.segment_seconds.to_string(),
-                "seed": (options.base_seed + i as u64).to_string(),
-            }
-        });
-        let wav = client.run_audio(&options.model, request)?;
-        // 服务端返回的段必须是可由 hound 完整读取的 WAV，否则不能落盘冒充成功。
-        let reader = hound::WavReader::new(std::io::Cursor::new(&wav))
-            .map_err(|e| ClientError::Decode(e.to_string()))?;
-        let spec = reader.spec();
-        if spec.bits_per_sample != 16 || spec.channels == 0 || spec.sample_rate == 0 {
-            return Err(ClientError::Decode("BGM 不是 16-bit PCM WAV".into()));
-        }
-        if reader.duration() == 0 {
-            return Err(ClientError::Decode("BGM 段为 0 帧".into()));
-        }
-        write_atomic(&path, &wav).map_err(|e| ClientError::Http(e.to_string()))?;
+        generate_one_segment(client, options, i, &path)?;
         on_progress(i + 1, total, "done");
     }
+    // 全部段都在，才把 manifest 落成"有效"（中途停止不写，下次仍视为未完成）
     let manifest = serde_json::to_vec(&BgmManifest::from_options(options))
         .map_err(|e| ClientError::Decode(e.to_string()))?;
     write_atomic(&manifest_path(dir), &manifest).map_err(|e| ClientError::Http(e.to_string()))?;
-    Ok(total)
+    Ok(BgmRun::Done(total))
+}
+
+pub fn generate_segments(
+    client: &Client,
+    dir: &Path,
+    options: &BgmOptions,
+    on_progress: impl FnMut(usize, usize, &str),
+) -> Result<usize, ClientError> {
+    // 老调用点不需要停止：转发给可停止版本，谓词恒 false。
+    match generate_segments_stoppable(client, dir, options, on_progress, || false)? {
+        BgmRun::Done(n) => Ok(n),
+        // 谓词恒 false，理论上到不了这里；真到了也别谎报成功。
+        BgmRun::Stopped(n) => Err(ClientError::Decode(format!(
+            "内部状态异常：不可停止的生成被报告为已停止（完成 {n} 段）"
+        ))),
+    }
+}
+
+/// 生成并落盘单段（请求 → 校验 WAV → 原子写）。
+fn generate_one_segment(
+    client: &Client,
+    options: &BgmOptions,
+    i: usize,
+    path: &Path,
+) -> Result<(), ClientError> {
+    let request = json!({
+        "text": options.prompt,
+        "options": {
+            "duration_seconds": options.segment_seconds.to_string(),
+            "seed": (options.base_seed + i as u64).to_string(),
+        }
+    });
+    let wav = client.run_audio(&options.model, request)?;
+    // 服务端返回的段必须是可由 hound 完整读取的 WAV，否则不能落盘冒充成功。
+    let reader = hound::WavReader::new(std::io::Cursor::new(&wav))
+        .map_err(|e| ClientError::Decode(e.to_string()))?;
+    let spec = reader.spec();
+    if spec.bits_per_sample != 16 || spec.channels == 0 || spec.sample_rate == 0 {
+        return Err(ClientError::Decode("BGM 不是 16-bit PCM WAV".into()));
+    }
+    if reader.duration() == 0 {
+        return Err(ClientError::Decode("BGM 段为 0 帧".into()));
+    }
+    write_atomic(path, &wav).map_err(|e| ClientError::Http(e.to_string()))
 }
 
 /// 将 N 个 30s 段拼接；不足目标时长时循环，最终严格截到目标帧数。

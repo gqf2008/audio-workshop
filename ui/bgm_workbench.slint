@@ -1,18 +1,43 @@
 // ============================================================================
-// BGM 工作台：当前配音工程 + 文本描述 → 生成/对齐/duck → voice/BGM/mixed 三轨
+// BGM 工作台：当前配音工程 + 文本描述 → 生成 / 对齐 / duck → 三轨产物
+//
+// 按设计稿 screens.md §3 整改（此前是"三个并列按钮：生成并混音 / 试听混音 / 导出三轨"）：
+//   · 每屏**一个主操作**（生成并混音 → 停止 → 再生成一版），试听/导出不再是并列主按钮；
+//   · 结果就绪后用**轨道结果区**呈现：人声 / BGM / 混音各一行，行内试听 + 导出；
+//   · 参数进「高级」：duck 强度、分段长度；
+//   · 改 prompt 即把旧产物标为"旧版本"（主操作变「重新生成」，旧产物仍可试听）。
+//
+// 密度（v1.4 红线：每屏 ≤8，外壳 3 个各 Tab 共用）：
+//   本页默认态 4 个 —— prompt · 主操作 · 高级入口 · 状态行
+//   结果就绪 + 轨道结果区 1 个 = 5 ⇒ 3 + 5 = 8 ✓
 // ============================================================================
-import { PixelButton, PixelProgressBar, PixelTextArea, PixelTheme } from "@slint_pixel";
+import { PixelButton, PixelProgressBar, PixelSegmentedControl, PixelTextArea, PixelTheme } from "@slint_pixel";
 
 export component BgmWorkbench inherits Rectangle {
     in-out property <string> prompt: "";
     in property <float> progress: 0.0;
     in property <bool> busy: false;
     in property <bool> has-result: false;
+    // 配音**成品**（out/final.wav）是否就绪：BGM 依赖它定目标时长与 duck 时间轴，
+    // 没有它主操作禁用（独立生成 BGM 是后续项，见 screens.md §3.3 的差异说明）
+    in property <bool> voice-ready: false;
+    // 改过 prompt 之后旧产物是"旧版本"（仍可试听，不再作为当前结果）
+    in property <bool> stale: false;
     in property <string> status-text: "";
+    in property <string> source-text: "";
+    // 三轨的可读路径（结果就绪后由 Rust 填）
+    in property <string> voice-label: "";
+    in property <string> bgm-label: "";
+    in property <string> mixed-label: "";
+    // 高级：duck 强度（0 弱 / 1 中 / 2 强）
+    in-out property <int> duck-index: 1;
+    in-out property <bool> show-advanced: false;
 
     callback generate();
-    callback preview();
-    callback export-tracks();
+    callback stop();
+    callback prompt-edited();
+    callback preview-track(int);
+    callback export-track(int);
 
     HorizontalLayout {
         horizontal-stretch: 1;
@@ -28,56 +53,171 @@ export component BgmWorkbench inherits Rectangle {
                 width: 100%;
                 padding-top: 20px;
                 padding-bottom: 16px;
-                spacing: 18px;
-                alignment: center;
+                spacing: 16px;
+                alignment: start;
 
                 Text {
-                    text: "BGM · 当前配音工程";
+                    text: "BGM";
                     color: PixelTheme.text;
                     font-size: 22px;
                     font-weight: 800;
                 }
                 Text {
-                    text: "按描述生成 30 秒音乐段，自动生成到配音时长，并在人声句段压低音量。";
+                    text: root.voice-ready
+                        ? "按描述生成音乐段，自动对齐到配音时长，并在人声句段压低音量。"
+                        : "BGM 要跟配音同框：先用「配音」Tab 跑一次合成（拿到配音成品），再用这里对齐时长并做 ducking。";
                     color: PixelTheme.dim;
                     font-size: 13px;
+                    wrap: word-wrap;
                 }
-                PixelTextArea {
+
+                PixelTextArea { // 首屏
                     width: 100%;
                     height: 104px;
                     frame-height: 104px;
                     enabled: !root.busy;
                     text <=> root.prompt;
                     placeholder: "例如：温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好";
+                    edited => { root.prompt-edited(); }
                 }
+
+                // 主操作 + 高级入口（同级 2 个；试听/导出下沉到结果区）
                 HorizontalLayout {
                     spacing: 16px;
-                    PixelButton {
-                        width: 160px;
+                    PixelButton { // 首屏
+                        width: 176px;
                         variant: "primary";
-                        text: root.busy ? "生成中…" : "生成并混音";
-                        enabled: !root.busy && root.prompt != "";
-                        clicked => { root.generate(); }
+                        text: root.busy
+                            ? "停止"
+                            : (root.has-result ? (root.stale ? "重新生成" : "再生成一版") : "生成并混音");
+                        enabled: root.busy || (root.prompt != "" && root.voice-ready);
+                        // 说明放在副标题与状态行（Slint 的 Tooltip 只允许一个子元素、
+                        // 且 @markdown 只吃字面量，动态提示改用可见文案更稳）。
+                        clicked => {
+                            if root.busy { root.stop(); }
+                            else { root.generate(); }
+                        }
                     }
-                    PixelButton {
-                        width: 110px;
-                        text: "试听混音";
-                        enabled: root.has-result && !root.busy;
-                        clicked => { root.preview(); }
-                    }
-                    PixelButton {
-                        width: 150px;
-                        text: "导出三轨";
-                        enabled: root.has-result && !root.busy;
-                        clicked => { root.export-tracks(); }
+                    Rectangle { horizontal-stretch: 1; }
+                    PixelButton { // 首屏
+                        width: 96px;
+                        text: root.show-advanced ? "收起高级" : "高级";
+                        Tooltip { text: @markdown("BGM 独有参数：duck 强度（人声段压低多少）"); }
+                        clicked => { root.show-advanced = !root.show-advanced; }
                     }
                 }
-                PixelProgressBar { progress: root.progress; }
-                Text {
-                    text: root.status-text;
-                    color: PixelTheme.dim;
-                    font-size: 12px;
-                    wrap: word-wrap;
+
+                // 高级：duck 强度（语义档位，不暴露 dB 原值）
+                if root.show-advanced : Rectangle {
+                    width: 100%;
+                    background: PixelTheme.bg;
+                    border-width: 2px;
+                    border-color: PixelTheme.edge;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 12px;
+                        alignment: start;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "duck 强度";
+                                width: 72px;
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelSegmentedControl {
+                                width: 240px;
+                                options: ["弱", "中", "强"];
+                                index <=> root.duck-index;
+                                enabled: !root.busy;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "人声句段把 BGM 压低多少：弱 = 保持存在感，强 = 人声更突出（改完需重新生成）";
+                                color: PixelTheme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                // 状态行（有结果时并进结果区头，不重复展示）
+                if !root.has-result : VerticalLayout { // 首屏
+                    spacing: 8px;
+                    Text {
+                        text: root.status-text;
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    if root.busy : PixelProgressBar {
+                        width: 100%;
+                        progress: root.progress;
+                    }
+                }
+
+                // 结果区：人声 / BGM / 混音 三轨，各自试听 + 导出（计 1 个列表对象）
+                if root.has-result : Rectangle { // 首屏-结果就绪
+                    width: 100%;
+                    background: PixelTheme.panel;
+                    border-width: 2px;
+                    border-color: root.stale ? PixelTheme.danger : PixelTheme.edge;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: root.stale ? "旧版本（prompt 已改）：试听可用，重新生成后才作为当前结果" : root.status-text;
+                            color: root.stale ? PixelTheme.danger : PixelTheme.dim;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+                        if root.busy : PixelProgressBar {
+                            width: 100%;
+                            progress: root.progress;
+                        }
+                        for i in [0, 1, 2] : Rectangle {
+                            width: 100%;
+                            height: 44px;
+                            background: transparent;
+                            border-width: 2px;
+                            border-color: PixelTheme.hover;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 8px;
+                                spacing: 10px;
+                                Rectangle {
+                                    width: 10px; height: 10px; border-radius: 5px;
+                                    background: i == 0 ? PixelTheme.dim
+                                        : (i == 1 ? PixelTheme.accent : PixelTheme.text);
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: i == 0 ? root.voice-label : (i == 1 ? root.bgm-label : root.mixed-label);
+                                    color: PixelTheme.text;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                PixelButton {
+                                    width: 64px;
+                                    size: "small";
+                                    text: "试听";
+                                    enabled: !root.busy;
+                                    clicked => { root.preview-track(i); }
+                                }
+                                PixelButton {
+                                    width: 84px;
+                                    size: "small";
+                                    text: "导出";
+                                    enabled: !root.busy;
+                                    clicked => { root.export-track(i); }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
