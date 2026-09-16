@@ -35,12 +35,33 @@ impl Default for BgmOptions {
 
 #[derive(Debug, Clone)]
 pub struct BgmArtifacts {
-    pub voice: PathBuf,
+    /// 人声轨（把配音成品拷过来）；**独立生成 BGM 时没有这一轨** → None
+    pub voice: Option<PathBuf>,
+    /// BGM 轨：永远是有的（不管是不是跟配音同框）
     pub bgm: PathBuf,
-    pub mixed: PathBuf,
-    pub srt: PathBuf,
+    /// 混音轨：只有拿到配音成品时才生成 → None
+    pub mixed: Option<PathBuf>,
+    /// 字幕：来自配音工程；独立生成时没有 → None
+    pub srt: Option<PathBuf>,
     pub duration: f64,
     pub segments: usize,
+}
+
+/// 独立生成（没有配音成品）时的产物：只有 BGM 一轨，时长按用户选的来。
+pub fn bgm_only_artifacts(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, String> {
+    let bgm = dir.join("bgm/bgm.wav");
+    if !bgm.is_file() {
+        return Err("缺少 bgm/bgm.wav".into());
+    }
+    let seconds = options.target_seconds.max(0.1);
+    Ok(BgmArtifacts {
+        voice: None,
+        bgm,
+        mixed: None,
+        srt: None,
+        duration: seconds,
+        segments: segment_count(options)?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -404,10 +425,10 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
         .map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &mixed_path).map_err(|e| e.to_string())?;
     Ok(BgmArtifacts {
-        voice: voice_copy,
+        voice: Some(voice_copy),
         bgm: bgm_path,
-        mixed: mixed_path,
-        srt: srt_path,
+        mixed: Some(mixed_path),
+        srt: Some(srt_path),
         duration: frames as f64 / vs.sample_rate as f64,
         segments: segment_count(options)?,
     })

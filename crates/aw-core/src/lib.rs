@@ -16,8 +16,8 @@ pub mod text_layer;
 
 pub use audio_client::{Client, ClientError};
 pub use bgm::{
-    assemble_bgm, generate_segments, generate_segments_stoppable, mix_project, BgmArtifacts,
-    BgmOptions, BgmRun,
+    assemble_bgm, bgm_only_artifacts, generate_segments, generate_segments_stoppable, mix_project,
+    BgmArtifacts, BgmOptions, BgmRun,
 };
 pub use dub::{
     split_sentences, srt_timestamp, Assembled, Project, Sentence, DEFAULT_INSTRUCTION,
