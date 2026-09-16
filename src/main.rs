@@ -281,6 +281,8 @@ struct EvalSummary {
     worst: Vec<EvalIssue>,
     /// 全部评上的分数（句 index → 可懂度%），给句子行展示用
     scores: Vec<(usize, f64)>,
+    /// 分数没能写进工程时的说明（写成功为 None）——分数仍然有效，但要如实告诉你它没落盘
+    persist_warning: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1344,6 +1346,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     continue;
                 }
                 let total = done.len();
+                let mut project = project;
                 let mut issues: Vec<EvalIssue> = Vec::new();
                 let mut scores: Vec<(usize, f64)> = Vec::new();
                 let mut sum = 0.0f64;
@@ -1359,23 +1362,30 @@ fn worker_loop(ctx: WorkerCtx) {
                     let wav = dir.join(format!("sentences/{idx:03}.wav"));
                     match client.asr(&wav) {
                         Ok(hypothesis) => {
+                            // clone 一份参考文本：下面还要 mut 借 project.sentences 写分数
                             let reference = project
                                 .sentences
                                 .iter()
                                 .find(|s| s.index == *idx)
-                                .map(|s| s.text.as_str())
-                                .unwrap_or("");
-                            let score = aw_core::intelligibility(reference, &hypothesis);
+                                .map(|s| s.text.clone())
+                                .unwrap_or_default();
+                            let score = aw_core::intelligibility(&reference, &hypothesis);
                             sum += score.percent;
                             scored += 1;
                             scores.push((*idx, score.percent));
+                            // 顺手写进工程：质检结果要能跨会话留存（否则每次开都要重跑 N 句 ASR）
+                            if let Some(sen) =
+                                project.sentences.iter_mut().find(|s| s.index == *idx)
+                            {
+                                sen.eval_percent = Some(score.percent);
+                            }
                             // 只收"有差异"的句子：worst 为空就等于全部一致
                             // （否则满分句也会被列成"最差 第 1 句 100%"，复核指出过）
                             if score.distance > 0 {
                                 issues.push(EvalIssue {
                                     index: *idx,
                                     percent: score.percent,
-                                    snippet: aw_core::diff_snippet(reference, &hypothesis)
+                                    snippet: aw_core::diff_snippet(&reference, &hypothesis)
                                         .unwrap_or_default(),
                                 });
                             }
@@ -1402,6 +1412,8 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
+                // 分数落盘：失败不算质检失败（分数本身有效），但要如实报出来
+                let persist_warning = project.save(&dir).err().map(|e| e.to_string());
                 issues.sort_by(|a, b| a.percent.partial_cmp(&b.percent).unwrap());
                 issues.truncate(3);
                 let percent = if scored == 0 {
@@ -1419,6 +1431,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             asr_failed,
                             worst: issues,
                             scores,
+                            persist_warning,
                         },
                     },
                 });
@@ -2245,6 +2258,17 @@ fn restore_project(
     ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
     refresh_voice_labels(ui);
     let done = apply_project_to_rows(ui, rows, &project);
+    // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）
+    {
+        let mut scores = state.eval_scores.borrow_mut();
+        scores.clear();
+        for sen in &project.sentences {
+            if let Some(p) = sen.eval_percent {
+                scores.insert(sen.index, p);
+            }
+        }
+    }
+    apply_eval_labels(rows, &state.eval_scores.borrow());
     let _ = cmd_tx.send(Cmd::OpenProject {
         revision: state.project_revision.get(),
         dir,
@@ -2895,6 +2919,9 @@ fn eval_summary_note(summary: &EvalSummary) -> String {
             worst.snippet
         )),
         None => note.push_str("·全部一致"),
+    }
+    if let Some(warn) = &summary.persist_warning {
+        note.push_str(&format!("·（分数未写入工程：{warn}）"));
     }
     note
 }
@@ -3836,7 +3863,18 @@ fn tick(
                 refresh_tasks(ui, state);
             }
             Msg::ProjectLoaded { project, reused } => {
+                // 工程里的质检分数回灌（跨会话留存：重开应用不用重跑 ASR）
+                {
+                    let mut scores = state.eval_scores.borrow_mut();
+                    scores.clear();
+                    for sen in &project.sentences {
+                        if let Some(p) = sen.eval_percent {
+                            scores.insert(sen.index, p);
+                        }
+                    }
+                }
                 apply_project_to_rows(ui, rows, &project);
+                apply_eval_labels(rows, &state.eval_scores.borrow());
                 state.project_ready.set(true);
                 if reused > 0 {
                     ui.set_status_text(
@@ -4165,7 +4203,13 @@ fn tick(
                     }
                 }
                 apply_eval_labels(rows, &state.eval_scores.borrow());
-                let note = eval_summary_note(&summary);
+                let mut note = eval_summary_note(&summary);
+                // 质检是用户主动发起的"找问题"动作：跑完直接把最差那句选中，
+                // 用户当场就能点旁边的「重录」（列表不滚动，长稿还要自己滚一下）
+                if let Some(worst) = summary.worst.first() {
+                    ui.set_selected(worst.index as i32);
+                    note.push_str(&format!("·已选中第 {} 句", worst.index + 1));
+                }
                 // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
                 let outcome = if summary.scored == 0 {
                     tasks::TaskState::Failed
@@ -6026,6 +6070,7 @@ mod tests {
             asr_failed: 5,
             worst: Vec::new(),
             scores: Vec::new(),
+            persist_warning: None,
         };
         let note = eval_summary_note(&all_failed);
         assert!(note.contains("未能评分"), "{note}");
@@ -6039,6 +6084,7 @@ mod tests {
             asr_failed: 0,
             worst: Vec::new(),
             scores: vec![(0, 100.0), (1, 100.0), (2, 100.0)],
+            persist_warning: None,
         };
         let note = eval_summary_note(&clean);
         assert!(note.contains("100.0%") && note.contains("3 句"), "{note}");
@@ -6049,6 +6095,7 @@ mod tests {
             scored: 57,
             asr_failed: 2,
             scores: vec![(0, 100.0), (11, 92.3)],
+            persist_warning: Some("磁盘空间不足：…".into()),
             worst: vec![EvalIssue {
                 index: 11,
                 percent: 92.3,
@@ -6071,5 +6118,28 @@ mod tests {
         assert_eq!(eval_label(95.0), "可懂度 95.0%", "正好等于阈值不加警告");
         assert_eq!(eval_label(94.9), "⚠ 可懂度 94.9%");
         assert_eq!(eval_label(0.0), "⚠ 可懂度 0.0%");
+    }
+
+    /// 分数写不进工程时要如实说（分数有效但没落盘），别让用户以为下次打开还在。
+    #[test]
+    fn eval_summary_note_reports_persist_warning() {
+        let summary = EvalSummary {
+            percent: 96.4,
+            scored: 57,
+            asr_failed: 0,
+            worst: vec![EvalIssue {
+                index: 11,
+                percent: 92.3,
+                snippet: "…【应为 例，读到 力】…".into(),
+            }],
+            scores: vec![(11, 92.3)],
+            persist_warning: Some("磁盘空间不足（需要 0.1 MB）".into()),
+        };
+        let note = eval_summary_note(&summary);
+        assert!(note.contains("92.3%"), "{note}");
+        assert!(
+            note.contains("分数未写入工程") && note.contains("磁盘空间不足"),
+            "要如实报出没落盘：{note}"
+        );
     }
 }

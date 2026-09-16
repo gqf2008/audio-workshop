@@ -111,6 +111,14 @@ pub struct Sentence {
     pub start: Option<f64>,
     #[serde(default)]
     pub status: String, // pending | done | error:...
+    /// 最近一次质检的可懂度（0..=100）。`None` = 没测过 / 已失效。
+    ///
+    /// 失效规则（UI 侧维护内存副本，两边要一致）：
+    /// · 这句被重新合成（合成/重录都走 `synthesize_stoppable`）→ 清空；
+    /// · 稿件改了 → `load_resumable` 判定文本不一致会重建工程，旧分数自然丢；
+    /// · 只改工程名、续跑时跳过已完成的句子 → 保留（音频没变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +171,7 @@ impl Project {
                 duration: None,
                 start: None,
                 status: "pending".into(),
+                eval_percent: None,
             })
             .collect();
         Self {
@@ -240,6 +249,8 @@ impl Project {
                     let s = &mut self.sentences[i];
                     s.duration = Some(d);
                     s.status = "done".into();
+                    // 音频换了：这一句的旧质检分数必须作废（重录也走这条路径）
+                    s.eval_percent = None;
                     format!("done {d:.2}s")
                 }
                 Err(e) => {

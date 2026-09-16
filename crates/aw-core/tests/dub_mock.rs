@@ -259,3 +259,40 @@ fn stoppable_synthesize_keeps_done_and_stops() {
     assert_eq!(prj.sentences[2].status, "pending");
     assert_eq!(mock.hit_count(), 1, "取消后不得再发请求");
 }
+
+/// 质检分数要能跨会话留存（写进工程），而**重新合成那一句必须把它清掉**——
+/// 否则界面会拿旧分数描述新音频。
+#[test]
+fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let dir = temp_dir("eval-persist");
+    let mut prj = project();
+    // 假装上一轮质检给第 0 句打了 91.5 分
+    prj.sentences[0].status = "done".into();
+    prj.sentences[0].duration = Some(0.1);
+    prj.sentences[0].eval_percent = Some(91.5);
+    prj.save(&dir).unwrap();
+
+    // 跨会话：重新读回来分数还在（没有这个字段的旧工程按 None 处理，`#[serde(default)]`）
+    let loaded = Project::load(&dir).unwrap();
+    assert_eq!(loaded.sentences[0].eval_percent, Some(91.5));
+    assert_eq!(loaded.sentences[1].eval_percent, None);
+
+    // 重新合成第 1 句 → 它的旧分数作废
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let mut prj = loaded;
+    prj.sentences[1].eval_percent = Some(50.0);
+    let failed = prj
+        .synthesize(&client(&mock.base), &dir, Some(&[1]), None, |_, _| {})
+        .unwrap();
+    assert_eq!(failed, 0);
+    assert_eq!(
+        prj.sentences[1].eval_percent, None,
+        "音频换了，旧质检分数必须清掉"
+    );
+    assert_eq!(
+        prj.sentences[0].eval_percent,
+        Some(91.5),
+        "没重合成的句子分数要保留"
+    );
+}
