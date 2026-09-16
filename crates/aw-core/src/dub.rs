@@ -233,6 +233,16 @@ impl Project {
                 }
                 (s.index, s.spoken.clone(), s.seed)
             };
+            // 这一句要重做：先把旧质检分数作废并**立刻落盘**，再做（可能失败的）重合成。
+            //
+            // 顺序是这条不变式的全部：先清后写 ⇒ 磁盘上永远不会出现"新音频 + 旧分数"。
+            // 若反过来（先写 wav 再清分），进程在换 wav 与逐句 save 之间退出就会留下那个组合，
+            // 重启后旧分会被贴到新音频上（复核指出）。代价是失败后这句没有分数——丢一个分数
+            // 比显示一个错的分数好，重跑一次质检即可补回来。
+            if self.sentences[i].eval_percent.take().is_some() {
+                self.save(dir)
+                    .map_err(|e| ClientError::Local(e.to_string()))?;
+            }
             on_progress(index, &spoken);
             let outcome = match client.synth(
                 &self.model,
@@ -249,11 +259,6 @@ impl Project {
                     let s = &mut self.sentences[i];
                     s.duration = Some(d);
                     s.status = "done".into();
-                    // **音频真的换了**（新 wav 已落盘）才作废旧质检分数：
-                    // 分数描述的是磁盘上那段音频，所以写盘失败/合成失败/进程中途退出时
-                    // 旧分数仍然成立，磁盘与界面都不该清（复核指出"一开始就在内存里清"
-                    // 会在这些失败路径上让两边说法不一）。
-                    s.eval_percent = None;
                     format!("done {d:.2}s")
                 }
                 Err(e) => {

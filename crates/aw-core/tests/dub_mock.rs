@@ -297,35 +297,30 @@ fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
     );
 }
 
-/// 重新合成**失败**时**保留**旧分：音频没变（新 wav 没写成），分数描述的那段音频仍然有效。
-/// 复核指出过我的第一版把"开始重做就清分"写成了磁盘语义，会在写盘失败/进程退出这类
-/// 早退路径上留下"界面已清、磁盘还留着"的不一致；现在的语义是"音频真的换了才清"。
+/// 重新合成**失败**时这句没有分数：aw-core 在**开始重做**时就把旧分作废并落盘
+/// （先清后写，磁盘上不会出现"新音频 + 旧分数"），失败后两边都没有分数——
+/// 丢一个分数比显示一个错的分数好，重跑质检可补（复核两轮后收敛到这个语义）。
 #[test]
-fn failed_resynthesis_keeps_eval_percent_on_disk() {
-    let dir = temp_dir("eval-fail-keep");
+fn failed_resynthesis_leaves_no_score_on_disk() {
+    let dir = temp_dir("eval-fail-clear");
     let mut prj = project();
     prj.sentences[0].status = "done".into();
     prj.sentences[0].duration = Some(0.1);
     prj.sentences[0].eval_percent = Some(88.0);
     prj.save(&dir).unwrap();
 
-    // mock 返回 500：这一句合成失败（没有新 wav）
+    // mock 返回 500：这一句合成失败
     let mock = support::Mock::start(vec![(500, r#"{"error":"模型没加载"}"#.into())]);
     let failed = prj
         .synthesize(&client(&mock.base), &dir, Some(&[0]), None, |_, _| {})
         .unwrap();
     assert_eq!(failed, 1);
-    assert_eq!(
-        prj.sentences[0].eval_percent,
-        Some(88.0),
-        "音频没变，旧分数仍然成立"
-    );
+    assert_eq!(prj.sentences[0].eval_percent, None, "内存里要清");
 
     let on_disk = Project::load(&dir).unwrap();
     assert_eq!(
-        on_disk.sentences[0].eval_percent,
-        Some(88.0),
-        "磁盘与内存一致（都保留）"
+        on_disk.sentences[0].eval_percent, None,
+        "磁盘上也要清（旧分已经作废并落盘）"
     );
     assert!(
         on_disk.sentences[0].status.starts_with("error"),
