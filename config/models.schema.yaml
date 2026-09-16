@@ -10,9 +10,9 @@ profile: creator-zh-mac          # 一份配置 = 一套决策；换人群/换�
 
 # ── 1. 运行时：部署与资源（谁管：产品自动探测，不暴露给创作者）────────────
 runtime:
-  backend: metal                 # mac→metal / nvidia→cuda / 其它→cpu（可自动探测）
+  backend: auto                  # auto：mac→metal / nvidia-smi→cuda / 其它→cpu；AW_BACKEND 可覆盖
   threads: 8
-  models_root: /Volumes/DataExt/models
+  models_root: /Volumes/DataExt/models  # 可用 AW_MODELS_ROOT 覆盖；不存在时回落到 ~/models/audio-workshop
   memory:
     max_loaded_models: 2         # 创作者机器内存有限，比服务端默认(4)更保守
     idle_unload_ms: 300000

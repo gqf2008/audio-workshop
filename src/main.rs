@@ -311,10 +311,10 @@ fn models_under_dir(cfg: &Option<ServerConfig>, dir: &Path) -> usize {
 
 /// 设置文件：与工程产物同目录，便于用户找到与备份。
 fn settings_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("Documents")
-        .join(WORKSHOP_DIR)
-        .join("settings.json")
+    // 与 projects_root()/export_dir() 同源：走系统 Documents（Windows 上是
+    // %USERPROFILE%\Documents），不再写死 HOME —— 否则 Windows 上会落到相对路径，
+    // 换个目录启动就相当于"设置丢失"。
+    documents_dir().join(WORKSHOP_DIR).join("settings.json")
 }
 
 fn load_settings() -> AppSettings {
@@ -344,18 +344,35 @@ fn settings_snapshot() -> AppSettings {
 }
 
 fn default_config_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".local/opt/audio.cpp/server.json")
+    // 用 home_dir()（内部走 dirs）：Windows 上 HOME 常未设置，env 版本会退化成相对路径
+    home_dir().join(".local/opt/audio.cpp/server.json")
 }
 
-/// 模型清单路径：AW_SERVER_CONFIG > 全局设置 > 默认路径
+/// 模型清单路径：AW_SERVER_CONFIG > 已存在的候选 > HOME 旧路径（兜底）。
+///
+/// 候选顺序（吸收 M3 的跨平台发现，且与 `tools/platform_paths.py` **保持一致**）：
+///   1. `~/.local/opt/audio.cpp/server.json`（历史路径，macOS/Linux 一直在用）
+///   2. `$XDG_CONFIG_HOME/audio.cpp/server.json`（Windows: `%APPDATA%\audio.cpp\...`）
+///
+/// 顺序刻意是"历史优先"：两个文件同时存在时，不改变老用户现有的读取目标。
+///
+/// 两者都不存在时返回第 1 条（错误信息里路径更符合老用户直觉）。
+///
+/// 说明：清单路径只在环境变量里可覆盖，UI 上不再暴露"模型清单文件"
+/// （用户口径：全局设置里是**模型目录**，不是清单文件）。
 fn config_path() -> PathBuf {
-    // 清单路径只在环境变量里可覆盖：UI 上不再暴露"模型清单文件"
-    // （用户口径：全局设置里是**模型目录**，不是清单文件）。
-    std::env::var("AW_SERVER_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .unwrap_or_else(default_config_path)
+    if let Ok(path) = std::env::var("AW_SERVER_CONFIG") {
+        return PathBuf::from(path);
+    }
+    let legacy = default_config_path();
+    let mut candidates = vec![legacy.clone()];
+    if let Some(config) = dirs::config_dir() {
+        candidates.push(config.join("audio.cpp/server.json"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or(legacy)
 }
 
 #[derive(serde::Deserialize)]
@@ -508,6 +525,12 @@ fn server_endpoint() -> (String, String, bool) {
         None,
     );
     (host, port, false)
+}
+
+/// 重新读 /health 并刷新状态栏的后端标签（启动、测试连接、应用并重连后都调用）。
+fn refresh_backend_label(ui: &MainWindow) {
+    let (_, base, _) = discover_engine();
+    ui.set_backend_label(backend_label(base.as_deref()).into());
 }
 
 /// 把「全局设置 + 模型清单」的现状回灌到界面。
@@ -732,6 +755,28 @@ fn short_path(p: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.to_string())
+}
+
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn documents_dir() -> PathBuf {
+    dirs::document_dir().unwrap_or_else(|| home_dir().join("Documents"))
+}
+
+/// 状态栏显示的服务后端（/health 回报的 backend）。
+///
+/// 注意与音色面板的 `engine-label`（当前**模型**名，如 audio8-tts）区分：
+/// 这个是**服务/推理后端**（如 metal / cuda），两者不是一回事。
+fn backend_label(base: Option<&str>) -> String {
+    let Some(base) = base else {
+        return "audio.cpp · 未发现服务".into();
+    };
+    match Client::new(base).backend_label() {
+        Some(backend) => format!("audio.cpp · {}", backend.to_uppercase()),
+        None => "audio.cpp · 服务不可达".into(),
+    }
 }
 
 // ===========================================================================
@@ -1225,10 +1270,7 @@ fn make_client() -> Result<Client, String> {
 
 /// 工程目录：~/Documents/音频作坊/projects/<stem>/
 fn projects_root() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("Documents")
-        .join(WORKSHOP_DIR)
-        .join("projects")
+    documents_dir().join(WORKSHOP_DIR).join("projects")
 }
 
 fn project_dir(stem: &str) -> PathBuf {
@@ -1458,6 +1500,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_engine_discovery(&ui, None);
 
     ui.set_export_dir(export_dir().into());
+    ui.set_backend_label(backend_label(base.as_deref()).into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
     ui.set_script_text(SAMPLE_SCRIPT.into());
@@ -2852,6 +2895,8 @@ fn tick(
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());
                 ui.set_server_ok(ok);
+                // 服务刚被改地址 / 重启过时，后端可能从 metal 变 cuda，标签要跟着走
+                refresh_backend_label(ui);
             }
             Msg::VoicePreview { wav, label } => {
                 // 试听只写临时文件，不落工程目录：不参与导出、不污染断点续作
@@ -3462,8 +3507,7 @@ const SCENE_NOTES: [&str; 5] = [
 ];
 
 fn export_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{home}/Documents/{WORKSHOP_DIR}")
+    documents_dir().join(WORKSHOP_DIR).display().to_string()
 }
 
 fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
