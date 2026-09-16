@@ -25,8 +25,8 @@ use std::time::Duration;
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use aw_core::{
-    assemble_bgm, generate_segments, mix_project, BgmArtifacts, BgmOptions, Client, Project,
-    DEFAULT_PUNCTUATION,
+    assemble_bgm, generate_segments, generate_song, mix_project, BgmArtifacts, BgmOptions, Client,
+    Project, SongModel, SongOptions, DEFAULT_PUNCTUATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -72,6 +72,14 @@ enum Cmd {
     InvalidateProject,
     /// 基于当前配音工程生成并混合 BGM。
     RunBgm { revision: u64, prompt: String },
+    /// 歌曲彩蛋生成（独立于配音工程内容，只复用工程目录）。
+    RunSong {
+        revision: u64,
+        project_name: String,
+        model: String,
+        lyrics: String,
+        style: String,
+    },
 }
 
 enum Msg {
@@ -116,6 +124,11 @@ enum Msg {
         segments: usize,
     },
     BgmFailed(String),
+    SongDone {
+        path: PathBuf,
+        duration: f64,
+    },
+    SongFailed(String),
     /// 工作线程无法继续的错误
     Fatal(String),
 }
@@ -388,6 +401,60 @@ fn worker_loop(ctx: WorkerCtx) {
                         let _ = ctx.tx.send(WorkerMsg {
                             revision,
                             msg: Msg::BgmFailed(format!("BGM 混音失败: {e}")),
+                        });
+                    }
+                }
+            }
+            Cmd::RunSong {
+                revision,
+                project_name,
+                model,
+                lyrics,
+                style,
+            } => {
+                let dir = project_dir(&file_stem(&project_name)).join("song");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::SongFailed(e.to_string()),
+                    });
+                    continue;
+                }
+                let client = match make_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::SongFailed(e),
+                        });
+                        continue;
+                    }
+                };
+                let model = match model.as_str() {
+                    "ace-step" => SongModel::AceStep,
+                    _ => SongModel::Yue2,
+                };
+                let options = SongOptions {
+                    model,
+                    lyrics,
+                    style,
+                    ..Default::default()
+                };
+                match generate_song(&client, &dir, "song", &options) {
+                    Ok(path) => {
+                        let duration = std::fs::read(&path)
+                            .ok()
+                            .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
+                            .unwrap_or(0.0);
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::SongDone { path, duration },
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::SongFailed(format!("歌曲生成失败: {e}")),
                         });
                     }
                 }
@@ -754,6 +821,8 @@ struct UiState {
     project_revision: std::cell::Cell<u64>,
     /// 最近一次 BGM 三轨产物，供试听和导出。
     bgm_artifacts: RefCell<Option<BgmArtifacts>>,
+    /// 最近一次歌曲产物（路径、时长）。
+    song_artifact: RefCell<Option<(PathBuf, f64)>>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -804,6 +873,7 @@ fn main() -> Result<(), slint::PlatformError> {
         project_ready: std::cell::Cell::new(false),
         project_revision: std::cell::Cell::new(0),
         bgm_artifacts: RefCell::new(None),
+        song_artifact: RefCell::new(None),
     });
     {
         let stop = Arc::clone(&stop);
@@ -830,6 +900,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &state);
     wire_bgm(&ui, &cmd_tx, &state, &player);
+    wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
 
     // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
@@ -1531,6 +1602,101 @@ fn wire_bgm(
     });
 }
 
+fn export_song(ui: &MainWindow, state: &Rc<UiState>) {
+    let Some((source, _)) = state.song_artifact.borrow().clone() else {
+        ui.set_status_text("还没有歌曲成品：先生成歌曲".into());
+        return;
+    };
+    let dir = PathBuf::from(ui.get_export_dir().to_string());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        ui.set_status_text(format!("导出目录不可写（{}）: {e}", dir.display()).into());
+        return;
+    }
+    let dst = dir.join(format!("{}_song.wav", stem_of(ui)));
+    if let Err(e) = std::fs::copy(&source, &dst) {
+        ui.set_status_text(format!("导出 {} 失败: {e}", dst.display()).into());
+        return;
+    }
+    toast(ui, &format!("已导出 {}", dst.display()));
+    ui.set_status_text(format!("歌曲已导出到 {}", dst.display()).into());
+}
+
+fn wire_song(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    state: &Rc<UiState>,
+    player: &Rc<player::Player>,
+) {
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let state1 = state.clone();
+    ui.on_song_generate(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：等当前任务结束再生成歌曲".into());
+            return;
+        }
+        let lyrics = ui.get_song_lyrics().to_string();
+        let style = ui.get_song_style().to_string();
+        if lyrics.trim().is_empty() || style.trim().is_empty() {
+            ui.set_status_text("先填歌词和歌曲风格".into());
+            return;
+        }
+        ui.set_busy(true);
+        ui.set_song_has_result(false);
+        ui.set_song_status_text(
+            "歌曲生成中（yue2 可能约 8 分钟，ACE-Step 120s 约 6.4 分钟）…".into(),
+        );
+        let model = if ui.get_song_model_index() == 1 {
+            "ace-step"
+        } else {
+            "yue2"
+        };
+        if tx
+            .send(Cmd::RunSong {
+                revision: state1.project_revision.get(),
+                project_name: file_stem(&ui.get_project_name()),
+                model: model.into(),
+                lyrics,
+                style,
+            })
+            .is_err()
+        {
+            ui.set_busy(false);
+            let note = "工作线程不可用：歌曲未发出，请重启应用";
+            ui.set_song_status_text(note.into());
+            ui.set_status_text(note.into());
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state2 = state.clone();
+    let player2 = player.clone();
+    ui.on_song_preview(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some((path, duration)) = state2.song_artifact.borrow().clone() else {
+            ui.set_status_text("还没有歌曲成品：先生成歌曲".into());
+            return;
+        };
+        match player2.play_wav(&path) {
+            Ok(()) => {
+                state2.playing_total.set(duration as f32);
+                ui.set_playing(true);
+                ui.set_playhead(0.0);
+                ui.set_status_text("试听歌曲".into());
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state3 = state.clone();
+    ui.on_song_export_track(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        export_song(&ui, &state3);
+    });
+}
+
 fn wire_keys(
     ui: &MainWindow,
     rows: &Rc<VecModel<Sentence>>,
@@ -1691,6 +1857,20 @@ fn tick(
                 ui.set_bgm_has_result(false);
                 ui.set_bgm_progress(0.0);
                 ui.set_bgm_status_text(error.clone().into());
+                ui.set_status_text(error.into());
+            }
+            Msg::SongDone { path, duration } => {
+                ui.set_busy(false);
+                ui.set_song_has_result(true);
+                let note = format!("歌曲完成：{duration:.1}s · {}", path.display());
+                ui.set_song_status_text(note.clone().into());
+                ui.set_status_text(note.into());
+                *state.song_artifact.borrow_mut() = Some((path, duration));
+            }
+            Msg::SongFailed(error) => {
+                ui.set_busy(false);
+                ui.set_song_has_result(false);
+                ui.set_song_status_text(error.clone().into());
                 ui.set_status_text(error.into());
             }
             Msg::Assembled {
@@ -2246,6 +2426,7 @@ mod tests {
             project_ready: std::cell::Cell::new(true),
             project_revision: std::cell::Cell::new(7),
             bgm_artifacts: RefCell::new(None),
+            song_artifact: RefCell::new(None),
         });
         let (tx, rx) = channel();
         invalidate_worker_project(&tx, &state);

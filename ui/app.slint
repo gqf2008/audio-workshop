@@ -23,6 +23,7 @@ import {
 import { Sentence, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
+import { SongWorkbench } from "song_workbench.slint";
 
 export { Sentence, Voice } from "model.slint";
 
@@ -75,6 +76,11 @@ export component MainWindow inherits Window {
     in-out property <float> bgm-progress: 0.0;
     in property <bool> bgm-has-result: false;
     in property <string> bgm-status-text: "先完成配音，再用当前工程生成 BGM。";
+    in-out property <string> song-lyrics: "[Verse]\n凌晨的厨房还亮着灯\n[Chorus]\n别让我一个人悬在那句也许";
+    in-out property <string> song-style: "Mandarin Chinese R&B slow jam, warm male lead vocal";
+    in-out property <int> song-model-index: 0;
+    in property <bool> song-has-result: false;
+    in property <string> song-status-text: "歌曲质量未达主线产品级，作为彩蛋使用。";
     in property <string> status-text: "就绪";
     in property <string> export-dir: "";
 
@@ -105,6 +111,9 @@ export component MainWindow inherits Window {
     callback bgm-generate();
     callback bgm-preview();
     callback bgm-export-tracks();
+    callback song-generate();
+    callback song-preview();
+    callback song-export-track();
     callback select-sentence(int);
     callback preview-all();
     callback preview-one(int);
@@ -212,7 +221,19 @@ export component MainWindow inherits Window {
             export-tracks => { root.bgm-export-tracks(); }
         }
 
-        if root.scene != 0 && root.scene != 1 : Rectangle {
+        if root.scene == 2 : SongWorkbench {
+            lyrics <=> root.song-lyrics;
+            style <=> root.song-style;
+            model-index <=> root.song-model-index;
+            busy: root.busy || root.running;
+            has-result: root.song-has-result;
+            status-text: root.song-status-text;
+            generate => { root.song-generate(); }
+            preview => { root.song-preview(); }
+            export-track => { root.song-export-track(); }
+        }
+
+        if root.scene != 0 && root.scene != 1 && root.scene != 2 : Rectangle {
             vertical-stretch: 1;
             background: PixelTheme.bg;
 

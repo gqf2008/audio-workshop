@@ -1,0 +1,98 @@
+// ============================================================================
+// 歌曲彩蛋工作台：yue2 / ACE-Step，慢且质量不稳定，不作为主线产品入口。
+// ============================================================================
+import { PixelButton, PixelSegmentedControl, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
+
+export component SongWorkbench inherits Rectangle {
+    in-out property <string> lyrics: "";
+    in-out property <string> style: "";
+    in-out property <int> model-index: 0;
+    in property <bool> busy: false;
+    in property <bool> has-result: false;
+    in property <string> status-text: "";
+
+    callback generate();
+    callback preview();
+    callback export-track();
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        vertical-stretch: 1;
+        padding-top: 20px;
+        padding-bottom: 16px;
+        alignment: center;
+        spacing: 18px;
+
+        Rectangle {
+            width: 880px;
+            height: 100%;
+            background: transparent;
+
+            VerticalLayout {
+                width: 100%;
+                height: 100%;
+                spacing: 18px;
+                alignment: center;
+
+                Text {
+                    text: "歌曲 · 彩蛋";
+                    color: PixelTheme.text;
+                    font-size: 22px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "yue2 咬字更稳但约 8 分钟/首；ACE-Step 120s 约 6.4 分钟。质量未达主线产品级。";
+                    color: PixelTheme.dim;
+                    font-size: 13px;
+                }
+                PixelSegmentedControl {
+                    options: ["yue2", "ACE-Step"];
+                    index <=> root.model-index;
+                    enabled: !root.busy;
+                }
+                PixelTextArea {
+                    width: 100%;
+                    height: 160px;
+                    frame-height: 160px;
+                    enabled: !root.busy;
+                    text <=> root.lyrics;
+                    placeholder: "歌词，可写 [Verse] / [Chorus] 结构";
+                }
+                PixelTextInput {
+                    width: 100%;
+                    enabled: !root.busy;
+                    text <=> root.style;
+                    placeholder: "风格，如 Mandarin Chinese R&B slow jam, warm male lead vocal";
+                }
+                HorizontalLayout {
+                    spacing: 16px;
+                    PixelButton {
+                        width: 150px;
+                        variant: "primary";
+                        text: root.busy ? "生成中…" : "生成歌曲";
+                        enabled: !root.busy && root.lyrics != "" && root.style != "";
+                        clicked => { root.generate(); }
+                    }
+                    PixelButton {
+                        width: 110px;
+                        text: "试听";
+                        enabled: root.has-result && !root.busy;
+                        clicked => { root.preview(); }
+                    }
+                    PixelButton {
+                        width: 110px;
+                        text: "导出 WAV";
+                        enabled: root.has-result && !root.busy;
+                        clicked => { root.export-track(); }
+                    }
+                }
+                Text {
+                    text: root.status-text;
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
