@@ -733,6 +733,15 @@ pub fn bgm_standalone_seconds(index: i32) -> f64 {
 ///
 /// 独立生成的 BGM 没有 voice / mixed 两轨 → 返回 None（UI 侧那一行不显示，
 /// 而不是给一个不存在的路径让用户点了报错）。
+/// BGM 结果列表的下标 → 分轨导出用的轨（两处映射必须一致：列表第 0 行是人声）。
+fn stem_for_track(index: i32) -> export::Stem {
+    match index {
+        0 => export::Stem::Voice,
+        1 => export::Stem::Bgm,
+        _ => export::Stem::Mixed,
+    }
+}
+
 pub fn bgm_track_path(artifacts: &BgmArtifacts, index: i32) -> Option<PathBuf> {
     match index {
         0 => artifacts.voice.clone(),
@@ -898,20 +907,23 @@ fn pick_audio_blocking() -> Option<String> {
     pick_output_to_path(out)
 }
 
-/// 批量导出的互斥判据：**有别的写 `out/final.*` 的动作在飞时不导**。
+/// 所有导出（批量导出 / 分轨导出 / BGM 逐轨导出）共用的互斥判据：
+/// **有别的动作正在写这些成品时不导**。
 ///
-/// 原因不是"读会读到半截文件"——`final.wav` 是原子写出来的；而是 `assemble` 是
-/// **先发布 final.wav、再写 final.srt**：中间那一瞬扫过去，会看到新 WAV 配旧 SRT
-/// （或把新工程误报成"缺字幕"）。两处写者：
-///   · 单篇拼装/导出 → UI 的 `busy`（导出按钮自己也是这个标志）；
-///   · 批量 worker 的 `assemble` → 在跑的那一行是 Running（`batch_in_flight`）。
-/// 都排除掉，成对产物就一定是同一次拼装写出来的。
-fn batch_export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> {
+/// 原因不是"读会读到半截文件"——这些文件都是原子写出来的；而是有两类问题：
+///   · `assemble` 是**先发布 final.wav、再写 final.srt**：中间那一瞬扫过去会看到
+///     新 WAV 配旧 SRT（或把新工程误报成"缺字幕"）；
+///   · 分轨导出的源（`out/voice.wav`、`out/mixed.wav`、`bgm/bgm.wav`）是 BGM 混音
+///     写出来的，混音跑到一半导出去就是半套。
+/// 写这些产物的动作都有在飞标志：
+///   · 单篇拼装/导出 / BGM 生成 / 重录 / 试听 → UI 的 `busy`；
+///   · 批量 worker 每篇的拼装 → 在跑那一行是 Running（`batch_in_flight`）。
+fn export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> {
     if batch_in_flight {
-        return Some("批量任务正在跑：等它跑完再批量导出（避免导到刚写了一半的成对产物）");
+        return Some("批量任务正在跑：等它跑完再导出（避免导到刚写了一半的成对产物）");
     }
     if ui_busy {
-        return Some("拼装/导出正在进行：等它结束再批量导出");
+        return Some("拼装/合成/导出正在进行：等它结束再导出");
     }
     None
 }
@@ -4372,6 +4384,7 @@ fn wire_export(
     let state = state.clone();
     // 批量导出的闭包也要一份（下面这个 clone 必须在 state 被移进 on_export_requested 之前）
     let state_batch = state.clone();
+    let state_stems = state.clone();
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
         // 批量导出正在跑时拒绝：两边都会往导出目录写 `<工程名>.wav`，当前工程也在
@@ -4415,7 +4428,7 @@ fn wire_export(
             ui.set_status_text("批量导出还在进行…".into());
             return;
         }
-        if let Some(refusal) = batch_export_refusal(ui.get_busy(), batch_in_flight(&st)) {
+        if let Some(refusal) = export_refusal(ui.get_busy(), batch_in_flight(&st)) {
             ui.set_status_text(refusal.into());
             return;
         }
@@ -4435,6 +4448,33 @@ fn wire_export(
             wav_on,
             srt_on,
         );
+    });
+
+    // 分轨导出（P6 的另一半）：人声 + BGM 两轨 → 导出目录，文件名沿用 _voice / _bgm
+    let weak = ui.as_weak();
+    let st = state_stems;
+    ui.on_export_stems(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if let Some(refusal) = export_refusal(ui.get_busy(), batch_in_flight(&st)) {
+            ui.set_status_text(refusal.into());
+            return;
+        }
+        let name = file_stem(&ui.get_project_name());
+        let dir = PathBuf::from(ui.get_export_dir().to_string());
+        let outcome = export::export_stems(&name, &project_dir(&name), &dir);
+        let text = match &outcome {
+            export::StemExportOutcome::Done(s) => {
+                if let Some(first) = s.written.first() {
+                    toast(&ui, &format!("已导出 {}", file_label(first)));
+                }
+                export::stem_summary_text(s, &dir)
+            }
+            export::StemExportOutcome::NothingToExport => {
+                "分轨导出：这个工程还没有成品（先合成 / 混音）".to_string()
+            }
+            export::StemExportOutcome::Failed(e) => format!("分轨导出失败：{e}"),
+        };
+        ui.set_status_text(text.into());
     });
 }
 
@@ -4561,34 +4601,32 @@ fn wire_bgm(
     let st_export = state.clone();
     ui.on_bgm_export_track(move |i| {
         let Some(ui) = weak.upgrade() else { return };
-        let Some(artifacts) = st_export.bgm_artifacts.borrow().clone() else {
+        // 还没混过音时先给一句更贴近情境的话（下面 export_stem 也会兜底返回"没有可导出的轨"）
+        if st_export.bgm_artifacts.borrow().is_none() {
             ui.set_status_text("还没有 BGM 成品：先生成并混音".into());
             return;
-        };
-        let Some(src) = bgm_track_path(&artifacts, i) else {
-            ui.set_status_text("这一轨不存在：本次是独立生成的 BGM（只有 BGM 轨）".into());
-            return;
-        };
-        let suffix = match i {
-            0 => "voice",
-            1 => "bgm",
-            _ => "mixed",
-        };
-        let dir = PathBuf::from(ui.get_export_dir().to_string());
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            ui.set_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
+        }
+        if let Some(refusal) = export_refusal(ui.get_busy(), batch_in_flight(&st_export)) {
+            ui.set_status_text(refusal.into());
             return;
         }
-        let dst = dir.join(format!(
-            "{}_{suffix}.wav",
-            file_stem(&ui.get_project_name())
-        ));
-        match aw_core::dub::copy_atomic(&src, &dst) {
-            Ok(_) => {
-                ui.set_status_text(format!("已导出：{}", dst.display()).into());
-                toast(&ui, &format!("已导出 {}", file_label(&dst)));
+        // 与「分轨导出」共用同一份实现：**来源与命名只有一处**（<工程名>_voice/_bgm/_mixed.wav）
+        let dir = PathBuf::from(ui.get_export_dir().to_string());
+        let name = file_stem(&ui.get_project_name());
+        let project = project_dir(&name);
+        match export::export_stem(&name, &project, &dir, stem_for_track(i)) {
+            export::StemExportOutcome::Done(s) => {
+                let Some(path) = s.written.first() else {
+                    ui.set_status_text("这一轨没有导出".into());
+                    return;
+                };
+                ui.set_status_text(format!("已导出：{}", path.display()).into());
+                toast(&ui, &format!("已导出 {}", file_label(path)));
             }
-            Err(e) => ui.set_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into()),
+            export::StemExportOutcome::NothingToExport => {
+                ui.set_status_text("这一轨不存在：本次是独立生成的 BGM（只有 BGM 轨）".into());
+            }
+            export::StemExportOutcome::Failed(e) => ui.set_status_text(e.into()),
         }
     });
 }
@@ -6584,6 +6622,11 @@ mod tests {
         assert_eq!(bgm_track_path(&a, 1), Some(a.bgm.clone()));
         assert_eq!(bgm_track_path(&a, 2), a.mixed);
         assert_eq!(bgm_track_path(&a, 7), a.mixed, "越界按混音处理");
+        // 导出用的下标映射必须与列表一致（第 0 行是人声），两处一起改才不会错位
+        assert_eq!(stem_for_track(0), export::Stem::Voice);
+        assert_eq!(stem_for_track(1), export::Stem::Bgm);
+        assert_eq!(stem_for_track(2), export::Stem::Mixed);
+        assert_eq!(stem_for_track(7), export::Stem::Mixed, "越界按混音处理");
 
         // 独立生成：只有 BGM 轨 → 另外两行返回 None（UI 不显示，不给假路径）
         let only = BgmArtifacts {
@@ -8072,19 +8115,20 @@ mod tests {
             accompaniment.display()
         );
     }
-    /// 批量导出的互斥判据：两个写者（单篇拼装/导出、批量 worker 的拼装）任何一个在飞
-    /// 都不许导——`assemble` 先发布 final.wav 再写 final.srt，中间扫过去会配错成对产物。
+    /// 导出的互斥判据：两个写者（UI 侧在飞的拼装/混音/导出、批量 worker 每篇的拼装）
+    /// 任何一个在飞都不许导——`assemble` 先发布 final.wav 再写 final.srt，混音也是先写
+    /// voice/mixed 再落盘，中间导出去就会配错成对产物。
     #[test]
-    fn batch_export_refuses_while_any_publisher_is_in_flight() {
-        assert_eq!(batch_export_refusal(false, false), None, "都空闲才允许");
-        let by_batch = batch_export_refusal(false, true).expect("批量在跑要拒绝");
+    fn export_refuses_while_any_publisher_is_in_flight() {
+        assert_eq!(export_refusal(false, false), None, "都空闲才允许");
+        let by_batch = export_refusal(false, true).expect("批量在跑要拒绝");
         assert!(by_batch.contains("批量任务正在跑"), "{by_batch}");
         assert!(by_batch.contains("成对产物"), "要说清为什么等：{by_batch}");
-        let by_busy = batch_export_refusal(true, false).expect("单篇拼装要拒绝");
-        assert!(by_busy.contains("拼装/导出正在进行"), "{by_busy}");
+        let by_busy = export_refusal(true, false).expect("拼装/混音在飞要拒绝");
+        assert!(by_busy.contains("正在进行"), "{by_busy}");
         // 两个都在飞时以批量那条为准（先判的那条）
         assert_eq!(
-            batch_export_refusal(true, true).map(|s| s.contains("批量任务正在跑")),
+            export_refusal(true, true).map(|s| s.contains("批量任务正在跑")),
             Some(true)
         );
     }

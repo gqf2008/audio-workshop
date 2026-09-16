@@ -67,6 +67,162 @@ pub fn export_one(
     ExportOutcome::Exported(PathBuf::from(last))
 }
 
+/// 一份工程里可导出的轨（P6「人声+BGM 分轨」的那两轨，加上混音轨）。
+///
+/// 命名沿用 BGM Tab 逐轨导出的既有约定（`<工程名>_voice.wav` / `_bgm.wav` / `_mixed.wav`）：
+/// **同一轨不能因为从哪个按钮导出就换个名字**，否则导出目录里会同时出现同一内容的两份文件。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stem {
+    /// 人声 / 配音成品
+    Voice,
+    /// BGM 轨
+    Bgm,
+    /// 混音成品（人声 + BGM，已按句压 BGM）
+    Mixed,
+}
+
+impl Stem {
+    /// 文件后缀（既有约定，别改：BGM Tab 一直用它）
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Stem::Voice => "voice",
+            Stem::Bgm => "bgm",
+            Stem::Mixed => "mixed",
+        }
+    }
+
+    /// 界面上的名字
+    pub fn label(self) -> &'static str {
+        match self {
+            Stem::Voice => "人声",
+            Stem::Bgm => "BGM",
+            Stem::Mixed => "混音",
+        }
+    }
+}
+
+/// 一轨的来源文件（**只看磁盘**，不看内存里的 `BgmArtifacts`）。
+///
+/// 为什么从磁盘解析：`bgm/bgm.wav`、`out/voice.wav` 是落盘产物，重开应用打开旧工程时
+/// 内存里没有 artifacts——只认内存会让"昨天混好的分轨今天导不出来"。
+///
+/// 人声轨的优先级：`out/voice.wav`（混音时拷的那份）→ `out/final.wav`（老工程没混过音时，
+/// 配音成品本身就是人声轨）。
+pub fn stem_source(project_dir: &Path, stem: Stem) -> Option<PathBuf> {
+    let candidates: [PathBuf; 2] = match stem {
+        Stem::Voice => [
+            project_dir.join("out/voice.wav"),
+            project_dir.join("out/final.wav"),
+        ],
+        Stem::Bgm => [
+            project_dir.join("bgm/bgm.wav"),
+            project_dir.join("bgm/bgm.wav"),
+        ],
+        Stem::Mixed => [
+            project_dir.join("out/mixed.wav"),
+            project_dir.join("out/mixed.wav"),
+        ],
+    };
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// 分轨导出的结果（P6「人声+BGM 分轨」用）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StemExportSummary {
+    /// 实际写出的文件
+    pub written: Vec<PathBuf>,
+    /// 没有这一轨（例如还没生成过 BGM）——不是失败，但要如实说
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum StemExportOutcome {
+    Done(StemExportSummary),
+    /// 一轨都没有（连配音成品都没有）：说明白"先跑一次配音"
+    NothingToExport,
+    Failed(String),
+}
+
+/// 导出一轨（BGM Tab 的逐轨导出走这里）。
+pub fn export_stem(name: &str, project_dir: &Path, dir: &Path, stem: Stem) -> StemExportOutcome {
+    let Some(src) = stem_source(project_dir, stem) else {
+        return StemExportOutcome::NothingToExport;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return StemExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
+    }
+    let dst = dir.join(format!("{name}_{}.wav", stem.suffix()));
+    match aw_core::dub::copy_atomic(&src, &dst) {
+        Ok(()) => StemExportOutcome::Done(StemExportSummary {
+            written: vec![dst],
+            missing: Vec::new(),
+        }),
+        Err(e) => StemExportOutcome::Failed(aw_core::dub::write_failure_note(&dst, 0, &e)),
+    }
+}
+
+/// 一次导出「人声 + BGM」两轨（P6 的分轨导出）。
+///
+/// 缺一轨不算整次失败：人声导出成功、BGM 还没生成时，用户要的是"拿到人声 + 知道 BGM 没有"，
+/// 而不是一个"全失败"。`missing` 里会写清缺哪一轨。
+pub fn export_stems(name: &str, project_dir: &Path, dir: &Path) -> StemExportOutcome {
+    let wanted = [Stem::Voice, Stem::Bgm];
+    // 先解析来源再建目录：一轨都没有时不该在导出目录里留下一个空目录
+    let resolved: Vec<(Stem, PathBuf)> = wanted
+        .iter()
+        .filter_map(|s| stem_source(project_dir, *s).map(|p| (*s, p)))
+        .collect();
+    let mut summary = StemExportSummary::default();
+    for stem in wanted {
+        if !resolved.iter().any(|(s, _)| *s == stem) {
+            summary.missing.push(stem.label().to_string());
+        }
+    }
+    if resolved.is_empty() {
+        return StemExportOutcome::NothingToExport;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return StemExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
+    }
+    for (stem, src) in resolved {
+        let dst = dir.join(format!("{name}_{}.wav", stem.suffix()));
+        if let Err(e) = aw_core::dub::copy_atomic(&src, &dst) {
+            return StemExportOutcome::Failed(aw_core::dub::write_failure_note(&dst, 0, &e));
+        }
+        summary.written.push(dst);
+    }
+    StemExportOutcome::Done(summary)
+}
+
+/// 分轨导出的状态行文案。
+pub fn stem_summary_text(summary: &StemExportSummary, dir: &Path) -> String {
+    if summary.written.is_empty() {
+        return "分轨导出：没有可导出的轨".to_string();
+    }
+    let names: Vec<String> = summary
+        .written
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let mut text = format!("分轨导出：{} → {}", names.join(" / "), dir.display());
+    if !summary.missing.is_empty() {
+        // 缺哪一轨给的下一步不一样：人声来自配音合成，BGM 来自 BGM 页。
+        // 一句"先在 BGM 页生成"套到人声上就是错的指引（本机真实工程里
+        // 就有"只有 BGM、没人声"的这种，正好照出来）。
+        let hints: Vec<String> = summary
+            .missing
+            .iter()
+            .map(|m| match m.as_str() {
+                "人声" => "还没有人声轨（先完成配音合成）".to_string(),
+                "BGM" => "还没有 BGM 轨（先在 BGM 页生成）".to_string(),
+                other => format!("还没有{other}轨"),
+            })
+            .collect();
+        text.push_str(&format!(" · {}", hints.join("；")));
+    }
+    text
+}
+
 /// 一个"有成品"的工程（批量导出的输入）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectOut {
@@ -440,6 +596,139 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!dst.join("外面的工程.wav").exists(), "不该把外面那篇导出来");
+    }
+
+    /// 造一个"混过音"的工程：out/{final,voice,mixed}.wav + bgm/bgm.wav
+    fn make_mixed_project(root: &Path, name: &str) {
+        let out = root.join(name).join("out");
+        let bgm = root.join(name).join("bgm");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&bgm).unwrap();
+        std::fs::write(out.join("final.wav"), b"final").unwrap();
+        std::fs::write(out.join("voice.wav"), b"voice").unwrap();
+        std::fs::write(out.join("mixed.wav"), b"mixed").unwrap();
+        std::fs::write(bgm.join("bgm.wav"), b"bgm").unwrap();
+    }
+
+    /// 人声轨来源优先级：有 `out/voice.wav` 用它；老工程（没混过音）退回 `out/final.wav`——
+    /// 那种工程的配音成品本身就是人声轨。
+    #[test]
+    fn stem_source_prefers_voice_then_falls_back_to_final() {
+        let root = temp_dir("stem-src");
+        make_mixed_project(&root, "甲");
+        let p = root.join("甲");
+        assert_eq!(stem_source(&p, Stem::Voice), Some(p.join("out/voice.wav")));
+        assert_eq!(stem_source(&p, Stem::Bgm), Some(p.join("bgm/bgm.wav")));
+        assert_eq!(stem_source(&p, Stem::Mixed), Some(p.join("out/mixed.wav")));
+
+        // 老工程：只有 final.wav
+        let old = root.join("老工程");
+        std::fs::create_dir_all(old.join("out")).unwrap();
+        std::fs::write(old.join("out/final.wav"), b"final").unwrap();
+        assert_eq!(
+            stem_source(&old, Stem::Voice),
+            Some(old.join("out/final.wav")),
+            "没混过音的工程，人声轨就是配音成品"
+        );
+        assert_eq!(stem_source(&old, Stem::Bgm), None, "没有 BGM 就别给假路径");
+        assert_eq!(stem_source(&old, Stem::Mixed), None);
+    }
+
+    /// 分轨导出写出的名字必须与 BGM Tab 逐轨导出**完全一致**（同一轨一套命名）。
+    #[test]
+    fn stem_export_uses_the_legacy_suffixes() {
+        let root = temp_dir("stem-name");
+        make_mixed_project(&root, "甲");
+        let dst = temp_dir("stem-name-dst");
+        match export_stems("甲", &root.join("甲"), &dst) {
+            StemExportOutcome::Done(s) => {
+                assert_eq!(s.written.len(), 2);
+                assert!(s.missing.is_empty(), "{:?}", s.missing);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(dst.join("甲_voice.wav")).unwrap(), b"voice");
+        assert_eq!(std::fs::read(dst.join("甲_bgm.wav")).unwrap(), b"bgm");
+
+        // 单轨导出走同一套命名（BGM Tab 的按钮就是它）
+        let one = temp_dir("stem-name-one");
+        assert!(matches!(
+            export_stem("甲", &root.join("甲"), &one, Stem::Mixed),
+            StemExportOutcome::Done(_)
+        ));
+        assert!(one.join("甲_mixed.wav").is_file());
+    }
+
+    /// 缺 BGM 不算整次失败：人声照常导出，`missing` 里说清缺哪一轨。
+    #[test]
+    fn export_stems_reports_missing_bgm_without_failing_voice() {
+        let root = temp_dir("stem-missing-bgm");
+        let dir = root.join("只有人声");
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out/final.wav"), b"final-as-voice").unwrap();
+        let dst = temp_dir("stem-missing-dst");
+
+        match export_stems("只有人声", &dir, &dst) {
+            StemExportOutcome::Done(s) => {
+                assert_eq!(s.written.len(), 1, "人声要导出来");
+                assert_eq!(s.missing, vec!["BGM".to_string()]);
+                let text = stem_summary_text(&s, &dst);
+                assert!(text.contains("只有人声_voice.wav"), "{text}");
+                assert!(text.contains("还没有 BGM 轨"), "要说清缺什么：{text}");
+                assert!(text.contains("先在 BGM 页生成"), "要给对下一步：{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dst.join("只有人声_voice.wav")).unwrap(),
+            b"final-as-voice"
+        );
+        assert!(!dst.join("只有人声_bgm.wav").exists());
+    }
+
+    /// 只有 BGM、没有配音成品（本机 `projects/示例工程 · 频道口播` 就是这种）：
+    /// BGM 照常导出，缺人声的提示要指到配音页——套用"先在 BGM 页生成"是指错路。
+    #[test]
+    fn export_stems_only_bgm_hints_at_dubbing_not_bgm_page() {
+        let root = temp_dir("stem-bgm-only");
+        let dir = root.join("只有BGM");
+        std::fs::create_dir_all(dir.join("bgm")).unwrap();
+        std::fs::write(dir.join("bgm/bgm.wav"), b"bgm-only").unwrap();
+        let dst = temp_dir("stem-bgm-only-dst");
+
+        match export_stems("只有BGM", &dir, &dst) {
+            StemExportOutcome::Done(s) => {
+                assert_eq!(s.written.len(), 1);
+                assert_eq!(s.missing, vec!["人声".to_string()]);
+                let text = stem_summary_text(&s, &dst);
+                assert!(text.contains("只有BGM_bgm.wav"), "{text}");
+                assert!(text.contains("还没有人声轨"), "{text}");
+                assert!(
+                    text.contains("先完成配音合成"),
+                    "缺人声要指向配音页，不是 BGM 页：{text}"
+                );
+                assert!(!text.contains("先在 BGM 页生成"), "别给错的下一步：{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dst.join("只有BGM_bgm.wav")).unwrap(),
+            b"bgm-only"
+        );
+    }
+
+    /// 一轨都没有（连配音成品都没有）：明确说"没有可导出的轨"，且不建导出目录。
+    #[test]
+    fn export_stems_with_nothing_to_export_does_not_create_dir() {
+        let root = temp_dir("stem-empty");
+        let dir = root.join("空工程");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = root.join("不该建");
+        assert_eq!(
+            export_stems("空工程", &dir, &dst),
+            StemExportOutcome::NothingToExport
+        );
+        assert!(!dst.exists(), "没有可导的轨就别建目录");
     }
 
     #[test]
