@@ -46,9 +46,13 @@ pub fn export_one(
     }
     if srt_on {
         let Some(srt) = srt else {
-            return ExportOutcome::Failed(format!(
-                "{name}：没有字幕文件（out/final.srt），这条只导出了 WAV；重新导出时把它一起带上"
-            ));
+            // 文案必须跟着**实际做了什么**走：只勾了 SRT 时我们一个文件都没写，
+            // 说"只导出了 WAV"是假的（复核抓到）。
+            return ExportOutcome::Failed(if wav_on {
+                format!("{name}：没有字幕文件（out/final.srt），这条只导出了 WAV；重新导出时把它一起带上")
+            } else {
+                format!("{name}：没有字幕文件（out/final.srt），这条什么都没导出")
+            });
         };
         let t = dir.join(format!("{name}.srt"));
         if let Err(e) = aw_core::dub::copy_atomic(srt, &t) {
@@ -80,7 +84,7 @@ pub struct ProjectOut {
 ///
 /// **目录读不出来要报错**，不能和"目录里没有成品"合成同一个结果：前者用户要去看
 /// 权限/路径，后者是"你还没跑过配音"，两句话完全不同。
-pub fn scan_projects(root: &Path) -> Result<Vec<ProjectOut>, String> {
+pub fn scan_projects(root: &Path) -> Result<ScanOutcome, String> {
     if !root.is_dir() {
         return Err(format!(
             "工程目录不存在：{}（还没有跑过配音？）",
@@ -89,25 +93,80 @@ pub fn scan_projects(root: &Path) -> Result<Vec<ProjectOut>, String> {
     }
     let entries = std::fs::read_dir(root)
         .map_err(|e| format!("读工程目录失败：{}（{e}）", root.display()))?;
-    let mut out: Vec<ProjectOut> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| {
-            let dir = e.path();
-            let wav = dir.join("out/final.wav");
-            if !wav.is_file() {
-                return None;
+    let mut scan = ScanOutcome::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            // 目录项读不出来要如实报出来：`.flatten()` 会把它静默吞掉，
+            // 用户只会看到"怎么少导了一篇"（复核抓到）
+            Err(e) => {
+                scan.problems
+                    .push(format!("读取目录项失败（该篇没导）：{e}"));
+                continue;
             }
-            let srt = dir.join("out/final.srt");
-            Some(ProjectOut {
-                name: e.file_name().to_string_lossy().into_owned(),
-                wav,
-                srt: srt.is_file().then_some(srt),
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+        };
+        let dir = entry.path();
+        // 符号链接一律不跟：projects/ 下放一个指向别处的链接，导出就会把工程目录
+        // 之外的东西复制出来（路径逃逸）。目录名本身也要求是 UTF-8，否则
+        // `to_string_lossy` 会把两个不同的目录名压成同一个名字、互相覆盖产物。
+        let md = match std::fs::symlink_metadata(&dir) {
+            Ok(md) => md,
+            Err(e) => {
+                scan.problems
+                    .push(format!("读目录属性失败（该篇没导）：{e}"));
+                continue;
+            }
+        };
+        if md.file_type().is_symlink() {
+            scan.problems
+                .push("跳过符号链接（不导出工程目录之外的内容）".to_string());
+            continue;
+        }
+        if !md.is_dir() {
+            continue;
+        }
+        let wav = dir.join("out/final.wav");
+        if !wav.is_file() {
+            continue;
+        }
+        let name = match export_name(&entry.file_name()) {
+            Ok(n) => n,
+            Err(note) => {
+                scan.problems.push(note);
+                continue;
+            }
+        };
+        let srt = dir.join("out/final.srt");
+        scan.projects.push(ProjectOut {
+            name,
+            wav,
+            srt: srt.is_file().then_some(srt),
+        });
+    }
+    scan.projects.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(scan)
+}
+
+/// 目录名 → 导出用的工程名。
+///
+/// 非 UTF-8 直接拒绝而不是 `to_string_lossy`：lossy 会把两个不同的目录名压成含 `�`
+/// 的同一个字符串，导出时就写到同一个 `<名字>.wav` 上互相覆盖（复核抓到）。
+fn export_name(file_name: &std::ffi::OsStr) -> Result<String, String> {
+    match file_name.to_str() {
+        Some(n) => Ok(n.to_string()),
+        None => Err(format!(
+            "工程目录名不是 UTF-8，跳过（导出文件名会与别的工程撞车）：{}",
+            file_name.to_string_lossy()
+        )),
+    }
+}
+
+/// 扫描结果：能导的工程 + 扫描时就发现的问题（读不出的目录项、非 UTF-8 目录名、
+/// 符号链接）。问题不能吞——它们会让"少导了一篇"看起来像成功。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub projects: Vec<ProjectOut>,
+    pub problems: Vec<String>,
 }
 
 /// 批量导出汇总。
@@ -136,15 +195,17 @@ pub fn export_all(root: &Path, dir: &Path, wav_on: bool, srt_on: bool) -> BatchE
     if let Err(e) = std::fs::create_dir_all(dir) {
         return BatchExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
     }
-    let projects = match scan_projects(root) {
+    let scan = match scan_projects(root) {
         Ok(p) => p,
         Err(e) => return BatchExportOutcome::Failed(e),
     };
     let mut summary = BatchExportSummary {
-        total: projects.len(),
+        // 扫描期发现问题的那些目录也算进总数：它们确实是"有个工程没导出成"
+        total: scan.projects.len() + scan.problems.len(),
+        failures: scan.problems,
         ..Default::default()
     };
-    for p in projects {
+    for p in scan.projects {
         match export_one(&p.name, dir, &p.wav, p.srt.as_deref(), wav_on, srt_on) {
             ExportOutcome::Exported(_) => summary.exported += 1,
             // NoneSelected 在上面已经拦过，这里只可能出现在"开关在循环里变"那种
@@ -205,7 +266,13 @@ mod tests {
         std::fs::write(root.join("没跑完/out/中间物.txt"), b"x").unwrap();
         std::fs::write(root.join("随便一个文件.txt"), b"x").unwrap();
 
-        let got = scan_projects(&root).expect("工程目录存在");
+        let scan = scan_projects(&root).expect("工程目录存在");
+        assert!(
+            scan.problems.is_empty(),
+            "不该有扫描问题：{:?}",
+            scan.problems
+        );
+        let got = scan.projects;
         let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
         // 排序是**码位序**（`String::cmp`）：乙(U+4E59) < 甲(U+7532)，所以乙在前。
         // 这里钉的是"顺序确定、与目录遍历顺序无关"，不是"字典序"——本地化排序会随
@@ -218,7 +285,8 @@ mod tests {
     fn scan_marks_missing_srt_as_none() {
         let root = temp_dir("scan-nosrt");
         make_project(&root, "只有wav", false);
-        let got = scan_projects(&root).expect("工程目录存在");
+        let scan = scan_projects(&root).expect("工程目录存在");
+        let got = scan.projects;
         assert_eq!(got.len(), 1);
         assert!(got[0].srt.is_none(), "缺字幕要如实记成 None");
     }
@@ -298,9 +366,9 @@ mod tests {
             Ok(v) => panic!("目录不存在时不该返回空表：{v:?}"),
         }
 
-        // 对照：目录在、但没有成品 → 成功返回空表（export_all 会报"没有找到有成品"）
+        // 对照：目录在、但没有成品 → 成功返回空结果（export_all 会报"没有找到有成品"）
         let empty_root = temp_dir("empty-root");
-        assert_eq!(scan_projects(&empty_root).unwrap(), Vec::new());
+        assert_eq!(scan_projects(&empty_root).unwrap(), ScanOutcome::default());
         let dst = temp_dir("empty-dst");
         match export_all(&empty_root, &dst, true, true) {
             BatchExportOutcome::Done(s) => {
@@ -310,6 +378,68 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// 非 UTF-8 目录名：**拒绝**而不是 `to_string_lossy`——两个不同的非法名字会被
+    /// lossy 压成同一个含 `�` 的名字，导出时互相覆盖（复核抓到）。
+    ///
+    /// 用纯函数测：macOS 的 APFS 不允许创建非 UTF-8 的名字（`EILSEQ`），这条判定在
+    /// Linux/ext4 上才会真的遇到，所以不能靠造目录来测。
+    #[cfg(unix)]
+    #[test]
+    fn export_name_rejects_non_utf8_directory_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // 只有中间那个非法字节不同：lossy 之后两者**一模一样**
+        let a = OsString::from_vec(vec![b'a', 0xff, b'1']);
+        let b = OsString::from_vec(vec![b'a', 0xfe, b'1']);
+        // 前提：lossy 之后两者会撞名（这正是不能用 lossy 的原因）
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "前提变了，请重看这条理由"
+        );
+
+        for name in [a, b] {
+            let err = export_name(&name).expect_err("非 UTF-8 目录名要拒绝");
+            assert!(err.contains("不是 UTF-8"), "{err}");
+            assert!(err.contains("撞车"), "要说清为什么拒绝：{err}");
+        }
+        assert_eq!(
+            export_name(std::ffi::OsStr::new("第一集")).unwrap(),
+            "第一集"
+        );
+    }
+
+    /// 符号链接指向工程目录之外的东西：不能跟着导出（路径逃逸），而且要如实报出来。
+    #[cfg(unix)]
+    #[test]
+    fn scan_reports_symlinked_directories() {
+        let root = temp_dir("symlink-root");
+        let outside = temp_dir("symlink-outside");
+        make_project(&outside, "外面的工程", true);
+        std::os::unix::fs::symlink(outside.join("外面的工程"), root.join("链接进来的")).unwrap();
+
+        let scan = scan_projects(&root).expect("工程目录存在");
+        assert!(
+            scan.projects.is_empty(),
+            "符号链接不该被当成可导出工程：{:?}",
+            scan.projects
+        );
+        assert_eq!(scan.problems.len(), 1, "{:?}", scan.problems);
+        assert!(scan.problems[0].contains("符号链接"), "{:?}", scan.problems);
+
+        let dst = temp_dir("symlink-dst");
+        match export_all(&root, &dst, true, true) {
+            BatchExportOutcome::Done(s) => {
+                assert_eq!(s.exported, 0);
+                assert_eq!(s.total, s.failures.len());
+                assert_eq!(s.total, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!dst.join("外面的工程.wav").exists(), "不该把外面那篇导出来");
     }
 
     #[test]
@@ -364,6 +494,28 @@ mod tests {
         }
         // WAV 已经写出去了：这条不变量要说清楚（不能假装什么都没发生）
         assert!(dst.join("工程.wav").is_file());
+    }
+
+    /// 只勾 SRT（没勾 WAV）时缺字幕：一个文件都没写，文案就不能说"只导出了 WAV"。
+    #[test]
+    fn export_one_missing_srt_does_not_claim_wav_was_exported_when_it_was_not() {
+        let dir = temp_dir("one-srt-only");
+        let wav = dir.join("final.wav");
+        std::fs::write(&wav, b"wav").unwrap();
+        let dst = dir.join("dst");
+        match export_one("工程", &dst, &wav, None, false, true) {
+            ExportOutcome::Failed(e) => {
+                assert!(e.contains("没有字幕文件"), "{e}");
+                assert!(
+                    !e.contains("只导出了 WAV"),
+                    "没勾 WAV 就不该说导出了 WAV：{e}"
+                );
+                assert!(e.contains("什么都没导出"), "要如实说清：{e}");
+            }
+            other => panic!("缺字幕时要报失败：{other:?}"),
+        }
+        assert!(!dst.join("工程.wav").exists(), "没勾 WAV 不该写出 WAV");
+        assert!(!dst.join("工程.srt").exists());
     }
 
     #[test]

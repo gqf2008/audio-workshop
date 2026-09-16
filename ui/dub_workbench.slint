@@ -778,7 +778,7 @@ export component DubWorkbench inherits Rectangle {
                                 width: 92px;
                                 text: "批量导出";
                                 Tooltip { text: @markdown("把 projects/ 下所有有成品的工程按上面的格式导到导出目录（正在合成也能导：成品是原子写出来的）"); }
-                                enabled: root.export-wav-on || root.export-srt-on;
+                                enabled: (root.export-wav-on || root.export-srt-on) && !root.busy;
                                 clicked => { root.batch-export(); }
                             }
                         }

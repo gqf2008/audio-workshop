@@ -290,6 +290,8 @@ enum Msg {
     },
     /// 批量导出跑完了（后台线程回报；不是 worker 任务，不进任务台账）
     BatchExportDone {
+        /// 导出到哪个目录（消息自带，别在用的时候再读一次界面值——那个值可能已经变了）
+        dir: PathBuf,
         outcome: export::BatchExportOutcome,
     },
     /// 批量：系统文件框选完的多篇稿件（取消 = 空表）
@@ -911,7 +913,7 @@ fn spawn_batch_export(
         let outcome = export::export_all(&projects_root, &dir, wav_on, srt_on);
         let _ = msg_tx.send(WorkerMsg {
             revision: 0,
-            msg: Msg::BatchExportDone { outcome },
+            msg: Msg::BatchExportDone { dir, outcome },
         });
     });
 }
@@ -4354,6 +4356,12 @@ fn wire_export(
     let state_batch = state.clone();
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
+        // 批量导出正在跑时拒绝：两边都会往导出目录写 `<工程名>.wav`，当前工程也在
+        // 那批里的话就是同一个目标文件（复核指出并发写同一目标的风险）
+        if state.batch_export_running.get() {
+            ui.set_status_text("批量导出还在进行：等它结束再导出当前工程".into());
+            return;
+        }
         // 拼装只有亚秒级，同样不该排队：有任务在飞时直接拒绝并说清
         if ui.get_running() || ui.get_busy() || tasks_in_flight(&state) {
             ui.set_status_text(
@@ -4387,6 +4395,13 @@ fn wire_export(
         let Some(ui) = weak.upgrade() else { return };
         if st.batch_export_running.get() {
             ui.set_status_text("批量导出还在进行…".into());
+            return;
+        }
+        // 单篇拼装/导出在飞时不做批量导出：`assemble` 是**先发布 final.wav、再写
+        // final.srt**，中间那一瞬扫过去会把正在拼装的工程误报成「缺字幕」（复核指出）。
+        // 等这一下（亚秒级）没有代价，报错才是错的。
+        if ui.get_busy() {
+            ui.set_status_text("拼装/导出正在进行：等它结束再批量导出".into());
             return;
         }
         let wav_on = ui.get_export_wav_on();
@@ -5269,9 +5284,8 @@ fn tick(
                 ui.set_song_status_text(error.clone().into());
                 ui.set_status_text(error.into());
             }
-            Msg::BatchExportDone { outcome } => {
+            Msg::BatchExportDone { dir, outcome } => {
                 state.batch_export_running.set(false);
-                let dir = PathBuf::from(ui.get_export_dir().to_string());
                 let text = match outcome {
                     export::BatchExportOutcome::Done(summary) => {
                         export::summary_text(&summary, &dir)
@@ -7337,6 +7351,7 @@ mod tests {
                 stopped: false,
             },
             Msg::BatchExportDone {
+                dir: PathBuf::from("/tmp/out"),
                 outcome: export::BatchExportOutcome::NoneSelected,
             },
         ];
