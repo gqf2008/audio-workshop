@@ -53,6 +53,9 @@ pub struct Progress {
 pub struct SeparatedTracks {
     pub vocals: PathBuf,
     pub accompaniment: PathBuf,
+    /// 裁齐相关的说明（None = 正常裁齐或无需说明）。
+    /// 例：输入不是 wav（跳过裁齐）、wav 读不出时长（未裁齐）。
+    pub note: Option<String>,
 }
 
 /// 结果：正常完成，或用户在过程中按了停止（此时**不落盘**）。
@@ -144,15 +147,31 @@ pub fn install_progress_callbacks() {
 }
 
 /// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
-/// 输入音频时长（秒）。**只支持 wav**：mp3/flac 由上游解码器读，我们这边拿不到长度
-/// （那种输入就不裁，产物保持上游原样）。
-fn input_duration_seconds(path: &Path) -> Option<f64> {
-    let reader = hound::WavReader::open(path).ok()?;
-    let sr = reader.spec().sample_rate;
-    if sr == 0 {
-        return None;
+/// 输入音频时长（秒）。三态，别把三种情况揉成一个 `None`：
+///
+/// - `Ok(Some(secs))`：能裁（wav 且读得动）；
+/// - `Ok(None)`：**不是 wav**（mp3/flac 由上游解码器读，长度我们拿不到）→ 按文档跳过裁齐；
+/// - `Err(note)`：扩展名是 wav 却读不出来（损坏/权限）→ 如实报出去，不静默跳过
+///   （静默跳过会让用户拿到比输入长的产物却不知道原因——复核指出）。
+fn input_duration_seconds(path: &Path) -> Result<Option<f64>, String> {
+    let looks_like_wav = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+    match hound::WavReader::open(path) {
+        Ok(reader) => {
+            let sr = reader.spec().sample_rate;
+            if sr == 0 {
+                return Err(format!("输入 wav 的采样率为 0：{}", path.display()));
+            }
+            Ok(Some(reader.duration() as f64 / sr as f64))
+        }
+        Err(e) if looks_like_wav => Err(format!(
+            "输入是 wav 但读不出时长（{}）：{e}。请确认文件没损坏/有权限后重跑。",
+            path.display()
+        )),
+        Err(_) => Ok(None),
     }
-    Some(reader.duration() as f64 / sr as f64)
 }
 
 /// 把 wav 裁到指定时长（原地替换：临时文件 + rename）。比目标短就原样不动。
@@ -171,8 +190,12 @@ fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
     if total_frames <= keep_frames {
         return Ok(());
     }
-    let tmp = path.with_extension("wav.trim");
-    {
+    // 临时文件显式命名（`with_extension("wav.trim")` 作用在 `xxx.wav.part` 上会得到
+    // `xxx.wav.wav.trim`，名字难看也容易误导）。
+    let tmp = path.with_extension("trim");
+    // 写入放在闭包里：**任何**错误（创建/读样本/写样本/finalize）都会走下面的清理；
+    // 只在 rename 失败时清会留下 .trim 残渣（复核指出）。
+    let written = (|| -> Result<(), String> {
         let mut writer = hound::WavWriter::create(&tmp, spec)
             .map_err(|e| format!("创建 {} 失败：{e}", tmp.display()))?;
         let channels = spec.channels as usize;
@@ -186,7 +209,11 @@ fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
         }
         writer
             .finalize()
-            .map_err(|e| format!("收尾 {} 失败：{e}", tmp.display()))?;
+            .map_err(|e| format!("收尾 {} 失败：{e}", tmp.display()))
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -334,15 +361,26 @@ pub fn separate_tracks(
             accompaniment_tmp.display()
         ));
     }
-    if let Some(seconds) = input_duration_seconds(&req.input) {
-        for part in [&vocals_tmp, &accompaniment_tmp] {
-            if let Err(e) = trim_wav_to_seconds(part, seconds) {
-                let _ = std::fs::remove_file(&vocals_tmp);
-                let _ = std::fs::remove_file(&accompaniment_tmp);
-                return Err(format!("裁齐分离产物失败：{e}"));
+    let trim_note = match input_duration_seconds(&req.input) {
+        Ok(Some(seconds)) => {
+            for part in [&vocals_tmp, &accompaniment_tmp] {
+                if let Err(e) = trim_wav_to_seconds(part, seconds) {
+                    let _ = std::fs::remove_file(&vocals_tmp);
+                    let _ = std::fs::remove_file(&accompaniment_tmp);
+                    let _ = std::fs::remove_file(part.with_extension("trim"));
+                    return Err(format!("裁齐分离产物失败：{e}"));
+                }
             }
+            None
         }
-    }
+        // 非 wav：按文档跳过，但把这件事**说出来**（用户可能因此拿到比输入长的产物）
+        Ok(None) => Some(
+            "输入不是 wav：上游按模型分块补齐，产物可能比输入略长（wav 输入会自动裁齐）"
+                .to_string(),
+        ),
+        // wav 却读不出时长：不静默跳过，如实报出来
+        Err(note) => Some(format!("产物未裁齐：{note}")),
+    };
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
         // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
@@ -367,6 +405,7 @@ pub fn separate_tracks(
     Ok(SeparationOutcome::Done(SeparatedTracks {
         vocals: vocals_path,
         accompaniment: accompaniment_path,
+        note: trim_note,
     }))
 }
 
@@ -493,5 +532,43 @@ mod tests {
             22_050,
             "比目标短就原样不动"
         );
+    }
+
+    /// 三态分类：wav 读得出（可裁）、非 wav（跳过裁齐）、扩展名是 wav 但读不出来（要报错，
+    /// 不能静默跳过——静默跳过会让用户拿到比输入长的产物却不知道原因）。
+    #[test]
+    fn input_duration_classifies_wav_non_wav_and_broken_wav() {
+        let dir = std::env::temp_dir().join(format!("aw-dur-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. 正常 wav：能拿到时长
+        let good = dir.join("good.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        {
+            let mut w = hound::WavWriter::create(&good, spec).unwrap();
+            for _ in 0..8_000 {
+                w.write_sample(0i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        assert_eq!(input_duration_seconds(&good).unwrap(), Some(1.0));
+
+        // 2. 非 wav（这里用 mp3 后缀的垃圾内容模拟）：跳过裁齐，不算错
+        let mp3 = dir.join("song.mp3");
+        std::fs::write(&mp3, b"not really an mp3").unwrap();
+        assert_eq!(input_duration_seconds(&mp3).unwrap(), None);
+
+        // 3. 后缀是 wav 但内容坏了：必须报错（含路径与建议），不能 None
+        let broken = dir.join("broken.wav");
+        std::fs::write(&broken, b"definitely not a wav").unwrap();
+        let err = input_duration_seconds(&broken).unwrap_err();
+        assert!(err.contains("wav") && err.contains("broken.wav"), "{err}");
+        assert!(err.contains("损坏") || err.contains("权限"), "{err}");
     }
 }

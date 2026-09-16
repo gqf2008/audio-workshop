@@ -217,6 +217,9 @@ enum Msg {
         task_id: u32,
         vocals: PathBuf,
         accompaniment: PathBuf,
+        /// 裁齐说明（None = 正常裁齐）：非 wav 跳过裁齐、wav 读不出时长等。
+        /// 不解说用户就不知道"产物为什么比输入长"。
+        note: Option<String>,
     },
     SeparationStopped {
         task_id: u32,
@@ -1274,6 +1277,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         task_id,
                         vocals: t.vocals,
                         accompaniment: t.accompaniment,
+                        note: t.note,
                     },
                     Ok(aw_core::separate::SeparationOutcome::Stopped) => {
                         Msg::SeparationStopped { task_id }
@@ -4163,6 +4167,7 @@ fn tick(
                 task_id,
                 vocals,
                 accompaniment,
+                note,
             } => {
                 if state.sep_task.get() == Some(task_id) {
                     ui.set_sep_busy(false);
@@ -4172,7 +4177,10 @@ fn tick(
                     ui.set_sep_accompaniment_label(
                         format!("伴奏 · {}", file_label(&accompaniment)).into(),
                     );
-                    let note = "两轨已生成 · 可分别试听和导出".to_string();
+                    let note = match note {
+                        Some(extra) => format!("两轨已生成 · 可分别试听和导出（{extra}）"),
+                        None => "两轨已生成 · 可分别试听和导出".to_string(),
+                    };
                     ui.set_sep_status_text(note.clone().into());
                     ui.set_status_text(note.clone().into());
                     finish_task(ui, state, &state.sep_task, tasks::TaskState::Done, note);

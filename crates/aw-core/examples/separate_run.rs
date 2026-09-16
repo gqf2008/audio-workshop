@@ -44,6 +44,11 @@ fn main() {
                 tracks.vocals.display(),
                 tracks.accompaniment.display()
             );
+            // 裁齐相关的说明（非 wav 跳过裁齐 / wav 读不出时长）也要在 CLI 里说出来，
+            // 否则用户只会看到"产物比输入长"却不知道原因。
+            if let Some(note) = tracks.note {
+                println!("  说明 = {note}");
+            }
         }
         Ok(SeparationOutcome::Stopped) => println!("已停止（未落盘）"),
         Err(e) => {
