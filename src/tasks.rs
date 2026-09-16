@@ -10,6 +10,8 @@
 //! 回报 TaskStarted 把该条提升为 Running——"在跑"由执行事实决定，不由提交动作决定。
 //! 这样运行中也能继续提交任务，台账里能如实显示"排队中 #N"。
 
+use std::time::{Duration, Instant};
+
 /// 任务种类。tab 决定任务中心里「跳转」会切到哪个主 Tab。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum TaskKind {
@@ -20,6 +22,18 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// 这类任务会不会报中间进度。
+    ///
+    /// 状态栏 chip 对**不报进度**的种类改报"已运行 N"——写死的 0% 看起来像卡死
+    /// （歌曲是整段生成，服务端没有中间进度）。这里是穷举 match：以后新增任务种类
+    /// 必须显式决定它有没有进度，而不是被 `_ =>` 静默当作有。
+    pub fn reports_progress(self) -> bool {
+        match self {
+            TaskKind::Dub | TaskKind::Bgm | TaskKind::Separation => true,
+            TaskKind::Song => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             TaskKind::Dub => "配音",
@@ -83,6 +97,11 @@ pub struct Task {
     pub state: TaskState,
     pub detail: String,
     pub progress: f32,
+    /// 入队时刻。排队时长与运行时长都从它算起——用户关心的是"我等了多久"，
+    /// 而不是"轮到我之后跑了多久"（排队 8 分钟也不能装作没发生）。
+    enqueued_at: Instant,
+    /// 收尾时刻。终态后 elapsed 冻结在这里，否则一条昨天的任务会显示"已运行 14 小时"。
+    finished_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -122,6 +141,8 @@ impl TaskQueue {
             state: TaskState::Pending,
             detail: String::new(),
             progress: 0.0,
+            enqueued_at: Instant::now(),
+            finished_at: None,
         });
         self.trim_finished();
         id
@@ -178,6 +199,28 @@ impl TaskQueue {
         }
     }
 
+    /// 该任务已经等了 / 跑了多久。终态任务冻结在收尾那一刻（不会继续长）。
+    pub fn elapsed(&self, id: u32) -> Option<Duration> {
+        let t = self.tasks.iter().find(|t| t.id == id)?;
+        Some(match t.finished_at {
+            Some(end) => end.saturating_duration_since(t.enqueued_at),
+            None => t.enqueued_at.elapsed(),
+        })
+    }
+
+    /// 只改说明、不动进度（worker 报"到哪一步了"用：服务端不给中间进度时，
+    /// 阶段文案 + 已运行时长就是唯一诚实的信息）。终态任务不覆盖。
+    pub fn note(&mut self, id: u32, detail: impl Into<String>) -> bool {
+        let detail = detail.into();
+        match self.tasks.iter_mut().find(|t| t.id == id) {
+            Some(t) if !t.state.is_final() && !detail.is_empty() => {
+                t.detail = detail;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 更新进度与说明（只对运行中的任务生效：晚到的进度不该把已完成的任务改回运行中）。
     pub fn progress(&mut self, id: u32, progress: f32, detail: impl Into<String>) {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -198,6 +241,7 @@ impl TaskQueue {
             // 排队中的任务也能直接收尾（排队时点停止）——所以判据是"未终态"而不是"运行中"
             if !t.state.is_final() {
                 t.state = state;
+                t.finished_at = Some(Instant::now());
                 t.progress = if state == TaskState::Done {
                     1.0
                 } else {
@@ -437,5 +481,46 @@ mod tests {
         assert_eq!(q.clear_finished(), 1);
         assert_eq!(q.counts().pending, 1, "排队中的任务不能被清掉");
         assert!(q.pending().any(|t| t.id == queued));
+    }
+
+    /// 终态后 elapsed 必须冻住：否则昨天完成的任务今天会显示"已运行 20 小时"。
+    #[test]
+    fn elapsed_freezes_at_finish() {
+        let mut q = TaskQueue::default();
+        let id = q.start(TaskKind::Dub, "配音");
+        let during = q.elapsed(id).unwrap();
+        std::thread::sleep(Duration::from_millis(12));
+        assert!(
+            q.elapsed(id).unwrap() >= during + Duration::from_millis(10),
+            "运行中应随时间增长"
+        );
+
+        q.finish(id, TaskState::Done, "ok");
+        let frozen = q.elapsed(id).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            q.elapsed(id),
+            Some(frozen),
+            "收尾后时长不再增长（冻结在完成那一刻）"
+        );
+
+        assert_eq!(q.elapsed(9999), None, "不存在的任务没有时长");
+    }
+
+    /// note 只改说明、不碰进度；终态任务不会被晚到的阶段文案覆盖。
+    #[test]
+    fn note_sets_detail_without_touching_progress_and_never_resurrects() {
+        let mut q = TaskQueue::default();
+        let id = q.enqueue(TaskKind::Song, "歌曲");
+        q.progress(id, 0.0, "");
+        assert!(q.note(id, "已请求服务端（yue2 整段生成，无中间进度）"));
+        let t = q.tasks_newest_first().next().unwrap();
+        assert_eq!(t.detail, "已请求服务端（yue2 整段生成，无中间进度）");
+        assert_eq!(t.progress, 0.0, "note 不该动进度");
+        assert!(!q.note(id, ""), "空文案是空操作");
+
+        q.finish(id, TaskState::Failed, "服务端 500");
+        assert!(!q.note(id, "迟到的阶段文案"), "终态不被覆盖");
+        assert_eq!(q.tasks_newest_first().next().unwrap().detail, "服务端 500");
     }
 }

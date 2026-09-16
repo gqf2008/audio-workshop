@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -131,6 +131,11 @@ enum Msg {
     /// Running。与工程版本无关（排队顺序与改稿无关），所以带 revision: 0 且不过滤。
     TaskStarted {
         task_id: u32,
+    },
+    /// worker 报某条任务"走到哪一步了"。与 TaskStarted 同理：只认 task_id，不认 revision。
+    TaskStage {
+        task_id: u32,
+        stage: String,
     },
     /// 工程已从磁盘载入（含断点状态与句级复用结果），供 UI 在合成前对齐。
     ProjectLoaded {
@@ -881,6 +886,31 @@ fn task_take_started(ctx: &WorkerCtx, task_id: u32) -> bool {
     ctx.cancel.take(task_id)
 }
 
+/// 歌曲这类整段生成的任务没有中间进度：状态栏 chip 改报"已运行 N"，
+/// 任务中心靠这条阶段文案 + 时长说明它没卡死。
+fn song_stage_note(model_id: &str) -> &'static str {
+    if model_id == "ace-step" {
+        "正在请求服务端（ACE-Step 整段生成，无中间进度）"
+    } else {
+        "正在请求服务端（yue2 整段生成，无中间进度）"
+    }
+}
+
+/// 客户端就绪后：**先**回报"正在请求服务端…"，再执行真正的请求。
+///
+/// 抽成函数是为了让单测能用假的 run 钉住顺序——真跑一遍 generate_song 会打服务端，
+/// 测试里不能这么干；而"阶段必须晚于客户端就绪、早于请求"正是复核抓到过的那条。
+fn with_song_stage<T>(ctx: &WorkerCtx, task_id: u32, model_id: &str, run: impl FnOnce() -> T) -> T {
+    let _ = ctx.tx.send(WorkerMsg {
+        revision: 0,
+        msg: Msg::TaskStage {
+            task_id,
+            stage: song_stage_note(model_id).to_string(),
+        },
+    });
+    run()
+}
+
 fn worker_loop(ctx: WorkerCtx) {
     // 当前工程：dir + project。Assemble/Redo 复用 Run 留下的那份。
     let mut current: Option<(u64, PathBuf, Project)> = None;
@@ -1237,6 +1267,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         continue;
                     }
                 };
+                let model_id = model.clone();
                 let model = match model.as_str() {
                     "ace-step" => SongModel::AceStep,
                     _ => SongModel::Yue2,
@@ -1247,7 +1278,12 @@ fn worker_loop(ctx: WorkerCtx) {
                     style,
                     ..Default::default()
                 };
-                match generate_song(&client, &dir, "song", &options) {
+                // 目录与客户端都已就绪，下面这一下才是真的发请求：这时才回报阶段
+                // （复核指出：早于 create_dir_all / make_client 回报会在失败时报假进度）
+                let outcome = with_song_stage(&ctx, task_id, &model_id, || {
+                    generate_song(&client, &dir, "song", &options)
+                });
+                match outcome {
                     Ok(path) => {
                         let duration = std::fs::read(&path)
                             .ok()
@@ -1649,6 +1685,8 @@ struct UiState {
     redo_task: std::cell::Cell<Option<u32>>,
     /// 排队任务的取消登记表（UI 侧登记，worker 侧取走；见 src/cancel.rs）
     cancel: cancel::CancelRegistry,
+    /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
+    last_task_refresh: std::cell::Cell<Option<Instant>>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -2070,7 +2108,7 @@ fn task_rows(q: &tasks::TaskQueue) -> Vec<TaskRow> {
                 kind: t.kind.label().into(),
                 title: t.title.clone().into(),
                 state: state.into(),
-                detail: t.detail.clone().into(),
+                detail: task_detail(t, q.elapsed(t.id)).into(),
                 progress: t.progress,
                 tab: t.kind.tab(),
             }
@@ -2078,16 +2116,77 @@ fn task_rows(q: &tasks::TaskQueue) -> Vec<TaskRow> {
         .collect()
 }
 
+/// 任务中心的副标题：阶段文案 + 已经等了/跑了多久。
+///
+/// 时长是**排队+运行**的总时长（`Task::enqueued_at` 起算）——用户等的是这个数，
+/// 不是"轮到我之后跑了多久"。终态条目不挂时长（由各自的结果文案收尾）。
+fn task_detail(t: &tasks::Task, elapsed: Option<Duration>) -> String {
+    let clock = elapsed.map(format_elapsed);
+    match t.state {
+        tasks::TaskState::Pending => match clock {
+            Some(c) => format!("已排队 {c}"),
+            None => "已排队".to_string(),
+        },
+        tasks::TaskState::Running => match (t.detail.is_empty(), clock) {
+            (false, Some(c)) => format!("{} · 已运行 {c}", t.detail),
+            (false, None) => t.detail.clone(),
+            (true, Some(c)) => format!("已运行 {c}"),
+            (true, None) => String::new(),
+        },
+        _ => t.detail.clone(),
+    }
+}
+
+/// 时长文案：秒 / 分 / 时三档（任务中心的"已排队 / 已运行"用）。
+/// 只写已过去的整秒，不四舍五入——8 分钟的任务不该在第 7 分 30 秒时显示 8m00s。
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// 台账里有未终态任务时，按秒刷新任务中心（"已运行 N"才会走字）。
+/// tick 是 40ms 一次，不能每次都重建 VecModel。
+fn maybe_refresh_task_times(ui: &MainWindow, state: &Rc<UiState>) {
+    if !tasks_in_flight(state) {
+        return;
+    }
+    let now = Instant::now();
+    let due = state
+        .last_task_refresh
+        .get()
+        .map(|prev| now.duration_since(prev) >= Duration::from_secs(1))
+        .unwrap_or(true);
+    if due {
+        state.last_task_refresh.set(Some(now));
+        refresh_tasks(ui, state);
+    }
+}
+
 /// 状态栏那枚 chip 的文案：优先显示"正在跑什么"，其次失败，再次完成。
 fn task_chip_text(q: &tasks::TaskQueue) -> String {
     if let Some(t) = q.running() {
-        let pct = (t.progress * 100.0).round() as i32;
         let c = q.counts();
+        let head = if t.kind.reports_progress() {
+            let pct = (t.progress * 100.0).round() as i32;
+            format!("{} {}%", t.kind.label(), pct)
+        } else {
+            // 整段生成的任务没有中间进度：写 0% 会让人以为卡死，改报已运行时长
+            match q.elapsed(t.id) {
+                Some(d) => format!("{} 已运行 {}", t.kind.label(), format_elapsed(d)),
+                None => t.kind.label().to_string(),
+            }
+        };
         // 运行中还排着队：chip 上说清"后面还有几条"，否则用户以为只跑这一条
         if c.pending > 0 {
-            return format!("任务 · {} {}% · 另排队 {}", t.kind.label(), pct, c.pending);
+            return format!("任务 · {head} · 另排队 {}", c.pending);
         }
-        return format!("任务 · {} {}%", t.kind.label(), pct);
+        return format!("任务 · {head}");
     }
     let c = q.counts();
     if c.pending > 0 {
@@ -2459,7 +2558,12 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
     let st = state.clone();
     ui.on_preview_voice(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        // 试听的语义是"马上听到"：排到长任务后面就是没试听，所以明确拒绝 + 说清原因
+        // （此前这里是静默 return，用户点了没反应；分离在跑时还会被排到它后面）。
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&st) {
+            ui.set_status_text(
+                "有任务正在进行：试听要等它结束（试听是立刻返回的短操作，不排队）".into(),
+            );
             return;
         }
         let idx = ui.get_voice_index();
@@ -2477,13 +2581,23 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
         } else {
             "内置默认音色"
         };
+        // 试听本身也是一条 worker 命令：置 busy 让"提交即运行中"的互斥任务（配音/BGM）
+        // 在试听期间也被挡住，否则它们会排在试听后面却显示成已在跑。
+        ui.set_busy(true);
         ui.set_status_text(format!("正在合成试听（{what} · {model}）…").into());
-        let _ = tx.send(Cmd::PreviewVoice {
-            revision: st.project_revision.get(),
-            model,
-            voice_ref,
-            text: VOICE_PREVIEW_TEXT.to_string(),
-        });
+        if tx
+            .send(Cmd::PreviewVoice {
+                revision: st.project_revision.get(),
+                model,
+                voice_ref,
+                text: VOICE_PREVIEW_TEXT.to_string(),
+            })
+            .is_err()
+        {
+            // 发不出去就必须把 busy 放掉，否则试听按钮/编辑守卫会永远卡住
+            ui.set_busy(false);
+            ui.set_status_text("工作线程不可用：试听未发出，请重启应用".into());
+        }
     });
 
     let weak = ui.as_weak();
@@ -2560,12 +2674,13 @@ fn wire_sentence_actions(
         if model3.row_data(idx).is_none() {
             return;
         }
-        if ui.get_running() {
-            ui.set_status_text("合成进行中：等这轮跑完再重录单句".into());
-            return;
-        }
-        if ui.get_busy() || ui.get_sep_busy() {
-            ui.set_status_text("有任务正在进行：等当前任务结束再重录单句".into());
+        // 重录是"刚听完这句就要重录"的短操作：排在 8 分钟歌曲后面等于让用户执行一个
+        // 他已经不想要的旧动作，所以**不入队**，而是明确拒绝。判据统一取台账 + busy
+        // （重录自己也会置 busy，挡住随后的配音/BGM/导出）。
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&state3) {
+            ui.set_status_text(
+                "有任务正在进行：重录要等它结束（重录是立刻执行的短操作，不排队）".into(),
+            );
             return;
         }
         if !state3.project_ready.get() {
@@ -2757,8 +2872,11 @@ fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let state = state.clone();
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_busy() {
-            ui.set_status_text("已有导出 / 重录任务正在进行".into());
+        // 拼装只有亚秒级，同样不该排队：有任务在飞时直接拒绝并说清
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&state) {
+            ui.set_status_text(
+                "有任务正在进行：导出要等它结束（拼装是立刻执行的短操作，不排队）".into(),
+            );
             return;
         }
         if !state.project_ready.get() {
@@ -3167,6 +3285,7 @@ fn tick(
         let revision_agnostic = matches!(
             worker_msg.msg,
             Msg::TaskStarted { .. }
+                | Msg::TaskStage { .. }
                 | Msg::ServerHealth { .. }
                 | Msg::ModelDirPicked { .. }
                 | Msg::SeparationInputPicked { .. }
@@ -3186,6 +3305,11 @@ fn tick(
             continue;
         }
         match worker_msg.msg {
+            Msg::TaskStage { task_id, stage } => {
+                if state.tasks.borrow_mut().note(task_id, stage) {
+                    refresh_tasks(ui, state);
+                }
+            }
             Msg::TaskStarted { task_id } => {
                 // 只有台账里确实还排着的条目才会被提升（排队中点停止的不会被复活）。
                 // 先把借用收掉再动界面：set_task_running_text / refresh_tasks 都要再借一次
@@ -3320,6 +3444,7 @@ fn tick(
                 refresh_backend_label(ui);
             }
             Msg::VoicePreview { wav, label } => {
+                ui.set_busy(false);
                 // 试听只写临时文件，不落工程目录：不参与导出、不污染断点续作
                 let path = std::env::temp_dir().join("audio-workshop-voice-preview.wav");
                 match std::fs::write(&path, &wav) {
@@ -3336,6 +3461,7 @@ fn tick(
                 }
             }
             Msg::VoicePreviewFailed { label, error } => {
+                ui.set_busy(false);
                 ui.set_status_text(format!("试听失败（{label}）：{error}").into());
             }
             Msg::BgmProgress { done, total } => {
@@ -3611,6 +3737,9 @@ fn tick(
         ui.set_playing(false);
         ui.set_status_text("试听结束".into());
     }
+
+    // ── 任务中心的"已排队 / 已运行 N"走字（按秒节流）──
+    maybe_refresh_task_times(ui, state);
 }
 
 enum ExportOutcome {
@@ -4966,5 +5095,137 @@ mod tests {
             chip.contains("排队 1") && chip.contains("音乐制作"),
             "空闲但有排队时说清排的是哪一类，实得 {chip}"
         );
+    }
+
+    /// 时长文案的三档边界：秒 / 分 / 时。都要按"已过去的整秒"写，不四舍五入。
+    #[test]
+    fn format_elapsed_switches_at_minute_and_hour_boundaries() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m59s");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h00m");
+        assert_eq!(format_elapsed(Duration::from_secs(7384)), "2h03m");
+    }
+
+    /// 任务中心副标题：排队报"已排队"，运行报"阶段 · 已运行"，终态只在收尾时冻结
+    /// （不挂时长，由结果文案收尾）。
+    #[test]
+    fn task_detail_reports_wait_and_run_time() {
+        let mut q = tasks::TaskQueue::default();
+        let running = q.start(tasks::TaskKind::Song, "音乐制作 · 生成歌曲");
+
+        let rows = task_rows(&q);
+        assert!(
+            rows[0].detail.starts_with("已运行 "),
+            "还没报阶段时也该说明跑了多久，实得 {}",
+            rows[0].detail
+        );
+
+        // worker 报阶段 → 阶段 + 已运行（歌曲没有百分比，这两样就是全部信息）
+        assert!(q.note(running, "已请求服务端（yue2 整段生成，无中间进度）"));
+        let rows = task_rows(&q);
+        assert!(
+            rows[0].detail.starts_with("已请求服务端") && rows[0].detail.contains(" · 已运行 "),
+            "实得 {}",
+            rows[0].detail
+        );
+
+        // 排队中的那条报"已排队"，不报运行时长
+        let queued = q.enqueue(tasks::TaskKind::Separation, "人声分离 · 频道口播");
+        let rows = task_rows(&q);
+        assert_eq!(rows[0].id, queued as i32);
+        assert!(
+            rows[0].detail.starts_with("已排队"),
+            "实得 {}",
+            rows[0].detail
+        );
+
+        // 终态不挂时长
+        q.finish(running, tasks::TaskState::Done, "成品 168.0s");
+        let rows = task_rows(&q);
+        let done = rows.iter().find(|r| r.id == running as i32).unwrap();
+        assert_eq!(done.detail, "成品 168.0s");
+    }
+
+    /// 歌曲没有中间进度，状态栏 chip 不能写"0%"（看起来像卡死），改报已运行时长；
+    /// 有真实进度的任务照旧显示百分比。
+    #[test]
+    fn task_chip_avoids_fake_zero_percent_for_song() {
+        let mut song = tasks::TaskQueue::default();
+        song.start(tasks::TaskKind::Song, "音乐制作 · 生成歌曲");
+        let chip = task_chip_text(&song);
+        assert!(!chip.contains('%'), "歌曲不该显示 0%：{chip}");
+        assert!(chip.contains("已运行"), "实得 {chip}");
+
+        let mut dub = tasks::TaskQueue::default();
+        let id = dub.start(tasks::TaskKind::Dub, "配音 · 34 句");
+        dub.progress(id, 0.35, "第 12/34 句");
+        assert!(task_chip_text(&dub).contains("35%"));
+    }
+
+    /// 歌曲阶段消息必须**早于真正的请求、晚于客户端就绪**——复核抓到的正是"阶段报早了"：
+    /// 目录创建或 make_client 失败时界面已经写着"已请求服务端"。
+    /// 这里用假的 run 钉住顺序（真跑 generate_song 会打服务端），并顺带核 task_id 路由。
+    #[test]
+    fn song_stage_is_sent_right_before_the_request_runs() {
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let ctx = WorkerCtx {
+            rx: cmd_rx,
+            tx: msg_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            sep_stop: Arc::new(AtomicBool::new(false)),
+            cancel: cancel::CancelRegistry::new(),
+        };
+
+        let stage_already_sent = std::cell::Cell::new(false);
+        let out = with_song_stage(&ctx, 42, "ace-step", || {
+            // 闭包（=真正的请求）跑起来时，阶段消息必须已经在通道里
+            stage_already_sent.set(matches!(
+                msg_rx.try_recv(),
+                Ok(WorkerMsg {
+                    msg: Msg::TaskStage { task_id: 42, .. },
+                    ..
+                })
+            ));
+            "generated"
+        });
+
+        assert_eq!(out, "generated");
+        assert!(
+            stage_already_sent.get(),
+            "阶段消息必须先于请求执行，且带对的 task_id"
+        );
+        drop(cmd_tx);
+    }
+
+    /// 阶段文案按模型分别写清"整段生成、无中间进度"，不能只有一句笼统的话；
+    /// 有进度的种类与没进度的种类在状态栏 chip 上必须给出不同的东西。
+    #[test]
+    fn song_stage_note_names_the_model_and_progress_kinds_are_explicit() {
+        assert!(song_stage_note("yue2").contains("yue2"));
+        assert!(song_stage_note("ace-step").contains("ACE-Step"));
+        for note in [song_stage_note("yue2"), song_stage_note("ace-step")] {
+            assert!(
+                note.contains("整段生成") && note.contains("无中间进度"),
+                "实得 {note}"
+            );
+        }
+
+        // 有进度的种类在 chip 上给百分比，没进度的给时长——两边都不能写成 0%
+        for kind in [
+            tasks::TaskKind::Dub,
+            tasks::TaskKind::Bgm,
+            tasks::TaskKind::Separation,
+        ] {
+            assert!(kind.reports_progress(), "{kind:?} 应该报进度");
+            let mut q = tasks::TaskQueue::default();
+            let id = q.start(kind, "t");
+            q.progress(id, 0.4, "阶段");
+            let chip = task_chip_text(&q);
+            assert!(chip.contains("40%"), "{kind:?} 的 chip 实得 {chip}");
+        }
+        assert!(!tasks::TaskKind::Song.reports_progress());
     }
 }
