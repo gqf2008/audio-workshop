@@ -77,10 +77,18 @@ pub struct ProjectOut {
 /// 顺序按工程名排序：批量导出是"一次性把一批文件放进导出目录"，顺序不稳定会让
 /// 每次跑的结果对不上（也让测试变成碰运气）。没有 `out/final.wav` 的目录直接不算
 /// 候选——那是没跑完/跑失败/别的杂物，不是"导出失败"。
-pub fn scan_projects(root: &Path) -> Vec<ProjectOut> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
+///
+/// **目录读不出来要报错**，不能和"目录里没有成品"合成同一个结果：前者用户要去看
+/// 权限/路径，后者是"你还没跑过配音"，两句话完全不同。
+pub fn scan_projects(root: &Path) -> Result<Vec<ProjectOut>, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "工程目录不存在：{}（还没有跑过配音？）",
+            root.display()
+        ));
+    }
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("读工程目录失败：{}（{e}）", root.display()))?;
     let mut out: Vec<ProjectOut> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
@@ -99,7 +107,7 @@ pub fn scan_projects(root: &Path) -> Vec<ProjectOut> {
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    Ok(out)
 }
 
 /// 批量导出汇总。
@@ -128,7 +136,10 @@ pub fn export_all(root: &Path, dir: &Path, wav_on: bool, srt_on: bool) -> BatchE
     if let Err(e) = std::fs::create_dir_all(dir) {
         return BatchExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
     }
-    let projects = scan_projects(root);
+    let projects = match scan_projects(root) {
+        Ok(p) => p,
+        Err(e) => return BatchExportOutcome::Failed(e),
+    };
     let mut summary = BatchExportSummary {
         total: projects.len(),
         ..Default::default()
@@ -194,7 +205,7 @@ mod tests {
         std::fs::write(root.join("没跑完/out/中间物.txt"), b"x").unwrap();
         std::fs::write(root.join("随便一个文件.txt"), b"x").unwrap();
 
-        let got = scan_projects(&root);
+        let got = scan_projects(&root).expect("工程目录存在");
         let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
         // 排序是**码位序**（`String::cmp`）：乙(U+4E59) < 甲(U+7532)，所以乙在前。
         // 这里钉的是"顺序确定、与目录遍历顺序无关"，不是"字典序"——本地化排序会随
@@ -207,7 +218,7 @@ mod tests {
     fn scan_marks_missing_srt_as_none() {
         let root = temp_dir("scan-nosrt");
         make_project(&root, "只有wav", false);
-        let got = scan_projects(&root);
+        let got = scan_projects(&root).expect("工程目录存在");
         assert_eq!(got.len(), 1);
         assert!(got[0].srt.is_none(), "缺字幕要如实记成 None");
     }
@@ -267,6 +278,34 @@ mod tests {
         match export_all(&root, &dst_wav, true, false) {
             BatchExportOutcome::Done(s) => {
                 assert_eq!(s.exported, 2, "只导 WAV 时两篇都该成");
+                assert!(s.failures.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 工程目录不存在（还没跑过配音 / 路径被删）要报出来，不能和"目录在但没成品"
+    /// 共用一个结果——两句话对用户意味着完全不同的下一步。
+    #[test]
+    fn scan_reports_missing_projects_root() {
+        let dir = temp_dir("missing-root");
+        let missing = dir.join("根本没有这个目录");
+        match scan_projects(&missing) {
+            Err(e) => assert!(
+                e.contains("工程目录不存在") && e.contains("根本没有这个目录"),
+                "要说清是哪个目录：{e}"
+            ),
+            Ok(v) => panic!("目录不存在时不该返回空表：{v:?}"),
+        }
+
+        // 对照：目录在、但没有成品 → 成功返回空表（export_all 会报"没有找到有成品"）
+        let empty_root = temp_dir("empty-root");
+        assert_eq!(scan_projects(&empty_root).unwrap(), Vec::new());
+        let dst = temp_dir("empty-dst");
+        match export_all(&empty_root, &dst, true, true) {
+            BatchExportOutcome::Done(s) => {
+                assert_eq!(s.total, 0);
+                assert_eq!(s.exported, 0);
                 assert!(s.failures.is_empty());
             }
             other => panic!("{other:?}"),

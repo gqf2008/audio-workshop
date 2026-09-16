@@ -4798,6 +4798,9 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BatchItemProgress { .. }
         | Msg::BatchItemDone { .. }
         | Msg::BatchDone { .. }
+        // 批量导出同理：它来自后台线程，用户点按钮那一刻与工程版本无关；
+        // 用 revision 0 发回来，按版本过滤就会「点完没反应」
+        | Msg::BatchExportDone { .. }
     )
 }
 
@@ -7298,6 +7301,7 @@ mod tests {
     /// 台账停在运行中（复核抓到的阻塞项）。
     ///
     /// 这条测试对**每一条**批量消息都要过：以后再加批量消息，忘了进名单就会红。
+    /// `BatchExportDone` 就是同一族的第二个例子（后台线程发回、revision 0）。
     #[test]
     fn batch_messages_survive_revision_changes() {
         let batch_msgs = vec![
@@ -7332,6 +7336,9 @@ mod tests {
                 skipped: 1,
                 stopped: false,
             },
+            Msg::BatchExportDone {
+                outcome: export::BatchExportOutcome::NoneSelected,
+            },
         ];
         let names = [
             "BatchScriptsPicked",
@@ -7339,6 +7346,7 @@ mod tests {
             "BatchItemProgress",
             "BatchItemDone",
             "BatchDone",
+            "BatchExportDone",
         ];
         assert_eq!(names.len(), batch_msgs.len());
         for (i, msg) in batch_msgs.into_iter().enumerate() {
