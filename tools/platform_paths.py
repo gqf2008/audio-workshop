@@ -2,7 +2,8 @@
 """跨平台路径与推理后端发现（M3）。
 
 优先级：
-- server.json：AW_SERVER_CONFIG > 平台配置目录 > macOS 旧路径
+- server.json：AW_SERVER_CONFIG > 历史路径（~/.local/opt/audio.cpp）> 平台配置目录
+  （顺序与 Rust 侧 src/main.rs::config_path() 一致；两处都写明了要同步改）
 - eval 目录：AW_EVAL_DIR > <server.json 所在目录>/eval
 - models_root：AW_MODELS_ROOT / AUDIO_WORKSHOP_MODELS_ROOT > schema 值（存在时）> ~/models/audio-workshop
 - backend：AW_BACKEND > schema 的显式值（非 auto）> Darwin=metal / nvidia-smi=cuda / 其它=cpu
