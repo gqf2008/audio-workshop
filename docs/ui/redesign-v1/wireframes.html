@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>音频作坊· UI Redesign v1 线框</title>
+<title>音频作坊· UI Redesign v1.1 线框</title>
 <style>
   :root {
     --page: #eef0f3;
@@ -159,7 +159,7 @@
 
   .tabs {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 4px;
     padding: 7px 8px;
     background: #fff;
@@ -173,7 +173,7 @@
     border-radius: 7px;
     background: transparent;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 700;
     text-align: center;
     white-space: nowrap;
@@ -564,9 +564,9 @@
 <main class="wrap">
   <header class="intro">
     <div>
-      <p class="eyebrow">Audio Workshop / UI Redesign v1</p>
-      <h1>四个主 Tab，一屏一件事</h1>
-      <p>低密度线框：顶部四场景始终可见；每屏只突出一个主任务；参数进入当前 Tab 的高级抽屉；任务可跨 Tab、可恢复。</p>
+      <p class="eyebrow">Audio Workshop / UI Redesign v1.1</p>
+      <h1>五个主 Tab，一屏一件事</h1>
+      <p>低密度线框：顶部五场景始终可见；每屏只突出一个主任务；参数进入当前 Tab 的高级抽屉；任务可跨 Tab、可恢复。</p>
     </div>
     <div class="legend" aria-label="图例">
       <span>1 个主操作</span>
@@ -576,7 +576,7 @@
     </div>
   </header>
 
-  <section class="grid" aria-label="四个主 Tab 的线框">
+  <section class="grid" aria-label="五个主 Tab 的线框">
     <article class="screen">
       <div class="screen-head">
         <div class="screen-title"><strong>01 · 配音</strong><small>编辑/运行态 · 首屏 7/8</small></div>
@@ -585,7 +585,7 @@
       <div class="screen-body">
         <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
         <nav class="tabs" aria-label="主 Tab">
-          <span class="tab active">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span>
+          <span class="tab active">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span><span class="tab">音色设计</span>
         </nav>
         <div class="projectbar"><span class="pill">0921 开箱口播</span><span class="pill ok">已保存</span><span class="grow"></span><span class="pill">断点 19/34</span></div>
         <div class="canvas">
@@ -625,7 +625,7 @@
       <div class="screen-body">
         <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
         <nav class="tabs" aria-label="主 Tab">
-          <span class="tab">配音</span><span class="tab active">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span>
+          <span class="tab">配音</span><span class="tab active">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span><span class="tab">音色设计</span>
         </nav>
         <div class="projectbar"><span class="pill">当前工程：0921 开箱口播</span><span class="pill ok">混音源就绪</span><span class="grow"></span><span class="pill">BGM 独立</span></div>
         <div class="canvas tight">
@@ -647,7 +647,7 @@
       <div class="screen-body">
         <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
         <nav class="tabs" aria-label="主 Tab">
-          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab active">人声分离</span><span class="tab">音乐制作</span>
+          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab active">人声分离</span><span class="tab">音乐制作</span><span class="tab">音色设计</span>
         </nav>
         <div class="projectbar"><span class="pill">保存到当前工程</span><span class="grow"></span><span class="pill warn">模型/端点未接入</span></div>
         <div class="canvas tight">
@@ -669,7 +669,7 @@
       <div class="screen-body">
         <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
         <nav class="tabs" aria-label="主 Tab">
-          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab active">音乐制作</span>
+          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab active">音乐制作</span><span class="tab">音色设计</span>
         </nav>
         <div class="projectbar"><span class="pill">当前工程 · 未生成</span><span class="pill warn">实验性</span><span class="grow"></span><span class="pill">本地模型</span></div>
         <div class="canvas">
@@ -684,6 +684,31 @@
         <div class="result"><span>完成后出现：试听 · 导出 · 再生成一版</span><span class="btn ghost">结果条</span></div>
       </div>
     </article>
+
+    <article class="screen">
+      <div class="screen-head">
+        <div class="screen-title"><strong>05 · 音色设计</strong><small>主操作：生成试听 → 创建音色 · 7/8</small></div>
+        <span class="metric">主操作 1 · P4 门控</span>
+      </div>
+      <div class="screen-body">
+        <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
+        <nav class="tabs" aria-label="主 Tab">
+          <span class="tab">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span><span class="tab active">音色设计</span>
+        </nav>
+        <div class="projectbar"><span class="pill">当前工程 · 未命名音色</span><span class="pill ok">voice_ref 可用</span><span class="grow"></span><span class="pill warn">P4 音色库待实现</span></div>
+        <div class="canvas">
+          <div class="field big"><strong>试听文本</strong>今天想和你分享一款我最近常用的产品。</div>
+          <div style="height:8px"></div>
+          <div class="field small"><strong>基础音色 / 参考音频</strong>已选择基础音色；可替换为参考音频路径或拖入本地文件。</div>
+          <div class="controls">
+            <span class="btn ghost">高级：模型 / 参考 / 风格</span><span class="grow"></span><span class="btn primary">生成试听</span>
+          </div>
+          <div class="statusline"><span>试听文本已填写</span><span>· 选择基础音色或参考音频后开始</span></div>
+        </div>
+        <div class="result"><span>完成后：试听 · 保存为音色 · 预设菜单（导出/导入）</span><span class="btn ghost">结果条</span></div>
+        <div class="note"><strong>能力边界：</strong>单条 voice_ref 克隆已有基础；保存为音色、多音色库、参考文本、风格/情绪和预设互操作未完整实现，必须能力门控。</div>
+      </div>
+    </article>
   </section>
 
   <section class="screen" style="margin-top:22px">
@@ -696,7 +721,7 @@
         <div class="dark-shell">
           <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="grow"></span><span>音频作坊</span></div>
           <nav class="tabs" aria-label="深色主 Tab">
-            <span class="tab">配音</span><span class="tab active">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span>
+            <span class="tab">配音</span><span class="tab active">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span><span class="tab">音色设计</span>
           </nav>
           <div class="dark-content">
             <div class="projectbar"><span class="pill">当前工程：0921 开箱口播</span><span class="pill">混音源就绪</span><span class="grow"></span><span class="pill">BGM 运行中</span></div>
@@ -729,8 +754,8 @@
 
   <section class="footer" aria-label="设计规则摘要">
     <div class="card"><strong>密度</strong>默认首屏语义元素 ≤ 8；列表多行只计一个对象；抽屉默认不计。</div>
-    <div class="card"><strong>层级</strong>顶部四 Tab 是唯一一级导航；工程、任务、导出、设置都是从属结构。</div>
-    <div class="card"><strong>渐进披露</strong>配音参数、BGM 参数、分离阈值、音乐模型全部藏在当前 Tab 的高级抽屉。</div>
+    <div class="card"><strong>层级</strong>顶部五 Tab 是唯一一级导航；工程、任务、导出、设置都是从属结构。</div>
+    <div class="card"><strong>渐进披露</strong>配音参数、BGM 参数、分离阈值、音乐模型、音色设计参数全部藏在当前 Tab 的高级抽屉。</div>
     <div class="card"><strong>恢复</strong>切换 Tab 不取消任务；失败可重试；重启后恢复工程、任务和上次选中对象。</div>
   </section>
 </main>
