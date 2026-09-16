@@ -1700,6 +1700,10 @@ struct UiState {
     cancel: cancel::CancelRegistry,
     /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
     last_task_refresh: std::cell::Cell<Option<Instant>>,
+    /// 截图/演示态（`AW_UI_STATE=tasks`）。演示任务只是给任务中心摆样子、没有对应的
+    /// worker 命令，所以**不能参与**"有没有任务在飞"的判断——否则演示态下点开始配音
+    /// 会被这些假任务挡住（复核指出）。只有 debug 构建会置位。
+    demo_tasks: std::cell::Cell<bool>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -2144,11 +2148,12 @@ impl TaskSlots {
 ///  · 音乐制作：**只有排队中**能取消——请求发出去就中断不了，不摆假按钮；
 ///  · 其它（重录 / 拼装）：不显示。
 fn can_stop_task(t: &tasks::Task, slots: &TaskSlots) -> bool {
-    match t.kind {
-        tasks::TaskKind::Dub => slots.dub == Some(t.id) && t.state == tasks::TaskState::Running,
-        tasks::TaskKind::Bgm => slots.bgm == Some(t.id) && t.state == tasks::TaskState::Running,
-        tasks::TaskKind::Separation => slots.sep == Some(t.id) && !t.state.is_final(),
-        tasks::TaskKind::Song => slots.song == Some(t.id) && t.state == tasks::TaskState::Pending,
+    // 槽位匹配只写一份（stop_target）；这里只加"该类任务在什么状态下能停"
+    match stop_target(t.id, t.kind, slots) {
+        Some(StopTarget::Dub | StopTarget::Bgm) => t.state == tasks::TaskState::Running,
+        Some(StopTarget::Separation) => !t.state.is_final(),
+        Some(StopTarget::Song) => t.state == tasks::TaskState::Pending,
+        None => false,
     }
 }
 
@@ -2325,6 +2330,11 @@ fn set_task_running_text(ui: &MainWindow, state: &Rc<UiState>, task_id: u32) {
 /// 配音 / BGM 这类互斥任务用它做提交前提：它们会改写 worker 持有的工程，
 /// 不能与别的任务并行——判据从"几个散落的 busy 标志"收敛成台账一处。
 fn tasks_in_flight(state: &Rc<UiState>) -> bool {
+    // 演示态（AW_UI_STATE=tasks）里的条目没有对应 worker 命令：它们只用于截图，
+    // 不能把真实提交守卫挡住。
+    if state.demo_tasks.get() {
+        return false;
+    }
     let c = state.tasks.borrow().counts();
     c.pending + c.running > 0
 }
@@ -2512,6 +2522,8 @@ fn seed_shot_tasks(ui: &MainWindow, state: &Rc<UiState>) {
     if std::env::var("AW_UI_STATE").as_deref() != Ok("tasks") {
         return;
     }
+    // 演示任务不入调度：`tasks_in_flight` 会因为这个标记直接返回 false
+    state.demo_tasks.set(true);
     let running = state
         .tasks
         .borrow_mut()
