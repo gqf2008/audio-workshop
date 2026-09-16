@@ -83,6 +83,20 @@ enum Cmd {
         voice_ref: Option<String>,
         text: String,
     },
+    /// 人声分离（本地 htdemucs）：两轨写到 out_dir。
+    ///
+    /// `task_id` 是任务台账里的 id：分离与"配音工程 revision"无关，但**必须与自身运行对齐**，
+    /// 所以所有分离消息都带回 task_id，UI 侧用"是不是当前这条任务"过滤，
+    /// 不依赖 revision（否则期间改稿就会把终态消息丢掉、任务永远停在运行中）。
+    RunSeparation {
+        revision: u64,
+        task_id: u32,
+        input: PathBuf,
+        out_dir: PathBuf,
+        stem: String,
+        model_dir: Option<PathBuf>,
+        chunk_seconds: Option<u32>,
+    },
     /// 歌曲彩蛋生成（独立于配音工程内容，只复用工程目录）。
     RunSong {
         revision: u64,
@@ -147,6 +161,28 @@ enum Msg {
     },
     /// 全局设置里「选择模型目录」的结果
     ModelDirPicked {
+        path: Option<String>,
+    },
+    /// 人声分离进度 / 终态（都带 task_id 以便与当前任务对齐）
+    SeparationProgress {
+        task_id: u32,
+        percent: f32,
+        note: String,
+    },
+    SeparationDone {
+        task_id: u32,
+        vocals: PathBuf,
+        accompaniment: PathBuf,
+    },
+    SeparationStopped {
+        task_id: u32,
+    },
+    SeparationFailed {
+        task_id: u32,
+        error: String,
+    },
+    /// 选择待分离音频的结果
+    SeparationInputPicked {
         path: Option<String>,
     },
     /// 音色试听失败（保留音色名，便于在状态栏说清是哪个音色挂了）
@@ -579,6 +615,53 @@ fn spawn_folder_pick(msg_tx: Sender<WorkerMsg>, revision: u64) {
     });
 }
 
+/// 选一段待分离音频（系统文件框，后台线程 + 消息回传）。
+fn spawn_file_pick(msg_tx: Sender<WorkerMsg>) {
+    std::thread::spawn(move || {
+        let path = pick_audio_blocking();
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::SeparationInputPicked { path },
+        });
+    });
+}
+
+fn pick_audio_blocking() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose file with prompt \"选择要分离的音频\")",
+        ])
+        .output()
+        .ok()?;
+
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+             $d = New-Object System.Windows.Forms.OpenFileDialog; \
+             $d.Filter = '音频|*.wav;*.mp3;*.flac;*.m4a;*.ogg'; \
+             if ($d.ShowDialog() -eq \"OK\") { Write-Output $d.FileName }",
+        ])
+        .output()
+        .ok()?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let out = std::process::Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--title=选择要分离的音频",
+            "--file-filter=音频 | *.wav *.mp3 *.flac *.m4a *.ogg",
+        ])
+        .output()
+        .ok()?;
+
+    pick_output_to_path(out)
+}
+
 fn pick_folder_blocking() -> Option<String> {
     #[cfg(target_os = "macos")]
     let out = std::process::Command::new("osascript")
@@ -607,8 +690,13 @@ fn pick_folder_blocking() -> Option<String> {
         .output()
         .ok()?;
 
+    pick_output_to_path(out)
+}
+
+/// 系统选择框的输出 → 路径（取消时退出码非 0，返回 None，不静默失败）。
+fn pick_output_to_path(out: std::process::Output) -> Option<String> {
     if !out.status.success() {
-        return None; // 取消时退出码非 0
+        return None;
     }
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if raw.is_empty() {
@@ -653,7 +741,11 @@ fn short_path(p: &str) -> String {
 struct WorkerCtx {
     rx: Receiver<Cmd>,
     tx: Sender<WorkerMsg>,
+    /// 配音 / BGM / 音乐制作共用（它们走同一台 worker 的顺序队列）
     stop: Arc<AtomicBool>,
+    /// 人声分离**单独**一个：与上面分开，避免两边互相把对方的停止请求吃掉
+    /// （审查抓到过：分离运行中点配音停止，会让分离结果被当成"用户停止"丢掉）。
+    sep_stop: Arc<AtomicBool>,
 }
 
 fn worker_loop(ctx: WorkerCtx) {
@@ -872,6 +964,53 @@ fn worker_loop(ctx: WorkerCtx) {
                         });
                     }
                 }
+            }
+            Cmd::RunSeparation {
+                revision: _revision,
+                task_id,
+                input,
+                out_dir,
+                stem,
+                model_dir,
+                chunk_seconds,
+            } => {
+                let tx = ctx.tx.clone();
+                // 读分离**自己的**停止位
+                let stop = Arc::clone(&ctx.sep_stop);
+                let req = aw_core::separate::SeparationRequest {
+                    input,
+                    out_dir,
+                    stem,
+                    model_dir,
+                    chunk_seconds,
+                };
+                let progress_tx = tx.clone();
+                let result = aw_core::separate::separate_tracks(
+                    &req,
+                    |p| {
+                        let _ = progress_tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::SeparationProgress {
+                                task_id,
+                                percent: p.percent,
+                                note: p.note,
+                            },
+                        });
+                    },
+                    || stop.load(Ordering::Relaxed),
+                );
+                let msg = match result {
+                    Ok(aw_core::separate::SeparationOutcome::Done(t)) => Msg::SeparationDone {
+                        task_id,
+                        vocals: t.vocals,
+                        accompaniment: t.accompaniment,
+                    },
+                    Ok(aw_core::separate::SeparationOutcome::Stopped) => {
+                        Msg::SeparationStopped { task_id }
+                    }
+                    Err(e) => Msg::SeparationFailed { task_id, error: e },
+                };
+                let _ = tx.send(WorkerMsg { revision: 0, msg });
             }
             Cmd::RunSong {
                 revision,
@@ -1292,7 +1431,11 @@ struct UiState {
     bgm_artifacts: RefCell<Option<BgmArtifacts>>,
     /// 最近一次歌曲产物（路径、时长）。
     song_artifact: RefCell<Option<(PathBuf, f64)>>,
-    /// 跨 Tab 任务台账（配音 / BGM / 音乐制作共用一份）。
+    /// 人声分离：当前输入路径（用于 stale 判定）与两轨产物
+    sep_input: RefCell<Option<String>>,
+    sep_tracks: RefCell<Option<(PathBuf, PathBuf)>>,
+    sep_task: std::cell::Cell<Option<u32>>,
+    /// 跨 Tab 任务台账（配音 / BGM / 音乐制作 / 人声分离共用一份）。
     tasks: RefCell<tasks::TaskQueue>,
     /// 各类任务当前的 id（进度/收尾消息按 id 回填）
     dub_task: std::cell::Cell<Option<u32>>,
@@ -1334,7 +1477,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let msg_tx_ui = msg_tx.clone();
     // 启动即探一次服务：状态栏 / 全局设置里立刻能看到连不连得上
     spawn_server_check(msg_tx_ui.clone(), 0);
+    // 配音/BGM/歌曲共用这一个停止位（它们走同一台 worker 的顺序队列）；
+    // **分离单独一个**：否则一边的停止请求会被另一边的"清零/置位"吃掉
+    // （审查抓到：分离运行中点配音停止，会把分离结果当"用户停止"丢掉）。
     let stop = Arc::new(AtomicBool::new(false));
+    let sep_stop = Arc::new(AtomicBool::new(false));
     let state = Rc::new(UiState {
         // 只有"试听总时长"需要一个非零默认值；其余字段都走 Default，
         // 这样以后加字段不会再打破这里的构造（以及测试里的构造）
@@ -1343,11 +1490,13 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     {
         let stop = Arc::clone(&stop);
+        let sep_stop = Arc::clone(&sep_stop);
         std::thread::spawn(move || {
             worker_loop(WorkerCtx {
                 rx: cmd_rx,
                 tx: msg_tx,
                 stop,
+                sep_stop,
             })
         });
     }
@@ -1371,6 +1520,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
     wire_task_center(&ui, &state);
+    wire_separation(&ui, &msg_tx_ui, &cmd_tx, &state, &player, &sep_stop);
 
     // 启动就把"任务 · 空闲"画上（状态栏 chip 与任务中心都读同一份台账）
     refresh_tasks(&ui, &state);
@@ -1458,6 +1608,29 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_dub_voice(true);
             ui.set_dub_advanced(true);
             ui.set_status_text("音色 + 高级同时展开：Body 区应出垂直滚动条".into());
+        }
+        "sep" => {
+            ui.set_scene(2);
+            ui.set_status_text("人声分离：选一段音频，本地模型拆人声 / 伴奏".into());
+        }
+        "sep-done" => {
+            // 结果态渲染核对（不是真跑）：直接灌两轨标签与状态
+            ui.set_scene(2);
+            ui.set_sep_input_path("/tmp/aw-sep-src.wav".into());
+            ui.set_sep_input_summary("待分离：aw-sep-src.wav".into());
+            ui.set_sep_has_result(true);
+            ui.set_sep_vocals_label("人声 · cli_vocals.wav".into());
+            ui.set_sep_accompaniment_label("伴奏 · cli_accompaniment.wav".into());
+            ui.set_sep_status_text("两轨已生成 · 可分别试听和导出".into());
+            ui.set_status_text("人声分离：结果就绪态（示例数据，用于核对两轨列表）".into());
+        }
+        "sep-run" => {
+            // 走 UI 代码路径真跑一次：输入用已存在的测试音频，模型已在缓存里
+            ui.set_scene(2);
+            ui.set_sep_input_path("/tmp/aw-sep-src.wav".into());
+            ui.set_sep_input_summary("待分离：aw-sep-src.wav".into());
+            ui.set_sep_chunk_seconds("30".into());
+            ui.invoke_sep_run();
         }
         "song" => {
             ui.set_scene(3);
@@ -2031,8 +2204,8 @@ fn wire_sentence_actions(
             ui.set_status_text("合成进行中：等这轮跑完再重录单句".into());
             return;
         }
-        if ui.get_busy() {
-            ui.set_status_text("重录 / 导出正在进行：请等当前任务结束".into());
+        if ui.get_busy() || ui.get_sep_busy() {
+            ui.set_status_text("有任务正在进行：等当前任务结束再重录单句".into());
             return;
         }
         if !state3.project_ready.get() {
@@ -2091,8 +2264,8 @@ fn wire_run(
     let state1 = state.clone();
     ui.on_start_run(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_busy() {
-            ui.set_status_text("重录 / 导出正在进行：请等当前任务结束".into());
+        if ui.get_busy() || ui.get_sep_busy() {
+            ui.set_status_text("有任务正在进行：等当前任务结束再开始配音".into());
             return;
         }
         let n = model4.row_count();
@@ -2285,7 +2458,7 @@ fn wire_bgm(
     let state1 = state.clone();
     ui.on_bgm_generate(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if ui.get_running() || ui.get_busy() || ui.get_sep_busy() {
             ui.set_status_text("任务进行中：等当前任务结束再生成 BGM".into());
             return;
         }
@@ -2391,7 +2564,7 @@ fn wire_song(
     let state1 = state.clone();
     ui.on_song_generate(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if ui.get_running() || ui.get_busy() || ui.get_sep_busy() {
             ui.set_status_text("任务进行中：等当前任务结束再生成歌曲".into());
             return;
         }
@@ -2545,7 +2718,13 @@ fn tick(
         // 因为期间编过稿件（revision+1）被静默丢掉，状态永远停在"正在打开系统目录选择框…"。
         let revision_agnostic = matches!(
             worker_msg.msg,
-            Msg::ServerHealth { .. } | Msg::ModelDirPicked { .. }
+            Msg::ServerHealth { .. }
+                | Msg::ModelDirPicked { .. }
+                | Msg::SeparationInputPicked { .. }
+                | Msg::SeparationProgress { .. }
+                | Msg::SeparationDone { .. }
+                | Msg::SeparationStopped { .. }
+                | Msg::SeparationFailed { .. }
         );
         if !revision_agnostic
             && !worker_message_is_current(&worker_msg, state.project_revision.get())
@@ -2736,6 +2915,67 @@ fn tick(
                 ui.set_bgm_progress(0.0);
                 ui.set_bgm_status_text(error.clone().into());
                 ui.set_status_text(error.into());
+            }
+            Msg::SeparationInputPicked { path } => match path {
+                Some(p) => {
+                    set_separation_input(ui, state, p);
+                }
+                None => {
+                    ui.set_status_text("取消了选择音频".into());
+                }
+            },
+            Msg::SeparationProgress {
+                task_id,
+                percent,
+                note,
+            } => {
+                if state.sep_task.get() == Some(task_id) {
+                    ui.set_sep_progress(percent);
+                    ui.set_sep_status_text(note.clone().into());
+                    progress_task(ui, state, &state.sep_task, percent, note);
+                }
+            }
+            Msg::SeparationDone {
+                task_id,
+                vocals,
+                accompaniment,
+            } => {
+                if state.sep_task.get() == Some(task_id) {
+                    ui.set_sep_busy(false);
+                    ui.set_sep_progress(1.0);
+                    ui.set_sep_has_result(true);
+                    ui.set_sep_vocals_label(format!("人声 · {}", file_label(&vocals)).into());
+                    ui.set_sep_accompaniment_label(
+                        format!("伴奏 · {}", file_label(&accompaniment)).into(),
+                    );
+                    let note = "两轨已生成 · 可分别试听和导出".to_string();
+                    ui.set_sep_status_text(note.clone().into());
+                    ui.set_status_text(note.clone().into());
+                    finish_task(ui, state, &state.sep_task, tasks::TaskState::Done, note);
+                    *state.sep_tracks.borrow_mut() = Some((vocals, accompaniment));
+                }
+            }
+            Msg::SeparationStopped { task_id } => {
+                if state.sep_task.get() == Some(task_id) {
+                    ui.set_sep_busy(false);
+                    ui.set_sep_progress(0.0);
+                    ui.set_sep_has_result(false);
+                    // 上游没有取消 API：已经跑掉的算力收不回，这里如实说
+                    let note = "已停止（本次不落盘；已经跑过的分块无法中断）".to_string();
+                    ui.set_sep_status_text(note.clone().into());
+                    ui.set_status_text(note.clone().into());
+                    finish_task(ui, state, &state.sep_task, tasks::TaskState::Stopped, note);
+                }
+            }
+            Msg::SeparationFailed { task_id, error } => {
+                if state.sep_task.get() == Some(task_id) {
+                    ui.set_sep_busy(false);
+                    ui.set_sep_progress(0.0);
+                    ui.set_sep_has_result(false);
+                    ui.set_sep_status_text(error.clone().into());
+                    ui.set_status_text(format!("人声分离失败：{error}").into());
+                    finish_task(ui, state, &state.sep_task, tasks::TaskState::Failed, error);
+                }
             }
             Msg::SongDone { path, duration } => {
                 ui.set_busy(false);
@@ -3262,6 +3502,195 @@ fn clock_label(secs: f32) -> String {
     let minutes = (total / 60.0) as u32;
     let seconds = (total % 60.0) as u32;
     format!("{minutes}:{seconds:02}")
+}
+
+/// 界面上显示的文件名（音轨标签用）。
+fn file_label(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// 切换/粘贴待分离音频：输入变了就把旧两轨标为过期（导出与试听都要求 has-result）。
+fn set_separation_input(ui: &MainWindow, state: &Rc<UiState>, path: String) {
+    let same = state.sep_input.borrow().as_deref() == Some(path.as_str());
+    ui.set_sep_input_path(path.clone().into());
+    let label = file_label(Path::new(&path));
+    ui.set_sep_input_summary(format!("待分离：{label}").into());
+    if same {
+        return;
+    }
+    *state.sep_input.borrow_mut() = Some(path);
+    state.sep_tracks.borrow_mut().take();
+    ui.set_sep_has_result(false);
+    ui.set_sep_progress(0.0);
+    ui.set_sep_status_text("已就绪，可分离".into());
+}
+
+/// 人声分离：选文件 / 分离 / 停止 / 两轨试听与导出。
+fn wire_separation(
+    ui: &MainWindow,
+    msg_tx: &Sender<WorkerMsg>,
+    cmd_tx: &Sender<Cmd>,
+    state: &Rc<UiState>,
+    player: &Rc<player::Player>,
+    stop: &Arc<AtomicBool>,
+) {
+    // 选择音频（系统文件框，跑在后台线程）
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    ui.on_sep_pick_file(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_sep_busy() {
+            return;
+        }
+        ui.set_status_text("正在打开系统文件选择框…".into());
+        spawn_file_pick(msg.clone());
+    });
+
+    // 分离
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    let stop1 = Arc::clone(stop);
+    ui.on_sep_run(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_sep_busy() || ui.get_running() || ui.get_busy() {
+            ui.set_sep_status_text("任务进行中：等当前任务结束再分离".into());
+            return;
+        }
+        let input = ui.get_sep_input_path().trim().to_string();
+        if input.is_empty() {
+            ui.set_sep_status_text("先选择一段音频".into());
+            return;
+        }
+        if !Path::new(&input).is_file() {
+            ui.set_sep_status_text(format!("音频不存在或不可读：{input}").into());
+            return;
+        }
+        // 分块秒数：非数字/留空都当"用模型默认"，不让输入错误变成阻断
+        let chunk = ui
+            .get_sep_chunk_seconds()
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v > 0);
+
+        let stem = file_stem(&ui.get_project_name());
+        let out_dir = project_dir(&stem).join("stems");
+        stop1.store(false, Ordering::Relaxed);
+        ui.set_sep_busy(true);
+        ui.set_sep_has_result(false);
+        ui.set_sep_progress(0.0);
+        ui.set_sep_status_text("正在加载模型并分离（首次会下载约 200MB 模型）…".into());
+        let id = {
+            let mut q = st.tasks.borrow_mut();
+            q.start(tasks::TaskKind::Separation, format!("人声分离 · {stem}"))
+        };
+        st.sep_task.set(Some(id));
+        refresh_tasks(&ui, &st);
+
+        if tx
+            .send(Cmd::RunSeparation {
+                revision: 0,
+                task_id: id,
+                input: PathBuf::from(input),
+                out_dir,
+                stem,
+                model_dir: Some(model_dir()),
+                chunk_seconds: chunk,
+            })
+            .is_err()
+        {
+            ui.set_sep_busy(false);
+            let note = "工作线程不可用：分离未发出，请重启应用";
+            finish_task(&ui, &st, &st.sep_task, tasks::TaskState::Failed, note);
+            ui.set_sep_status_text(note.into());
+        }
+    });
+
+    // 高级里手输/粘贴路径：与"选文件"走同一套 stale 逻辑（否则旧两轨还能导出）
+    let weak = ui.as_weak();
+    let st_edit = state.clone();
+    ui.on_sep_path_edited(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_sep_busy() {
+            return;
+        }
+        let path = ui.get_sep_input_path().trim().to_string();
+        if path.is_empty() {
+            return;
+        }
+        set_separation_input(&ui, &st_edit, path);
+    });
+
+    // 停止：上游没有取消 API，这里只是"别再落盘"，如实写在状态里
+    let weak = ui.as_weak();
+    let stop2 = Arc::clone(stop);
+    ui.on_sep_stop(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if !ui.get_sep_busy() {
+            return;
+        }
+        stop2.store(true, Ordering::Relaxed);
+        ui.set_sep_status_text("停止中：当前分块跑完才停（上游没有中断接口）…".into());
+    });
+
+    // 两轨试听（0 = 人声，1 = 伴奏）
+    let weak = ui.as_weak();
+    let st2 = state.clone();
+    let player2 = player.clone();
+    ui.on_sep_preview_track(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some((vocals, accompaniment)) = st2.sep_tracks.borrow().clone() else {
+            ui.set_sep_status_text("还没有分离结果".into());
+            return;
+        };
+        let (path, what) = if i == 0 {
+            (vocals, "人声")
+        } else {
+            (accompaniment, "伴奏")
+        };
+        match player2.play_wav(&path) {
+            Ok(()) => {
+                ui.set_playing(true);
+                ui.set_status_text(format!("试听{what}轨：{}", file_label(&path)).into());
+            }
+            Err(e) => ui.set_sep_status_text(format!("试听失败：{e}").into()),
+        }
+    });
+
+    // 两轨导出（复制到导出目录）
+    let weak = ui.as_weak();
+    let st3 = state.clone();
+    ui.on_sep_export_track(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some((vocals, accompaniment)) = st3.sep_tracks.borrow().clone() else {
+            ui.set_sep_status_text("还没有分离结果".into());
+            return;
+        };
+        let (src, suffix) = if i == 0 {
+            (vocals, "vocals")
+        } else {
+            (accompaniment, "accompaniment")
+        };
+        let dir = PathBuf::from(ui.get_export_dir().to_string());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            ui.set_sep_status_text(format!("导出目录不可写（{}）：{e}", dir.display()).into());
+            return;
+        }
+        let dst = dir.join(format!(
+            "{}_{suffix}.wav",
+            file_stem(&ui.get_project_name())
+        ));
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => {
+                ui.set_sep_status_text(format!("已导出：{}", dst.display()).into());
+                toast(&ui, &format!("已导出 {}", file_label(&dst)));
+            }
+            Err(e) => ui.set_sep_status_text(format!("导出失败：{e}").into()),
+        }
+    });
 }
 
 fn file_stem(name: &str) -> String {

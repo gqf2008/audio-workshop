@@ -10,3 +10,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 hound = "3.5"
+# 人声分离：纯 Rust + ONNX Runtime 的 htdemucs 实现（见 docs/vocal-separation-backend.md）。
+# 用 git rev 而不是 crates.io 1.2.0：**1.2.0 的 API 少一大截**——没有 Separator /
+# mix_except（内置伴奏轨）/ model_path（离线模型）/ chunk_seconds，上游 App 自己也是
+# 用这个 rev。代价：构建时要从 GitHub 取一次（cargo 会缓存）。
+# 另：首次编译会拉入 ONNX Runtime 与音频解码栈（实测 check 约 30s）；
+# 运行时首次使用需下载 ~200MB 模型，可用 SplitOptions.model_path 指向本地模型走离线。
+stem-splitter-core = { git = "https://github.com/gqf2008/stem-splitter-core", rev = "9120251a64283ff7101662fc4509186c4f6cf274" }
+# 显式钉死 ort：上面那个 rev 写的是 "2.0.0-rc.10"，但 semver 会解析到 rc.11，
+# 而 rc.11 改了 Session::inputs 等 API → stem-splitter-core 直接编译不过。
+# 这条不是"用到 ort"，是**约束传递依赖**，不加的话一次 cargo update 就会把构建搞红。
+# 见 docs/vocal-separation-backend.md §2.5。
+ort = "=2.0.0-rc.10"

@@ -1,6 +1,7 @@
 # 人声分离后端：接入可行性（来源：gqf2008/Xmusic-splitter）
 
-> 状态：**可行性已核实，实现未开始**。本文只记录"能不能用、怎么用、代价是什么"，不含臆造的模型名或阈值。
+> 状态：**可行性已核实 + 已端到端跑通**（`crates/aw-core/src/separate.rs` + `examples/separate_run.rs`）。
+> 本文记录"能不能用、怎么用、代价是什么"，不含臆造的模型名或阈值。
 > 核实日期 2026-09-16；被核实的上游仓库当时为最新 master。
 
 ## 1. 上游是什么
@@ -40,11 +41,40 @@ pub fn prepare_model(model_name: &str, manifest_url_override: Option<&str>) -> R
 设计稿 `docs/ui/redesign-v1/screens.md` §4 要求：拖入区 → `分离人声 / 伴奏` → **两轨结果**（人声 + 伴奏），
 每轨可试听 / 导出；模型、阈值、输出进「高级」；能力未就绪时明确写"未接入"且不给假选项。
 
-上游的 4 轨正好够用：
-- **人声轨** = `vocals`
-- **伴奏轨** = `drums + bass + other` 求和（我们自己做一次混音；上游没有直接的"伴奏"轨）
+**伴奏轨不用自己求和**（此处修正早先版本的说法）：上游 `SeparatedStems` 自带
+`mix_except(&[Stem::Vocals])` / `save_mix_except(...)`，正是为"去人声"准备的。
+我们只需要两次保存：
 
-## 4. 接入方案（建议）
+```rust
+stems.save(Stem::Vocals, ".../xxx_vocals.wav")?;
+stems.save_mix_except(&[Stem::Vocals], ".../xxx_accompaniment.wav")?;
+```
+
+## 2.5 接入时踩到的两个硬坑（都已解决，别重复踩）
+
+| 坑 | 现象 | 处置 |
+|---|---|---|
+| **crates.io 的 1.2.0 API 不完整** | 只有 `split_file`，没有 `Separator` / `mix_except` / `model_path`（离线模型）/ `chunk_seconds` | 与上游 App 一样改用 **git rev**：`rev = "9120251a64283ff7101662fc4509186c4f6cf274"` |
+| **master + ort 默认解析版本编译不过** | `ort = "2.0.0-rc.10"` 被解析成 rc.11 → 报 `no method named map_err found for type bool`、`field inputs of Session is private` | 把 ort 钉到 **`=2.0.0-rc.10`**（`cargo update -p ort --precise 2.0.0-rc.10`，并在 Cargo.lock 里固定） |
+
+## 2.6 实测数据（本机 Apple Silicon，2026-09-16）
+
+| 项 | 实测 |
+|---|---|
+| 依赖构建 | `cargo check -p aw-core` 冷启 **30.5s**（含 ort 2.0.0-rc.11 解析）；切 git rev + 钉 rc.10 后总量级相当 |
+| ONNX Runtime 获取方式 | `ort` 用 `download-binaries` + `copy-dylibs`：**构建期下载**并拷贝 dylib 到 target 旁（打包要带上这个库） |
+| 首次模型下载 | **209,884,896 字节**，有逐字节进度回调 |
+| 推理后端 | 自动探测 → `Trying execution providers: ["oneDNN"] (with CPU fallback)` → `Successfully initialized session with GPU providers!` |
+| 端到端 | 4.27s 单声道 44.1k 输入：**131s**（含 200MB 下载 + 首次加载模型）；两轨写出成功 |
+| 分离质量抽样 | 输入是人声 TTS：`vocals` RMS **0.13802**（≈ 输入 0.13820），`accompaniment` RMS **0.00095**（≈ 静音），帧数三者一致（188416）—— 符合"纯语音应全进人声轨"的预期，说明链路真的在分离而不是复制 |
+
+## 4. 接入方案（**已实现**；文件名/消息名以代码为准）
+
+> 实现落地在两处：`crates/aw-core/src/separate.rs`（后端）与 `ui/separation_workbench.slint`
+> + `src/main.rs::wire_separation`（页面与接线）。本节早期版本写的是"改 `ui/extra_tabs.slint`、
+> 消息名 `SeparationProgress|Done|Failed`"，实际改成独立页面文件 + 单一 `Msg::Separation*`
+> 系列；另外停止用的是**分离自己的** `sep_stop` 标志（与配音共用会把两边的停止请求互相吃掉，
+> 审查抓到过）。以下原文保留作设计意图记录。
 
 1. `crates/aw-core` 新增 `separate.rs`，依赖 `stem-splitter-core`：
    - `Separator` 复用（模型只加载一次，避免每次分离都吃一遍模型加载）；
@@ -66,7 +96,7 @@ pub fn prepare_model(model_name: &str, manifest_url_override: Option<&str>) -> R
 | 依赖体积与构建时间 | ONNX Runtime + 音频解码栈会显著拉长首次编译（分钟级） | 单独批次做，先量一次 `cargo build` 增量再决定是否默认开启 |
 | 首次联网下载 ~200MB | 与"本地优先"口径需要一句话说明 | UI 明写"首次使用需下载模型（约 200MB），之后离线"；给下载进度 |
 | 内存/显存 | 官方建议 4GB+ RAM；本机是共享显存的 Apple Silicon | 用 `chunk_seconds` 控制；失败时给可执行原因（内存不足） |
-| 无内置"伴奏"轨 | 上游 4 轨需自己求和 | 求和逻辑写进 `aw-core`，加单测（长度/采样率一致才允和） |
+| ~~无内置"伴奏"轨~~ | **已澄清：上游有 `mix_except`**，不需要自己求和 | 直接用 `save_mix_except(&[Stem::Vocals])` |
 | 停止不彻底 | 上游无 stop API | 先按"停止=不再排队 + 丢弃结果"实现，UI 文案写清"正在处理的分块会跑完" |
 | 模型许可 | 上游代码 MIT/Apache；**模型权重许可是另一件事**，需单独核对后再对外分发 | 接入前核对模型 manifest 里的许可字段；不确定就不随包分发、只走用户侧下载 |
 
