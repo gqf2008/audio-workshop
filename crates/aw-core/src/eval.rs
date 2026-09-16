@@ -27,14 +27,26 @@ pub struct Intelligibility {
 }
 
 /// 只保留 CJK / 字母 / 数字，去标点空白，ASCII 转小写。
+///
+/// **数字之间的小数点要留**：否则「3.14」被清成「314」，而回读的「三点一四」归一成
+/// 「3.14」，读法差异会变成 1 个编辑距离（reviewer 抓到过：可懂度 66.7% 而不是 100%）。
 pub fn normalize_for_eval(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            let c = *c;
-            c.is_ascii_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c)
-        })
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in chars.iter().copied().enumerate() {
+        let keep = c.is_ascii_alphanumeric()
+            || ('\u{4e00}'..='\u{9fff}').contains(&c)
+            // 小数点只在"两边都是 ASCII 数字"时保留（尾点/前点/字母间的点照旧丢掉）
+            || (c == '.'
+                && i > 0
+                && i + 1 < chars.len()
+                && chars[i - 1].is_ascii_digit()
+                && chars[i + 1].is_ascii_digit());
+        if keep {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
 }
 
 fn cn_digit() -> &'static HashMap<char, u64> {
@@ -283,6 +295,23 @@ mod tests {
         let r = intelligibility("2026 年 17 人", "二零二六年十七人");
         assert_eq!(r.distance, 0, "归一后应完全一致：{r:?}");
         assert!((r.percent - 100.0).abs() < 1e-9);
+    }
+
+    /// 小数点的两种写法要等价（reviewer 抓到过：3.14 vs 三点一四 被算成 66.7%）
+    #[test]
+    fn decimal_point_written_or_spoken_is_the_same() {
+        let r = intelligibility("3.14", "三点一四");
+        assert_eq!(r.distance, 0, "归一后应一致：{r:?}");
+        assert_eq!(r.percent, 100.0);
+
+        let r = intelligibility("圆周率约 3.14。", "圆周率约三点一四");
+        assert_eq!(r.distance, 0, "{r:?}");
+
+        // 不是数字之间的点照旧丢掉（句号、缩写、句尾的点）
+        assert_eq!(normalize_for_eval("结束。"), "结束");
+        // 数字之间的点两侧都会保留（对称归一，不影响比较）；句尾的点丢掉
+        assert_eq!(normalize_for_eval("v1.2.3"), "v1.2.3");
+        assert_eq!(normalize_for_eval("3."), "3");
     }
 
     /// 标点与空白不算错

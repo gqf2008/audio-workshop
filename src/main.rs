@@ -1365,12 +1365,16 @@ fn worker_loop(ctx: WorkerCtx) {
                             let score = aw_core::intelligibility(reference, &hypothesis);
                             sum += score.percent;
                             scored += 1;
-                            issues.push(EvalIssue {
-                                index: *idx,
-                                percent: score.percent,
-                                snippet: aw_core::diff_snippet(reference, &hypothesis)
-                                    .unwrap_or_default(),
-                            });
+                            // 只收"有差异"的句子：worst 为空就等于全部一致
+                            // （否则满分句也会被列成"最差 第 1 句 100%"，复核指出过）
+                            if score.distance > 0 {
+                                issues.push(EvalIssue {
+                                    index: *idx,
+                                    percent: score.percent,
+                                    snippet: aw_core::diff_snippet(reference, &hypothesis)
+                                        .unwrap_or_default(),
+                                });
+                            }
                         }
                         Err(e) => {
                             // 单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分
@@ -4100,13 +4104,13 @@ fn tick(
                     continue;
                 }
                 let note = eval_summary_note(&summary);
-                finish_task(
-                    ui,
-                    state,
-                    &state.eval_task,
-                    tasks::TaskState::Done,
-                    note.clone(),
-                );
+                // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
+                let outcome = if summary.scored == 0 {
+                    tasks::TaskState::Failed
+                } else {
+                    tasks::TaskState::Done
+                };
+                finish_task(ui, state, &state.eval_task, outcome, note.clone());
                 ui.set_status_text(note.into());
             }
             Msg::EvalStopped { task_id } => {
