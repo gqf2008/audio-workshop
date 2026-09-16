@@ -1288,6 +1288,9 @@ fn worker_loop(ctx: WorkerCtx) {
                     if abort || ctx.stop.load(Ordering::Relaxed) {
                         abort = true;
                         skipped += 1;
+                        // 之前登记过"这条已取消"的要摘掉：登记表只在 worker 取走时收缩，
+                        // 不摘就会随着"先取消几条、再停整批"越积越多
+                        let _ = ctx.cancel.take(item.task_id);
                         let _ = ctx.tx.send(WorkerMsg {
                             revision: 0,
                             msg: batch_item_done(
@@ -3840,12 +3843,27 @@ fn wire_batch(
         {
             st.batch_running.set(false);
             ui.set_batch_running(false);
-            for row in st.batch_rows.borrow_mut().iter_mut() {
-                if row.state == batch::ItemState::Waiting {
-                    row.state = batch::ItemState::Failed;
-                    row.detail = "工作线程不可用，没有提交".into();
-                }
+            // 台账里那几条已经 enqueue 过了：必须逐条收成失败，否则它们会永远挂在
+            // Pending，`tasks_in_flight` 一直为真，之后连单篇都提交不了
+            let orphan_ids: Vec<u32> = {
+                let mut rows = st.batch_rows.borrow_mut();
+                rows.iter_mut()
+                    .filter(|r| r.state == batch::ItemState::Waiting)
+                    .filter_map(|r| {
+                        r.state = batch::ItemState::Failed;
+                        r.detail = "工作线程不可用，没有提交".into();
+                        r.task_id
+                    })
+                    .collect()
+            };
+            for id in orphan_ids {
+                st.tasks.borrow_mut().finish(
+                    id,
+                    tasks::TaskState::Failed,
+                    "工作线程不可用，没有提交",
+                );
             }
+            refresh_tasks(&ui, &st);
             refresh_batch_rows(&ui, &st);
             refresh_batch_summary(&ui, &st, "工作线程不可用：一篇都没提交，请重启应用");
             ui.set_status_text("工作线程不可用：批量未提交，请重启应用".into());
@@ -4671,6 +4689,56 @@ fn wire_keys(
 // 主循环节拍：消息泵 + 播放头
 // ===========================================================================
 
+/// 哪些消息**不该**按工程版本（`project_revision`）过滤。
+///
+/// 判据不是"哪条命令发的"，而是"这条消息自己有没有别的身份"：
+///   · 带 `task_id` 的（任务中心那套）：队列会让它跨过若干次改稿才回来；
+///   · 来自文件/目录对话框的结果：用户点的是"选一个文件"，与工程版本无关。
+///
+/// 反面教材见本批复核抓到的第一版：批量那五条消息不在名单里，于是用户只要先编辑
+/// 一次稿件（revision+1），导入结果与整批进度就全被静默丢掉——界面停在"合成本"、
+/// 台账停在运行中。抽成函数是为了让单测能钉住**每一条**批量消息都在名单里。
+/// 这条 worker 消息现在该不该处理：不在名单里的必须 revision 对得上。
+/// 生产（`tick`）与单测共用这一个判定，避免"测试过了但泵里还是老逻辑"。
+fn should_handle_message(worker_msg: &WorkerMsg, current_revision: u64) -> bool {
+    message_ignores_revision(&worker_msg.msg)
+        || worker_message_is_current(worker_msg, current_revision)
+}
+
+fn message_ignores_revision(msg: &Msg) -> bool {
+    matches!(
+        msg,
+        Msg::TaskStarted { .. }
+        | Msg::TaskStage { .. }
+        | Msg::ServerHealth { .. }
+        | Msg::ModelDirPicked { .. }
+        | Msg::SeparationInputPicked { .. }
+        | Msg::SeparationProgress { .. }
+        | Msg::SeparationDone { .. }
+        | Msg::SeparationStopped { .. }
+        | Msg::SeparationFailed { .. }
+        // 歌曲带 task_id 自证身份：它可能排在别的任务后面，期间改稿不该
+        // 让终态消息被 revision 过滤掉（否则任务永远停在"运行中"）
+        | Msg::SongDone { .. }
+        | Msg::SongStopped { .. }
+        | Msg::SongFailed { .. }
+        // 质检同理：它可能排在别的任务后面，期间改稿不该把终态丢掉
+        | Msg::EvalProgress { .. }
+        | Msg::EvalDone { .. }
+        | Msg::EvalStopped { .. }
+        | Msg::EvalFailed { .. }
+        // 批量：导入结果来自文件对话框（与工程版本无关）；逐篇消息都带
+        // task_id 自证身份，而且批量跑的时候用户**可以**继续改当前稿件
+        // （批量写的是别的工程目录）——按 revision 过滤会让整批消息在
+        // 第一次改稿后全部消失，界面停在"合成本"、台账停在运行中
+        | Msg::BatchScriptsPicked { .. }
+        | Msg::BatchItemStarted { .. }
+        | Msg::BatchItemProgress { .. }
+        | Msg::BatchItemDone { .. }
+        | Msg::BatchDone { .. }
+    )
+}
+
 fn tick(
     ui: &MainWindow,
     rows: &Rc<VecModel<Sentence>>,
@@ -4686,31 +4754,7 @@ fn tick(
         // 服务健康检查与工程版本无关：不过滤，否则刚改完设置的结果会被静默丢掉
         // 与工程版本无关的后台结果（服务健康、目录选择）不过滤：过滤会让"刚选好的目录"
         // 因为期间编过稿件（revision+1）被静默丢掉，状态永远停在"正在打开系统目录选择框…"。
-        let revision_agnostic = matches!(
-            worker_msg.msg,
-            Msg::TaskStarted { .. }
-                | Msg::TaskStage { .. }
-                | Msg::ServerHealth { .. }
-                | Msg::ModelDirPicked { .. }
-                | Msg::SeparationInputPicked { .. }
-                | Msg::SeparationProgress { .. }
-                | Msg::SeparationDone { .. }
-                | Msg::SeparationStopped { .. }
-                | Msg::SeparationFailed { .. }
-                // 歌曲带 task_id 自证身份：它可能排在别的任务后面，期间改稿不该
-                // 让终态消息被 revision 过滤掉（否则任务永远停在"运行中"）
-                | Msg::SongDone { .. }
-                | Msg::SongStopped { .. }
-                | Msg::SongFailed { .. }
-                // 质检同理：它可能排在别的任务后面，期间改稿不该把终态丢掉
-                | Msg::EvalProgress { .. }
-                | Msg::EvalDone { .. }
-                | Msg::EvalStopped { .. }
-                | Msg::EvalFailed { .. }
-        );
-        if !revision_agnostic
-            && !worker_message_is_current(&worker_msg, state.project_revision.get())
-        {
+        if !should_handle_message(&worker_msg, state.project_revision.get()) {
             continue;
         }
         match worker_msg.msg {
@@ -7197,6 +7241,89 @@ mod tests {
 
         assert_eq!(terminal, vec![51, 52], "两篇都要有终态，不能留 Pending");
         assert_eq!(summary, (0, 0, 2, true));
+    }
+
+    /// 批量消息必须**不受工程版本过滤**：批量跑着的时候用户可以继续改当前稿件
+    /// （批量写的是别的工程目录），一改稿 `project_revision` 就 +1——第一版没把批量
+    /// 消息放进 agnostic 名单，于是导入结果与逐篇进度全被静默丢掉，界面停在"合成本"、
+    /// 台账停在运行中（复核抓到的阻塞项）。
+    ///
+    /// 这条测试对**每一条**批量消息都要过：以后再加批量消息，忘了进名单就会红。
+    #[test]
+    fn batch_messages_survive_revision_changes() {
+        let batch_msgs = vec![
+            Msg::BatchScriptsPicked { paths: Vec::new() },
+            Msg::BatchItemStarted {
+                task_id: 1,
+                index: 0,
+                total: 2,
+                name: "甲".into(),
+            },
+            Msg::BatchItemProgress {
+                task_id: 1,
+                index: 0,
+                done: 1,
+                total: 2,
+            },
+            Msg::BatchItemDone {
+                task_id: 1,
+                index: 0,
+                name: "甲".into(),
+                wav: None,
+                srt: None,
+                failed: 0,
+                reused: 0,
+                skipped: false,
+                error: None,
+                note: None,
+            },
+            Msg::BatchDone {
+                done: 1,
+                failed: 0,
+                skipped: 1,
+                stopped: false,
+            },
+        ];
+        let names = [
+            "BatchScriptsPicked",
+            "BatchItemStarted",
+            "BatchItemProgress",
+            "BatchItemDone",
+            "BatchDone",
+        ];
+        assert_eq!(names.len(), batch_msgs.len());
+        for (i, msg) in batch_msgs.into_iter().enumerate() {
+            let m = WorkerMsg { revision: 0, msg };
+            assert!(
+                message_ignores_revision(&m.msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+            assert!(
+                should_handle_message(&m, 7),
+                "改过稿（revision=7）之后 {} 也必须被处理",
+                names[i]
+            );
+        }
+
+        // 对照：按工程版本过滤的消息仍要过滤——别为了修批量把过滤整个放开
+        let stale_sentence = WorkerMsg {
+            revision: 0,
+            msg: Msg::Sentence {
+                index: 0,
+                status: "done".into(),
+                duration: Some(1.0),
+            },
+        };
+        assert!(!message_ignores_revision(&stale_sentence.msg));
+        assert!(
+            !should_handle_message(&stale_sentence, 7),
+            "旧 revision 的句级消息仍要丢掉"
+        );
+        assert!(
+            should_handle_message(&stale_sentence, 0),
+            "revision 对得上就该处理"
+        );
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。

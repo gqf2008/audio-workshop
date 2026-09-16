@@ -31,13 +31,21 @@ pub struct ImportOutcome {
     pub skipped: Vec<String>,
 }
 
+/// 单篇稿件的体积上限：5 分钟口播稿才几 KB，2MB 已经宽到不可能误伤真稿件。
+/// 没有上限的话，误选一个几百 MB 的文件会在导入线程里直接吃内存。
+pub const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
+
 /// 把用户选中的稿件读成可提交条目。
 ///
 /// - 目录 / 不存在的路径：跳过
+/// - 超过 [`MAX_SCRIPT_BYTES`]：跳过（按元数据先判，别先分配再报错）
 /// - 非 UTF-8（不是纯文本稿子，比如误选了 wav）：跳过并说是编码问题
 /// - 空稿（只有空白字符）：跳过
 /// - 归一后重名：只留先选中的那条，后一条跳过并指明与谁重名——两个工程同名会互相
 ///   覆盖落盘目录，这比"少跑一篇"严重得多
+///
+/// 文本清洗：去掉 UTF-8 BOM、把 CRLF / 单独 CR 统一成 LF。`\r` 留在正文里会被
+/// 带进切句与合成链路，而 Windows 导出的 .txt 一定是 CRLF。
 ///
 /// `sanitize` 由调用方传 `crate::file_stem`：批量落盘目录必须与单篇同一套归一规则，
 /// 否则同一个工程名在两条路径下会落到两个目录。
@@ -50,6 +58,20 @@ pub fn import_scripts(paths: &[PathBuf], sanitize: impl Fn(&str) -> String) -> I
                 .push(format!("{shown}：不是文件（或已不存在），跳过"));
             continue;
         }
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() > MAX_SCRIPT_BYTES => {
+                out.skipped.push(format!(
+                    "{shown}：稿件超过 {}MB，跳过（看着不像口播稿）",
+                    MAX_SCRIPT_BYTES / (1024 * 1024)
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                out.skipped.push(format!("{shown}：读不到（{e}），跳过"));
+                continue;
+            }
+        }
         let raw = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -58,7 +80,7 @@ pub fn import_scripts(paths: &[PathBuf], sanitize: impl Fn(&str) -> String) -> I
             }
         };
         let script = match String::from_utf8(raw) {
-            Ok(text) => text,
+            Ok(text) => clean_script(&text),
             Err(_) => {
                 out.skipped
                     .push(format!("{shown}：不是 UTF-8 文本稿子，跳过"));
@@ -74,7 +96,10 @@ pub fn import_scripts(paths: &[PathBuf], sanitize: impl Fn(&str) -> String) -> I
             .and_then(|s| s.to_str())
             .unwrap_or_default();
         let name = sanitize(stem);
-        if let Some(existing) = out.items.iter().find(|i| i.name == name) {
+        // 撞名按**大小写归一**判：macOS / Windows 的文件系统默认不区分大小写，
+        // 「Foo.txt」与「foo.txt」会落进同一个工程目录、互相覆盖产物。
+        let key = name.to_lowercase();
+        if let Some(existing) = out.items.iter().find(|i| i.name.to_lowercase() == key) {
             out.skipped.push(format!(
                 "{shown}：工程名与 {} 撞了（都归一成「{name}」），跳过",
                 display_path(&existing.path)
@@ -88,6 +113,16 @@ pub fn import_scripts(paths: &[PathBuf], sanitize: impl Fn(&str) -> String) -> I
         });
     }
     out
+}
+
+/// 稿件文本清洗：去 BOM、CRLF / 单独 CR 统一成 LF。
+fn clean_script(text: &str) -> String {
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if body.contains('\r') {
+        body.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        body.to_string()
+    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -215,6 +250,55 @@ mod tests {
         assert!(
             out.skipped[0].contains("口播.txt"),
             "要说清是谁先占了这个名字：{:?}",
+            out.skipped
+        );
+
+        // 大小写不同也要判重：macOS / Windows 的文件系统不区分大小写，
+        // 「Foo」与「foo」是同一个工程目录
+        let upper = write(&dir, "Foo.txt", "甲。".as_bytes());
+        let lower = write(&dir, "foo.txt", "乙。".as_bytes());
+        let out = import_scripts(&[upper, lower], sanitize);
+        assert_eq!(out.items.len(), 1, "只留第一条：{:?}", out.items);
+        assert_eq!(out.skipped.len(), 1);
+        assert!(out.skipped[0].contains("撞了"), "{:?}", out.skipped);
+    }
+
+    /// Windows 导出的稿件一定是 CRLF，编辑器还可能留 BOM：两者都要在导入时洗掉，
+    /// 否则 `\r` 会跟着正文进切句/合成链路。
+    #[test]
+    fn strips_bom_and_normalizes_crlf() {
+        let dir = temp_dir("crlf");
+        let p = write(
+            &dir,
+            "带BOM.txt",
+            "\u{feff}第一句。\r\n第二句。\r\n".as_bytes(),
+        );
+        let out = import_scripts(&[p], sanitize);
+        assert_eq!(out.items.len(), 1, "{:?}", out.skipped);
+        assert_eq!(out.items[0].script, "第一句。\n第二句。\n");
+        assert!(
+            !out.items[0].script.contains('\r'),
+            "CR 不能留在正文里：{:?}",
+            out.items[0].script
+        );
+    }
+
+    /// 误选一个几百 MB 的文件不该先读进内存再报错——按元数据大小先拦。
+    #[test]
+    fn skips_oversized_scripts_before_reading_them() {
+        let dir = temp_dir("big");
+        let big = dir.join("太大.txt");
+        // 稀疏写：不做真的写 2MB+ 内容，只要文件长度超过上限
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_SCRIPT_BYTES + 1).unwrap();
+        drop(f);
+
+        let out = import_scripts(&[big], sanitize);
+        assert!(out.items.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert!(
+            out.skipped[0].contains("超过") && out.skipped[0].contains("跳过"),
+            "{:?}",
             out.skipped
         );
     }
