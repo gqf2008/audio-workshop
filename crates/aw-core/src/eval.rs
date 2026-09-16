@@ -64,6 +64,16 @@ fn cn_digit() -> &'static HashMap<char, u64> {
     })
 }
 
+/// 小数部分的数字类：权威实现的正则里小数尾是 `[零〇一幺二两三四五六七八九]`，
+/// **不含大写 O**（首字符类才有 O）。别把两个类写成同一个，否则「三点O五」会算成 3.05
+/// 而权威实现给的是 3点05 —— reviewer 加边界用例时抓到的。
+fn is_frac_digit(c: char) -> bool {
+    matches!(
+        c,
+        '零' | '〇' | '一' | '幺' | '二' | '两' | '三' | '四' | '五' | '六' | '七' | '八' | '九'
+    )
+}
+
 fn cn_unit(c: char) -> Option<u64> {
     match c {
         '十' => Some(10),
@@ -87,7 +97,7 @@ fn cn_run_to_num(run: &str) -> String {
     let digit = cn_digit();
     if run.contains('点') {
         let (head, tail) = run.split_once('点').unwrap();
-        let tail_is_digits = !tail.is_empty() && tail.chars().all(|c| digit.contains_key(&c));
+        let tail_is_digits = !tail.is_empty() && tail.chars().all(is_frac_digit);
         if tail_is_digits {
             let frac: String = tail
                 .chars()
@@ -153,9 +163,9 @@ pub fn normalize_numerals(s: &str) -> String {
                 i += 1;
                 continue;
             }
-            if k == '点' && i + 1 < chars.len() && cn_digit().contains_key(&chars[i + 1]) {
+            if k == '点' && i + 1 < chars.len() && is_frac_digit(chars[i + 1]) {
                 i += 1; // 吃掉「点」
-                while i < chars.len() && cn_digit().contains_key(&chars[i]) {
+                while i < chars.len() && is_frac_digit(chars[i]) {
                     i += 1;
                 }
             }

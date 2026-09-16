@@ -2572,6 +2572,14 @@ fn progress_task(
     refresh_tasks(ui, state);
 }
 
+/// 工程编辑守卫：合成/其它任务在飞，**或质检在飞**。
+///
+/// 质检结果按"第 N 句"报出来；质检期间改稿会让这个序号指向另一句话，所以质检
+/// （含排队中）也要挡住稿件/工程名编辑。质检本身很短（N×0.3s 量级）。
+fn project_editing_blocked(ui: &MainWindow, state: &Rc<UiState>) -> bool {
+    ui.get_running() || ui.get_busy() || state.eval_task.get().is_some()
+}
+
 fn reset_bgm(ui: &MainWindow, state: &Rc<UiState>) {
     state.bgm_artifacts.borrow_mut().take();
     ui.set_bgm_has_result(false);
@@ -2589,7 +2597,7 @@ fn wire_script(
     let state0 = state.clone();
     ui.on_project_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state0) {
             ui.set_status_text("任务进行中：工程名暂不可改".into());
             return;
         }
@@ -2605,7 +2613,7 @@ fn wire_script(
     let state1 = state.clone();
     ui.on_script_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state1) {
             ui.set_status_text("任务进行中：等这轮跑完或先停止，再编辑稿件".into());
             return;
         }
@@ -2629,7 +2637,7 @@ fn wire_script(
     let state2 = state.clone();
     ui.on_use_sample(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state2) {
             ui.set_status_text("任务进行中：暂不能载入示例稿".into());
             return;
         }
@@ -2646,7 +2654,7 @@ fn wire_script(
     let state3 = state.clone();
     ui.on_clear_script(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state3) {
             ui.set_status_text("任务进行中：暂不能清空稿件".into());
             return;
         }
@@ -2663,7 +2671,7 @@ fn wire_script(
     let state4 = state.clone();
     ui.on_resplit(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if project_editing_blocked(&ui, &state4) {
             ui.set_status_text("任务进行中：暂不能重新切句".into());
             return;
         }
@@ -2805,6 +2813,39 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
     // 如实说：上游没有取消 API，should_stop 只在整轮分离返回后被查（aw-core
     // separate_tracks 的实现），所以这里只是"跑完丢弃、不落盘"，耗时照算
     ui.set_sep_status_text("停止中：本轮分离跑完才会丢弃结果（上游没有取消接口）…".into());
+}
+
+/// 质检完成后的摘要文案（抽成纯函数：全失败 / 全一致 / 有最差句三种要分开说，
+/// 否则"0 句评上分"会被说成"平均 0%"甚至"全部一致"——复核抓到过）。
+fn eval_summary_note(summary: &EvalSummary) -> String {
+    if summary.scored == 0 {
+        return format!(
+            "质检未能评分：{} 句 ASR 转写都失败了（检查 ASR 模型/服务）",
+            summary.asr_failed
+        );
+    }
+    let mut note = format!(
+        "质检完成：平均可懂度 {:.1}%（{} 句）",
+        summary.percent, summary.scored
+    );
+    if summary.asr_failed > 0 {
+        note.push_str(&format!("·{} 句转写失败", summary.asr_failed));
+    }
+    match summary.worst.first() {
+        Some(worst) if worst.snippet.is_empty() => note.push_str(&format!(
+            "·最差 第 {} 句 {:.1}%",
+            worst.index + 1,
+            worst.percent
+        )),
+        Some(worst) => note.push_str(&format!(
+            "·最差 第 {} 句 {:.1}%：{}",
+            worst.index + 1,
+            worst.percent,
+            worst.snippet
+        )),
+        None => note.push_str("·全部一致"),
+    }
+    note
 }
 
 /// 停止质检：排队中 = 立刻出队；运行中 = 协作停止（当前句转写完就停，ASR 调用中断不了）。
@@ -4058,27 +4099,7 @@ fn tick(
                 if state.eval_task.get() != Some(task_id) {
                     continue;
                 }
-                let mut note = format!(
-                    "质检完成：平均可懂度 {:.1}%（{} 句）",
-                    summary.percent, summary.scored
-                );
-                if summary.asr_failed > 0 {
-                    note.push_str(&format!("· {} 句转写失败", summary.asr_failed));
-                }
-                if let Some(worst) = summary.worst.first() {
-                    note.push_str(&format!(
-                        "· 最差 第 {} 句 {:.1}%{}",
-                        worst.index + 1,
-                        worst.percent,
-                        if worst.snippet.is_empty() {
-                            String::new()
-                        } else {
-                            format!("：{}", worst.snippet)
-                        }
-                    ));
-                } else {
-                    note.push_str("· 全部一致");
-                }
+                let note = eval_summary_note(&summary);
                 finish_task(
                     ui,
                     state,
@@ -5924,6 +5945,51 @@ mod tests {
         assert_eq!(
             stop_target(10, tasks::TaskKind::Dub, &TaskSlots::default()),
             None
+        );
+    }
+
+    /// 质检摘要的三种情形要分开说：全失败**不能**说成"平均 0%"或"全部一致"
+    /// （复核抓到过：0 句评上分时旧文案会同时给出这两个错误结论）。
+    #[test]
+    fn eval_summary_note_handles_all_failed_and_all_clean() {
+        let all_failed = EvalSummary {
+            percent: 0.0,
+            scored: 0,
+            asr_failed: 5,
+            worst: Vec::new(),
+        };
+        let note = eval_summary_note(&all_failed);
+        assert!(note.contains("未能评分"), "{note}");
+        assert!(note.contains('5') && note.contains("转写"), "{note}");
+        assert!(!note.contains("平均"), "没评上分不该给平均分：{note}");
+        assert!(!note.contains("全部一致"), "全失败不是全部一致：{note}");
+
+        let clean = EvalSummary {
+            percent: 100.0,
+            scored: 3,
+            asr_failed: 0,
+            worst: Vec::new(),
+        };
+        let note = eval_summary_note(&clean);
+        assert!(note.contains("100.0%") && note.contains("3 句"), "{note}");
+        assert!(note.contains("全部一致"), "{note}");
+
+        let with_worst = EvalSummary {
+            percent: 96.4,
+            scored: 57,
+            asr_failed: 2,
+            worst: vec![EvalIssue {
+                index: 11,
+                percent: 92.3,
+                snippet: "…质检用【应为 例，读到 力】…".into(),
+            }],
+        };
+        let note = eval_summary_note(&with_worst);
+        assert!(note.contains("96.4%") && note.contains("57 句"), "{note}");
+        assert!(note.contains("2 句转写失败"), "部分失败也要报出来：{note}");
+        assert!(
+            note.contains("第 12 句") && note.contains("92.3%") && note.contains("应为"),
+            "最差句要给序号、分数与差异片段：{note}"
         );
     }
 }
