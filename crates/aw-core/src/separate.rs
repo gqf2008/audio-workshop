@@ -53,9 +53,6 @@ pub struct Progress {
 pub struct SeparatedTracks {
     pub vocals: PathBuf,
     pub accompaniment: PathBuf,
-    /// 采样率修正相关的说明（None = 已按输入采样率修正或无需修正）。
-    /// 例：输入不是 wav（跳过修正）、wav 读不出采样率（未修正）。
-    pub note: Option<String>,
 }
 
 /// 结果：正常完成，或用户在过程中按了停止（此时**不落盘**）。
@@ -176,7 +173,8 @@ fn write_stems_with_cleanup(
 ///
 /// - wav：用 hound 读头（快，不解码）；
 /// - mp3/flac…：用 symphonia 探测音轨参数（上游自己就用它解码，这里复用同一套）；
-/// - 读不出（损坏/权限/不支持的格式）：`Err(note)` → 调用方把它写成可见说明，而不是悄悄不改。
+/// - 读不出（损坏/权限/不支持的格式）：`Err(note)` → **在进模型之前**返回可执行错误（带上
+///   支持的格式与转换建议），既不静默跳过，也不白烧一轮算力。
 ///
 /// 为什么需要它（2026-09-17 实测）：上游**不做重采样、保留输入的帧数/时间轴**，但把输出标签
 /// 写成**模型自己的采样率 44100**。48kHz 输入因此得到一个"同帧数、44.1kHz"的产物——
@@ -332,6 +330,11 @@ pub fn separate_tracks(
     if !req.input.is_file() {
         return Err(format!("输入音频不存在：{}", req.input.display()));
     }
+    // 先探输入采样率：① 拿到才知道产物该标什么采样率（上游一律标模型采样率 44100）；
+    // ② 拿不到就**在花算力之前**报错——上游不支持的容器（如 m4a/aac）会先失败，
+    //    只留一句「分离失败：end of stream」，用户既不知道原因也不知道下一步（复核指出）。
+    let input_rate = input_sample_rate(&req.input)
+        .map_err(|note| format!("{note}（目前支持 wav / mp3 / flac；可以先转成 wav 再试）"))?;
     install_progress_callbacks();
 
     let model_path = req
@@ -419,21 +422,16 @@ pub fn separate_tracks(
                 })
         },
     )?;
-    let rate_note = match input_sample_rate(&req.input) {
-        Ok(rate) => {
-            for part in [&vocals_tmp, &accompaniment_tmp] {
-                if let Err(e) = relabel_wav_sample_rate(part, rate) {
-                    let _ = std::fs::remove_file(&vocals_tmp);
-                    let _ = std::fs::remove_file(&accompaniment_tmp);
-                    let _ = std::fs::remove_file(part.with_extension("rate"));
-                    return Err(format!("修正分离产物采样率失败：{e}"));
-                }
-            }
-            None
+    // 把两轨标签改回输入采样率（样本不动）：上游不重采样、保留输入帧数，但把标签写成模型
+    // 采样率 44100 —— 48kHz 输入会因此被拉慢 1.0884 倍。采样率上面已经探过，这里只做改写。
+    for part in [&vocals_tmp, &accompaniment_tmp] {
+        if let Err(e) = relabel_wav_sample_rate(part, input_rate) {
+            let _ = std::fs::remove_file(&vocals_tmp);
+            let _ = std::fs::remove_file(&accompaniment_tmp);
+            let _ = std::fs::remove_file(part.with_extension("rate"));
+            return Err(format!("修正分离产物采样率失败：{e}"));
         }
-        // 拿不到输入采样率：不静默跳过，如实报出来（产物会沿用上游的 44100 标签）
-        Err(note) => Some(format!("产物采样率未修正：{note}")),
-    };
+    }
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
         // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
@@ -458,7 +456,6 @@ pub fn separate_tracks(
     Ok(SeparationOutcome::Done(SeparatedTracks {
         vocals: vocals_path,
         accompaniment: accompaniment_path,
-        note: rate_note,
     }))
 }
 
@@ -620,6 +617,27 @@ mod tests {
         std::fs::write(&junk, b"not really an mp3").unwrap();
         let err = input_sample_rate(&junk).unwrap_err();
         assert!(err.contains("song.mp3") && err.contains("探测"), "{err}");
+
+        // 2c. 上游同样不支持的容器（m4a/aac：symphonia 默认不含 aac/isomp4，上游也没开）
+        //     —— 必须在**进模型之前**失败，并给出"支持哪些格式"的动作提示
+        let m4a = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-0.2s.m4a");
+        let err = separate_tracks(
+            &SeparationRequest {
+                input: m4a,
+                out_dir: dir.join("m4a-out"),
+                stem: "x".into(),
+                model_dir: None,
+                chunk_seconds: None,
+            },
+            |_| {},
+            || false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("wav") && err.contains("mp3") && err.contains("flac"),
+            "要告诉用户支持哪些格式：{err}"
+        );
+        assert!(err.contains("probe-0.2s.m4a"), "要带上路径：{err}");
 
         let broken = dir.join("broken.wav");
         std::fs::write(&broken, b"definitely not a wav").unwrap();
