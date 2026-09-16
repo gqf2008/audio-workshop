@@ -165,8 +165,9 @@ fn worker_message_is_current(worker_msg: &WorkerMsg, revision: u64) -> bool {
 /// 全局设置（跨 Tab 的基础设施）：本应用连哪个服务、从哪份清单读模型。
 ///
 /// 只覆盖**本应用的行为**，不改写 audio.cpp 自己的配置：
-///   · host/port 覆盖清单里的服务地址（服务自身的监听地址由 audio-service 启动参数决定）
-///   · config_path 指向要读的 server.json（模型清单）
+///   · host/port 覆盖清单里的服务地址（各自独立回落；服务自身的监听地址由
+///     audio-service 启动参数决定）
+///   · model_dir 是本机模型文件存放位置，用于核对模型盘；**不**决定引擎 id
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct AppSettings {
     #[serde(default)]
@@ -207,19 +208,33 @@ const SCAN_ENTRY_LIMIT: usize = 20_000;
 /// 扫模型目录（深度 ≤2，覆盖 `models/<模型名>/*.gguf` 这种常见摆放）：
 /// 返回 (目录是否存在, .gguf 文件数)。
 fn scan_model_dir(dir: &Path) -> (bool, usize) {
+    scan_model_dir_with_limit(dir, SCAN_ENTRY_LIMIT)
+}
+
+/// 带上限的扫描（上限可注入，便于测试）。`limit` 是**整次扫描**的总条目预算，
+/// 不是每个目录各自的上限——否则 20000 个子目录 × 每层 20000 条照样能扫死 UI 线程
+/// （审查指出过这点）。预算耗尽即停，结果是"至少这么多"。
+fn scan_model_dir_with_limit(dir: &Path, limit: usize) -> (bool, usize) {
     if !dir.is_dir() {
         return (false, 0);
     }
-    fn count_gguf(dir: &Path, depth: usize) -> usize {
+    fn count_gguf(dir: &Path, depth: usize, budget: &mut usize) -> usize {
+        if *budget == 0 {
+            return 0;
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return 0;
         };
         let mut n = 0;
-        for e in entries.flatten().take(SCAN_ENTRY_LIMIT) {
+        for e in entries.flatten() {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
             let path = e.path();
             if path.is_dir() {
                 if depth > 0 {
-                    n += count_gguf(&path, depth - 1);
+                    n += count_gguf(&path, depth - 1, budget);
                 }
             } else if path
                 .extension()
@@ -231,7 +246,8 @@ fn scan_model_dir(dir: &Path) -> (bool, usize) {
         }
         n
     }
-    (true, count_gguf(dir, 2))
+    let mut budget = limit;
+    (true, count_gguf(dir, 2, &mut budget))
 }
 
 /// 模型目录里有多少个清单模型的权重文件（用来判断模型盘挂上没）。
@@ -316,23 +332,15 @@ fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
     let cfg_path = config_path();
     let raw = std::fs::read_to_string(&cfg_path).ok();
     let over = settings_snapshot();
-    // 地址优先级：AW_SERVER（临时覆盖）> 全局设置 > 清单里的 host:port
-    let base = std::env::var("AW_SERVER").ok().or_else(|| {
-        let from_settings = match (over.host.clone(), over.port) {
-            (Some(h), Some(p)) => Some(format!("http://{h}:{p}")),
-            _ => None,
-        };
-        from_settings.or_else(|| {
-            raw.as_deref().and_then(|r| {
-                let cfg: ServerConfig = serde_json::from_str(r).ok()?;
-                Some(format!(
-                    "http://{}:{}",
-                    cfg.host.unwrap_or_else(|| "127.0.0.1".into()),
-                    cfg.port.unwrap_or(8080)
-                ))
-            })
-        })
+    let cfg = raw.as_deref().and_then(|r| {
+        serde_json::from_str::<ServerConfig>(r)
+            .map_err(|e| e.to_string())
+            .ok()
     });
+    // 与界面回显共用同一个解析入口（见 resolve_base 的注释）
+    let env_base = std::env::var("AW_SERVER").ok();
+    let (base_url, _) = resolve_base(&over, &cfg, env_base.as_deref());
+    let base = has_endpoint_source(&over, &cfg, env_base.as_deref()).then_some(base_url);
     let Some(raw) = raw else {
         return (Vec::new(), base, format!("没找到 {}", cfg_path.display()));
     };
@@ -398,21 +406,58 @@ fn split_base(cfg: &Option<ServerConfig>) -> (Option<String>, Option<u16>) {
     }
 }
 
-/// 服务地址回显：AW_SERVER > 全局设置 > 清单；第三个返回值表示"环境变量在生效"。
-fn server_endpoint() -> (String, String, bool) {
-    let over = settings_snapshot();
-    let cfg = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
-    let (cfg_host, cfg_port) = split_base(&cfg);
-    let env_base = std::env::var("AW_SERVER").ok();
-    resolve_endpoint(
+/// **唯一的服务地址解析入口**：真正连服务的 `discover_engine` 与界面回显 `server_endpoint`
+/// 都必须走它。审查抓到过一次事故——回显改成了独立回落、客户端仍走"host/port 成对"的旧逻辑，
+/// 结果同一屏里抽屉写着 10.9.9.9、状态栏却在连 127.0.0.1。两份实现必然漂移，所以只留一份。
+///
+/// 返回 `(base_or_host, from_env)`：AW_SERVER 在时是第一项就是完整 URL（不做字段合并）。
+fn resolve_base(
+    over: &AppSettings,
+    cfg: &Option<ServerConfig>,
+    env_base: Option<&str>,
+) -> (String, bool) {
+    let (cfg_host, cfg_port) = split_base(cfg);
+    let (host, port, from_env) = resolve_endpoint(
         over.host.as_deref(),
         over.port,
         cfg_host.as_deref(),
         cfg_port,
-        env_base.as_deref(),
-    )
+        env_base,
+    );
+    if from_env {
+        (host, true)
+    } else {
+        (format!("http://{host}:{port}"), false)
+    }
+}
+
+/// 有没有任何地址来源（环境变量 / 全局设置 / 清单）。都没有才认为"未发现服务"。
+fn has_endpoint_source(
+    over: &AppSettings,
+    cfg: &Option<ServerConfig>,
+    env_base: Option<&str>,
+) -> bool {
+    env_base.is_some() || cfg.is_some() || over.host.is_some() || over.port.is_some()
+}
+
+/// 服务地址回显：AW_SERVER > 全局设置 > 清单；第三个返回值表示"环境变量在生效"。
+fn server_endpoint() -> (String, String, bool) {
+    let over = settings_snapshot();
+    let cfg = read_server_config();
+    let env_base = std::env::var("AW_SERVER").ok();
+    let (base, from_env) = resolve_base(&over, &cfg, env_base.as_deref());
+    if from_env {
+        return (base, String::new(), true);
+    }
+    let (cfg_host, cfg_port) = split_base(&cfg);
+    let (host, port, _) = resolve_endpoint(
+        over.host.as_deref(),
+        over.port,
+        cfg_host.as_deref(),
+        cfg_port,
+        None,
+    );
+    (host, port, false)
 }
 
 /// 把「全局设置 + 模型清单」的现状回灌到界面。
@@ -431,14 +476,28 @@ fn refresh_settings_view(ui: &MainWindow) {
         }
         .into(),
     );
-    // AW_SERVER 生效时不要伪装成"抽屉里的值就是生效值"——回显里标注出来
-    if from_env {
-        ui.set_server_host("(AW_SERVER 覆盖中)".into());
-        ui.set_server_port("".into());
-        ui.set_server_status(format!("环境变量 AW_SERVER 正在覆盖：{host}").into());
+    // AW_SERVER 生效时：输入框**保持真实可编辑值**（放占位串会被用户连"应用"一起写进
+    // settings.json ——审查抓到过这条污染），只把输入锁住 + 在状态行说明谁在生效。
+    let (shown_host, shown_port) = if from_env {
+        let over = settings_snapshot();
+        let cfg = read_server_config();
+        let (cfg_host, cfg_port) = split_base(&cfg);
+        let (h, p, _) = resolve_endpoint(
+            over.host.as_deref(),
+            over.port,
+            cfg_host.as_deref(),
+            cfg_port,
+            None,
+        );
+        (h, p)
     } else {
-        ui.set_server_host(host.into());
-        ui.set_server_port(port.into());
+        (host.clone(), port.clone())
+    };
+    ui.set_server_host(shown_host.into());
+    ui.set_server_port(shown_port.into());
+    ui.set_server_locked(from_env);
+    if from_env {
+        ui.set_server_status(format!("环境变量 AW_SERVER 正在覆盖：{host}（输入已锁定）").into());
     }
 }
 
@@ -2451,6 +2510,7 @@ fn wire_global_settings(
     let msg = msg_tx.clone();
     ui.on_apply_server_settings(move || {
         let Some(ui) = weak.upgrade() else { return };
+        let locked = ui.get_server_locked();
         let host = ui.get_server_host().trim().to_string();
         let port_raw = ui.get_server_port().trim().to_string();
         let dir = ui.get_model_dir().trim().to_string();
@@ -2474,9 +2534,15 @@ fn wire_global_settings(
         // 与默认目录相同时存 None（而不是把当时的绝对路径固化下来）：
         // 应用以后换位置/换工作目录时，默认值应该跟着走，不该被旧快照钉死。
         let is_default_dir = Path::new(dir.as_str()) == default_model_dir().as_path();
+        // AW_SERVER 生效时输入是锁住的：不要把这时的显示值固化进配置，保留原有 host/port
+        let prev = settings_snapshot();
         let next = AppSettings {
-            host: (!host.is_empty()).then_some(host),
-            port,
+            host: if locked {
+                prev.host
+            } else {
+                (!host.is_empty()).then_some(host)
+            },
+            port: if locked { prev.port } else { port },
             model_dir: (!dir.is_empty() && !is_default_dir).then_some(dir.clone()),
         };
         if let Err(e) = save_settings(&next) {
@@ -2761,36 +2827,88 @@ mod tests {
         assert_eq!(scan_model_dir(&missing), (false, 0));
     }
 
-    /// 「清单里有多少模型落在该目录下」用前缀判定；空 path 不能被算进去。
+    /// 「清单里有多少模型落在该目录下」是**路径组件前缀**判定：
+    /// `/models-2/x.gguf` 不能被算进 `/models`（字符串前缀会误算）。
     #[test]
-    fn models_under_dir_counts_only_paths_inside_dir() {
+    fn models_under_dir_uses_path_prefix_not_string_prefix() {
+        let model = |id: &str, path: &str| ServerModel {
+            id: id.into(),
+            task: "tts".into(),
+            family: "f".into(),
+            path: path.into(),
+        };
         let cfg = Some(ServerConfig {
             host: None,
             port: None,
             models: vec![
-                ServerModel {
-                    id: "in".into(),
-                    task: "tts".into(),
-                    family: "f".into(),
-                    path: "/models/in/x.gguf".into(),
-                },
-                ServerModel {
-                    id: "out".into(),
-                    task: "tts".into(),
-                    family: "f".into(),
-                    path: "/elsewhere/out/y.gguf".into(),
-                },
-                ServerModel {
-                    id: "empty".into(),
-                    task: "tts".into(),
-                    family: "f".into(),
-                    path: String::new(),
-                },
+                model("in", "/models/in/x.gguf"),
+                model("sibling", "/models-2/s/x.gguf"),
+                model("out", "/elsewhere/out/y.gguf"),
             ],
         });
-        assert_eq!(models_under_dir(&cfg, Path::new("/models")), 1);
+        assert_eq!(
+            models_under_dir(&cfg, Path::new("/models")),
+            1,
+            "/models-2 是同级目录，不能被字符串前缀误算进来"
+        );
         assert_eq!(models_under_dir(&cfg, Path::new("/elsewhere")), 1);
         assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
+    }
+
+    /// `resolve_base` 是客户端与回显的**唯一**解析入口：单边覆盖必须两边同样生效。
+    /// （审查抓到的正是"回显改了、客户端没改"→ 同屏显示 A、实连 B。）
+    #[test]
+    fn resolve_base_is_single_source_for_client_and_echo() {
+        let cfg = Some(ServerConfig {
+            host: Some("manifest-host".into()),
+            port: Some(1111),
+            models: vec![],
+        });
+
+        // 只覆盖端口 → host 回落清单
+        let over_port = AppSettings {
+            host: None,
+            port: Some(9999),
+            model_dir: None,
+        };
+        assert_eq!(
+            resolve_base(&over_port, &cfg, None).0,
+            "http://manifest-host:9999"
+        );
+
+        // 只覆盖 host → 端口回落清单
+        let over_host = AppSettings {
+            host: Some("10.0.0.1".into()),
+            port: None,
+            model_dir: None,
+        };
+        assert_eq!(
+            resolve_base(&over_host, &cfg, None).0,
+            "http://10.0.0.1:1111"
+        );
+
+        // AW_SERVER 整串优先，且标记 from_env
+        let (base, from_env) = resolve_base(&over_host, &cfg, Some("http://env:2222"));
+        assert_eq!(base, "http://env:2222");
+        assert!(from_env);
+
+        // 有没有地址来源：决定 discover_engine 返回 None（"未发现服务"）还是可用地址
+        let empty = AppSettings::default();
+        assert!(!has_endpoint_source(&empty, &None, None));
+        assert!(has_endpoint_source(&empty, &cfg, None));
+        assert!(has_endpoint_source(&empty, &None, Some("http://env:2222")));
+    }
+
+    /// 扫描条目上限是**整次扫描**的预算：超限就停，不会把 UI 线程扫死。
+    #[test]
+    fn scan_model_dir_stops_at_entry_budget() {
+        let dir = temp_dir("scan-cap");
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("m{i}.gguf")), b"x").unwrap();
+        }
+        let (exists, n) = scan_model_dir_with_limit(&dir, 2);
+        assert!(exists);
+        assert!(n <= 2, "预算 2 时最多数到 2 个，实得 {n}");
     }
 
     /// 服务地址三档优先级：AW_SERVER 整串优先；全局设置 > 清单；host/port **各自独立**回落

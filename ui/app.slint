@@ -87,6 +87,7 @@ export component MainWindow inherits Window {
     in-out property <string> server-port: "";
     in property <string> server-status: "还没测过连接";
     in property <bool> server-ok: false;
+    in property <bool> server-locked: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
@@ -474,6 +475,7 @@ export component MainWindow inherits Window {
                     server-port <=> root.server-port;
                     server-status: root.server-status;
                     server-ok: root.server-ok;
+            server-locked: root.server-locked;
                     model-dir <=> root.model-dir;
                     model-dir-info: root.model-dir-info;
                     apply-server-settings => { root.apply-server-settings(); }

@@ -1,7 +1,7 @@
 // ============================================================================
 // 音频作坊 · 配音工作台（低密度 / 渐进披露版）
 //
-// 首屏（默认态）在**本组件内**贡献 4 个元素，逐个用 `// 首屏` 标在声明行上：
+// 首屏（默认态）在**本组件内**贡献 5 个元素，逐个用 `// 首屏` 标在声明行上：
 //   旁白块（块头=当前音色+试听/换音色，块体=稿件）· 状态行 · 高级入口 · 主操作
 //   · 句子列表
 // 外壳另有 3 个（标题栏 / 顶部五 Tab / 状态栏），合计 8 个 ≤ 8。
@@ -180,6 +180,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in-out property <string> server-port: "";
     in property <string> server-status: "还没测过连接";
     in property <bool> server-ok: false;
+    // AW_SERVER 生效中：地址/端口输入锁定（别让展示值被"应用"写进配置）
+    in property <bool> server-locked: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
     callback apply-server-settings();
@@ -252,7 +254,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                         horizontal-stretch: 1;
                         text <=> root.server-host;
                         placeholder: "127.0.0.1";
-                        enabled: !root.busy;
+                        enabled: !root.busy && !root.server-locked;
                     }
                     Text {
                         text: "端口";
@@ -265,7 +267,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                         width: 84px;
                         text <=> root.server-port;
                         placeholder: "8080";
-                        enabled: !root.busy;
+                        enabled: !root.busy && !root.server-locked;
                     }
                 }
                 HorizontalLayout {
