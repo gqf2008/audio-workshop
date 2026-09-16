@@ -88,20 +88,27 @@ HTDemucs-ORT，M4/16GB）：
 它会把最后 8.8% 的**真实内容**裁掉。复核之后做了一次对齐测量（同一首歌，输入 50.919s /
 48kHz / 2ch / 2444096 帧），三种比法：
 
-| 假设 | 与输入包络的相关系数 |
-|---|---|
-| 直接按 44.1kHz 读产物 | 0.268 |
-| 把产物时间轴按 48/44.1 压缩后再比 | 0.792 |
-| **把产物按输入采样率（48k）读**（只改标签、样本不动） | **vocals 0.800 / accompaniment 0.822** |
+测量方法（可复算）：取左声道，**20ms 窗平均绝对值**做包络，逐窗算 Pearson 相关系数。
 
-而且两轨的**帧数与输入完全一致**（2444096）。结论：上游把输入样本**原样**输出，但产物 WAV
-**一律声明 44.1kHz** —— 48kHz 输入因此得到一个"同帧数、44.1kHz"的产物：**时长 +8.84%、
-播放被拉慢 1.0884 倍**。它不是多了尾巴，是**标签错了**。
+| 读法 | 与输入包络的相关系数 |
+|---|---|
+| 按各自声明的采样率读（= 按墙钟位置对齐） | 0.268 |
+| **把产物按输入采样率（48k）重读**（= relabel 之后） | **vocals 0.800 / accompaniment 0.822** |
+
+（第一版文档里还有一行"把时间轴按 48/44.1 压缩后再比 = 0.792"，那是**按包络下标插值**的口径，
+复核按常见包络/重采样口径复原不出来 —— 已删掉，只留两行可复现的。两行已经足够区分
+"内容变多"与"标签错"：如果只是尾巴变长，relabel 不会让相关系数从 0.27 跳到 0.82。）
+
+而且两轨的**帧数与输入完全一致**（2444096）。结论：上游**不做重采样、保留输入的帧数/时间轴**，
+但把输出标签写成**模型自己的采样率 44100**（`splitter.rs` 里输出 `sample_rate` 取自模型 manifest；
+`audio.rs` 只是按上层传入的值写头）—— 48kHz 输入因此得到"同帧数、44.1kHz"的产物：
+**时长 +8.84%、播放被拉慢 1.0884 倍**。它不是多了尾巴，是**标签错了**。
 
 `separate_tracks` 现在的做法是 **relabel**（把两轨标签改回输入的采样率，样本一个不动）：
 
-- 这是**无损往返**：上游喂给模型的是"输入样本按 44.1kHz 播"的慢放版本，产物样本与输入样本
-  一一对应，改回标签即可 1:1 还原（比真做一次重采样更保真——不引入抗混叠滤波损失）；
+- 这是**无损往返**：上游喂给模型的是"输入样本按 44.1kHz 播"的慢放版本，产物的**帧索引与输入
+  帧索引对齐**（复核逐样本比对过：旧产物与 relabel 后产物 `array_equal`，最大绝对差 0），
+  改回标签即可 1:1 还原（比真做一次重采样更保真——不引入抗混叠滤波损失）；
 - 真机复验（release）：两轨 **48000Hz / 2ch / 2444096 帧 / 50.919s**，与输入逐项一致；
   与输入的包络相关系数 **0.800 / 0.822**（按 44.1kHz 读只有 0.268）；
 - 只在**拿得到输入采样率**时做（wav）；mp3/flac 的采样率在上游解码器里，这两种输入沿用上游
@@ -109,8 +116,10 @@ HTDemucs-ORT，M4/16GB）：
 - wav 却读不出采样率（损坏/权限）也算一类说明报出去，不静默跳过；
 - 只处理 16-bit PCM（该模型产物就是 16-bit），其它位深原样返回；
 - 临时文件用 `*.rate` 显式命名，创建/读/写/finalize/rename 任一步失败都会清掉它；
-- **上游该修的地方**：`write_audio` 应当按输入采样率写头（或先把输入重采样到模型采样率），
-  而不是一律声明 44.1kHz。这属于上游的 bug，值得提 issue/PR（本仓库只做 relabel 兜底）。
+- **上游该修的地方**：`separate_stems_internal` 输出时把 `sample_rate` 传成**模型**的 44100，
+  而输入并没有被重采样到模型采样率。正确的修法二选一：① 输出时保留输入的采样率标签；
+  ② 在输入阶段重采样到模型采样率（那样输出 44.1kHz 也是对的）。这属于上游的 bug，值得提
+  issue/PR（本仓库只做 relabel 兜底，不改上游）。
 
 **两轨 `.part` 的失败清理**（这一条与上面的诊断无关，是复核另外抓到的既有洞）：上游 `write_audio`
 是先建目标文件再逐样本写，中途 ENOSPC/权限变化会留下半截文件。复核用 8MB 受限卷复现过
@@ -181,6 +190,28 @@ HTDemucs-ORT，M4/16GB）：
 | 模型许可 | 上游代码 MIT/Apache；**模型权重许可是另一件事**，需单独核对后再对外分发 | 接入前核对模型 manifest 里的许可字段；不确定就不随包分发、只走用户侧下载 |
 
 ## 6. 复现本结论的命令
+
+§2.7 那两行相关系数可以用这段脚本复算（输入 = 源音频，产物 = 分离结果）：
+
+```python
+import wave, struct, math
+def mono(path):
+    with wave.open(path) as w:
+        sr, ch, n = w.getframerate(), w.getnchannels(), w.getnframes()
+        v = struct.unpack(f"<{n*ch}h", w.readframes(n)[:n*ch*2])
+    return sr, [v[i] for i in range(0, len(v), ch)]          # 左声道
+def env(sig, win):                                            # win = 20ms 的样本数
+    return [sum(abs(x) for x in sig[i:i+win])/win for i in range(0, len(sig)-win+1, win)]
+def corr(a, b):
+    m = min(len(a), len(b)); ma = sum(a[:m])/m; mb = sum(b[:m])/m
+    num = sum((x-ma)*(y-mb) for x, y in zip(a[:m], b[:m]))
+    da = math.sqrt(sum((x-ma)**2 for x in a[:m])); db = math.sqrt(sum((y-mb)**2 for y in b[:m]))
+    return num/(da*db) if da and db else 0
+isr, isig = mono("源.wav"); ssr, ssig = mono("产物.wav")
+print("按各自声明采样率读 :", round(corr(env(isig, int(isr*0.02)), env(ssig, int(ssr*0.02))), 3))
+print("按输入采样率重读   :", round(corr(env(isig, int(isr*0.02)), env(ssig, int(isr*0.02))), 3))
+```
+
 
 ```console
 curl -sS https://api.github.com/repos/gqf2008/Xmusic-splitter \
