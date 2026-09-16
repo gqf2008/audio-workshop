@@ -233,6 +233,10 @@ impl Project {
                 }
                 (s.index, s.spoken.clone(), s.seed)
             };
+            // 这一句要重做：旧质检分数从此刻起失效。放在合成之前是为了让后面的逐句落盘
+            // （成功与失败都走）把"已作废"一起持久化——只在成功分支清会让失败时
+            // 磁盘上留着描述旧音频的分数，UI 与磁盘就会说法不一（复核抓到过）。
+            self.sentences[i].eval_percent = None;
             on_progress(index, &spoken);
             let outcome = match client.synth(
                 &self.model,
@@ -249,8 +253,6 @@ impl Project {
                     let s = &mut self.sentences[i];
                     s.duration = Some(d);
                     s.status = "done".into();
-                    // 音频换了：这一句的旧质检分数必须作废（重录也走这条路径）
-                    s.eval_percent = None;
                     format!("done {d:.2}s")
                 }
                 Err(e) => {

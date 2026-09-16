@@ -296,3 +296,34 @@ fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
         "没重合成的句子分数要保留"
     );
 }
+
+/// 重新合成**失败**时也要把该句旧分作废并落盘——只在成功分支清会让磁盘留着
+/// "描述旧音频"的分数，UI（已清）与磁盘就说法不一（复核指出）。
+#[test]
+fn failed_resynthesis_also_clears_eval_percent_on_disk() {
+    let dir = temp_dir("eval-fail-clear");
+    let mut prj = project();
+    prj.sentences[0].status = "done".into();
+    prj.sentences[0].duration = Some(0.1);
+    prj.sentences[0].eval_percent = Some(88.0);
+    prj.save(&dir).unwrap();
+
+    // mock 返回 500：这一句合成失败
+    let mock = support::Mock::start(vec![(500, r#"{"error":"模型没加载"}"#.into())]);
+    let failed = prj
+        .synthesize(&client(&mock.base), &dir, Some(&[0]), None, |_, _| {})
+        .unwrap();
+    assert_eq!(failed, 1);
+    assert_eq!(prj.sentences[0].eval_percent, None, "内存里要清");
+
+    let on_disk = Project::load(&dir).unwrap();
+    assert_eq!(
+        on_disk.sentences[0].eval_percent, None,
+        "磁盘上也要清（否则重开又冒出来）"
+    );
+    assert!(
+        on_disk.sentences[0].status.starts_with("error"),
+        "状态应记为失败：{}",
+        on_disk.sentences[0].status
+    );
+}
