@@ -867,10 +867,23 @@ fn bgm_context(ui: &MainWindow) -> export::BgmContext {
     )
 }
 
-/// 当前工程有没有配音成品（决定 BGM 是混音还是独立生成）。
+/// 配音成品的可用时长（秒）：**worker 与导出侧共用同一个判定**。
+///
+/// 有配音成品（能读出来、时长 > 0）→ BGM 走混音模式；否则独立生成。两边各写一份
+/// "有没有配音成品"迟早漂移——复核抓到的反例就是：`out/final.wav` 存在但损坏时，
+/// worker 按独立生成产出并写下 standalone 摘要，而导出侧只看文件存在就按 mixed 比，
+/// 刚生成的 BGM 立刻被判过期。
+fn usable_voice_seconds(project_dir: &Path) -> Option<f64> {
+    std::fs::read(project_dir.join("out/final.wav"))
+        .ok()
+        .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
+        .filter(|d| *d > 0.0)
+}
+
+/// 当前工程有没有可用的配音成品（决定 BGM 是混音还是独立生成）。
 fn has_voice_product(ui: &MainWindow) -> bool {
     let name = file_stem(&ui.get_project_name());
-    project_dir(&name).join("out/final.wav").is_file()
+    usable_voice_seconds(&project_dir(&name)).is_some()
 }
 
 /// 写产物清单时用的摘要：模式由**这次实际的生成结果**给（`mixed` 来自 worker 回报），
@@ -1046,7 +1059,7 @@ fn pick_audio_blocking() -> Option<String> {
 /// 原因不是"读会读到半截文件"——这些文件都是原子写出来的；而是有两类问题：
 ///   · `assemble` 是**先发布 final.wav、再写 final.srt**：中间那一瞬扫过去会看到
 ///     新 WAV 配旧 SRT（或把新工程误报成"缺字幕"）；
-///   · 分轨导出的源（`out/voice.wav`、`out/mixed.wav`、`bgm/bgm.wav`）是 BGM 混音
+///   · 分轨导出的源（`out/mixed.wav`、`bgm/bgm.wav`）是 BGM 混音
 ///     写出来的，混音跑到一半导出去就是半套。
 /// 写这些产物的动作都有在飞标志：
 ///   · 单篇拼装/导出 / BGM 生成 / 重录 / 试听 → UI 的 `busy`；
@@ -1674,12 +1687,8 @@ fn worker_loop(ctx: WorkerCtx) {
                     None => dir,
                 };
                 let dir = &dir;
-                // 有配音成品 → 按它对齐并混音；没有 → 独立生成（用 UI 选的时长，只出 BGM 轨）。
-                let voice_path = dir.join("out/final.wav");
-                let dub_seconds = std::fs::read(&voice_path)
-                    .ok()
-                    .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
-                    .filter(|d| *d > 0.0);
+                // 有配音成品 → 按它对齐并混音；没有（或读不出时长）→ 独立生成（只出 BGM 轨）。
+                let dub_seconds = usable_voice_seconds(dir);
                 let (target_seconds, mix) = match dub_seconds {
                     Some(v) => (v, true),
                     None => (
@@ -8360,6 +8369,67 @@ mod tests {
         assert_eq!(d.prompt, DEFAULT_BGM_PROMPT);
         assert_eq!(d.duck_index, 1);
         assert_eq!(d.standalone_index, 1);
+    }
+
+    /// 配音成品**损坏**时要按"没有配音成品"处理：worker 会走独立生成并写下
+    /// standalone 摘要，导出侧必须用同一个判定，否则刚生成的 BGM 立刻被判过期
+    /// （复核给的反例）。
+    #[test]
+    fn usable_voice_requires_a_readable_positive_duration() {
+        let dir = std::env::temp_dir().join(format!("aw-voice-usable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+
+        // 没有文件
+        assert_eq!(usable_voice_seconds(&dir), None);
+
+        // 有文件但读不出时长（损坏 / 半截）→ 按没有配音成品处理
+        std::fs::write(dir.join("out/final.wav"), b"not a wav").unwrap();
+        assert_eq!(usable_voice_seconds(&dir), None, "损坏的成品不算可用");
+
+        // 真的 wav（3 秒）→ 可用，并返回时长
+        write_test_tone_wav(&dir.join("out/final.wav"), 3.0);
+        let secs = usable_voice_seconds(&dir).expect("合法 wav 应该可用");
+        assert!((secs - 3.0).abs() < 0.05, "时长要对得上：{secs}");
+
+        // 0 帧的 wav 同样不可用
+        write_test_tone_wav(&dir.join("out/final.wav"), 0.0);
+        assert_eq!(usable_voice_seconds(&dir), None, "0 帧不算可用");
+    }
+
+    /// 反例回归（复核给的）：`out/final.wav` 损坏时 worker 走独立生成、清单里写的是
+    /// standalone 摘要；导出侧也必须用"有没有**可用**配音成品"来定模式，两边摘要才一致。
+    /// 只判断文件存在的话，这里算出来的是 mixed 摘要，刚生成的 BGM 立刻被判过期。
+    #[test]
+    fn broken_voice_makes_both_sides_use_standalone_mode() {
+        let dir = std::env::temp_dir().join(format!("aw-broken-voice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::create_dir_all(dir.join("bgm")).unwrap();
+        std::fs::write(dir.join("out/final.wav"), b"broken").unwrap();
+        std::fs::write(dir.join("bgm/bgm.wav"), b"bgm").unwrap();
+
+        let prompt = "口播背景";
+        // worker 侧：没有可用配音成品 → 独立生成 → 写 standalone 摘要
+        let digest = export::bgm_options_digest(prompt, export::BgmMode::Standalone, 30.0, 0.22);
+        export::write_result_manifest(&dir, &digest).unwrap();
+
+        // 导出侧：同一个判定 → 同一个模式 → 摘要必须一致
+        let ctx = export::BgmContext::new(
+            true,
+            usable_voice_seconds(&dir).is_some(),
+            prompt,
+            0.22,
+            30.0,
+        );
+        assert!(
+            export::bgm_result_is_current(&dir, &ctx.options_digest),
+            "两边模式判定必须同源，否则刚生成的 BGM 会被判过期"
+        );
+        assert!(matches!(
+            export::stem_state(&dir, export::Stem::Bgm, &ctx),
+            export::StemState::Ready(_)
+        ));
     }
 
     /// 设置文件里某一段坏了（例如 `bgm.duck_index` 被手改成字符串）：

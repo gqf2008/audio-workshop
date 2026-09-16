@@ -105,7 +105,7 @@ impl Stem {
 ///
 /// 光"文件存在"不够：`out/mixed.wav`、`bgm/bgm.wav` 是**混音那一刻**的成品，之后改稿、
 /// 重录、重新拼装都会让配音成品变样——旧混音再导出就成了"新配音配旧 BGM"。
-/// 所以混音成功时会写下 `bgm/mix-manifest.json`（记录当时的配音成品指纹），
+/// 所以生成/混音成功时会写下 `bgm/result-manifest.json`（参数摘要 + 当时的配音成品指纹），
 /// 这里比对着看（复核指出"磁盘来源可能把旧产物当当前产物导出"）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum StemState {

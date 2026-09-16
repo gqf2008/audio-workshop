@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 单篇 | 导出行「导出」（或拼装完成时自动） | `<工程名>.wav` / `.srt`（按格式开关） | 当前工程 `out/final.wav` + `out/final.srt` |
 | 批量 | 导出行「批量导出」 | 每个有成品的工程各一份 `<工程名>.wav` / `.srt` | 扫 `projects/` 下所有 `out/final.wav` |
-| 分轨 | 导出行「分轨导出」；BGM 页每轨的「导出」 | `<工程名>_voice.wav` + `<工程名>_bgm.wav`（BGM 页还可单独导 `_mixed.wav`） | 磁盘上的 `out/voice.wav`（退回 `out/final.wav`）/ `bgm/bgm.wav` / `out/mixed.wav` |
+| 分轨 | 导出行「分轨导出」；BGM 页每轨的「导出」 | `<工程名>_voice.wav` + `<工程名>_bgm.wav`（BGM 页还可单独导 `_mixed.wav`） | 磁盘上的 `out/final.wav` / `bgm/bgm.wav` / `out/mixed.wav` |
 
 分轨的命名是**既有约定**（BGM 页逐轨导出一开始就用 `_voice` / `_bgm` / `_mixed`）：
 同一轨不能因为从哪个按钮导出就换个名字，否则导出目录里会出现同一内容的两份文件。
@@ -29,7 +29,7 @@
 
 "文件存在"不等于"能当当前成品导出"。要导出 BGM/混音两轨，必须同时满足三条：
 
-1. **配音成品变过没有**（磁盘层）：混音成功时写 `bgm/mix-manifest.json`，记录当时
+1. **配音成品变过没有**（磁盘层）：生成/混音成功时写 `bgm/result-manifest.json`，记录当时
    `out/final.wav` 的 sha256；导出时比对当前指纹，不一致就是「旧混音」，**拒绝导出**
    并提示重新混音。独立生成的 BGM（没有配音成品）不存在配套问题，直接可用。
 2. **BGM 描述改过没有**（UI 层）：判据是 `has_result && !stale`（`bgm_result_exportable`）。
