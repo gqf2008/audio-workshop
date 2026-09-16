@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>音频作坊· UI Redesign v1.2 线框</title>
+<title>音频作坊· UI Redesign v1.4 线框</title>
 <style>
   :root {
     --page: #eef0f3;
@@ -214,6 +214,29 @@
   .pill.ok { color: var(--success); border-color: #bdd8c8; background: #f2fbf6; }
   .pill.warn { color: #9a5d13; border-color: #ebd2a8; background: #fff9ee; }
   .pill.bad { color: var(--danger); border-color: #e8bcbc; background: #fff5f5; }
+
+  .voicebar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-bottom: 0;
+    background: #fffaf5;
+  }
+
+  .voicebar .voice-name { color: var(--ink); font-weight: 800; }
+  .narrator-dot-mini { width: 10px; height: 10px; border-radius: 50%; background: #e99aaf; box-shadow: 0 0 0 3px #fdeef2; }
+  .voicebar .grow { flex: 1; }
+  .voicebar .btn { min-height: 30px; padding: 5px 8px; font-size: 10px; }
+  .voicebar-note {
+    padding: 5px 10px 7px;
+    border: 1px solid var(--line);
+    border-top: 0;
+    background: #fffaf5;
+    color: var(--muted);
+    font-size: 10px;
+  }
 
   .canvas {
     min-height: 210px;
@@ -578,7 +601,7 @@
 <main class="wrap">
   <header class="intro">
     <div>
-      <p class="eyebrow">Audio Workshop / UI Redesign v1.2</p>
+      <p class="eyebrow">Audio Workshop / UI Redesign v1.4</p>
       <h1>五个主 Tab，一屏一件事</h1>
       <p>低密度线框：顶部五场景始终可见；每屏只突出一个主任务；参数进入当前 Tab 的高级抽屉；任务可跨 Tab、可恢复。</p>
     </div>
@@ -602,7 +625,9 @@
         <nav class="tabs" aria-label="主 Tab">
           <span class="tab active">配音</span><span class="tab">BGM</span><span class="tab">人声分离</span><span class="tab">音乐制作</span><span class="tab">音色设计</span>
         </nav>
-        <div class="projectbar"><span class="pill">0921 开箱口播</span><span class="pill ok">已保存</span><span class="grow"></span><span class="pill">断点 19/34</span></div>
+        <div class="projectbar"><span class="pill">0921 开箱口播</span><span class="pill ok">已保存</span><span class="grow"></span><span class="pill">断点 19/34</span><span class="pill blue">任务中心 1</span></div>
+        <div class="voicebar"><span class="narrator-dot-mini"></span><span class="mini-label" style="margin:0">当前音色</span><span class="voice-name">audio8-tts</span><span class="pill ok">内置</span><span class="grow"></span><span class="btn">试听</span><span class="btn">换音色</span><span class="btn ghost">新建音色 →</span></div>
+        <div class="voicebar-note">彩色 dot + 音色名是旁白块头，文本 / 句子挂在下方；未选择音色时“开始配音”disabled，运行中“换音色 / 新建音色”禁用并解释。</div>
         <div class="canvas">
           <div class="split">
             <div class="subpane">
@@ -625,11 +650,11 @@
           </div>
         </div>
         <div class="controls">
-          <span class="btn ghost">高级：音色与输出</span><span class="grow"></span><span class="btn primary">停止</span>
+          <span class="btn ghost">高级：语速与模型细节</span><span class="grow"></span><span class="btn primary">停止</span>
         </div>
         <div class="statusline"><span>正在合成</span><strong>第 12 / 34 句</strong><span>· 可切换到其他 Tab</span><span class="grow"></span><span>35%</span></div>
         <div class="result"><span>完成后出现：成品 03:42 · 导出</span><span class="btn">结果条</span></div>
-        <div class="interaction-notes"><strong>交互：</strong>点击开始后变停止；运行中切 Tab 不取消；停止后已完成句保留；编辑文稿后旧成品 stale；单句失败只重录该句。</div>
+        <div class="interaction-notes"><strong>交互：</strong>先选当前音色再开始；换音色打开内置 / 我的音色选择器；运行中音色锁定；完成后换音色使旧成品 stale；编辑文稿同样触发 stale；单句失败只重录该句。</div>
       </div>
     </article>
 
@@ -706,7 +731,7 @@
 
     <article class="screen">
       <div class="screen-head">
-        <div class="screen-title"><strong>05 · 音色设计</strong><small>主操作：生成试听 → 创建音色 · 7/8</small></div>
+        <div class="screen-title"><strong>05 · 音色设计</strong><small>Prompt + Text to preview + Generate voice · 7/8</small></div>
         <span class="metric">主操作 1 · P4 门控</span>
       </div>
       <div class="screen-body">
@@ -716,16 +741,16 @@
         </nav>
         <div class="projectbar"><span class="pill">当前工程 · 未命名音色</span><span class="pill ok">voice_ref 可用</span><span class="grow"></span><span class="pill warn">P4 音色库待实现</span></div>
         <div class="canvas">
-          <div class="field big"><strong>试听文本</strong>今天想和你分享一款我最近常用的产品。</div>
+          <div class="field small"><strong>Prompt · 声音描述</strong>温暖、克制、适合中文口播的年轻女声。</div>
           <div style="height:8px"></div>
-          <div class="field small"><strong>基础音色 / 参考音频</strong>已选择基础音色；可替换为参考音频路径或拖入本地文件。</div>
+          <div class="field big"><strong>Text to preview · 试听文本</strong>今天想和你分享一款我最近常用的产品。</div>
           <div class="controls">
-            <span class="btn ghost">高级：模型 / 参考 / 风格</span><span class="grow"></span><span class="btn primary">生成试听</span>
+            <span class="btn ghost">克隆向导 →</span><span class="btn ghost">高级：模型 / 风格</span><span class="grow"></span><span class="btn primary">生成试听</span>
           </div>
-          <div class="statusline"><span>试听文本已填写</span><span>· 选择基础音色或参考音频后开始</span></div>
+          <div class="statusline"><span>Prompt 和 Text to preview 已填写</span><span>· Generate voice 后进入试听</span></div>
         </div>
         <div class="result"><span>完成后：试听 · 保存为音色 · 预设菜单（导出/导入）</span><span class="btn ghost">结果条</span></div>
-        <div class="interaction-notes"><strong>交互：</strong>生成试听完成后主按钮变创建音色；P4 unsupported 时保存、用于配音、预设全部 disabled；P4 ready 保存后点击用于配音跳转配音并预选该音色。</div>
+        <div class="interaction-notes"><strong>交互：</strong>Prompt + Text to preview + Generate voice；完成后主按钮变创建音色；克隆向导独立为 Add Voice → Voice Info → Finish up；P4 unsupported 时保存、用于配音、Professional Clone、预设全部 disabled。</div>
         <div class="note"><strong>能力边界：</strong>单条 voice_ref 克隆已有基础；保存为音色、多音色库、参考文本、风格/情绪和预设互操作未完整实现，必须能力门控。</div>
       </div>
     </article>

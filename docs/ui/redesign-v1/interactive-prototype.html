@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>音频作坊 · UI Redesign v1.2 可点击原型</title>
+<title>音频作坊 · UI Redesign v1.4 可点击原型</title>
 <style>
   :root {
     --bg: #eef0f3;
@@ -145,6 +145,52 @@
   .pill.warn { border-color: #e8ce94; background: #fff8e8; color: var(--warning); }
   .pill.bad { border-color: #e9baba; background: #fff4f4; color: var(--danger); }
   .pill.blue { border-color: #b5c8df; background: #f1f6fc; color: #315f9b; }
+  .voice-card {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 11px;
+    padding: 9px 10px;
+    border: 1px solid #e4c9ad;
+    border-radius: 10px;
+    background: #fffaf5;
+  }
+  .voice-card .voice-main { min-width: 0; display: flex; align-items: center; gap: 7px; flex: 1; }
+  .voice-card .voice-label { color: var(--muted); font: 800 10px/1.2 var(--mono); }
+  .voice-card .voice-name { overflow: hidden; color: var(--ink); font-weight: 800; white-space: nowrap; text-overflow: ellipsis; }
+  .voice-card .voice-warning { margin-top: 3px; color: var(--warning); font-size: 10px; }
+  .voice-card .voice-actions { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+  .voice-card .tiny-btn { min-height: 30px; }
+  .narrator-block { margin-bottom: 11px; padding: 0; border: 1px solid #d9dee5; border-radius: 12px; overflow: hidden; background: #fff; }
+  .narrator-block .voice-card { margin: 0; border: 0; border-bottom: 1px solid #e4c9ad; border-radius: 0; }
+  .narrator-block .layout { padding: 12px; }
+  .narrator-dot { width: 10px; height: 10px; border-radius: 50%; background: #e99aaf; box-shadow: 0 0 0 3px #fdeef2; }
+  .narrator-block.stale .narrator-dot { background: var(--warning); box-shadow: 0 0 0 3px #fff2d8; }
+  .narrator-block.locked .narrator-dot { background: #9aa2ad; box-shadow: 0 0 0 3px #eef0f3; }
+  .voice-picker-search { margin-bottom: 9px; }
+  .voice-picker-tabs { display: flex; gap: 5px; margin-bottom: 9px; }
+  .voice-picker-tabs .tiny-btn.active { border-color: #9bb0c9; background: #edf4fb; color: var(--focus); }
+  .voice-row { display: flex; align-items: center; gap: 8px; min-height: 48px; margin-bottom: 6px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; }
+  .voice-row:hover { background: #f8fafc; }
+  .voice-row.selected { border-color: #9bb0c9; background: #f2f7fc; }
+  .voice-row.current { box-shadow: inset 3px 0 0 var(--success); }
+  .voice-row .grow { flex: 1; min-width: 0; }
+  .voice-row .voice-source { color: var(--muted); font-size: 10px; }
+  .voice-row .voice-name { display: block; overflow: hidden; color: var(--ink); font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+  .voice-row .mark { color: var(--success); font-weight: 800; }
+  .voice-picker-footer { position: sticky; bottom: 0; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); background: #fff; }
+  .voice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .voice-card-choice { display: flex; flex-direction: column; gap: 7px; min-height: 118px; padding: 9px; border: 1px solid var(--line); border-radius: 10px; background: #fff; cursor: pointer; }
+  .voice-card-choice:hover { background: #f8fafc; }
+  .voice-card-choice.selected { border-color: #9bb0c9; background: #f2f7fc; }
+  .voice-card-choice.current { box-shadow: inset 3px 0 0 var(--success); }
+  .voice-card-choice .voice-card-top { display: flex; align-items: center; gap: 7px; }
+  .voice-card-choice .voice-avatar { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: var(--accent-soft); color: #984315; font: 800 12px/1 var(--mono); }
+  .voice-card-choice.clone .voice-avatar { background: #eef4fb; color: var(--focus); }
+  .voice-card-choice .voice-card-info { flex: 1; min-width: 0; }
+  .voice-card-choice .voice-card-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .voice-card-choice .voice-card-info span { color: var(--muted); font-size: 10px; }
+  .voice-card-choice .voice-card-actions { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--muted); font-size: 10px; }
   .workspace { min-height: 560px; background: var(--panel); }
   .panel { display: none; padding: 18px; }
   .panel.active { display: block; }
@@ -354,7 +400,7 @@
 <main class="wrap">
   <header class="proto-header">
     <div>
-      <p class="proto-kicker">AUDIO WORKSHOP / UI REDESIGN v1.2</p>
+      <p class="proto-kicker">AUDIO WORKSHOP / UI REDESIGN v1.4</p>
       <h1>可点击交互原型</h1>
       <p>演示五 Tab、空/运行/完成/失败/恢复状态、跨 Tab 任务、高级抽屉、stale、取消、重试与音色设计 P4 门控。所有任务和数据均为本地模拟，不调用后端。</p>
     </div>
@@ -396,8 +442,23 @@
     <div class="workspace">
       <section class="panel active" data-panel="dub">
         <div class="panel-head">
-          <div><h2>配音</h2><p>稿件 → 句子校听 → 配音 → 导出。运行中可以切 Tab，任务不会取消。</p></div>
+          <div><h2>配音</h2><p>先选当前音色，再稿件 → 句子校听 → 配音 → 导出。运行中可以切 Tab，任务不会取消。</p></div>
           <span class="state-chip" id="dub-chip">空态</span>
+        </div>
+        <div class="narrator-block" id="dub-narrator-block">
+        <div class="voice-card" id="dub-voice-card" tabindex="0" role="group" aria-label="当前音色">
+          <div class="voice-main">
+            <span class="narrator-dot" aria-hidden="true"></span>
+            <span class="voice-label">当前音色</span>
+            <span class="voice-name" id="dub-voice-name">未选择</span>
+            <span class="pill" id="dub-voice-kind">—</span>
+            <span class="voice-warning" id="dub-voice-warning">选择音色后才能开始配音</span>
+          </div>
+          <div class="voice-actions">
+            <button class="tiny-btn" id="dub-voice-preview" disabled>试听</button>
+            <button class="tiny-btn" id="dub-voice-change">换音色</button>
+            <button class="tiny-btn" id="dub-voice-new">新建音色 →</button>
+          </div>
         </div>
         <div class="layout">
           <div class="card soft">
@@ -412,14 +473,15 @@
             <div class="progress"><span id="dub-progress"></span></div>
           </div>
         </div>
+        </div>
         <div class="actions">
-          <button class="btn ghost" data-drawer="dub">高级：音色与输出</button>
+          <button class="btn ghost" data-drawer="dub">高级：语速与模型细节</button>
           <span class="grow"></span>
           <span class="validation" id="dub-validation"></span>
           <button class="btn primary" id="dub-primary">开始配音</button>
         </div>
         <div class="resultbox hidden" id="dub-result">
-          <div class="row"><span><strong>成品已就绪</strong> · 03:42 · WAV / SRT</span><span class="grow"></span><button class="btn" data-drawer="export">导出</button></div>
+          <div class="row"><span><strong>成品已就绪</strong> · 03:42 · WAV / SRT</span><span class="grow"></span><button class="btn" id="dub-export-btn" data-drawer="export">导出</button></div>
         </div>
       </section>
 
@@ -508,36 +570,33 @@
 
       <section class="panel" data-panel="voice">
         <div class="panel-head">
-          <div><h2>音色设计</h2><p>试听文本 + 基础音色/参考音频 → 生成试听 → 创建音色 → 用于配音。P4 未完成时保存与复用门控。</p></div>
+          <div><h2>音色设计</h2><p>Voice Design 主卡片只做 Prompt + Text to preview + Generate voice；克隆向导独立为二级流程。</p></div>
           <span class="state-chip" id="voice-chip">空态</span>
         </div>
         <div class="card soft">
-          <label class="field-label" for="voice-text">试听文本</label>
-          <textarea id="voice-text" class="tall">今天想和你分享一款我最近常用的产品。</textarea>
+          <label class="field-label" for="voice-prompt">Prompt · 声音描述</label>
+          <input type="text" id="voice-prompt" placeholder="例如：温暖、克制、适合中文口播的年轻女声">
           <div style="height:8px"></div>
-          <div class="layout">
-            <div>
-              <label class="field-label" for="voice-base">基础音色</label>
-              <select id="voice-base">
-                <option value="">请选择基础音色</option>
-                <option value="audio8-tts">audio8-tts · 本地</option>
-                <option value="index-tts2">index-tts2 · 需要参考音频</option>
-                <option value="我的音色 A">我的音色 A · 已保存（模拟）</option>
-              </select>
-            </div>
-            <div>
-              <label class="field-label">参考音频</label>
-              <div class="drop" id="voice-ref-drop" tabindex="0" role="button" aria-label="拖入参考音频或点击选择"><div><strong>拖入参考音频，或点击选择</strong><span>单条 voice_ref；m4 P4 未完成时不提供音色库保存。</span></div></div>
-              <input type="file" id="voice-ref-file" class="hidden" accept=".wav,.mp3,.flac,audio/*">
-            </div>
+          <label class="field-label" for="voice-text">Text to preview · 试听文本</label>
+          <textarea id="voice-text" class="tall">今天想和你分享一款我最近常用的产品。</textarea>
+          <div id="voice-clone-fields" class="hidden">
+            <label class="field-label" for="voice-base">克隆基础音色</label>
+            <select id="voice-base">
+              <option value="">不使用基础音色</option>
+              <option value="audio8-tts">audio8-tts · 本地</option>
+              <option value="index-tts2">index-tts2 · 需要参考音频</option>
+            </select>
+            <div class="drop" id="voice-ref-drop" tabindex="0" role="button" aria-label="拖入参考音频或点击选择"><div><strong>拖入参考音频，或点击选择</strong><span>单条 voice_ref；P4 未完成时不提供音色库保存。</span></div></div>
+            <input type="file" id="voice-ref-file" class="hidden" accept=".wav,.mp3,.flac,audio/*">
+            <div class="resultbox" id="voice-ref-info">尚未选择参考音频。</div>
           </div>
-          <div class="resultbox" id="voice-ref-info">尚未选择参考音频。</div>
           <div class="actions">
-            <button class="btn ghost" data-drawer="voice">高级：模型 / 参考 / 风格</button>
+            <button class="btn ghost" data-drawer="clone-wizard">克隆向导 →</button>
+            <button class="btn ghost" data-drawer="voice">高级：模型 / 风格</button>
             <span class="grow"></span><span class="validation" id="voice-validation"></span>
-            <button class="btn primary" id="voice-primary" disabled>生成试听</button>
+            <button class="btn primary" id="voice-primary" disabled>生成试听 / Generate voice</button>
           </div>
-          <div class="statusline" id="voice-status"><span>默认试听文本已填写；选择基础音色或参考音频后开始。</span></div>
+          <div class="statusline" id="voice-status"><span>填写 Prompt 和 Text to preview 后开始。</span></div>
           <div class="progress"><span id="voice-progress"></span></div>
           <div class="resultbox hidden" id="voice-result">
             <div class="row"><strong id="voice-result-title">试听就绪</strong><span class="grow"></span><button class="tiny-btn" id="voice-play">试听</button><button class="tiny-btn" id="voice-save">保存为音色</button><button class="tiny-btn" id="voice-preset">预设</button></div>
@@ -588,6 +647,10 @@
   const DEFAULT_LYRICS = '[Verse]\n凌晨的厨房还亮着灯\n[Chorus]\n别让我一个人悬在那句也许';
   const DEFAULT_STYLE = 'Mandarin Chinese R&B slow jam, warm male lead vocal';
   const DEFAULT_VOICE = '今天想和你分享一款我最近常用的产品。';
+  const BUILTIN_VOICES = [
+    { id: 'audio8-tts', name: 'audio8-tts', kind: 'builtin', source: '内置', detail: '本地 · 可商用' },
+    { id: 'index-tts2', name: 'index-tts2', kind: 'builtin', source: '内置 · 需参考音', detail: '本地 · 克隆链' }
+  ];
 
   const state = {
     currentTab: 'dub',
@@ -596,14 +659,16 @@
     taskSeq: 1,
     activeTaskId: null,
     drawer: null,
+    drawerReturnFocus: null,
+    voicePicker: { tab: 'builtin', search: '', pendingId: '' },
     modalConfirm: null,
     playing: null,
     tabs: {
-      dub: { status: 'empty', text: '', sentences: [], selected: -1, progress: 0, result: false, stale: false, message: '还没有句子' },
+      dub: { status: 'empty', text: '', voiceId: '', voiceName: '', voiceKind: '', resultVoiceId: '', sentences: [], selected: -1, progress: 0, result: false, stale: false, message: '还没有句子' },
       bgm: { status: 'empty', prompt: '', progress: 0, result: false, stale: false, duck: '中', selectedTrack: 'mix', message: '等待输入' },
       separation: { status: 'empty', progress: 0, fileName: '', fileValid: false, result: false, stale: false, selectedTrack: 'vocals', message: '后端能力未接入：可选择文件，但不会创建伪任务。' },
       music: { status: 'empty', lyrics: '', style: '', versions: [], selectedVersion: -1, progress: 0, message: '填写歌词和风格后开始。' },
-      voice: { status: 'empty', text: DEFAULT_VOICE, base: '', refName: '', refValid: false, progress: 0, previewReady: false, saved: false, savedName: '', stale: false, message: '默认试听文本已填写；选择基础音色或参考音频后开始。' }
+      voice: { status: 'empty', prompt: '', text: DEFAULT_VOICE, base: '', refName: '', refValid: false, progress: 0, previewReady: false, saved: false, savedName: '', stale: false, message: '填写 Prompt 和 Text to preview 后开始。' }
     }
   };
 
@@ -741,18 +806,44 @@
 
   function renderDub() {
     const s = state.tabs.dub;
+    const running = s.status === 'running' || s.status === 'queued';
     setChip('#dub-chip', s.status);
     $('#dub-input').value = s.text;
-    $('#dub-input').disabled = s.status === 'running' || s.status === 'queued';
-    $('#dub-validation').textContent = s.status === 'ready' && !s.text.trim() ? '请先输入稿件。' : '';
+    $('#dub-input').disabled = running;
+
+    const hasVoice = !!s.voiceId;
+    const voiceName = s.voiceName || s.voiceId || '未选择';
+    const voiceKind = s.voiceKind === 'clone' ? '克隆' : s.voiceKind === 'temporary_ref' ? '克隆 · 临时' : s.voiceKind === 'builtin' ? '内置' : '—';
+    $('#dub-voice-name').textContent = voiceName;
+    $('#dub-voice-kind').textContent = voiceKind;
+    $('#dub-voice-kind').className = `pill ${s.voiceKind === 'builtin' ? 'ok' : s.voiceKind === 'clone' ? 'blue' : ''}`.trim();
+    const voiceWarning = !hasVoice
+      ? '选择音色后才能开始配音'
+      : running
+        ? '任务运行中不可更换音色'
+        : s.stale
+          ? '音色已更换，当前成品为旧版本'
+          : s.voiceKind === 'builtin' ? '当前使用内置音色' : '当前使用克隆音色';
+    $('#dub-voice-warning').textContent = voiceWarning;
+    $('#dub-narrator-block').classList.toggle('stale', !!s.stale);
+    $('#dub-narrator-block').classList.toggle('locked', running);
+    $('#dub-voice-preview').disabled = !hasVoice;
+    $('#dub-voice-change').disabled = running;
+    $('#dub-voice-new').disabled = running;
+
     const primary = $('#dub-primary');
-    if (s.status === 'running' || s.status === 'queued') primary.textContent = s.status === 'queued' ? '取消排队' : '停止';
+    if (running) primary.textContent = s.status === 'queued' ? '取消排队' : '停止';
     else if (s.status === 'recover') primary.textContent = '继续配音';
-    else if (s.status === 'complete' || s.status === 'stale') primary.textContent = s.status === 'stale' ? '重新生成' : '再生成一版';
+    else if (s.status === 'stale') primary.textContent = '重新生成';
+    else if (s.status === 'complete') primary.textContent = '再生成一版';
     else primary.textContent = '开始配音';
-    primary.disabled = (s.status === 'empty' || s.status === 'editing') && !s.text.trim();
-    setStatus('#dub-status', `<span>${s.message}</span><span class="grow"></span><span>${Math.round(s.progress * 100)}%</span>`, s.status === 'failed' ? 'error' : s.status === 'complete' ? 'ok' : s.status === 'recover' ? 'warn' : '');
+    primary.disabled = !running && (!s.text.trim() || !hasVoice);
+
+    const reason = !hasVoice ? '请选择音色后才能开始配音。' : (!s.text.trim() ? '请先输入稿件。' : '');
+    $('#dub-validation').textContent = primary.disabled && !running ? reason : '';
+    setStatus('#dub-status', `<span>${s.message}</span><span class="grow"></span><span>${Math.round(s.progress * 100)}%</span>`, s.status === 'failed' ? 'error' : s.status === 'complete' && !s.stale ? 'ok' : s.status === 'recover' || s.status === 'stale' ? 'warn' : '');
     setProgress('#dub-progress', s.progress);
+
     const list = $('#dub-list');
     list.innerHTML = s.sentences.map((sentence, index) => {
       const cls = sentence.status === 'done' ? 'done' : sentence.status === 'work' ? 'work' : sentence.status === 'fail' ? 'fail' : '';
@@ -763,6 +854,7 @@
       ? `<div class="row"><strong>第 ${String(s.selected + 1).padStart(2, '0')} 句</strong><span class="grow"></span><span class="pill">${selected.status === 'fail' ? '失败可重试' : selected.status === 'done' ? '已合成' : '待处理'}</span></div><div style="margin-top:7px">${escapeHtml(selected.text)}</div><div class="actions"><button class="btn" data-dub-action="play">试听</button><button class="btn primary" data-dub-action="redo">重录</button></div>`
       : '点击句子行查看试听 / 重录动作。';
     $('#dub-result').classList.toggle('hidden', !s.result);
+    $('#dub-export-btn').disabled = !s.result || s.stale;
   }
 
   function renderBgm() {
@@ -831,7 +923,7 @@
       list.innerHTML = '<span class="validation">尚未生成版本。</span>';
       $('#music-result').classList.add('hidden');
     } else {
-      list.innerHTML = s.versions.map((v, i) => `<div class="version ${i === s.selectedVersion ? 'selected' : ''}" data-version="${i}" tabindex="0"><span class="dot ${v.status === 'complete' ? 'done' : v.status === 'failed' ? 'fail' : 'work'}"></span><span class="grow">${v.name} · ${v.status === 'complete' ? '已就绪' : v.status === 'failed' ? '失败' : '生成中'}</span><span class="pill">${v.status === 'complete' ? '可导出' : v.status}</span></div>`).join('');
+      list.innerHTML = s.versions.map((v, i) => `<div class="track version ${i === s.selectedVersion ? 'selected' : ''}" data-version="${i}" tabindex="0"><span class="dot ${v.status === 'complete' ? 'done' : v.status === 'failed' ? 'fail' : 'work'}"></span><span class="grow">${v.name} · ${v.status === 'complete' ? '已就绪' : v.status === 'failed' ? '失败' : '生成中'}</span><span class="pill">${v.status === 'complete' ? '可导出' : v.status}</span></div>`).join('');
       const selected = s.versions[s.selectedVersion];
       $('#music-selected-label').textContent = selected ? selected.name : '未选择版本';
       $('#music-result').classList.toggle('hidden', !selected || selected.status !== 'complete');
@@ -842,8 +934,9 @@
     const s = state.tabs.voice;
     const p4 = state.capability.voiceLibrary === 'ready';
     setChip('#voice-chip', s.status);
+    $('#voice-prompt').value = s.prompt;
     $('#voice-text').value = s.text;
-    $('#voice-base').value = s.base;
+    $('#voice-prompt').disabled = s.status === 'running' || s.status === 'queued';
     $('#voice-text').disabled = s.status === 'running' || s.status === 'queued';
     $('#voice-base').disabled = s.status === 'running' || s.status === 'queued';
     $('#voice-validation').textContent = s.status === 'ready' && !s.text.trim() ? '试听文本不能为空。' : '';
@@ -852,8 +945,8 @@
     else if (s.status === 'recover') primary.textContent = '继续生成试听';
     else if (s.status === 'stale') primary.textContent = '重新生成试听';
     else if (s.previewReady && !s.stale) primary.textContent = '创建音色';
-    else primary.textContent = '生成试听';
-    primary.disabled = !s.text.trim() || (!s.base && !s.refValid) || (primary.textContent === '创建音色' && !p4);
+    else primary.textContent = '生成试听 / Generate voice';
+    primary.disabled = !s.prompt.trim() || !s.text.trim() || (primary.textContent === '创建音色' && !p4);
     if (!p4) {
       $('#voice-status').className = 'statusline warn';
       $('#voice-status').innerHTML = `<span>${s.message}</span><span class="grow"></span><span>可试听；多音色保存与复用待 P4</span>`;
@@ -885,7 +978,7 @@
       $('#drawer-body').innerHTML = state.tasks.length ? state.tasks.map(task => taskHtml(task)).join('') : '<div class="validation">暂无任务。</div>';
       return;
     }
-    $('#drawer-title').textContent = `${TAB_LABELS[state.drawer] || '导出'} · 高级设置`;
+    $('#drawer-title').textContent = state.drawer === 'voice-picker' ? '配音 · 音色选择器' : state.drawer === 'clone-wizard' ? '音色设计 · 克隆向导' : `${TAB_LABELS[state.drawer] || '导出'} · 高级设置`;
     $('#drawer-body').innerHTML = drawerHtml(state.drawer);
   }
 
@@ -902,10 +995,35 @@
     return `<div class="task-item"><div class="task-title"><strong>${TAB_LABELS[task.tab]} · ${escapeHtml(task.label)}</strong><span class="pill ${task.status === 'failed' ? 'bad' : task.status === 'done' ? 'ok' : 'blue'}">${statusLabel(task.status)}</span></div><div class="task-meta">${task.message || '本地串行任务'}</div><div class="progress"><span style="width:${Math.round(task.progressValue * 100)}%"></span></div><div class="task-actions"><button class="tiny-btn" data-task-open="${task.id}">打开来源</button>${action}</div></div>`;
   }
 
+  function voiceCatalog() {
+    const mine = state.tabs.voice.saved && state.capability.voiceLibrary === 'ready'
+      ? [{ id: state.tabs.voice.savedName, name: state.tabs.voice.savedName, kind: 'clone', source: '我的音色', detail: '来自音色设计 · 当前工程' }]
+      : [];
+    return [...BUILTIN_VOICES, ...mine];
+  }
+
   function drawerHtml(kind) {
     if (kind === 'dub') {
-      const selectedVoice = state.tabs.dub.voicePreset || 'audio8-tts';
-      return `<div class="drawer-section"><h4>音色</h4><label class="field-label">音色 / 模型</label><select id="drawerDubVoice"><option ${selectedVoice === 'audio8-tts' ? 'selected' : ''}>audio8-tts</option><option ${selectedVoice === 'index-tts2' ? 'selected' : ''}>index-tts2 · 需要参考音频</option>${state.tabs.voice.saved ? `<option selected>${escapeHtml(state.tabs.voice.savedName)} · 来自音色设计</option>` : ''}</select><div class="drawer-line"><span>参考音频</span><span>${escapeHtml(state.tabs.voice.refName || '未指定')}</span></div></div><div class="drawer-section"><h4>交付</h4><div class="drawer-line"><span>语速</span><input class="control" type="range" min="0.5" max="1.5" step="0.05" value="1"><span>1.00×</span></div><label class="drawer-line"><span>数字 / 年份规范化</span><input type="checkbox" checked></label></div><div class="drawer-section"><h4>导出</h4><div class="drawer-line"><span>格式</span><select class="control"><option>WAV + SRT</option><option>仅 WAV</option><option>仅 SRT</option></select></div><div class="drawer-line"><span>目录</span><span>~/Documents/音频作坊</span></div></div><button class="btn primary" data-action="close-drawer">应用设置</button>`;
+      const current = state.tabs.dub.voiceName || state.tabs.dub.voiceId || '未选择';
+      return `<div class="drawer-section"><h4>语音交付</h4><div class="drawer-line"><span>语速</span><input class="control" type="range" min="0.5" max="1.5" step="0.05" value="1"><span>1.00×</span></div><label class="drawer-line"><span>数字 / 年份规范化</span><input type="checkbox" checked></label></div><div class="drawer-section"><h4>模型细节</h4><div class="drawer-line"><span>当前音色</span><strong>${escapeHtml(current)}</strong></div><div class="drawer-line"><span>来源模型</span><span>${state.tabs.dub.voiceKind === 'builtin' ? '内置 TTS 模型' : '克隆链路'}</span></div><div class="drawer-line"><span>参考音频</span><input id="drawerReferencePath" class="control" type="text" placeholder="临时参考音路径" value="${escapeHtml(state.tabs.voice.refName || '')}"></div><div class="validation">选择参考音会创建“克隆 · 临时参考”，并让现有成品 stale。</div></div><div class="drawer-section"><h4>导出</h4><div class="drawer-line"><span>格式</span><select class="control"><option>WAV + SRT</option><option>仅 WAV</option><option>仅 SRT</option></select></div><div class="drawer-line"><span>目录</span><span>~/Documents/音频作坊</span></div></div><button class="btn primary" data-action="close-drawer">应用设置</button>`;
+    }
+    if (kind === 'voice-picker') {
+      const s = state.tabs.dub;
+      const catalog = voiceCatalog().filter(v => v.name.toLowerCase().includes(state.voicePicker.search.toLowerCase()) || v.detail.toLowerCase().includes(state.voicePicker.search.toLowerCase()));
+      const rows = catalog.map(v => {
+        const current = s.voiceId === v.id;
+        const selected = state.voicePicker.pendingId === v.id;
+        const initials = escapeHtml(v.name.slice(0, 1).toUpperCase());
+        return `<div class="voice-card-choice ${v.kind === 'clone' ? 'clone' : ''} ${current ? 'current' : ''} ${selected ? 'selected' : ''}" data-voice-select="${escapeHtml(v.id)}" tabindex="0" role="option" aria-selected="${current || selected}"><div class="voice-card-top"><span class="voice-avatar">${initials}</span><span class="voice-card-info"><strong>${escapeHtml(v.name)}</strong><span>${escapeHtml(v.source)}</span></span>${current ? '<span class="mark">当前</span>' : ''}</div><div class="voice-card-actions"><span>${escapeHtml(v.detail)}</span><button class="tiny-btn" data-voice-preview="${escapeHtml(v.id)}">试听</button></div></div>`;
+      }).join('');
+      const tab = state.voicePicker.tab;
+      const mineEmpty = tab === 'mine' && !state.tabs.voice.saved;
+      const body = state.capability.voiceLibrary !== 'ready' && tab === 'mine'
+        ? '<div class="validation">P4 音色库未完成：当前没有可用的“我的音色”，不会显示假数据。</div>'
+        : mineEmpty
+          ? '<div class="validation">还没有保存的音色。<button class="tiny-btn" data-action="new-voice">新建音色 →</button></div>'
+          : rows ? `<div class="voice-grid">${rows}</div>` : '<div class="validation">没有匹配的音色。</div>';
+      return `<input id="voicePickerSearch" class="voice-picker-search" type="text" placeholder="搜索音色、来源或模型" value="${escapeHtml(state.voicePicker.search)}"><div class="voice-picker-tabs"><button class="tiny-btn ${tab === 'builtin' ? 'active' : ''}" data-voice-picker-tab="builtin">内置</button><button class="tiny-btn ${tab === 'mine' ? 'active' : ''}" data-voice-picker-tab="mine">我的音色</button></div><div>${body}</div><div class="voice-picker-footer"><button class="btn primary" data-action="use-voice" ${state.voicePicker.pendingId ? '' : 'disabled'}>使用此音色</button> <button class="btn" data-action="new-voice">新建音色 →</button></div>`;
     }
     if (kind === 'bgm') {
       return `<div class="drawer-section"><h4>生成</h4><div class="drawer-line"><span>时长</span><span>跟随配音 03:42</span></div><div class="drawer-line"><span>分段</span><span>30s</span></div><div class="drawer-line"><span>模型</span><span>本地 BGM 模型</span></div></div><div class="drawer-section"><h4>混音</h4><div class="drawer-line"><span>混音源</span><span>${state.tabs.dub.result ? '配音成品就绪' : '暂无配音成品'}</span></div><div class="drawer-line"><span>Duck</span><select class="control" id="drawerDuck"><option ${state.tabs.bgm.duck === '弱' ? 'selected' : ''}>弱</option><option ${state.tabs.bgm.duck === '中' ? 'selected' : ''}>中</option><option ${state.tabs.bgm.duck === '强' ? 'selected' : ''}>强</option></select></div><div class="drawer-line"><span>保留分轨</span><input type="checkbox" checked></div></div><div class="drawer-section"><h4>导出</h4><div class="drawer-line"><span>产物</span><span>BGM / 混音 / 分轨</span></div></div><button class="btn primary" data-action="apply-mix" ${state.tabs.bgm.result ? '' : 'disabled'}>应用并重新混音</button>`;
@@ -920,6 +1038,10 @@
     if (kind === 'voice') {
       const p4 = state.capability.voiceLibrary === 'ready';
       return `<div class="drawer-section"><h4>基础音色 / 模型</h4><select><option>audio8-tts</option><option>index-tts2</option></select><div class="drawer-line"><span>许可</span><span>仅自用</span></div></div><div class="drawer-section"><h4>参考音频与参考文本</h4><div class="drawer-line"><span>参考音频</span><span>${escapeHtml(state.tabs.voice.refName || '未选择')}</span></div><div class="drawer-line"><span>参考文本</span><input type="text" class="control" placeholder="后端支持时可用" ${p4 ? '' : 'disabled'}></div></div><div class="drawer-section"><h4>风格 / 情绪 / seed</h4><div class="drawer-line"><span>风格</span><input type="text" class="control" placeholder="后端支持时可用" ${p4 ? '' : 'disabled'}></div><div class="drawer-line"><span>情绪</span><input type="text" class="control" placeholder="后端支持时可用" ${p4 ? '' : 'disabled'}></div><div class="drawer-line"><span>seed</span><input type="number" class="control" value="831001" ${p4 ? '' : 'disabled'}></div>${p4 ? '' : '<div class="validation">P4 音色库未完成：上述参数仅占位，不可编辑。</div>'}</div><button class="btn" data-action="close-drawer">关闭</button>`;
+    }
+    if (kind === 'clone-wizard') {
+      const p4 = state.capability.voiceLibrary === 'ready';
+      return `<div class="drawer-section"><h4>Add Voice · 选择路径</h4><label class="drawer-line"><span>Instant Voice Clone</span><input type="radio" name="clone-path" checked></label><label class="drawer-line"><span>Professional Voice Clone ${p4 ? '' : '（P4 未完成）'}</span><input type="radio" name="clone-path" ${p4 ? '' : 'disabled'}></label></div><div class="drawer-section"><h4>Voice Info</h4><label class="field-label">音色名称</label><input type="text" placeholder="例如：我的口播音色"><div class="drawer-line"><span>语言</span><span>中文 · 真实支持时可选</span></div><div class="drawer-line"><span>用途 / 许可</span><span>仅自用</span></div></div><div class="drawer-section"><h4>Add Voice · 样本</h4><div class="track"><span class="dot done"></span><span class="grow">sample_1.wav</span><span class="pill">00:12</span></div><div class="track"><span class="dot work"></span><span class="grow">sample_2.wav</span><span class="pill">上传中</span></div></div><div class="drawer-section"><h4>Finish up</h4><div class="validation">${p4 ? '保存后会出现在配音旁白块的换音色选择器中。' : '单条 voice_ref 可试听；Professional Clone 与音色库保存待 P4。'}</div></div><button class="btn primary" data-action="close-drawer">关闭向导</button>`;
     }
     if (kind === 'export') {
       const scene = state.currentTab;
@@ -938,16 +1060,26 @@
   }
 
   function openDrawer(kind) {
+    if (kind === 'voice-picker') {
+      state.voicePicker = { tab: 'builtin', search: '', pendingId: state.tabs.dub.voiceId || '' };
+      state.drawerReturnFocus = 'dub-voice-change';
+    } else {
+      state.drawerReturnFocus = document.activeElement && document.activeElement.id ? document.activeElement.id : null;
+    }
     state.drawer = kind;
     renderDrawer();
     $('#drawer').classList.add('open');
     $('#scrim').classList.add('open');
+    if (kind === 'voice-picker') setTimeout(() => { const input = $('#voicePickerSearch'); if (input) input.focus(); }, 30);
   }
 
   function closeDrawer() {
+    const returnId = state.drawerReturnFocus;
     state.drawer = null;
+    state.drawerReturnFocus = null;
     $('#drawer').classList.remove('open');
     $('#scrim').classList.remove('open');
+    if (returnId) setTimeout(() => { const el = document.getElementById(returnId); if (el) el.focus(); }, 0);
   }
 
   function focusPrimary(tab) {
@@ -1038,7 +1170,10 @@
   function primaryAction(tab) {
     const s = state.tabs[tab];
     if (s.status === 'running' || s.status === 'queued') return stopTask(tab);
-    if (tab === 'dub') return startDub(s.status === 'recover' ? 0.25 : 0);
+    if (tab === 'dub') {
+      if (!s.voiceId) { toast('请选择音色后才能开始配音'); $('#dub-voice-change').focus(); return; }
+      return startDub(s.status === 'recover' ? 0.25 : 0);
+    }
     if (tab === 'bgm') return startBgm(s.status === 'recover' ? 0.25 : 0);
     if (tab === 'separation') return startSeparation(s.status === 'recover' ? 0.25 : 0);
     if (tab === 'music') return startMusic(s.status === 'recover' ? 0.25 : 0);
@@ -1055,6 +1190,7 @@
   function startDub(initial = 0) {
     const s = state.tabs.dub;
     if (!s.text.trim()) return;
+    if (!s.voiceId) { s.message = '请选择音色后才能开始配音'; return; }
     if (!s.sentences.length) s.sentences = splitSentences(s.text).map(text => ({ text, status: 'pending' }));
     s.result = false;
     s.stale = false;
@@ -1064,6 +1200,7 @@
       s.progress = 1;
       s.result = true;
       s.stale = false;
+      s.resultVoiceId = s.voiceId;
       s.status = 'complete';
       s.message = `${s.sentences.length}/${s.sentences.length} 完成 · 成品 03:42`;
     }, (value) => {
@@ -1126,7 +1263,7 @@
 
   function startVoice(initial = 0) {
     const s = state.tabs.voice;
-    if (!s.text.trim() || (!s.base && !s.refValid)) return;
+    if (!s.prompt.trim() || !s.text.trim()) return;
     s.previewReady = false;
     s.saved = false;
     s.stale = false;
@@ -1150,7 +1287,7 @@
       toast('请先生成有效的试听');
       return;
     }
-    s.savedName = s.base || '参考音频音色';
+    s.savedName = s.prompt.trim() ? s.prompt.trim().slice(0, 18) : 'Voice Design 音色';
     openModal('保存音色', `将“${s.savedName}”保存到当前工程？`, () => {
       s.saved = true;
       s.status = 'complete';
@@ -1163,11 +1300,14 @@
 
   function seedDemoInput(tab) {
     const s = state.tabs[tab];
-    if (tab === 'dub') s.text = DEFAULT_DUB;
+    if (tab === 'dub') {
+      s.text = DEFAULT_DUB;
+      if (!s.voiceId) { s.voiceId = 'audio8-tts'; s.voiceName = 'audio8-tts'; s.voiceKind = 'builtin'; }
+    }
     if (tab === 'bgm') s.prompt = DEFAULT_BGM;
     if (tab === 'separation') { s.fileName = 'interview.wav'; s.fileValid = true; }
     if (tab === 'music') { s.lyrics = DEFAULT_LYRICS; s.style = DEFAULT_STYLE; }
-    if (tab === 'voice') { s.text = DEFAULT_VOICE; s.base = 'audio8-tts'; }
+    if (tab === 'voice') { s.prompt = '温暖、克制、适合中文口播的年轻女声'; s.text = DEFAULT_VOICE; s.base = 'audio8-tts'; }
   }
 
   function clearTasksForTab(tab) {
@@ -1186,16 +1326,16 @@
     const s = state.tabs[tab];
     clearTasksForTab(tab);
     if (name === 'empty') {
-      if (tab === 'dub') Object.assign(s, { status: 'empty', text: '', sentences: [], selected: -1, progress: 0, result: false, stale: false, message: '还没有句子' });
+      if (tab === 'dub') Object.assign(s, { status: 'empty', text: '', voiceId: '', voiceName: '', voiceKind: '', resultVoiceId: '', sentences: [], selected: -1, progress: 0, result: false, stale: false, message: '还没有句子' });
       if (tab === 'bgm') Object.assign(s, { status: 'empty', prompt: '', progress: 0, result: false, stale: false, message: '等待输入' });
       if (tab === 'separation') Object.assign(s, { status: 'empty', progress: 0, fileName: '', fileValid: false, result: false, stale: false, message: state.capability.separation === 'ready' ? '支持 wav / mp3 / flac' : '后端能力未接入：可选择文件，但不会创建伪任务。' });
       if (tab === 'music') Object.assign(s, { status: 'empty', lyrics: '', style: '', versions: [], selectedVersion: -1, progress: 0, message: '填写歌词和风格后开始。' });
-      if (tab === 'voice') Object.assign(s, { status: 'empty', text: DEFAULT_VOICE, base: '', refName: '', refValid: false, progress: 0, previewReady: false, saved: false, savedName: '', stale: false, message: '默认试听文本已填写；选择基础音色或参考音频后开始。' });
+      if (tab === 'voice') Object.assign(s, { status: 'empty', prompt: '', text: DEFAULT_VOICE, base: '', refName: '', refValid: false, progress: 0, previewReady: false, saved: false, savedName: '', stale: false, message: '填写 Prompt 和 Text to preview 后开始。' });
     } else if (name === 'running') {
       seedDemoInput(tab); s.status = 'ready'; renderAll(); startOrPrimary(tab);
     } else if (name === 'complete') {
       seedDemoInput(tab);
-      if (tab === 'dub') { s.sentences = splitSentences(s.text).map(text => ({ text, status: 'done' })); s.selected = 0; s.result = true; s.progress = 1; s.status = 'complete'; s.message = `${s.sentences.length}/${s.sentences.length} 完成 · 成品 03:42`; s.stale = false; }
+      if (tab === 'dub') { seedDemoInput('dub'); s.sentences = splitSentences(s.text).map(text => ({ text, status: 'done' })); s.selected = 0; s.result = true; s.progress = 1; s.status = 'complete'; s.resultVoiceId = s.voiceId; s.message = `${s.sentences.length}/${s.sentences.length} 完成 · 成品 03:42`; s.stale = false; }
       if (tab === 'bgm') { s.result = true; s.progress = 1; s.status = 'complete'; s.message = '5 段 · 混音 03:42 · 已完成'; s.stale = false; }
       if (tab === 'separation') { if (state.capability.separation !== 'ready') state.capability.separation = 'ready'; s.result = true; s.progress = 1; s.status = 'complete'; s.message = '两轨已生成 · 可分别试听和下载'; s.stale = false; }
       if (tab === 'music') { s.versions = [{ name: 'v1', status: 'complete' }]; s.selectedVersion = 0; s.progress = 1; s.status = 'complete'; s.message = 'v1 已生成 · 历史版本保留'; }
@@ -1208,7 +1348,7 @@
       else s.status = 'failed', s.message = tab === 'dub' ? '第 18 句失败，可单句重录或继续。' : '第 3 段失败，已完成段保留。';
     } else if (name === 'recover') {
       seedDemoInput(tab);
-      if (tab === 'dub') { s.sentences = splitSentences(s.text).map((text, i) => ({ text, status: i < 2 ? 'done' : 'pending' })); s.selected = 2; }
+      if (tab === 'dub') { seedDemoInput('dub'); s.sentences = splitSentences(s.text).map((text, i) => ({ text, status: i < 2 ? 'done' : 'pending' })); s.selected = 2; }
       if (tab === 'music') s.versions = [];
       s.status = 'recover';
       s.progress = tab === 'separation' ? 0.42 : 0.35;
@@ -1219,11 +1359,14 @@
 
   function startOrPrimary(tab) {
     const s = state.tabs[tab];
-    if (tab === 'dub' && !s.text.trim()) s.text = DEFAULT_DUB;
+    if (tab === 'dub') {
+      if (!s.text.trim()) s.text = DEFAULT_DUB;
+      if (!s.voiceId) { s.voiceId = 'audio8-tts'; s.voiceName = 'audio8-tts'; s.voiceKind = 'builtin'; }
+    }
     if (tab === 'bgm' && !s.prompt.trim()) s.prompt = DEFAULT_BGM;
     if (tab === 'separation' && !s.fileValid) { s.fileName = 'interview.wav'; s.fileValid = true; if (state.capability.separation !== 'ready') state.capability.separation = 'ready'; }
     if (tab === 'music' && (!s.lyrics.trim() || !s.style.trim())) { s.lyrics = DEFAULT_LYRICS; s.style = DEFAULT_STYLE; }
-    if (tab === 'voice' && (!s.base && !s.refValid)) s.base = 'audio8-tts';
+    if (tab === 'voice') { if (!s.prompt.trim()) s.prompt = '温暖、克制、适合中文口播的年轻女声'; }
     primaryAction(tab);
   }
 
@@ -1265,13 +1408,50 @@
   // Primary actions.
   TABS.forEach(tab => $(`#${tab}-primary`).addEventListener('click', () => primaryAction(tab)));
 
+  // Dub current-voice control.
+  function applyDubVoice(id) {
+    const voice = voiceCatalog().find(v => v.id === id);
+    if (!voice) return;
+    const s = state.tabs.dub;
+    s.voiceId = voice.id;
+    s.voiceName = voice.name;
+    s.voiceKind = voice.kind;
+    if (s.result) {
+      s.stale = s.voiceId !== s.resultVoiceId;
+      s.status = s.stale ? 'stale' : 'complete';
+      s.message = s.stale ? '音色已更换，旧成品为旧版本。' : '已切回生成时的音色，成品可导出。';
+    } else {
+      s.status = s.text.trim() ? 'ready' : 'empty';
+      s.message = s.text.trim() ? '已选择音色，可开始配音。' : '还没有句子';
+    }
+    closeDrawer();
+    renderAll();
+    toast(`当前音色：${voice.name}`);
+  }
+
+  $('#dub-voice-change').addEventListener('click', () => {
+    if (state.tabs.dub.status === 'running' || state.tabs.dub.status === 'queued') return toast('任务运行中不可更换音色');
+    openDrawer('voice-picker');
+  });
+  $('#dub-voice-card').addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.target.closest('button')) $('#dub-voice-change').click();
+  });
+  $('#dub-voice-preview').addEventListener('click', () => toast(state.tabs.dub.voiceId ? `试听音色：${state.tabs.dub.voiceName}` : '请先选择音色'));
+  $('#dub-voice-new').addEventListener('click', () => {
+    setCurrentTab('voice');
+    state.tabs.voice.status = state.tabs.voice.previewReady ? 'complete' : 'ready';
+    state.tabs.voice.message = '从配音新建音色；保存后可用“用于配音”回到当前工程。';
+    renderVoice();
+    setTimeout(() => $('#voice-text').focus(), 40);
+    toast('已跳转音色设计；配音稿件已保留');
+  });
+
   // Input handlers.
   $('#dub-input').addEventListener('input', event => {
     state.tabs.dub.text = event.target.value;
     state.tabs.dub.sentences = [];
     state.tabs.dub.selected = -1;
     state.tabs.dub.progress = 0;
-    state.tabs.dub.result = false;
     markInputStale('dub');
     if (state.tabs.dub.status === 'empty' && event.target.value.trim()) state.tabs.dub.status = 'ready', state.tabs.dub.message = '稿件已就绪，可以开始配音。';
     renderDub();
@@ -1285,6 +1465,7 @@
   });
   $('#music-lyrics').addEventListener('input', event => { state.tabs.music.lyrics = event.target.value; state.tabs.music.status = state.tabs.music.versions.length ? 'ready' : 'ready'; state.tabs.music.message = '有未生成的新修改；旧版本仍有效。'; renderMusic(); });
   $('#music-style').addEventListener('input', event => { state.tabs.music.style = event.target.value; state.tabs.music.status = state.tabs.music.versions.length ? 'ready' : 'ready'; state.tabs.music.message = '有未生成的新修改；旧版本仍有效。'; renderMusic(); });
+  $('#voice-prompt').addEventListener('input', event => { state.tabs.voice.prompt = event.target.value; markInputStale('voice'); renderVoice(); });
   $('#voice-text').addEventListener('input', event => { state.tabs.voice.text = event.target.value; markInputStale('voice'); renderVoice(); });
   $('#voice-base').addEventListener('change', event => { state.tabs.voice.base = event.target.value; markInputStale('voice'); renderVoice(); });
 
@@ -1356,6 +1537,21 @@
   document.addEventListener('click', event => {
     const drawerButton = event.target.closest('[data-drawer]');
     if (drawerButton) openDrawer(drawerButton.dataset.drawer);
+    const voiceTabButton = event.target.closest('[data-voice-picker-tab]');
+    if (voiceTabButton) { state.voicePicker.tab = voiceTabButton.dataset.voicePickerTab; state.voicePicker.pendingId = ''; renderDrawer(); return; }
+    const voicePreview = event.target.closest('[data-voice-preview]');
+    if (voicePreview) { const v = voiceCatalog().find(x => x.id === voicePreview.dataset.voicePreview); toast(`试听音色：${v ? v.name : voicePreview.dataset.voicePreview}`); return; }
+    const voiceRow = event.target.closest('[data-voice-select]');
+    if (voiceRow) {
+      const id = voiceRow.dataset.voiceSelect;
+      if (state.voicePicker.pendingId === id) toast(`试听音色：${id}`);
+      else { state.voicePicker.pendingId = id; renderDrawer(); setTimeout(() => { const input = $('#voicePickerSearch'); if (input) input.focus(); }, 10); }
+      return;
+    }
+    const useVoice = event.target.closest('[data-action="use-voice"]');
+    if (useVoice && !useVoice.disabled) { applyDubVoice(state.voicePicker.pendingId); return; }
+    const newVoice = event.target.closest('[data-action="new-voice"]');
+    if (newVoice) { closeDrawer(); setCurrentTab('voice'); state.tabs.voice.message = '从配音新建音色；保存后可用“用于配音”回到当前工程。'; renderVoice(); setTimeout(() => $('#voice-text').focus(), 30); return; }
     const close = event.target.closest('[data-action="close-drawer"], #drawer-close');
     if (close) closeDrawer();
     const mix = event.target.closest('[data-action="apply-mix"]');
@@ -1400,12 +1596,14 @@
   });
   $('#voice-use-dub').addEventListener('click', () => {
     if (state.capability.voiceLibrary !== 'ready' || !state.tabs.voice.saved) return toast('P4 音色库未完成：暂不可用于配音');
-    state.tabs.dub.voicePreset = state.tabs.voice.savedName;
+    state.tabs.dub.voiceId = state.tabs.voice.savedName;
+    state.tabs.dub.voiceName = state.tabs.voice.savedName;
+    state.tabs.dub.voiceKind = 'clone';
+    if (state.tabs.dub.result) { state.tabs.dub.stale = state.tabs.dub.voiceId !== state.tabs.dub.resultVoiceId; state.tabs.dub.status = state.tabs.dub.stale ? 'stale' : 'complete'; }
     setCurrentTab('dub');
-    openDrawer('dub');
     state.tabs.dub.message = `已预选音色：${state.tabs.voice.savedName} · 不会自动开始配音`;
     renderDub();
-    setTimeout(() => { const select = $('#drawerDubVoice'); if (select) select.focus(); }, 50);
+    setTimeout(() => $('#dub-voice-card').focus(), 50);
     toast(`已预选音色：${state.tabs.voice.savedName}`);
   });
 
@@ -1432,6 +1630,13 @@
   $('#modal').addEventListener('click', event => { if (event.target.id === 'modal') closeModal(); });
 
   // Scrim / keyboard.
+  document.addEventListener('input', event => {
+    if (event.target.id === 'voicePickerSearch') {
+      state.voicePicker.search = event.target.value;
+      renderDrawer();
+      setTimeout(() => { const input = $('#voicePickerSearch'); if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); } }, 0);
+    }
+  });
   $('#scrim').addEventListener('click', closeDrawer);
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
@@ -1449,6 +1654,13 @@
       primaryAction(state.currentTab);
       return;
     }
+    const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName);
+    if (state.currentTab === 'dub' && !typing && !$('#drawer').classList.contains('open')) {
+      const key = event.key.toLowerCase();
+      if (key === 'v') { event.preventDefault(); $('#dub-voice-change').click(); return; }
+      if (key === 'p') { event.preventDefault(); $('#dub-voice-preview').click(); return; }
+      if (key === 'n') { event.preventDefault(); $('#dub-voice-new').click(); return; }
+    }
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
       if (state.currentTab === 'dub' && state.tabs.dub.sentences.length) {
         event.preventDefault();
@@ -1463,14 +1675,14 @@
   // Reset prototype.
   $('#resetBtn').addEventListener('click', () => {
     state.tasks.forEach(task => clearInterval(task.timer));
-    Object.assign(state, { tasks: [], taskSeq: 1, activeTaskId: null, modalConfirm: null, playing: null });
+    Object.assign(state, { tasks: [], taskSeq: 1, activeTaskId: null, modalConfirm: null, playing: null, drawer: null, drawerReturnFocus: null, voicePicker: { tab: 'builtin', search: '', pendingId: '' } });
     state.capability = { separation: 'unsupported', voiceLibrary: 'unsupported' };
     state.tabs = {
-      dub: { status: 'empty', text: '', sentences: [], selected: -1, progress: 0, result: false, stale: false, message: '还没有句子' },
+      dub: { status: 'empty', text: '', voiceId: '', voiceName: '', voiceKind: '', resultVoiceId: '', sentences: [], selected: -1, progress: 0, result: false, stale: false, message: '还没有句子' },
       bgm: { status: 'empty', prompt: '', progress: 0, result: false, stale: false, duck: '中', selectedTrack: 'mix', message: '等待输入' },
       separation: { status: 'empty', progress: 0, fileName: '', fileValid: false, result: false, stale: false, selectedTrack: 'vocals', message: '后端能力未接入：可选择文件，但不会创建伪任务。' },
       music: { status: 'empty', lyrics: '', style: '', versions: [], selectedVersion: -1, progress: 0, message: '填写歌词和风格后开始。' },
-      voice: { status: 'empty', text: DEFAULT_VOICE, base: '', refName: '', refValid: false, progress: 0, previewReady: false, saved: false, savedName: '', stale: false, message: '默认试听文本已填写；选择基础音色或参考音频后开始。' }
+      voice: { status: 'empty', prompt: '', text: DEFAULT_VOICE, base: '', refName: '', refValid: false, progress: 0, previewReady: false, saved: false, savedName: '', stale: false, message: '填写 Prompt 和 Text to preview 后开始。' }
     };
     closeDrawer(); closeModal(); setCurrentTab('dub'); renderAll();
   });

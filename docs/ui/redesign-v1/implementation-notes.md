@@ -1,8 +1,8 @@
-# 音频作坊 · UI Redesign v1.2 实现说明
+# 音频作坊 · UI Redesign v1.4 实现说明
 
 > 本文只给出从设计到 Rust / Slint 的映射、callback/属性增删建议、迁移步骤与验收标准，不修改实现、不提交代码。
-> v1.2 的逐 Tab 交互契约见 `interaction-spec.md`；可点击状态演示见 `interactive-prototype.html`。
-> 实施基线：当前 `feat/ui-simplify` 实际是“配音 + BGM”两 Tab；`feat/m4-song` 另有 `SongWorkbench`，但主界面模型与命名不符合本轮设计。v1.2 目标导航为“配音 / BGM / 人声分离 / 音乐制作 / 音色设计”五 Tab。实施时应先把两条线对齐，再做壳层重构。
+> v1.4 的逐 Tab 交互契约见 `interaction-spec.md`；竞品模式依据见 `competitive-analysis.md`；可点击状态演示见 `interactive-prototype.html`。配音采用旁白块，音色资产与音色设计共享。
+> 实施基线：当前 `feat/ui-simplify` 实际是“配音 + BGM”两 Tab；`feat/m4-song` 另有 `SongWorkbench`，但主界面模型与命名不符合本轮设计。v1.4 目标导航为“配音 / BGM / 人声分离 / 音乐制作 / 音色设计”五 Tab。实施时应先把两条线对齐，再做壳层重构。
 
 ## 1. 现状事实
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | 场景导航 | `ui/app.slint` 当前 `scenes = ["配音", "BGM"]`；顶部有 segmented tab | 保留顶部导航，扩展为五个场景 |
 | 抽屉 | `WorkbenchDrawer` 同时承载工程、主题、音色、任务、导出 | 拆为“全局设置 + 当前 Tab 高级抽屉 + 任务中心 + 统一导出” |
-| 配音 | `DubWorkbench` 已做到句子行简化、选中展开、首屏主按钮 | 作为低密度基线保留，补状态化和高级分组 |
+| 配音 | `DubWorkbench` 已做到句子行简化、选中展开、首屏主按钮；当前音色仍在高级抽屉 | 保留低密度基线，新增首屏一等“当前音色”控件；模型 / 参考音细节继续留在高级 |
 | BGM | `BgmWorkbench` 只有 prompt + 3 个并列按钮 + progress + status | 改成一个主操作和状态化结果区 |
 | 音乐制作 | `feat/m4-song/ui/song_workbench.slint` 存在但叫“歌曲 · 彩蛋”，模型选择在首屏 | 合并到主线后改名“音乐制作”，模型/步数/时长移入高级 |
 | 人声分离 | 当前 `ui/`、`src/main.rs`、`config/models.schema.yaml`、`aw-core` 均未发现分离任务/模型接口 | 必须在实施前补后端能力；UI 先做能力门控，不造模型名 |
@@ -28,13 +28,17 @@
 | `ProjectStrip` | `ui/shell.slint` | 工程名、保存状态、恢复状态、切工程入口 |
 | `TaskStatusLine` | `ui/shell.slint` | 当前 Tab 的一条状态；不承担全局状态栏 |
 | `AdvancedButton` | `ui/shell.slint` | 打开当前 Tab 的高级抽屉；标题随 Tab 变化 |
+| `NarratorBlock` | `ui/dub_workbench.slint` | 彩色 dot + 当前音色名称/来源 + 试听/换音色；文本/句子直接挂在块下 |
+| `VoicePickerDrawer` | `ui/dub_workbench.slint` | Murf 式搜索/筛选/卡片/试听/使用/当前选中和空态 |
 | `TaskCenterButton` | `ui/shell.slint` | 跨 Tab 任务摘要与入口 |
 | `TaskCenterDrawer` | `ui/task_center.slint` | 运行中、等待中、失败、完成任务列表；重试/取消/回来源 |
 | `ExportDrawer` | `ui/export_drawer.slint` | 按当前结果类型展示格式、目录、分轨选择 |
 | `AudioDropZone` | `ui/separation_workbench.slint` | 点击/拖入音频、文件摘要、能力未就绪态 |
 | `StemResultRow` | `ui/separation_workbench.slint` | 人声/伴奏两轨试听与下载 |
+| `TrackResultRow` | `ui/shell.slint` / 各 workbench | 统一轨道行：色点 + 名称 + 试听 + 更多/导出，不铺高级参数 |
 | `MusicWorkbench` | `ui/music_workbench.slint` | 由 `SongWorkbench` 迁移；歌词/风格/主操作/结果 |
-| `VoiceDesignWorkbench` | `ui/voice_design_workbench.slint` | 试听文本、基础音色/参考音频、试听/创建音色、结果条 |
+| `VoiceDesignWorkbench` | `ui/voice_design_workbench.slint` | Prompt + Text to preview + Generate voice、试听/创建音色、结果条 |
+| `CloneWizard` | `ui/voice_design_workbench.slint` | 二级流程 Add Voice → Voice Info → Finish up；Instant / Professional 能力门控 |
 | `VoiceAdvancedDrawer` | `ui/voice_design_workbench.slint` | 基础模型、参考音频/文本、风格/情绪/seed 三组高级参数 |
 | `VoicePresetMenu` | `ui/voice_design_workbench.slint` | 导出/导入音色预设的受限入口；P4 未完成时显示能力未就绪 |
 | `ResultBar` | `ui/shell.slint` | 结果摘要、试听、导出次操作；结果就绪才出现 |
@@ -53,7 +57,7 @@
 | `PixelToast` | 保留用于瞬时反馈；失败和恢复状态不能只靠 toast |
 | `PixelSegmentedControl` | 顶部五 Tab 可作为初始实现；若选中态或等分宽度在窄屏不稳定，另做 `TopTabBar` 包装 |
 
-`build.rs` 当前只监听 `ui/app.slint`、`ui/dub_workbench.slint`、`ui/model.slint`；新增 `shell.slint`、`task_center.slint`、`export_drawer.slint`、`separation_workbench.slint`、`music_workbench.slint`、`voice_design_workbench.slint` 后必须同步增加 rerun 监听。此项属于实施步骤，不在本轮设计改动中执行。
+`build.rs` 当前只监听 `ui/app.slint`、`ui/dub_workbench.slint`、`ui/model.slint`；新增 `shell.slint`、`task_center.slint`、`export_drawer.slint`、`separation_workbench.slint`、`music_workbench.slint`、`voice_design_workbench.slint`，并在 `dub_workbench.slint` 内增加 `NarratorBlock` / `VoicePickerDrawer` 后必须同步增加 rerun 监听。此项属于实施步骤，不在本轮设计改动中执行。
 
 ## 3. 全局壳层：属性与 callback
 
@@ -83,15 +87,26 @@ busy/running: bool                          → active-task-id + tasks + 派生�
 | `project-saved-at` / `project-dirty` | string/bool | 项目条保存状态 |
 | `tasks` | `[TaskSummary]` | 任务中心数据 |
 | `active-task-id` | string/int | 当前 Tab 的任务状态 |
-| `drawer-scope` | string | `dub` / `bgm` / `separation` / `music` / `voice_design` / `export` |
+| `drawer-scope` | string | `dub` / `bgm` / `separation` / `music` / `voice_design` / `voice-picker` / `clone-wizard` / `export` |
 | `capability-separation` | string/bool | 分离后端未就绪时做能力门控 |
 | `capability-music` | string/bool | 音乐制作实验能力门控 |
 | `capability-voice-library` | string/bool | 多音色保存、音色库和预设能力门控 |
+| `current-voice-id` | string | 配音当前音色；空值表示未选择 |
+| `current-voice-kind` | string | `builtin` / `clone` / `temporary_ref` |
+| `voice-picker-open` | bool | 音色选择器开关 |
+| `voice-picker-tab` | string | `builtin` / `mine` |
+| `voice-picker-search` | string | 搜索词 |
+| `voice-picker-pending-id` | string | 选择器待应用音色，不等于当前音色 |
 | `music-result`、`separation-result`、`voice-preview-result` | struct/compatible model | 结果条和导出读取 |
 
 ### 3.4 建议新增 callback
 
 ```text
+voice-picker-opened()
+voice-picker-closed()
+voice-preview-requested(string voice_id)
+voice-use-requested(string voice_id)
+new-voice-requested()
 task-center-toggled()
 task-retry(string task_id)
 task-cancel(string task_id)
@@ -132,6 +147,11 @@ start-run / stop-run / stop-preview
 
 ```text
 view-changed("script" | "sentences")
+voice-picker-opened()
+voice-picker-closed()
+voice-preview-requested(string voice_id)
+voice-use-requested(string voice_id)
+new-voice-requested()
 retry-failed()
 advanced-open("dub")
 ```
@@ -139,19 +159,23 @@ advanced-open("dub")
 建议移动：
 
 - `resplit()`：从首屏/万能抽屉移到项目设置或配音高级的“文本处理”组。
-- `voice-index`、`voice-ref-path`、`speed`、`auto-normalize`：移入 `DubAdvancedDrawer`。
+- `current-voice-id`：保留在配音首屏，由 `NarratorBlock` / `VoicePickerDrawer` 管理；不能只放在高级抽屉。
+- `voice-ref-path`：继续在 `DubAdvancedDrawer` 的模型细节组，作为临时参考覆盖；它会更新 `current-voice-kind = temporary_ref` 并触发 stale 规则。
+- `speed`、`auto-normalize`：移入 `DubAdvancedDrawer`。
 - 导出选择与 `export-requested()`：通过统一 `ExportDrawer` 触发。
 - `total-duration`、`total-label`：只作为结果条的可读时长，不在句子行常驻。
 
 状态映射建议：
 
 ```text
-空稿       → primary = "导入 / 粘贴稿件"
-有稿未合成 → primary = "开始配音"
-运行中     → primary = "停止"
-完成       → primary = "再生成一版"，ResultBar 显示导出
-失败       → TaskStatusLine 显示 retry-failed
-恢复       → primary = "继续配音"
+空稿                         → primary = "导入 / 粘贴稿件"
+有稿但无音色                 → primary = "开始配音" disabled，显示选择音色原因
+有稿且有音色                 → primary = "开始配音"
+运行中                       → primary = "停止"
+完成后更换音色               → primary = "重新生成"，ResultBar 导出按 stale 禁用
+完成且未 stale               → primary = "再生成一版"，ResultBar 显示导出
+失败                         → TaskStatusLine 显示 retry-failed
+恢复                         → primary = "继续配音"
 ```
 
 ### 4.2 BGM Tab
@@ -272,14 +296,16 @@ seed（只在确有必要时显示，默认不在首屏）
 
 ### 4.5 音色设计 Tab
 
-新增 `VoiceDesignWorkbench`，与配音高级音色选择共享同一份音色资产。
+新增 `VoiceDesignWorkbench`，与配音旁白块 / 音色选择器共享同一份音色资产。
 
 建议属性：
 
 ```text
-audition-text: string                 // 默认预填，可编辑
-base-voice-index: int                 // 基础音色；-1 表示未选
-reference-path: string                // 参考音频路径
+design-prompt: string                  // Prompt：声音描述
+preview-text: string                   // Text to preview：默认预填，可编辑
+clone-wizard-open: bool                // 克隆向导二级流程
+clone-path: string                     // instant / professional
+reference-path: string                // 克隆向导内的参考音频
 reference-name: string                // 文件名/资产摘要
 reference-text: string                // 仅在后端真实支持时启用
 voice-name: string                    // 保存音色时使用
@@ -294,8 +320,10 @@ capability-voice-library: "ready" | "unsupported" | "error"
 建议 callback：
 
 ```text
-audition-text-edited()
-base-voice-changed(int)
+prompt-edited()
+text-to-preview-edited()
+clone-wizard-opened()
+clone-path-selected(string)
 pick-reference()
 reference-dropped(string path)
 start-preview()
@@ -336,21 +364,21 @@ Msg::VoiceAssetSaved { task_id, voice_id, name }
 首版状态映射：
 
 ```text
-未选音色/参考音 → primary = "生成试听"（禁用）
-输入就绪         → primary = "生成试听"
+Prompt / Text 为空 → primary = "生成试听"（禁用）
+Prompt + Text 就绪 → primary = "生成试听 / Generate voice"
 试听运行         → primary = "停止"
 试听完成         → primary = "创建音色"
 已保存音色       → primary = "再生成一版"，结果条出现“用于配音”
 P4 能力未就绪    → “创建音色/预设导入导出”置灰并解释
 ```
 
-高级抽屉分三组：
+高级 / 克隆向导按能力分组：
 
-1. **基础音色 / 模型**：TTS 模型、许可说明、默认音色。
-2. **参考音频与参考文本**：参考音频、参考文本；只有后端真实接受参考文本时才显示可编辑状态。
-3. **风格 / 情绪 / seed**：风格、情绪、seed、采样参数；能力未就绪时整组显示未就绪，不造滑杆。
+1. **Voice Design**：模型、许可和生成参数。
+2. **Instant Clone**：基础音色、参考音频、参考文本；只有后端真实接受时才可编辑。
+3. **Professional / Style**：风格、情绪、seed、样本要求；能力未就绪时显示未就绪，不造滑杆。
 
-与配音共享：`VoiceAsset` 只保存一份；配音高级只读取和选择，不复制或重写音色设计中的参考信息。保存成功后从结果条“用于配音”直达配音 Tab，并预选该音色。
+与配音共享：`VoiceAsset` 只保存一份；配音首屏 `NarratorBlock` 只读取和选择，不复制或重写音色设计中的参考信息。保存成功后从结果条“用于配音”跳到配音 Tab、聚焦当前音色控件并预选该音色；不打开高级抽屉。
 
 ## 5. 统一任务模型
 
@@ -510,10 +538,11 @@ voice_asset:
 ### Step 6：接入音色设计
 
 1. 先复用现有 `voice_ref` 试听链路，不新增未知模型字段。
-2. 实现 `VoiceDesignWorkbench`：预填试听文本、基础音色/参考音频、生成试听主操作。
-3. 高级抽屉只放当前后端真实支持的模型、参考音频与参考文本、seed 等参数。
-4. `创建音色`、音色库和预设导入导出先做能力门控；P4 存储/序列化契约确认后再开启。
-5. 保存成功后让配音高级读取同一 `VoiceAsset`，并提供“用于配音”跳转。
+2. 实现 `VoiceDesignWorkbench` 主卡片：Prompt + Text to preview + Generate voice。
+3. 将 Instant / Professional Clone 做成独立 `CloneWizard`：Add Voice → Voice Info → Finish up。
+4. 高级 / 克隆向导只放当前后端真实支持的模型、参考音频、参考文本、seed 等参数。
+5. `创建音色`、Professional Clone、音色库和预设导入导出先做能力门控；P4 契约确认后再开启。
+6. 保存成功后让配音首屏 `NarratorBlock` 读取同一 `VoiceAsset`，并提供“用于配音”跳转与预选。
 
 ### Step 7：接入人声分离
 
@@ -543,7 +572,7 @@ voice_asset:
 
 - [ ] 每个 Tab 默认首屏语义元素 ≤ 8，完成态也 ≤ 8。
 - [ ] 每个稳定状态只有 1 个主操作。
-- [ ] 首屏可见参数输入数量：配音 0、BGM 1、分离 1、音乐 2、音色设计 2。
+- [ ] 首屏可见参数输入数量：配音 0（另有 1 个必需对象选择“当前音色”）、BGM 1、分离 1、音乐 2、音色设计 2。
 - [ ] 首屏没有 seed、毫秒、时间轴刻度、模型名、步数、阈值、duck dB。
 - [ ] 任意一行并列操作 ≤ 3 个。
 - [ ] 高级参数默认 0 个，打开抽屉后才出现。
@@ -566,7 +595,21 @@ voice_asset:
 - [ ] 音色设计中的参考文本、风格、情绪、seed 只有在后端真实支持时才可编辑；否则显示未就绪。
 - [ ] 模型许可、参考音用途和实验性提示只在需要时显示，不占主画布。
 
-### 8.5 实现验证
+### 8.5 配音音色交互
+
+- [ ] 配音首屏存在 ElevenLabs 式 `NarratorBlock`：彩色 dot + 音色名称/来源 + 文本 / 句子块体。
+- [ ] 当前音色控件提供 `试听`、`换音色`、`新建音色 →`，且三者不增加第二个主操作。
+- [ ] 未选择音色时 `start-run` 不发出，主按钮 disabled，控件下显示原因。
+- [ ] 运行中 `换音色`、`新建音色` disabled，状态行说明任务运行中不可更换；当前音色试听不阻塞。
+- [ ] 完成后更换音色会触发 stale，主按钮变 `重新生成`，导出默认禁用；切回生成时的音色可恢复。
+- [ ] 音色选择器支持 Murf 式搜索 / 真实筛选 / 音色卡片 / 试听 / 使用 / 当前音色选中态和空 / 不可用态。
+- [ ] `我的音色` 在 P4 未就绪时不展示假数据。
+- [ ] `新建音色 →` 跳转音色设计且不丢当前配音稿件；音色设计首屏只显示 Prompt + Text to preview + Generate voice。
+- [ ] `用于配音` 跳转配音、聚焦 `NarratorBlock`、预选目标音色，不打开高级抽屉、不自动开始。
+- [ ] 语速、参考音、模型细节仍在配音高级抽屉；克隆向导独立为 Add Voice → Voice Info → Finish up。
+- [ ] BGM、人声分离、音乐制作结果均可用统一轨道行表达，高级参数默认不铺开。
+
+### 8.6 实现验证
 
 代码实施后至少执行：
 
@@ -587,16 +630,16 @@ cargo test --workspace
 | 交互 | Slint / Rust 状态 | 实现要求 |
 |---|---|---|
 | 顶部 Tab 点击 | `scene`、`scene-changed(int)`、`tab-busy` 派生状态 | 切 Tab 只更新视图；不得调用 stop/cancel |
-| 主按钮点击 / 二次点击 | `active-task-id`、`active-task-scene`、任务状态 | 第一次启动 / 继续，第二次停止；文案由状态派生 |
+| 主按钮点击 / 二次点击 | `active-task-id`、`active-task-scene`、`current-voice-id`、任务状态 | 第一次启动 / 继续，第二次停止；配音无音色时 `start-run` 不发出 |
 | 高级抽屉 | `drawer-open`、`drawer-scope` | 启动主任务时自动关闭；`Esc` / 遮罩关闭后焦点回到触发按钮 |
 | 任务中心 | `[TaskSummary] tasks`、`active-task-id` | 显示来源 Tab、状态、进度、结果、取消 / 重试 / 打开来源 |
 | 取消任务 | `task-cancel-requested(task_id)` | 任务二次点击确认；取消后状态为 recoverable，不删除已完成结果 |
 | 失败重试 | `task-retry-requested(task_id)`、单句 / 分段 retry callback | 配音支持单句，BGM 支持失败段，分离使用整任务，音乐支持单版本 |
-| stale | `input-revision`、`result-revision`、`result-stale: bool` | 输入变化后比较 revision；不自动删除旧结果；导出按钮按 stale 禁用或进入旧版本确认 |
-| 焦点 | `FocusScope` / Rust 侧 focus 请求 | `用于配音` 后切到配音、打开高级抽屉、聚焦音色选择器；关闭抽屉后回到触发点。具体聚焦调用以 Slint 1.17 API 验证为准 |
+| stale | `input-revision`、`result-revision`、`current-voice-id`、`result-stale: bool` | 配音文稿、当前音色或高级参考音变化后比较 revision；不自动删除旧结果；导出按钮按 stale 禁用或进入旧版本确认 |
+| 焦点 | `FocusScope` / Rust 侧 focus 请求 | `用于配音` 后切到配音、聚焦首屏 `NarratorBlock` 并预选音色；音色选择器关闭后焦点回到 `换音色`。具体聚焦调用以 Slint 1.17 API 验证为准 |
 | 确认 / 撤销 | `confirm-requested(kind)`、`undo-token` | 清空、覆盖音色、删除版本、替换源文件需确认；软删除支持 5 秒撤销 |
 | 文件校验 | `file-pick-requested()`、`file-dropped(path)`、`file-validation-state` | 分离音频和音色参考音频共用校验状态；后端限制由服务返回，不在 UI 写死 |
-| “用于配音” | `voice-asset-id`、`preselected-voice-id` | 保存成功后写入工程资产；点击后只预选，不自动触发合成 |
+| “用于配音” | `voice-asset-id`、`preselected-voice-id`、`focus-request` | 保存成功后写入工程资产；点击后跳转配音、聚焦首屏当前音色控件并预选，不打开高级、不自动触发合成 |
 | 能力门控 | `capability-separation`、`capability-voice-library` | unsupported 时主按钮 disabled、状态行解释、任务中心不新增伪任务 |
 
 交互状态与视觉状态的绑定必须单源：
