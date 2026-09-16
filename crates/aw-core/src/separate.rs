@@ -53,6 +53,9 @@ pub struct Progress {
 pub struct SeparatedTracks {
     pub vocals: PathBuf,
     pub accompaniment: PathBuf,
+    /// 裁齐相关的说明（None = 正常裁齐或无需说明）。
+    /// 例：输入不是 wav（跳过裁齐）、wav 读不出时长（未裁齐）。
+    pub note: Option<String>,
 }
 
 /// 结果：正常完成，或用户在过程中按了停止（此时**不落盘**）。
@@ -141,6 +144,106 @@ pub fn install_progress_callbacks() {
             });
         });
     });
+}
+
+/// 写出两轨，并保证**任一失败都不留 `.part`**。
+///
+/// 为什么必须统一清理：上游 `write_audio` 是"先创建目标文件、再逐样本写"，中途失败
+/// （磁盘满/权限变化）会留下半截文件。复核用 8MB 受限卷复现过：人声轨 ENOSPC 后留下
+/// 8.1MB 的 `cli_vocals.wav.part`——原来的代码在人声失败分支直接 `?` 返回，没清。
+fn write_stems_with_cleanup(
+    vocals_tmp: &Path,
+    accompaniment_tmp: &Path,
+    write_vocals: impl FnOnce(&Path) -> Result<(), String>,
+    write_accompaniment: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let cleanup = || {
+        let _ = std::fs::remove_file(vocals_tmp);
+        let _ = std::fs::remove_file(accompaniment_tmp);
+    };
+    if let Err(e) = write_vocals(vocals_tmp) {
+        cleanup();
+        return Err(e);
+    }
+    if let Err(e) = write_accompaniment(accompaniment_tmp) {
+        cleanup();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 输入音频时长（秒）。三态，别把三种情况揉成一个 `None`：
+///
+/// - `Ok(Some(secs))`：能裁（wav 且读得动）；
+/// - `Ok(None)`：**不是 wav**（mp3/flac 由上游解码器读，长度我们拿不到）→ 按文档跳过裁齐；
+/// - `Err(note)`：扩展名是 wav 却读不出来（损坏/权限）→ 如实报出去，不静默跳过
+///   （静默跳过会让用户拿到比输入长的产物却不知道原因——复核指出）。
+fn input_duration_seconds(path: &Path) -> Result<Option<f64>, String> {
+    let looks_like_wav = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+    match hound::WavReader::open(path) {
+        Ok(reader) => {
+            let sr = reader.spec().sample_rate;
+            if sr == 0 {
+                return Err(format!("输入 wav 的采样率为 0：{}", path.display()));
+            }
+            Ok(Some(reader.duration() as f64 / sr as f64))
+        }
+        Err(e) if looks_like_wav => Err(format!(
+            "输入是 wav 但读不出时长（{}）：{e}。请确认文件没损坏/有权限后重跑。",
+            path.display()
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 把 wav 裁到指定时长（原地替换：临时文件 + rename）。比目标短就原样不动。
+///
+/// 只处理 16-bit PCM（该模型的产物就是 16-bit）；其它位深原样返回，不让"裁不了"
+/// 变成"分离失败"。
+fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
+    let reader =
+        hound::WavReader::open(path).map_err(|e| format!("打开 {} 失败：{e}", path.display()))?;
+    let spec = reader.spec();
+    if spec.bits_per_sample != 16 || spec.sample_rate == 0 {
+        return Ok(());
+    }
+    let keep_frames = (seconds * spec.sample_rate as f64).round().max(0.0) as usize;
+    let total_frames = reader.duration() as usize;
+    if total_frames <= keep_frames {
+        return Ok(());
+    }
+    // 临时文件显式命名（`with_extension("wav.trim")` 作用在 `xxx.wav.part` 上会得到
+    // `xxx.wav.wav.trim`，名字难看也容易误导）。
+    let tmp = path.with_extension("trim");
+    // 写入放在闭包里：**任何**错误（创建/读样本/写样本/finalize）都会走下面的清理；
+    // 只在 rename 失败时清会留下 .trim 残渣（复核指出）。
+    let written = (|| -> Result<(), String> {
+        let mut writer = hound::WavWriter::create(&tmp, spec)
+            .map_err(|e| format!("创建 {} 失败：{e}", tmp.display()))?;
+        let channels = spec.channels as usize;
+        for (i, sample) in reader.into_samples::<i16>().enumerate() {
+            if i / channels >= keep_frames {
+                break;
+            }
+            writer
+                .write_sample(sample.map_err(|e| format!("读 {} 失败：{e}", path.display()))?)
+                .map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| format!("收尾 {} 失败：{e}", tmp.display()))
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换 {} 失败：{e}", path.display())
+    })
 }
 
 /// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
@@ -262,24 +365,56 @@ pub fn separate_tracks(
 
     // 先写临时名、两个都成了再改名：否则第一步成功、第二步失败会留下"半套结果"
     let (vocals_path, accompaniment_path) = output_paths(&req.out_dir, &req.stem);
+    // 上游按模型分块补齐：产物可能比输入长（本机实测 50.9s 输入 → 55.4s 产物，
+    // 尾巴那 4.5s 是模型为补齐最后一块生成的内容）。输入是 wav 时把两轨裁回输入时长——
+    // 用户拿到的东西该跟他给的音频一样长。mp3/flac 的长度在上游解码器里，我们拿不到，
+    // 这两种输入保持上游产物（文档写明）。裁在 .part 上，再走原来的 rename 发布。
     let vocals_tmp = vocals_path.with_extension("wav.part");
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
-    stems
-        .save(Stem::Vocals, &vocals_tmp.display().to_string())
-        .map_err(|e| {
-            format!(
-                "写出人声轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
-                vocals_tmp.display()
-            )
-        })?;
-    if let Err(e) = stems.save_mix_except(&[Stem::Vocals], &accompaniment_tmp.display().to_string())
-    {
-        let _ = std::fs::remove_file(&vocals_tmp);
-        return Err(format!(
-            "写出伴奏轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
-            accompaniment_tmp.display()
-        ));
-    }
+    write_stems_with_cleanup(
+        &vocals_tmp,
+        &accompaniment_tmp,
+        |path| {
+            stems
+                .save(Stem::Vocals, &path.display().to_string())
+                .map_err(|e| {
+                    format!(
+                        "写出人声轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
+                        path.display()
+                    )
+                })
+        },
+        |path| {
+            stems
+                .save_mix_except(&[Stem::Vocals], &path.display().to_string())
+                .map_err(|e| {
+                    format!(
+                        "写出伴奏轨失败（{}）：{e}。请检查磁盘空间与目录权限后重跑。",
+                        path.display()
+                    )
+                })
+        },
+    )?;
+    let trim_note = match input_duration_seconds(&req.input) {
+        Ok(Some(seconds)) => {
+            for part in [&vocals_tmp, &accompaniment_tmp] {
+                if let Err(e) = trim_wav_to_seconds(part, seconds) {
+                    let _ = std::fs::remove_file(&vocals_tmp);
+                    let _ = std::fs::remove_file(&accompaniment_tmp);
+                    let _ = std::fs::remove_file(part.with_extension("trim"));
+                    return Err(format!("裁齐分离产物失败：{e}"));
+                }
+            }
+            None
+        }
+        // 非 wav：按文档跳过，但把这件事**说出来**（用户可能因此拿到比输入长的产物）
+        Ok(None) => Some(
+            "输入不是 wav：上游按模型分块补齐，产物可能比输入略长（wav 输入会自动裁齐）"
+                .to_string(),
+        ),
+        // wav 却读不出时长：不静默跳过，如实报出来
+        Err(note) => Some(format!("产物未裁齐：{note}")),
+    };
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
         // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
@@ -304,6 +439,7 @@ pub fn separate_tracks(
     Ok(SeparationOutcome::Done(SeparatedTracks {
         vocals: vocals_path,
         accompaniment: accompaniment_path,
+        note: trim_note,
     }))
 }
 
@@ -381,5 +517,150 @@ mod tests {
         };
         let err = separate_tracks(&req, |_| {}, || false).unwrap_err();
         assert!(err.contains("输入音频不存在"), "错误要能直接定位：{err}");
+    }
+
+    /// 裁齐：产物比输入长时裁到输入时长；比输入短就原样不动（不能把短的拉长）。
+    /// 这条规则来自真机实测：50.9s 输入 → 55.4s 产物，尾巴 4.5s 是模型补齐最后一块
+    /// 生成的"想象"内容。
+    #[test]
+    fn trim_wav_to_seconds_trims_padding_and_keeps_short_files() {
+        let dir = std::env::temp_dir().join(format!("aw-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        // 1.2s 的"产物"，输入只有 1.0s
+        let long = dir.join("long.wav");
+        {
+            let mut w = hound::WavWriter::create(&long, spec).unwrap();
+            for i in 0..(44_100 * 2 * 12 / 10) {
+                w.write_sample((i % 11) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        trim_wav_to_seconds(&long, 1.0).unwrap();
+        let r = hound::WavReader::open(&long).unwrap();
+        assert_eq!(r.duration(), 44_100, "应裁到 1.0s（44.1kHz）");
+        assert!(
+            r.spec().sample_rate == 44_100 && r.spec().channels == 2,
+            "参数要原样保留"
+        );
+
+        // 0.5s 的"产物"：比目标短，不能被拉长
+        let short = dir.join("short.wav");
+        {
+            let mut w = hound::WavWriter::create(&short, spec).unwrap();
+            for i in 0..(44_100 * 2 / 2) {
+                w.write_sample((i % 7) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        trim_wav_to_seconds(&short, 1.0).unwrap();
+        assert_eq!(
+            hound::WavReader::open(&short).unwrap().duration(),
+            22_050,
+            "比目标短就原样不动"
+        );
+    }
+
+    /// 三态分类：wav 读得出（可裁）、非 wav（跳过裁齐）、扩展名是 wav 但读不出来（要报错，
+    /// 不能静默跳过——静默跳过会让用户拿到比输入长的产物却不知道原因）。
+    #[test]
+    fn input_duration_classifies_wav_non_wav_and_broken_wav() {
+        let dir = std::env::temp_dir().join(format!("aw-dur-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. 正常 wav：能拿到时长
+        let good = dir.join("good.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        {
+            let mut w = hound::WavWriter::create(&good, spec).unwrap();
+            for _ in 0..8_000 {
+                w.write_sample(0i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        assert_eq!(input_duration_seconds(&good).unwrap(), Some(1.0));
+
+        // 2. 非 wav（这里用 mp3 后缀的垃圾内容模拟）：跳过裁齐，不算错
+        let mp3 = dir.join("song.mp3");
+        std::fs::write(&mp3, b"not really an mp3").unwrap();
+        assert_eq!(input_duration_seconds(&mp3).unwrap(), None);
+
+        // 3. 后缀是 wav 但内容坏了：必须报错（含路径与建议），不能 None
+        let broken = dir.join("broken.wav");
+        std::fs::write(&broken, b"definitely not a wav").unwrap();
+        let err = input_duration_seconds(&broken).unwrap_err();
+        assert!(err.contains("wav") && err.contains("broken.wav"), "{err}");
+        assert!(err.contains("损坏") || err.contains("权限"), "{err}");
+    }
+
+    /// 两轨写出：**任一失败都不留 `.part`**（上游是先建文件再逐样本写，中途失败会留半截）。
+    /// 复核用 8MB 受限卷复现过"人声轨 ENOSPC 后留下 8.1MB .part"。
+    #[test]
+    fn stem_write_failure_leaves_no_part_files() {
+        let dir = std::env::temp_dir().join(format!("aw-parts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("v.wav.part");
+        let a = dir.join("a.wav.part");
+
+        // 1. 人声轨失败（上游已经写了半截）：两个都不留
+        let err = write_stems_with_cleanup(
+            &v,
+            &a,
+            |p| {
+                std::fs::write(p, b"half").unwrap();
+                Err("磁盘空间不足（模拟）".to_string())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains("磁盘空间不足"), "{err}");
+        assert!(!v.exists() && !a.exists(), "人声失败也要清干净");
+
+        // 2. 伴奏轨失败：人声已经写成，也要一起清掉（不留半套）
+        let err = write_stems_with_cleanup(
+            &v,
+            &a,
+            |p| {
+                std::fs::write(p, b"ok").unwrap();
+                Ok(())
+            },
+            |p| {
+                std::fs::write(p, b"half").unwrap();
+                Err("权限不足（模拟）".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("权限"), "{err}");
+        assert!(!v.exists() && !a.exists(), "伴奏失败要把人声也清掉");
+
+        // 3. 成功路径：两个文件都在（别把清理写成"总是删"）
+        write_stems_with_cleanup(
+            &v,
+            &a,
+            |p| {
+                std::fs::write(p, b"v").unwrap();
+                Ok(())
+            },
+            |p| {
+                std::fs::write(p, b"a").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(v.is_file() && a.is_file());
     }
 }
