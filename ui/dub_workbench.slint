@@ -396,6 +396,10 @@ export component DubWorkbench inherits Rectangle {
     in-out property <bool> auto-normalize: true;
     /// 句间停顿（毫秒，字符串收；留空/非法由 Rust 侧归一成默认 250）
     in-out property <string> gap-ms-text: "250";
+    /// 模板（P2）：名字来自 templates.json；选中项与名字输入都在 Rust 侧读写
+    in property <[string]> template-names: [];
+    in-out property <int> template-index: -1;
+    in-out property <string> template-name-text: "";
     in property <float> progress: 0.0;
     in property <bool> has-result: false;
     in property <string> export-dir: "";
@@ -432,6 +436,9 @@ export component DubWorkbench inherits Rectangle {
     callback speed-changed(float);
     /// 停顿改了：只作废"拼装成品"（音频没变，重新导出即可应用）
     callback gap-edited();
+    callback template-apply();
+    callback template-save();
+    callback template-delete();
     callback export-requested();
     /// 批量导出：projects/ 下所有有成品的工程 → 导出目录（P6 的一部分）
     callback batch-export();
@@ -625,6 +632,50 @@ export component DubWorkbench inherits Rectangle {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 12px;
+
+                        // 模板（P2）：把「音色 / 语速 / 停顿 / 兜底规则」存成一份可复用的预设
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "模板";
+                                width: 40px;
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelComboBox {
+                                width: 180px;
+                                model: root.template-names;
+                                index <=> root.template-index;
+                                placeholder: "选择模板";
+                                enabled: !root.running && !root.busy && root.template-names.length > 0;
+                            }
+                            PixelButton {
+                                width: 64px;
+                                text: "应用";
+                                enabled: !root.running && !root.busy && root.template-index >= 0;
+                                clicked => { root.template-apply(); }
+                            }
+                            PixelTextInput {
+                                width: 150px;
+                                enabled: !root.running && !root.busy;
+                                text <=> root.template-name-text;
+                                placeholder: "模板名";
+                            }
+                            PixelButton {
+                                width: 64px;
+                                text: "存为";
+                                Tooltip { text: @markdown("把当前的引擎/音色/语速/停顿/兜底规则存成模板（同名覆盖）"); }
+                                enabled: !root.running && !root.busy;
+                                clicked => { root.template-save(); }
+                            }
+                            PixelButton {
+                                width: 64px;
+                                text: "删除";
+                                enabled: !root.running && !root.busy && root.template-index >= 0;
+                                clicked => { root.template-delete(); }
+                            }
+                        }
 
                         // 引擎 / 模型：换音色不是换模型，模型属于技术参数
                         HorizontalLayout {

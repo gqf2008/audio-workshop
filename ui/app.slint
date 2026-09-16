@@ -73,6 +73,10 @@ export component MainWindow inherits Window {
     in-out property <bool> auto-normalize: true;
     /// 句间停顿（毫秒）：配音独有，放本页「高级」
     in-out property <string> gap-ms-text: "250";
+    /// 模板（P2）：名字来自 templates.json，选中项与名字输入都由 Rust 侧维护
+    in property <[string]> template-names: [];
+    in-out property <int> template-index: -1;
+    in-out property <string> template-name-text: "";
 
     // ── 旁白块头（配音首屏一等元素）：当前音色 + 来源 + 为什么不能用 ──
     in property <string> voice-label: "未选择";
@@ -208,6 +212,9 @@ export component MainWindow inherits Window {
     callback redo-one(int);
     callback speed-changed(float);
     callback gap-edited();
+    callback template-apply();
+    callback template-save();
+    callback template-delete();
     callback start-run();
     callback stop-run();
     callback batch-import();
@@ -355,6 +362,12 @@ export component MainWindow inherits Window {
                     speed-label: root.speed-label;
                     auto-normalize <=> root.auto-normalize;
                     gap-ms-text <=> root.gap-ms-text;
+                    template-names: root.template-names;
+                    template-index <=> root.template-index;
+                    template-name-text <=> root.template-name-text;
+                    template-apply => { root.template-apply(); }
+                    template-save => { root.template-save(); }
+                    template-delete => { root.template-delete(); }
 
                     progress: root.progress;
                     has-result: root.has-result;

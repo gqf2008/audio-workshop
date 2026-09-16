@@ -16,6 +16,7 @@ mod cancel;
 mod export;
 mod player;
 mod tasks;
+mod templates;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -551,6 +552,75 @@ fn settings_path() -> PathBuf {
 ///
 /// **逐字段解析**：某一段坏掉（手改错、版本不兼容）只丢那一段，不要连带把 host/port
 /// 也清掉——整份 `from_str::<AppSettings>` 失败会让用户"设置全没了"。
+/// 模板文件：与 settings.json 同目录（用户备份/迁移时一处就够）。
+fn templates_path() -> PathBuf {
+    settings_path().with_file_name(templates::TEMPLATES_FILE)
+}
+
+/// 读模板集（小文件，按需读，不做缓存——避免"UI 里那份"和"盘上那份"两套真相）。
+fn read_templates() -> Result<templates::TemplateSet, String> {
+    templates::load(&templates_path())
+}
+
+/// 把当前界面的输入打包成一份模板（名字为空直接拒绝，别存出无名模板）。
+fn template_from_inputs(
+    name: &str,
+    model: &str,
+    voice_ref: Option<String>,
+    speed: f32,
+    gap_ms: u64,
+    auto_normalize: bool,
+) -> Result<templates::DubTemplate, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("先给模板起个名字（存为旁边的输入框）".into());
+    }
+    Ok(templates::DubTemplate {
+        name: name.to_string(),
+        model: model.to_string(),
+        voice_ref,
+        speed,
+        gap_ms,
+        auto_normalize,
+    })
+}
+
+/// 当前工程的输入（用来和模板比对，算出"应用后要作废什么"）。
+fn project_inputs_from_ui(ui: &MainWindow) -> templates::ProjectInputs {
+    let model = current_model_name(ui).unwrap_or_default();
+    templates::ProjectInputs {
+        model,
+        voice_ref: non_empty(ui.get_voice_ref_path().to_string()),
+        gap_ms: gap_ms_from_ui(ui),
+        auto_normalize: ui.get_auto_normalize(),
+    }
+}
+
+/// 当前选中的引擎名（下拉索引 → 名字）。索引非法时 None。
+fn current_model_name(ui: &MainWindow) -> Option<String> {
+    let idx = ui.get_voice_index();
+    (idx >= 0)
+        .then(|| ui.get_voice_names().row_data(idx as usize))
+        .flatten()
+        .map(|n| n.to_string())
+}
+
+/// 模板下拉的选项刷新（名字来自磁盘；当前选中项尽量保留）。
+fn refresh_template_names(ui: &MainWindow, keep: Option<&str>) {
+    let Ok(set) = read_templates() else {
+        ui.set_template_names(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
+        ui.set_template_index(-1);
+        return;
+    };
+    let names: Vec<SharedString> = set.names().into_iter().map(Into::into).collect();
+    let pick = keep
+        .and_then(|k| names.iter().position(|n| n.eq_ignore_ascii_case(k)))
+        .unwrap_or(0);
+    let idx = if names.is_empty() { -1 } else { pick as i32 };
+    ui.set_template_names(ModelRc::from(Rc::new(VecModel::from(names))));
+    ui.set_template_index(idx);
+}
+
 fn load_settings() -> AppSettings {
     let Some(raw) = std::fs::read_to_string(settings_path()).ok() else {
         return AppSettings::default();
@@ -2820,8 +2890,14 @@ fn main() -> Result<(), slint::PlatformError> {
     slint_pixel::install_window_resize(&ui);
 
     wire_theme(&ui);
+    // 模板下拉的名字来自 templates.json；坏了就在状态行说一声（不静默变空列表）
+    if let Err(e) = read_templates() {
+        ui.set_status_text(e.into());
+    }
+    refresh_template_names(&ui, None);
     wire_script(&ui, &rows, &cmd_tx, &state);
     wire_engine_changes(&ui, &cmd_tx, &state);
+    wire_templates(&ui, &cmd_tx, &state);
     wire_voice_panel(&ui, &cmd_tx, &state);
     wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
@@ -4359,6 +4435,159 @@ fn wire_task_center(
             ui.set_status_text(format!("已从任务中心清除 {n} 条已结束任务").into());
         }
     });
+}
+
+/// 模板（P2）：应用 / 存为 / 删除。
+///
+/// 应用是这里唯一有"后果"的动作：按 `templates::apply_effect` 判定要不要作废工程
+/// （重录 > 重新导出 > 只影响试听），并把同一句话写到状态行——界面文案与判定同源。
+fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+    // 应用
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let tx = cmd_tx.clone();
+    ui.on_template_apply(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st) {
+            ui.set_status_text("任务进行中：模板等这轮跑完再应用".into());
+            return;
+        }
+        let Ok(set) = read_templates() else {
+            ui.set_status_text("模板文件坏了：先修好或删掉 templates.json，再加新模板".into());
+            return;
+        };
+        let Some(name) = selected_template_name(&ui) else {
+            ui.set_status_text("先选一个模板".into());
+            return;
+        };
+        let Some(t) = set.get(&name).cloned() else {
+            ui.set_status_text(format!("找不到模板「{name}」：刷新一下再试").into());
+            return;
+        };
+        let effect = templates::apply_effect(&project_inputs_from_ui(&ui), &t);
+
+        // 先套用输入（模型索引按名字找回，找不到就把索引清 -1，别静默换成别的引擎）
+        ui.set_voice_ref_path(t.voice_ref.clone().unwrap_or_default().into());
+        if !restore_voice_index(&ui, &t.model) {
+            ui.set_voice_index(-1);
+        }
+        ui.set_speed(t.speed);
+        ui.set_speed_label(format!("{:.2}x", t.speed).into());
+        ui.set_gap_ms_text(t.gap_ms.to_string().into());
+        ui.set_auto_normalize(t.auto_normalize);
+        st.auto_normalize_seen.set(t.auto_normalize);
+        refresh_voice_labels(&ui);
+
+        match effect {
+            templates::ApplyEffect::Resynthesize => {
+                invalidate_worker_project(&tx, &st);
+                reset_bgm(&ui, &st);
+                st.assembled.borrow_mut().take();
+                ui.set_has_result(false);
+            }
+            templates::ApplyEffect::ReassembleOnly => {
+                // 停顿只影响拼装：不清 has_result（导出按钮要能点），导出时会带上新停顿
+                st.bgm_artifacts.borrow_mut().take();
+                ui.set_bgm_has_result(false);
+            }
+            templates::ApplyEffect::AuditionOnly => {}
+        }
+        ui.set_template_index(
+            ui.get_template_names()
+                .iter()
+                .position(|n| n == name)
+                .map(|i| i as i32)
+                .unwrap_or(-1),
+        );
+        ui.set_status_text(format!("已应用模板「{name}」：{}", effect.note()).into());
+    });
+
+    // 存为（同名覆盖）
+    let weak = ui.as_weak();
+    let st_save = state.clone();
+    ui.on_template_save(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st_save) {
+            ui.set_status_text("任务进行中：模板等这轮跑完再存".into());
+            return;
+        }
+        let model = current_model_name(&ui).unwrap_or_else(|| {
+            ui.set_status_text("先选一个引擎，再存模板".into());
+            String::new()
+        });
+        if model.is_empty() {
+            return;
+        }
+        let t = match template_from_inputs(
+            &ui.get_template_name_text(),
+            &model,
+            non_empty(ui.get_voice_ref_path().to_string()),
+            ui.get_speed(),
+            gap_ms_from_ui(&ui),
+            ui.get_auto_normalize(),
+        ) {
+            Ok(t) => t,
+            Err(note) => {
+                ui.set_status_text(note.into());
+                return;
+            }
+        };
+        let path = templates_path();
+        let mut set = match read_templates() {
+            Ok(set) => set,
+            Err(e) => {
+                // 坏文件绝不覆盖：先让用户处理，不然他已有的模板就没了
+                ui.set_status_text(format!("{e}；模板没有保存").into());
+                return;
+            }
+        };
+        set.upsert(t.clone());
+        if let Err(e) = templates::save(&path, &set) {
+            ui.set_status_text(e.into());
+            return;
+        }
+        refresh_template_names(&ui, Some(&t.name));
+        ui.set_template_name_text("".into());
+        ui.set_status_text(format!("已保存模板「{}」（同名会覆盖）", t.name).into());
+    });
+
+    // 删除
+    let weak = ui.as_weak();
+    ui.on_template_delete(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(name) = selected_template_name(&ui) else {
+            ui.set_status_text("先选一个模板".into());
+            return;
+        };
+        let mut set = match read_templates() {
+            Ok(set) => set,
+            Err(e) => {
+                ui.set_status_text(format!("{e}；模板没有删除").into());
+                return;
+            }
+        };
+        if !set.remove(&name) {
+            ui.set_status_text(format!("找不到模板「{name}」").into());
+            return;
+        }
+        if let Err(e) = templates::save(&templates_path(), &set) {
+            ui.set_status_text(e.into());
+            return;
+        }
+        refresh_template_names(&ui, None);
+        ui.set_status_text(format!("已删除模板「{name}」").into());
+    });
+}
+
+/// 模板下拉当前选中的名字（索引非法返回 None）。
+fn selected_template_name(ui: &MainWindow) -> Option<String> {
+    let idx = ui.get_template_index();
+    if idx < 0 {
+        return None;
+    }
+    ui.get_template_names()
+        .row_data(idx as usize)
+        .map(|n| n.to_string())
 }
 
 fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
@@ -6831,6 +7060,31 @@ mod tests {
 
     fn wav_sentinel(sentence: &aw_core::Sentence) -> String {
         format!("wav-{}-{}", sentence.index, sentence.text)
+    }
+
+    /// 存模板前必须有个名字：空白名字直接拒绝（否则会存出一条没法选中的无名模板）。
+    #[test]
+    fn template_from_inputs_requires_a_name() {
+        let t = template_from_inputs(
+            "  口播标准  ",
+            "audio8-tts",
+            Some("/v.wav".into()),
+            1.1,
+            300,
+            false,
+        )
+        .unwrap();
+        assert_eq!(t.name, "口播标准", "名字要 trim");
+        assert_eq!(t.model, "audio8-tts");
+        assert_eq!(t.voice_ref.as_deref(), Some("/v.wav"));
+        assert!((t.speed - 1.1).abs() < 1e-6);
+        assert_eq!(t.gap_ms, 300);
+        assert!(!t.auto_normalize);
+
+        for blank in ["", "   ", "\t"] {
+            let err = template_from_inputs(blank, "audio8-tts", None, 1.0, 250, true).unwrap_err();
+            assert!(err.contains("名字"), "{err}");
+        }
     }
 
     /// 停顿输入的归一：留空/非法回落默认，越界夹住（不做数值输入报错，界面上两句话写清）。
