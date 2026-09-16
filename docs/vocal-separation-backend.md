@@ -89,6 +89,30 @@ stems.save_mix_except(&[Stem::Vocals], ".../xxx_accompaniment.wav")?;
    接入统一任务队列（见下）。
 4. `ui/extra_tabs.slint`：把现在的 `GatedTab` 占位换成真正的分离页（拖入区 / 主操作 / 两轨结果 / 高级）。
 
+## 4.5 CoreML 加速 A/B 实测：**更慢且输出静音 → 已否决**（2026-09-17）
+
+上游 `stem-splitter-core` 有 `coreml` feature，而且即使编译进去也**默认关闭**
+（`core/src/engine.rs` 里要 `ENABLE_COREML` 环境变量才启用，注释原文写着
+"CoreML can sometimes produce silent/zero outputs on certain models"）。
+为了不拍脑袋，本机做了 A/B（同一段 4.27s 单声道 44.1k 输入、模型已缓存）：
+
+| 路径 | 计算耗时 | 人声轨 RMS | 伴奏轨 RMS |
+|---|---|---|---|
+| CPU（默认 `onednn`） | **13.7s** | 0.13802 | 0.00092 |
+| CoreML（`features = ["coreml"]` + `ENABLE_COREML=1`） | **34.1s（慢 2.5×）** | **0.00000** | **0.00000** |
+
+两条结论都是硬结论：
+
+1. **更慢**：htdemucs 的算子图对 CoreML 不友好，逐 op 派发开销压倒了加速收益。
+2. **输出静音**：全零产物 —— 正是上游注释警告的失败模式。CPU 跑到 0.138 的人声轨，
+   CoreML 得到 0.000。也就是说这条路不只是"没收益"，而是**会静默产出废品**。
+
+因此**不启用 coreml feature**，保持 CPU + oneDNN。当前 RTF ≈ 3.2（4.27s 音频 ≈ 13.7s 计算，
+另加约 9s 的进程/模型加载）。
+
+若将来要再试，先按上表复现：**必须同时比对耗时与产物 RMS**，只看耗时会被"更快"的假象骗到
+（这次恰好相反，但静音输出才是更危险的形态）。
+
 ## 5. 代价与风险（都是真实的，别在 UI 里藏）
 
 | 风险 | 具体 | 处置 |
