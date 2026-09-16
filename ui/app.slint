@@ -26,7 +26,8 @@ import {
 import { Sentence, TaskRow, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
-import { GatedTab, VoiceDesignTab } from "extra_tabs.slint";
+import { VoiceDesignTab } from "extra_tabs.slint";
+import { SeparationWorkbench } from "separation_workbench.slint";
 import { SongWorkbench } from "song_workbench.slint";
 
 export { Sentence, TaskRow, Voice } from "model.slint";
@@ -80,6 +81,18 @@ export component MainWindow inherits Window {
     in-out property <bool> dub-advanced: false;
 
     // ── 音色选择器（默认收起，从「换音色」打开） ──
+    // ── 人声分离场景：输入音频 / 两轨结果 ──
+    in-out property <string> sep-input-path: "";
+    in property <string> sep-input-summary: "还没选择音频";
+    in property <bool> sep-busy: false;
+    in property <float> sep-progress: 0.0;
+    in property <string> sep-status-text: "支持本地 wav / mp3 / flac";
+    in property <bool> sep-has-result: false;
+    in property <string> sep-vocals-label: "人声";
+    in property <string> sep-accompaniment-label: "伴奏";
+    in-out property <bool> sep-advanced: false;
+    in-out property <string> sep-chunk-seconds: "30";
+
     // ── 音乐制作（歌曲）场景：歌词 / 风格 / 模型 + 结果 ──
     //    预填示例歌词与风格：这个 Tab 一进去就能"生成歌曲"跑通，不留空态；
     //    状态行常驻一句质量免责（歌曲链路慢且未达主线产品级）。
@@ -176,6 +189,11 @@ export component MainWindow inherits Window {
     callback song-generate();
     callback song-preview();
     callback song-export-track();
+    callback sep-pick-file();
+    callback sep-run();
+    callback sep-stop();
+    callback sep-preview-track(int);
+    callback sep-export-track(int);
     callback task-jump(int);
     callback task-clear-finished();
     callback apply-server-settings();
@@ -341,15 +359,25 @@ export component MainWindow inherits Window {
                     export-tracks => { root.bgm-export-tracks(); }
                 }
 
-                if root.scene == 2 : GatedTab {
+                // 场景 2 = 人声分离（本地 htdemucs，见 docs/vocal-separation-backend.md）
+                if root.scene == 2 : SeparationWorkbench {
                     vertical-stretch: 1;
-                    title: "人声分离";
-                    summary: "把一首歌拆成人声与伴奏两轨。本分支还没接入分离后端，先用占位页把位置留给它。";
-                    requirements: [
-                        "audio.cpp 侧新增人声/伴奏分离任务（当前只有 tts / gen）",
-                        "两轨结果的试听与导出路径",
-                        "源文件更换后的 stale 规则（旧两轨默认禁止导出）",
-                    ];
+                    horizontal-stretch: 1;
+                    input-path <=> root.sep-input-path;
+                    input-summary: root.sep-input-summary;
+                    busy: root.sep-busy;
+                    progress: root.sep-progress;
+                    status-text: root.sep-status-text;
+                    has-result: root.sep-has-result;
+                    vocals-label: root.sep-vocals-label;
+                    accompaniment-label: root.sep-accompaniment-label;
+                    show-advanced <=> root.sep-advanced;
+                    chunk-seconds-text <=> root.sep-chunk-seconds;
+                    pick-file => { root.sep-pick-file(); }
+                    run => { root.sep-run(); }
+                    stop => { root.sep-stop(); }
+                    preview-track(i) => { root.sep-preview-track(i); }
+                    export-track(i) => { root.sep-export-track(i); }
                 }
 
                 // 场景 3 = 音乐制作（歌曲）：链路来自 feat/m4-song（yue2 / ace-step / S2 翻唱）

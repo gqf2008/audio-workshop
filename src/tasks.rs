@@ -13,6 +13,7 @@
 pub enum TaskKind {
     Dub,
     Bgm,
+    Separation,
     Song,
 }
 
@@ -21,6 +22,7 @@ impl TaskKind {
         match self {
             TaskKind::Dub => "配音",
             TaskKind::Bgm => "BGM",
+            TaskKind::Separation => "人声分离",
             TaskKind::Song => "音乐制作",
         }
     }
@@ -30,6 +32,7 @@ impl TaskKind {
         match self {
             TaskKind::Dub => 0,
             TaskKind::Bgm => 1,
+            TaskKind::Separation => 2,
             TaskKind::Song => 3,
         }
     }
@@ -272,6 +275,7 @@ mod tests {
         // 与 ui/app.slint 的 scenes 顺序对齐：0 配音 / 1 BGM / 2 人声分离 / 3 音乐制作 / 4 音色设计
         assert_eq!(TaskKind::Dub.tab(), 0);
         assert_eq!(TaskKind::Bgm.tab(), 1);
+        assert_eq!(TaskKind::Separation.tab(), 2);
         assert_eq!(TaskKind::Song.tab(), 3);
     }
 
