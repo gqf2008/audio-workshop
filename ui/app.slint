@@ -81,11 +81,13 @@ export component MainWindow inherits Window {
 
     // ── 音色选择器（默认收起，从「换音色」打开） ──
     // ── 音乐制作（歌曲）场景：歌词 / 风格 / 模型 + 结果 ──
-    in-out property <string> song-lyrics: "";
-    in-out property <string> song-style: "";
+    //    预填示例歌词与风格：这个 Tab 一进去就能"生成歌曲"跑通，不留空态；
+    //    状态行常驻一句质量免责（歌曲链路慢且未达主线产品级）。
+    in-out property <string> song-lyrics: "[Verse]\n凌晨的厨房还亮着灯\n[Chorus]\n别让我一个人悬在那句也许";
+    in-out property <string> song-style: "Mandarin Chinese R&B slow jam, warm male lead vocal";
     in-out property <int> song-model-index: 0;
     in property <bool> song-has-result: false;
-    in property <string> song-status-text: "";
+    in property <string> song-status-text: "歌曲质量未达主线产品级，作为彩蛋使用。";
 
     // 配音页内的「音色」区展开态（与「高级」同款，默认收起）
     in-out property <bool> dub-voice: false;
