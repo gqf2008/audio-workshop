@@ -1450,6 +1450,18 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_scene(3);
             ui.set_status_text("音乐制作：写歌 / 文生音乐（yue2 · ace-step）".into());
         }
+        "music-done" => {
+            // 结果条渲染的真机证据：不真跑生成（song 要 6–8 分钟），直接置 has-result
+            ui.set_scene(3);
+            ui.set_song_has_result(true);
+            ui.set_song_status_text("歌曲 02:48 · 已生成（示例状态，用于核对结果条）".into());
+            ui.set_status_text("音乐制作：结果就绪态（结果条含试听 / 导出）".into());
+        }
+        "music-adv" => {
+            ui.set_scene(3);
+            ui.set_song_advanced(true);
+            ui.set_status_text("音乐制作·高级：引擎（yue2 / ACE-Step）在这里，不占首屏".into());
+        }
         "bgm" => {
             ui.set_scene(1);
             ui.set_status_text("BGM：按描述生成，自动对齐配音时长并 ducking".into());
