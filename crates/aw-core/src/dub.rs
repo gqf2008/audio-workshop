@@ -132,8 +132,17 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_ref_hash: Option<String>,
     pub gap_ms: u64,
+    /// 文本兜底（数字/年份规范化）开关。**要持久化**：它是"这句该念什么"的一部分，
+    /// 续作时开关变了而句子文本没变的话，不复用旧音频就会把旧读法留在成品里。
+    /// 旧工程没有这个字段时按"开"处理（与历史行为一致）。
+    #[serde(default = "default_auto_normalize")]
+    pub auto_normalize: bool,
     pub base_seed: u64,
     pub sentences: Vec<Sentence>,
+}
+
+fn default_auto_normalize() -> bool {
+    true
 }
 
 /// 拼装结果。`skipped` 是**必须报出来的数**：失败句此前被静默跳过，
@@ -161,6 +170,8 @@ impl Project {
         max_chars: usize,
         normalize: impl Fn(&str) -> String,
     ) -> Self {
+        // 兜底开关由调用方在构造后按同一份输入设置（与 voice_ref_hash 同一模式）；
+        // 这里给"开"是与历史行为一致的默认（旧工程/老调用点不受影响）。
         let sentences = split_sentences(script, punctuation, max_chars)
             .into_iter()
             .enumerate()
@@ -180,6 +191,7 @@ impl Project {
             voice_ref,
             voice_ref_hash: None,
             gap_ms,
+            auto_normalize: true,
             base_seed,
             sentences,
         }
@@ -400,9 +412,16 @@ impl Project {
         let mut cursor_frames: u64 = 0;
         let mut srt = String::new();
         let mut srt_index = 0u32;
-        let last = self.sentences.len() - 1;
+        // 句间静音只加在**成功句之间**：最后一句失败时，前面那个 done 句后面不该再补 gap
+        // （否则成品尾部多一段静音；gap=2000 时就是多 2 秒）。
+        let last_done = self
+            .sentences
+            .iter()
+            .filter(|s| s.status == "done")
+            .map(|s| s.index)
+            .next_back();
 
-        for (k, s) in self.sentences.iter_mut().enumerate() {
+        for s in self.sentences.iter_mut() {
             if s.status != "done" {
                 s.start = None;
                 continue;
@@ -423,7 +442,7 @@ impl Project {
             let start = cursor_frames as f64 / spec.sample_rate as f64;
             s.start = Some(start);
             cursor_frames += frames as u64;
-            if k != last {
+            if Some(s.index) != last_done {
                 for _ in 0..(gap_frames * spec.channels as usize) {
                     writer
                         .write_sample(0i16)
@@ -1005,6 +1024,86 @@ mod tests {
                 .contains("工程.wav.tmp"),
             "临时名要能看出是哪个目标的：{}",
             a.display()
+        );
+    }
+
+    /// 句间停顿真的进了成品：同样两句（各 0.1s），gap 0 与 200ms 的成品时长差 0.2s。
+    /// 这条是"停顿设置真的生效"的可执行证据（不是只看字段被赋值）。
+    #[test]
+    fn assemble_gap_changes_product_duration() {
+        let dir = std::env::temp_dir().join(format!("aw-assemble-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::new(
+            "第一句。第二句。",
+            "audio8-tts",
+            0,
+            831001,
+            None,
+            DEFAULT_PUNCTUATION,
+            80,
+            |t| crate::normalize(t, &Default::default()),
+        );
+        for (i, s) in project.sentences.iter_mut().enumerate() {
+            write_valid_sentence_wav(&dir, i, 2400); // 2400 帧 @24k = 0.1s
+            s.status = "done".into();
+            s.duration = Some(0.1);
+        }
+
+        project.gap_ms = 0;
+        let tight = project.assemble(&dir).unwrap();
+        project.gap_ms = 200;
+        let loose = project.assemble(&dir).unwrap();
+
+        assert!(
+            (tight.duration - 0.2).abs() < 0.02,
+            "gap=0 时成品应≈0.2s，实得 {}",
+            tight.duration
+        );
+        assert!(
+            (loose.duration - 0.4).abs() < 0.02,
+            "gap=200ms 时成品应≈0.4s，实得 {}",
+            loose.duration
+        );
+    }
+
+    /// 末尾句失败时不该在成品尾部留一段句间静音（复核抓到：`k != last` 用的是句数组的
+    /// 最后一项，而那一项是失败句）。三句、只有前两句 done：成品 = 两句音频 + 1 个 gap。
+    #[test]
+    fn assemble_skips_trailing_gap_when_last_sentence_failed() {
+        let dir = std::env::temp_dir().join(format!("aw-assemble-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::new(
+            "第一句。第二句。第三句。",
+            "audio8-tts",
+            200,
+            831001,
+            None,
+            DEFAULT_PUNCTUATION,
+            80,
+            |t| crate::normalize(t, &Default::default()),
+        );
+        let mut done = 0usize;
+        for (i, s) in project.sentences.iter_mut().enumerate() {
+            if i < 2 {
+                write_valid_sentence_wav(&dir, i, 2400); // 0.1s each
+                s.status = "done".into();
+                s.duration = Some(0.1);
+                done += 1;
+            } else {
+                // 第三句失败：不写 wav、状态不是 done
+                s.status = "error: 服务端失败".into();
+            }
+        }
+        let a = project.assemble(&dir).unwrap();
+        assert_eq!(a.done, done);
+        assert_eq!(a.skipped, 1);
+        // 0.1 + 0.2 + 0.1 = 0.4（末尾没有 gap）
+        assert!(
+            (a.duration - 0.4).abs() < 0.02,
+            "末尾不该留静音：实得 {}",
+            a.duration
         );
     }
 
