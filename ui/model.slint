@@ -15,6 +15,8 @@ export struct Sentence {
     start: float,            // 在整段音频中的起始时间（秒）
     duration-label: string,  // 展示用，如 "2.4s"
     start-label: string,     // 展示用，如 "0:12"
+    // 质检分数（""= 没测过/已失效）。并进展开行的状态文案显示，不新增元素
+    eval-label: string,
 }
 
 // 音色：本地模型 + 参考音频，不联网（CHARTER 第 4 节平台策略）。

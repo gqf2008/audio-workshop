@@ -277,8 +277,10 @@ struct EvalSummary {
     scored: usize,
     /// ASR 转写失败的句数（服务端错误等）——不混进平均分，但要报出来
     asr_failed: usize,
-    /// 最差 N 句（按可懂度升序）
+    /// 最差 N 句（按可懂度升序；只含有差异的句子）
     worst: Vec<EvalIssue>,
+    /// 全部评上的分数（句 index → 可懂度%），给句子行展示用
+    scores: Vec<(usize, f64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1343,6 +1345,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 }
                 let total = done.len();
                 let mut issues: Vec<EvalIssue> = Vec::new();
+                let mut scores: Vec<(usize, f64)> = Vec::new();
                 let mut sum = 0.0f64;
                 let mut scored = 0usize;
                 let mut asr_failed = 0usize;
@@ -1365,6 +1368,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             let score = aw_core::intelligibility(reference, &hypothesis);
                             sum += score.percent;
                             scored += 1;
+                            scores.push((*idx, score.percent));
                             // 只收"有差异"的句子：worst 为空就等于全部一致
                             // （否则满分句也会被列成"最差 第 1 句 100%"，复核指出过）
                             if score.distance > 0 {
@@ -1414,6 +1418,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             scored,
                             asr_failed,
                             worst: issues,
+                            scores,
                         },
                     },
                 });
@@ -1878,6 +1883,8 @@ struct UiState {
     sep_task: std::cell::Cell<Option<u32>>,
     /// 质检任务的 id（配音页那一条）
     eval_task: std::cell::Cell<Option<u32>>,
+    /// 质检分数（句 index → 可懂度%）。重新合成/改稿后要清掉——分数会失效
+    eval_scores: RefCell<HashMap<usize, f64>>,
     /// 跨 Tab 任务台账（配音 / BGM / 音乐制作 / 人声分离共用一份）。
     tasks: RefCell<tasks::TaskQueue>,
     /// 各类任务当前的 id（进度/收尾消息按 id 回填）
@@ -2287,6 +2294,15 @@ fn wire_theme(ui: &MainWindow) {
     });
 }
 
+/// 稿件变了（改稿/载入示例/清空/重新切句）：句子序号与内容都会变，质检分数一律作废。
+///
+/// 注意**不**放进 `invalidate_worker_project`：工程改名不改句子，分数仍然有效。
+fn clear_eval_scores(state: &Rc<UiState>) {
+    if !state.eval_scores.borrow().is_empty() {
+        state.eval_scores.borrow_mut().clear();
+    }
+}
+
 fn invalidate_worker_project(cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     state.project_ready.set(false);
     state
@@ -2624,6 +2640,7 @@ fn wire_script(
         let text = ui.get_script_text();
         rebuild(&ui, &rows1, &text);
         invalidate_worker_project(&tx1, &state1);
+        clear_eval_scores(&state1);
         reset_bgm(&ui, &state1);
         ui.set_status_text(
             format!(
@@ -2648,6 +2665,7 @@ fn wire_script(
         ui.set_script_text(SAMPLE_SCRIPT.into());
         rebuild(&ui, &rows2, SAMPLE_SCRIPT);
         invalidate_worker_project(&tx2, &state2);
+        clear_eval_scores(&state2);
         reset_bgm(&ui, &state2);
         ui.set_status_text(format!("已载入示例稿：{} 句", rows2.row_count()).into());
     });
@@ -2665,6 +2683,7 @@ fn wire_script(
         ui.set_script_text("".into());
         rebuild(&ui, &rows3, "");
         invalidate_worker_project(&tx3, &state3);
+        clear_eval_scores(&state3);
         reset_bgm(&ui, &state3);
         ui.set_status_text("稿件已清空，粘一段口播稿试试".into());
     });
@@ -2682,6 +2701,7 @@ fn wire_script(
         let text = ui.get_script_text();
         rebuild(&ui, &rows4, &text);
         invalidate_worker_project(&tx4, &state4);
+        clear_eval_scores(&state4);
         reset_bgm(&ui, &state4);
         let n = rows4.row_count();
         ui.set_status_text(format!("已重新切句：{n} 句").into());
@@ -2817,6 +2837,33 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
     // 如实说：上游没有取消 API，should_stop 只在整轮分离返回后被查（aw-core
     // separate_tracks 的实现），所以这里只是"跑完丢弃、不落盘"，耗时照算
     ui.set_sep_status_text("停止中：本轮分离跑完才会丢弃结果（上游没有取消接口）…".into());
+}
+
+/// 质检分数在句子行上的标签。低于阈值加 ⚠ 前缀提醒看一眼。
+///
+/// 95% 是**启发式**（不是质量门槛）：CHARTER 记的基线是 98.5~100%，留一段余量；
+/// 触发后用户可以直接在展开行点「重录」。
+fn eval_label(percent: f64) -> String {
+    if percent < 95.0 {
+        format!("⚠ 可懂度 {percent:.1}%")
+    } else {
+        format!("可懂度 {percent:.1}%")
+    }
+}
+
+/// 把质检分数写进句子行（没有分数的行清空标签）。
+fn apply_eval_labels(rows: &Rc<VecModel<Sentence>>, scores: &HashMap<usize, f64>) {
+    for i in 0..rows.row_count() {
+        let Some(mut row) = rows.row_data(i) else {
+            continue;
+        };
+        let label = scores.get(&i).map(|p| eval_label(*p)).unwrap_or_default();
+        if row.eval_label.as_str() == label {
+            continue;
+        }
+        row.eval_label = SharedString::from(label);
+        rows.set_row_data(i, row);
+    }
 }
 
 /// 质检完成后的摘要文案（抽成纯函数：全失败 / 全一致 / 有最差句三种要分开说，
@@ -3815,6 +3862,13 @@ fn tick(
                 status,
                 duration,
             } => {
+                // 这句要重录/正在重跑：旧分数立刻失效（否则界面会拿旧分骗人）
+                if status == "running" || status == "done" || status == "error" {
+                    let had = state.eval_scores.borrow_mut().remove(&index).is_some();
+                    if had {
+                        apply_eval_labels(rows, &state.eval_scores.borrow());
+                    }
+                }
                 if let Some(d) = duration {
                     set_row_duration(rows, index, d as f32);
                     recompute_total(rows);
@@ -4103,6 +4157,14 @@ fn tick(
                 if state.eval_task.get() != Some(task_id) {
                     continue;
                 }
+                {
+                    let mut scores = state.eval_scores.borrow_mut();
+                    scores.clear();
+                    for (idx, percent) in &summary.scores {
+                        scores.insert(*idx, *percent);
+                    }
+                }
+                apply_eval_labels(rows, &state.eval_scores.borrow());
                 let note = eval_summary_note(&summary);
                 // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
                 let outcome = if summary.scored == 0 {
@@ -4618,6 +4680,7 @@ fn build_rows(lines: &[String]) -> Vec<Sentence> {
             start,
             duration_label: format!("{duration:.1}s").into(),
             start_label: clock_label(start).into(),
+            eval_label: "".into(),
         });
         start += duration;
     }
@@ -5462,6 +5525,7 @@ mod tests {
     #[test]
     fn fatal_marks_running_rows_failed() {
         let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![Sentence {
+            eval_label: "".into(),
             no: 1,
             text: "测试句。".into(),
             status: "合成中".into(),
@@ -5961,6 +6025,7 @@ mod tests {
             scored: 0,
             asr_failed: 5,
             worst: Vec::new(),
+            scores: Vec::new(),
         };
         let note = eval_summary_note(&all_failed);
         assert!(note.contains("未能评分"), "{note}");
@@ -5973,6 +6038,7 @@ mod tests {
             scored: 3,
             asr_failed: 0,
             worst: Vec::new(),
+            scores: vec![(0, 100.0), (1, 100.0), (2, 100.0)],
         };
         let note = eval_summary_note(&clean);
         assert!(note.contains("100.0%") && note.contains("3 句"), "{note}");
@@ -5982,6 +6048,7 @@ mod tests {
             percent: 96.4,
             scored: 57,
             asr_failed: 2,
+            scores: vec![(0, 100.0), (11, 92.3)],
             worst: vec![EvalIssue {
                 index: 11,
                 percent: 92.3,
@@ -5995,5 +6062,14 @@ mod tests {
             note.contains("第 12 句") && note.contains("92.3%") && note.contains("应为"),
             "最差句要给序号、分数与差异片段：{note}"
         );
+    }
+
+    /// 句子行上的质检标签：低于阈值加 ⚠（阈值是启发式，不是质量门槛）。
+    #[test]
+    fn eval_label_marks_low_scores() {
+        assert_eq!(eval_label(99.9), "可懂度 99.9%");
+        assert_eq!(eval_label(95.0), "可懂度 95.0%", "正好等于阈值不加警告");
+        assert_eq!(eval_label(94.9), "⚠ 可懂度 94.9%");
+        assert_eq!(eval_label(0.0), "⚠ 可懂度 0.0%");
     }
 }

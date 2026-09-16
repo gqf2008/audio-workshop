@@ -125,7 +125,9 @@ component SentenceRow inherits Rectangle {
 
             Text {
                 horizontal-stretch: 1;
-                text: root.item.status;
+                // 质检分数并进状态行：展开区仍是「状态/分数 + 试听 + 重录」3 个元素
+                text: root.item.status
+                    + (root.item.eval-label == "" ? "" : " · " + root.item.eval-label);
                 color: PixelTheme.dim;
                 font-size: 12px;
                 overflow: elide;
