@@ -1147,8 +1147,9 @@ fn sync_auto_normalize_toggle(ui: &MainWindow, state: &Rc<UiState>) {
     if now == seen {
         return;
     }
-    if project_editing_blocked(ui, state) {
-        // 拨回去（下一次 tick 就与 seen 一致了），并说清为什么不让改
+    if project_editing_blocked(ui, state) || batch_in_flight(state) {
+        // 拨回去（下一次 tick 就与 seen 一致了），并说清为什么不让改。
+        // 批量也要算"进行中"：它的 auto_normalize 在提交那一刻就定格了。
         ui.set_auto_normalize(seen);
         ui.set_status_text("任务进行中：兜底规则暂不可改".into());
         return;
@@ -1178,8 +1179,38 @@ fn normalize_gap_ms(text: &str) -> u64 {
 }
 
 /// 当前界面的句间停顿（毫秒）。
+///
+/// 顺手把归一后的值写回输入框：用户填 3000 时实际按 2000 用，界面也必须显示 2000
+/// ——"显示一套、执行一套"是最容易骗人的。**只在真正用到它的时刻回写**（提交/导出），
+/// 不在每次按键时回写：那样用户想清空重填都会被立刻塞回默认值。
 fn gap_ms_from_ui(ui: &MainWindow) -> u64 {
-    normalize_gap_ms(&ui.get_gap_ms_text())
+    let raw = ui.get_gap_ms_text().to_string();
+    let norm = normalize_gap_ms(&raw);
+    if raw.trim() != norm.to_string() {
+        ui.set_gap_ms_text(norm.to_string().into());
+    }
+    norm
+}
+
+/// 停顿输入的即时反馈：超上限/非法时在状态行说清会按什么值用（不回写输入框，
+/// 免得打断正在输入的用户）。
+fn gap_hint_for(raw: &str) -> String {
+    let norm = normalize_gap_ms(raw);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return format!("停顿留空 = 默认 {norm} 毫秒");
+    }
+    if trimmed
+        .parse::<u64>()
+        .map(|v| v > MAX_GAP_MS)
+        .unwrap_or(false)
+    {
+        return format!("停顿上限 {MAX_GAP_MS} 毫秒：会按 {norm} 应用");
+    }
+    if trimmed.parse::<u64>().is_err() {
+        return format!("停顿要填毫秒数（0–{MAX_GAP_MS}）：会按 {norm} 应用");
+    }
+    format!("句间停顿 {norm} 毫秒（改了重新导出就生效）")
 }
 
 /// 所有导出（批量导出 / 分轨导出 / BGM 逐轨导出）共用的互斥判据：
@@ -2368,16 +2399,21 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
-                // 停顿是拼装参数：这里应用当前值（改了停顿的用户点「导出」即可生效）
+                // 停顿是拼装参数：这里应用当前值（改了停顿的用户点「导出」即可生效）。
+                // **先存副本、成功再改内存**：直接改字段的话，save 失败会留下
+                // "内存里 300、project.json 里 250"，下一次同值调用因为字段已相等而跳过
+                // save，最后拼出与工程记录不一致的成品。
                 if project.gap_ms != gap_ms {
-                    project.gap_ms = gap_ms;
-                    if let Err(e) = project.save(dir) {
+                    let mut updated = project.clone();
+                    updated.gap_ms = gap_ms;
+                    if let Err(e) = updated.save(dir) {
                         let _ = ctx.tx.send(WorkerMsg {
                             revision,
                             msg: Msg::AssembleFailed(format!("保存工程失败: {e}")),
                         });
                         continue;
                     }
+                    project.gap_ms = gap_ms;
                 }
                 match project.assemble(dir) {
                     Ok(a) => {
@@ -3719,6 +3755,13 @@ fn wire_script(
         ui.set_status_text(format!("工程名：{}", ui.get_project_name()).into());
     });
 
+    // 停顿输入：只给即时反馈，不打断输入（真正的回写在 gap_ms_from_ui 里）
+    let weak = ui.as_weak();
+    ui.on_gap_edited(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_status_text(gap_hint_for(&ui.get_gap_ms_text()).into());
+    });
+
     let weak = ui.as_weak();
     let rows1 = rows.clone();
     let tx1 = cmd_tx.clone();
@@ -4474,7 +4517,8 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
         }
         ui.set_speed(t.speed);
         ui.set_speed_label(format!("{:.2}x", t.speed).into());
-        ui.set_gap_ms_text(t.gap_ms.to_string().into());
+        // 手写的模板可能填了超上限的 gap：应用时归一，界面与执行保持一致
+        ui.set_gap_ms_text(normalize_gap_ms(&t.gap_ms.to_string()).to_string().into());
         ui.set_auto_normalize(t.auto_normalize);
         st.auto_normalize_seen.set(t.auto_normalize);
         refresh_voice_labels(&ui);
@@ -7061,6 +7105,87 @@ mod tests {
 
     fn wav_sentinel(sentence: &aw_core::Sentence) -> String {
         format!("wav-{}-{}", sentence.index, sentence.text)
+    }
+
+    /// 复核抓到的：`Cmd::Assemble` 改 gap 后 save 失败，**内存里的 gap 不能被改掉**。
+    /// 做法：工程目录设成只读，连续发两次同值 Assemble——两次都必须报"保存工程失败"。
+    /// 如果实现是"先改内存再 save"，第二次会因为字段已相等而跳过 save、直接去拼装，
+    /// 最后拼出与 project.json 记录不一致的成品。
+    #[test]
+    fn assemble_gap_save_failure_does_not_mutate_memory() {
+        let root = std::env::temp_dir().join(format!("aw-assemble-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut project = saved_project("第一句。第二句。", None);
+        save_done_project(&root, &mut project);
+
+        let before = std::fs::metadata(&root).unwrap().permissions();
+        let mut ro = before.clone();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&root, ro).unwrap();
+
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let worker_root = root.clone();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: worker_root,
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+        cmd_tx
+            .send(Cmd::OpenProject {
+                revision: 1,
+                dir: root.clone(),
+                project,
+            })
+            .unwrap();
+        let new_gap = GAP_MS + 500;
+        let expect_save_failure =
+            |cmd_tx: &Sender<Cmd>, msg_rx: &Receiver<WorkerMsg>, nth: &str| {
+                cmd_tx
+                    .send(Cmd::Assemble {
+                        revision: 1,
+                        gap_ms: new_gap,
+                    })
+                    .unwrap();
+                loop {
+                    let m = msg_rx.recv().expect("worker 应有消息");
+                    match m.msg {
+                        Msg::AssembleFailed(e) => break e,
+                        Msg::Assembled { .. } => panic!("{nth}：目录不可写，不该拼成功"),
+                        _ => {}
+                    }
+                }
+            };
+        let first = expect_save_failure(&cmd_tx, &msg_rx, "第一次");
+        assert!(first.contains("保存工程失败"), "{first}");
+        let second = expect_save_failure(&cmd_tx, &msg_rx, "第二次");
+        assert!(
+            second.contains("保存工程失败"),
+            "第二次仍应尝试保存并失败（说明内存里的 gap 没被偷偷改掉）：{second}"
+        );
+
+        drop(cmd_tx);
+        handle.join().unwrap();
+        // 恢复权限，别给 temp 清理留坑
+        std::fs::set_permissions(&root, before).unwrap();
+    }
+
+    /// 停顿输入的即时反馈：留空/非法/超上限各有说法（与 `normalize_gap_ms` 同一判据）。
+    #[test]
+    fn gap_hint_explains_what_will_be_used() {
+        assert!(gap_hint_for("").contains("默认"));
+        assert!(gap_hint_for("abc").contains("毫秒数"), "非法要说明填什么");
+        let over = gap_hint_for("3000");
+        assert!(over.contains("上限") && over.contains("2000"), "{over}");
+        let ok = gap_hint_for("300");
+        assert!(ok.contains("300"), "{ok}");
     }
 
     /// 存模板前必须有个名字：空白名字直接拒绝（否则会存出一条没法选中的无名模板）。

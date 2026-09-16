@@ -412,9 +412,16 @@ impl Project {
         let mut cursor_frames: u64 = 0;
         let mut srt = String::new();
         let mut srt_index = 0u32;
-        let last = self.sentences.len() - 1;
+        // 句间静音只加在**成功句之间**：最后一句失败时，前面那个 done 句后面不该再补 gap
+        // （否则成品尾部多一段静音；gap=2000 时就是多 2 秒）。
+        let last_done = self
+            .sentences
+            .iter()
+            .filter(|s| s.status == "done")
+            .map(|s| s.index)
+            .next_back();
 
-        for (k, s) in self.sentences.iter_mut().enumerate() {
+        for s in self.sentences.iter_mut() {
             if s.status != "done" {
                 s.start = None;
                 continue;
@@ -435,7 +442,7 @@ impl Project {
             let start = cursor_frames as f64 / spec.sample_rate as f64;
             s.start = Some(start);
             cursor_frames += frames as u64;
-            if k != last {
+            if Some(s.index) != last_done {
                 for _ in 0..(gap_frames * spec.channels as usize) {
                     writer
                         .write_sample(0i16)
@@ -1057,6 +1064,46 @@ mod tests {
             (loose.duration - 0.4).abs() < 0.02,
             "gap=200ms 时成品应≈0.4s，实得 {}",
             loose.duration
+        );
+    }
+
+    /// 末尾句失败时不该在成品尾部留一段句间静音（复核抓到：`k != last` 用的是句数组的
+    /// 最后一项，而那一项是失败句）。三句、只有前两句 done：成品 = 两句音频 + 1 个 gap。
+    #[test]
+    fn assemble_skips_trailing_gap_when_last_sentence_failed() {
+        let dir = std::env::temp_dir().join(format!("aw-assemble-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::new(
+            "第一句。第二句。第三句。",
+            "audio8-tts",
+            200,
+            831001,
+            None,
+            DEFAULT_PUNCTUATION,
+            80,
+            |t| crate::normalize(t, &Default::default()),
+        );
+        let mut done = 0usize;
+        for (i, s) in project.sentences.iter_mut().enumerate() {
+            if i < 2 {
+                write_valid_sentence_wav(&dir, i, 2400); // 0.1s each
+                s.status = "done".into();
+                s.duration = Some(0.1);
+                done += 1;
+            } else {
+                // 第三句失败：不写 wav、状态不是 done
+                s.status = "error: 服务端失败".into();
+            }
+        }
+        let a = project.assemble(&dir).unwrap();
+        assert_eq!(a.done, done);
+        assert_eq!(a.skipped, 1);
+        // 0.1 + 0.2 + 0.1 = 0.4（末尾没有 gap）
+        assert!(
+            (a.duration - 0.4).abs() < 0.02,
+            "末尾不该留静音：实得 {}",
+            a.duration
         );
     }
 

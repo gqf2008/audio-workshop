@@ -762,6 +762,8 @@ export component DubWorkbench inherits Rectangle {
                             // PixelSwitch 没有 changed 回调：Rust 侧在 tick 里比对上一次的值
                             // 来发现切换（见 src/main.rs 的 auto_normalize_seen）
                             PixelSwitch {
+                                // 批量在跑时也锁：它的 auto_normalize 在提交那一刻就定格了
+                                enabled: !root.running && !root.busy && !root.batch-running;
                                 checked <=> root.auto-normalize;
                             }
                             Text {
