@@ -22,6 +22,18 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// 这类任务会不会报中间进度。
+    ///
+    /// 状态栏 chip 对**不报进度**的种类改报"已运行 N"——写死的 0% 看起来像卡死
+    /// （歌曲是整段生成，服务端没有中间进度）。这里是穷举 match：以后新增任务种类
+    /// 必须显式决定它有没有进度，而不是被 `_ =>` 静默当作有。
+    pub fn reports_progress(self) -> bool {
+        match self {
+            TaskKind::Dub | TaskKind::Bgm | TaskKind::Separation => true,
+            TaskKind::Song => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             TaskKind::Dub => "配音",

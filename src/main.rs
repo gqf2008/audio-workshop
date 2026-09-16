@@ -886,6 +886,31 @@ fn task_take_started(ctx: &WorkerCtx, task_id: u32) -> bool {
     ctx.cancel.take(task_id)
 }
 
+/// 歌曲这类整段生成的任务没有中间进度：状态栏 chip 改报"已运行 N"，
+/// 任务中心靠这条阶段文案 + 时长说明它没卡死。
+fn song_stage_note(model_id: &str) -> &'static str {
+    if model_id == "ace-step" {
+        "正在请求服务端（ACE-Step 整段生成，无中间进度）"
+    } else {
+        "正在请求服务端（yue2 整段生成，无中间进度）"
+    }
+}
+
+/// 客户端就绪后：**先**回报"正在请求服务端…"，再执行真正的请求。
+///
+/// 抽成函数是为了让单测能用假的 run 钉住顺序——真跑一遍 generate_song 会打服务端，
+/// 测试里不能这么干；而"阶段必须晚于客户端就绪、早于请求"正是复核抓到过的那条。
+fn with_song_stage<T>(ctx: &WorkerCtx, task_id: u32, model_id: &str, run: impl FnOnce() -> T) -> T {
+    let _ = ctx.tx.send(WorkerMsg {
+        revision: 0,
+        msg: Msg::TaskStage {
+            task_id,
+            stage: song_stage_note(model_id).to_string(),
+        },
+    });
+    run()
+}
+
 fn worker_loop(ctx: WorkerCtx) {
     // 当前工程：dir + project。Assemble/Redo 复用 Run 留下的那份。
     let mut current: Option<(u64, PathBuf, Project)> = None;
@@ -1221,20 +1246,6 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
-                // 服务端是整段生成，中途没有任何进度可报；至少说清"请求已经发出去了"，
-                // 任务中心再配上"已运行 N"的时钟，用户才知道它没卡死。
-                let stage = if model == "ace-step" {
-                    "已请求服务端（ACE-Step 整段生成，无中间进度）"
-                } else {
-                    "已请求服务端（yue2 整段生成，无中间进度）"
-                };
-                let _ = ctx.tx.send(WorkerMsg {
-                    revision: 0,
-                    msg: Msg::TaskStage {
-                        task_id,
-                        stage: stage.to_string(),
-                    },
-                });
                 let dir = project_dir(&file_stem(&project_name)).join("song");
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     let _ = ctx.tx.send(WorkerMsg {
@@ -1256,6 +1267,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         continue;
                     }
                 };
+                let model_id = model.clone();
                 let model = match model.as_str() {
                     "ace-step" => SongModel::AceStep,
                     _ => SongModel::Yue2,
@@ -1266,7 +1278,12 @@ fn worker_loop(ctx: WorkerCtx) {
                     style,
                     ..Default::default()
                 };
-                match generate_song(&client, &dir, "song", &options) {
+                // 目录与客户端都已就绪，下面这一下才是真的发请求：这时才回报阶段
+                // （复核指出：早于 create_dir_all / make_client 回报会在失败时报假进度）
+                let outcome = with_song_stage(&ctx, task_id, &model_id, || {
+                    generate_song(&client, &dir, "song", &options)
+                });
+                match outcome {
                     Ok(path) => {
                         let duration = std::fs::read(&path)
                             .ok()
@@ -2155,15 +2172,14 @@ fn maybe_refresh_task_times(ui: &MainWindow, state: &Rc<UiState>) {
 fn task_chip_text(q: &tasks::TaskQueue) -> String {
     if let Some(t) = q.running() {
         let c = q.counts();
-        let head = match t.kind {
-            // 歌曲是整段生成，没有中间进度：写 0% 会让人以为卡死，改报已运行时长
-            tasks::TaskKind::Song => match q.elapsed(t.id) {
+        let head = if t.kind.reports_progress() {
+            let pct = (t.progress * 100.0).round() as i32;
+            format!("{} {}%", t.kind.label(), pct)
+        } else {
+            // 整段生成的任务没有中间进度：写 0% 会让人以为卡死，改报已运行时长
+            match q.elapsed(t.id) {
                 Some(d) => format!("{} 已运行 {}", t.kind.label(), format_elapsed(d)),
                 None => t.kind.label().to_string(),
-            },
-            _ => {
-                let pct = (t.progress * 100.0).round() as i32;
-                format!("{} {}%", t.kind.label(), pct)
             }
         };
         // 运行中还排着队：chip 上说清"后面还有几条"，否则用户以为只跑这一条
@@ -2857,7 +2873,7 @@ fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     ui.on_export_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
         // 拼装只有亚秒级，同样不该排队：有任务在飞时直接拒绝并说清
-        if ui.get_busy() || tasks_in_flight(&state) {
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&state) {
             ui.set_status_text(
                 "有任务正在进行：导出要等它结束（拼装是立刻执行的短操作，不排队）".into(),
             );
@@ -5146,5 +5162,70 @@ mod tests {
         let id = dub.start(tasks::TaskKind::Dub, "配音 · 34 句");
         dub.progress(id, 0.35, "第 12/34 句");
         assert!(task_chip_text(&dub).contains("35%"));
+    }
+
+    /// 歌曲阶段消息必须**早于真正的请求、晚于客户端就绪**——复核抓到的正是"阶段报早了"：
+    /// 目录创建或 make_client 失败时界面已经写着"已请求服务端"。
+    /// 这里用假的 run 钉住顺序（真跑 generate_song 会打服务端），并顺带核 task_id 路由。
+    #[test]
+    fn song_stage_is_sent_right_before_the_request_runs() {
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let ctx = WorkerCtx {
+            rx: cmd_rx,
+            tx: msg_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            sep_stop: Arc::new(AtomicBool::new(false)),
+            cancel: cancel::CancelRegistry::new(),
+        };
+
+        let stage_already_sent = std::cell::Cell::new(false);
+        let out = with_song_stage(&ctx, 42, "ace-step", || {
+            // 闭包（=真正的请求）跑起来时，阶段消息必须已经在通道里
+            stage_already_sent.set(matches!(
+                msg_rx.try_recv(),
+                Ok(WorkerMsg {
+                    msg: Msg::TaskStage { task_id: 42, .. },
+                    ..
+                })
+            ));
+            "generated"
+        });
+
+        assert_eq!(out, "generated");
+        assert!(
+            stage_already_sent.get(),
+            "阶段消息必须先于请求执行，且带对的 task_id"
+        );
+        drop(cmd_tx);
+    }
+
+    /// 阶段文案按模型分别写清"整段生成、无中间进度"，不能只有一句笼统的话；
+    /// 有进度的种类与没进度的种类在状态栏 chip 上必须给出不同的东西。
+    #[test]
+    fn song_stage_note_names_the_model_and_progress_kinds_are_explicit() {
+        assert!(song_stage_note("yue2").contains("yue2"));
+        assert!(song_stage_note("ace-step").contains("ACE-Step"));
+        for note in [song_stage_note("yue2"), song_stage_note("ace-step")] {
+            assert!(
+                note.contains("整段生成") && note.contains("无中间进度"),
+                "实得 {note}"
+            );
+        }
+
+        // 有进度的种类在 chip 上给百分比，没进度的给时长——两边都不能写成 0%
+        for kind in [
+            tasks::TaskKind::Dub,
+            tasks::TaskKind::Bgm,
+            tasks::TaskKind::Separation,
+        ] {
+            assert!(kind.reports_progress(), "{kind:?} 应该报进度");
+            let mut q = tasks::TaskQueue::default();
+            let id = q.start(kind, "t");
+            q.progress(id, 0.4, "阶段");
+            let chip = task_chip_text(&q);
+            assert!(chip.contains("40%"), "{kind:?} 的 chip 实得 {chip}");
+        }
+        assert!(!tasks::TaskKind::Song.reports_progress());
     }
 }
