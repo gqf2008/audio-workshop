@@ -34,6 +34,10 @@
 会让人以为是只停这一条。判定见 `can_stop_task` / `stop_target`（`StopTarget::Batch`
 只认 `Pending`）。
 
+停整批时**每一篇都要收到终态**（已完成的算完成，没轮到的逐条报"整批已停止：这篇没跑"）：
+worker 不能直接跳出循环——留在台账里的 `Pending` 会让 `tasks_in_flight` 永远为真，
+用户之后连单篇都提交不了。有单测钉这条（`stopped_batch_reports_every_item_as_terminal`）。
+
 ## 4. 失败、跳过与断点续作
 
 - **跳过**（导入期）：不是文件 / 读不到 / 非 UTF-8 / 空稿 / 归一后重名。重名必须拦：

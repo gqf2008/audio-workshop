@@ -213,7 +213,10 @@ enum Msg {
         /// 这一篇复用了多少句已合成的音频（断点续作/重跑批量时 > 0）
         reused: usize,
         skipped: bool,
+        /// 真正的失败原因（服务不可用、拼装失败…）。跳过不带它。
         error: Option<String>,
+        /// 跳过的原因（"排队中被取消" / "整批已停止，这篇没跑"）。失败不带它。
+        note: Option<String>,
     },
     /// 整批收尾：完成 / 失败 / 跳过各几篇，以及是否被用户停掉
     BatchDone {
@@ -1277,12 +1280,26 @@ fn worker_loop(ctx: WorkerCtx) {
                 let mut done = 0usize;
                 let mut failed = 0usize;
                 let mut skipped = 0usize;
-                let mut stopped = false;
+                // 整批中止（用户按了停止）。**不能 break**：剩下的篇目也要各回一条终态，
+                // 否则任务台账里会永远挂着 Pending，`tasks_in_flight` 一直为真，
+                // 用户之后连单篇都提交不了（没人再回报那几条）。
+                let mut abort = false;
                 for (index, item) in items.into_iter().enumerate() {
-                    // 用户按了停止：当前篇已经在句间停住了，这里不再开下一篇
-                    if ctx.stop.load(Ordering::Relaxed) {
-                        stopped = true;
-                        break;
+                    if abort || ctx.stop.load(Ordering::Relaxed) {
+                        abort = true;
+                        skipped += 1;
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: batch_item_done(
+                                item.task_id,
+                                index,
+                                item.name,
+                                BatchItemOutcome::Skipped {
+                                    note: Some("整批已停止：这篇没跑".into()),
+                                },
+                            ),
+                        });
+                        continue;
                     }
                     // 排队中就被取消的那篇：不加载、不合成，如实收尾（不消耗算力）
                     if task_take_started(&ctx, item.task_id) {
@@ -1293,7 +1310,7 @@ fn worker_loop(ctx: WorkerCtx) {
                                 item.task_id,
                                 index,
                                 item.name,
-                                BatchItemOutcome::Skipped,
+                                BatchItemOutcome::Skipped { note: None },
                             ),
                         });
                         continue;
@@ -1403,8 +1420,11 @@ fn worker_loop(ctx: WorkerCtx) {
                         },
                         Err(e) => {
                             failed += 1;
+                            // 彻底跑不动（落盘/保存失败）：这是"这篇失败"，不是"N 句失败"。
+                            // 句数写 0，原因走 error——不要用 usize::MAX 这种哨兵值，
+                            // 它一旦被谁当句数显示出来就是个假数字。
                             BatchItemOutcome::Failed {
-                                failed: usize::MAX,
+                                failed: 0,
                                 error: format!("合成中止: {e}"),
                                 reused,
                             }
@@ -1415,22 +1435,18 @@ fn worker_loop(ctx: WorkerCtx) {
                         msg: batch_item_done(task_id, index, item.name, outcome),
                     });
                     if item_stopped {
-                        stopped = true;
-                        break;
+                        abort = true;
                     }
                 }
-                // 没轮上的那些篇也要有终态：否则任务中心里会永远停在"排队中"，
-                // 用户只能靠退出应用来清掉它
-                if stopped {
-                    skipped += total.saturating_sub(done + failed + skipped);
-                }
+                // 计数天然对得上：跑到哪算到哪，剩下的篇目在循环里被逐条记成 skipped
+                debug_assert_eq!(done + failed + skipped, total);
                 let _ = ctx.tx.send(WorkerMsg {
                     revision,
                     msg: Msg::BatchDone {
                         done,
                         failed,
                         skipped,
-                        stopped,
+                        stopped: abort,
                     },
                 });
             }
@@ -2045,7 +2061,8 @@ enum BatchItemOutcome {
         error: String,
         reused: usize,
     },
-    Skipped,
+    /// 没跑的那篇：`note` 说清为什么没跑（排队中被取消 / 整批被停止）
+    Skipped { note: Option<String> },
 }
 
 fn batch_item_done(task_id: u32, index: usize, name: String, outcome: BatchItemOutcome) -> Msg {
@@ -2065,6 +2082,7 @@ fn batch_item_done(task_id: u32, index: usize, name: String, outcome: BatchItemO
             reused,
             skipped: false,
             error: None,
+            note: None,
         },
         BatchItemOutcome::Failed {
             failed,
@@ -2080,8 +2098,9 @@ fn batch_item_done(task_id: u32, index: usize, name: String, outcome: BatchItemO
             reused,
             skipped: false,
             error: Some(error),
+            note: None,
         },
-        BatchItemOutcome::Skipped => Msg::BatchItemDone {
+        BatchItemOutcome::Skipped { note } => Msg::BatchItemDone {
             task_id,
             index,
             name,
@@ -2091,6 +2110,7 @@ fn batch_item_done(task_id: u32, index: usize, name: String, outcome: BatchItemO
             reused: 0,
             skipped: true,
             error: None,
+            note,
         },
     }
 }
@@ -5221,11 +5241,12 @@ fn tick(
                 reused,
                 skipped,
                 error,
+                note,
             } => {
                 let (item_state, detail, task_state) = if skipped {
                     (
                         batch::ItemState::Skipped,
-                        "排队中被取消，没有跑".to_string(),
+                        note.unwrap_or_else(|| "排队中被取消，没有跑".to_string()),
                         tasks::TaskState::Stopped,
                     )
                 } else if let Some(e) = error {
@@ -7102,6 +7123,80 @@ mod tests {
         );
         assert_eq!(summary, (0, 0, 2, false), "两条都被取消，整批没有失败");
         assert_eq!(cancel.len(), 0, "取走过的登记项不能留在表里（表要有界）");
+    }
+
+    /// 整批停止：**每篇都要收到终态**，一篇都不能留在"排队中"。
+    ///
+    /// 提交那一刻 stop 位已经是 true，等价于"刚提交就按了停止"。worker 不能直接
+    /// break——留在台账里的 Pending 会让 `tasks_in_flight` 永远为真，
+    /// 用户之后连单篇都提交不了（那几条再也没人回报）。
+    #[test]
+    fn stopped_batch_reports_every_item_as_terminal() {
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(true)), // 一开始就是"已按停止"
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: std::env::temp_dir(),
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+
+        cmd_tx
+            .send(Cmd::RunBatch {
+                revision: 1,
+                model: "audio8-tts".into(),
+                voice_ref: None,
+                items: vec![
+                    BatchCmdItem {
+                        task_id: 51,
+                        name: "停批甲".into(),
+                        script: "第一句。".into(),
+                    },
+                    BatchCmdItem {
+                        task_id: 52,
+                        name: "停批乙".into(),
+                        script: "第二句。".into(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        let mut terminal = Vec::new();
+        let summary = loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::BatchItemProgress { .. } => panic!("停止的批不该产生任何进度"),
+                Msg::BatchItemDone {
+                    task_id,
+                    skipped,
+                    note,
+                    error,
+                    ..
+                } => {
+                    assert!(skipped, "停止后没跑的篇目要报 skipped：{error:?}");
+                    let note = note.expect("跳过的原因要如实说");
+                    assert!(note.contains("停止"), "原因要说清是被停了：{note}");
+                    terminal.push(task_id);
+                }
+                Msg::BatchDone {
+                    done,
+                    failed,
+                    skipped,
+                    stopped,
+                } => break (done, failed, skipped, stopped),
+                _ => {}
+            }
+        };
+        drop(cmd_tx);
+        handle.join().unwrap();
+
+        assert_eq!(terminal, vec![51, 52], "两篇都要有终态，不能留 Pending");
+        assert_eq!(summary, (0, 0, 2, true));
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。
