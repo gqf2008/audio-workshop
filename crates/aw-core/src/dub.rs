@@ -536,15 +536,16 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
         dst.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
         std::process::id()
     ));
-    let result =
-        std::fs::copy(src, &tmp).and_then(|_| std::fs::File::open(&tmp).and_then(|f| f.sync_all()));
-    match result {
-        Ok(()) => std::fs::rename(&tmp, dst),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp); // 失败不留残渣
-            Err(e)
-        }
+    // 三步都算在结果里：只有 rename 成功才算落地。任何一步失败都清临时文件——
+    // 只在 copy/sync 失败时清会漏掉"临时文件写完但 rename 失败（例如目标被目录占着）"，
+    // 那种情况会在目录里留下 .tmp 残渣（复核抓到）。
+    let result = std::fs::copy(src, &tmp)
+        .and_then(|_| std::fs::File::open(&tmp).and_then(|f| f.sync_all()))
+        .and_then(|()| std::fs::rename(&tmp, dst));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    result
 }
 
 /// hound（wav 读写）的错误 → 可执行文案：`IoError` 能按 io 分类的就分类，
@@ -915,5 +916,37 @@ mod tests {
             note.contains("重建目录后再重跑"),
             "复制失败也要给动作：{note}"
         );
+    }
+
+    /// rename 失败（目标被目录占着）也必须清掉临时文件——复核补抓到的那条分支：
+    /// 只在 copy/sync 失败时清理会漏掉它，目录里会留下 `dst.wav.tmp<pid>`。
+    #[test]
+    fn copy_atomic_cleans_temp_when_rename_fails() {
+        let dir = std::env::temp_dir().join(format!("aw-copy-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src = dir.join("src.wav");
+        std::fs::write(&src, b"new-bytes").unwrap();
+        // 目标位置是个目录：rename(file → dir) 必然失败
+        let dst = dir.join("dst.wav");
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let err = copy_atomic(&src, &dst).unwrap_err();
+        assert!(
+            std::fs::read_dir(&dst).unwrap().next().is_none(),
+            "失败不该把内容塞进目标目录"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rename 失败也要清临时文件：{leftovers:?}"
+        );
+        assert!(err.raw_os_error().is_some(), "应是真实 io 错误：{err}");
     }
 }

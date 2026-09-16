@@ -49,7 +49,7 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
 现在导出也是原子的，要么旧文件不变、要么新文件完整，这句话对所有使用者都成立。
 
 失败路径的测试覆盖：`write_failure_note` 四类 + 零字节 + 顺序断言（helper 级）；
-`write_atomic_explained`（真实原子写）；`copy_atomic`（失败不动旧目标、不留 `.tmp`）；
+`write_atomic_explained`（真实原子写）；`copy_atomic`（源缺失时不动旧目标、不留 `.tmp`；**rename 失败时同样清临时文件**）；
 `assemble` 缺句文件（**真实拼装路径**）；`assemble_bgm` 写不进去（**真实 BGM 写入路径**，
 用只读目录触发）。
 
@@ -81,6 +81,7 @@ cargo test -p aw-core --lib dub::tests::zero_byte_write_note_omits_size_and_houn
 cargo test -p aw-core --lib dub::tests::missing_sentence_wav_says_which_file_is_gone
 cargo test -p aw-core --lib dub::tests::assemble_reports_which_sentence_wav_is_missing
 cargo test -p aw-core --lib dub::tests::copy_atomic_keeps_old_target_and_leaves_no_temp
+cargo test -p aw-core --lib dub::tests::copy_atomic_cleans_temp_when_rename_fails
 cargo test -p aw-core --lib bgm::tests::assemble_bgm_write_failure_reports_actionable_note
 
 # 工程损坏：不重建、不覆盖
