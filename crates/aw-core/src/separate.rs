@@ -53,8 +53,8 @@ pub struct Progress {
 pub struct SeparatedTracks {
     pub vocals: PathBuf,
     pub accompaniment: PathBuf,
-    /// 裁齐相关的说明（None = 正常裁齐或无需说明）。
-    /// 例：输入不是 wav（跳过裁齐）、wav 读不出时长（未裁齐）。
+    /// 采样率修正相关的说明（None = 已按输入采样率修正或无需修正）。
+    /// 例：输入不是 wav（跳过修正）、wav 读不出采样率（未修正）。
     pub note: Option<String>,
 }
 
@@ -172,62 +172,59 @@ fn write_stems_with_cleanup(
     Ok(())
 }
 
-/// 输入音频时长（秒）。三态，别把三种情况揉成一个 `None`：
+/// 输入音频的**采样率**。三态，别把三种情况揉成一个 `None`：
 ///
-/// - `Ok(Some(secs))`：能裁（wav 且读得动）；
-/// - `Ok(None)`：**不是 wav**（mp3/flac 由上游解码器读，长度我们拿不到）→ 按文档跳过裁齐；
-/// - `Err(note)`：扩展名是 wav 却读不出来（损坏/权限）→ 如实报出去，不静默跳过
-///   （静默跳过会让用户拿到比输入长的产物却不知道原因——复核指出）。
-fn input_duration_seconds(path: &Path) -> Result<Option<f64>, String> {
+/// - `Ok(Some(rate))`：能修标签（wav 且读得动）；
+/// - `Ok(None)`：**不是 wav**（mp3/flac 由上游解码器读，采样率我们拿不到）→ 跳过，并在说明里讲清；
+/// - `Err(note)`：扩展名是 wav 却读不出来（损坏/权限）→ 如实报出去，不静默跳过。
+///
+/// 为什么需要它（2026-09-17 实测）：上游**不做重采样、保留输入的帧数/时间轴**，但把输出标签
+/// 写成**模型自己的采样率 44100**。48kHz 输入因此得到一个"同帧数、44.1kHz"的产物——
+/// **时长 +8.84%、播放被拉慢 1.0884 倍**。
+/// 把两轨按输入采样率重新打标签（样本不动）就能 1:1 还原：实测按输入采样率读时，
+/// 伴奏/人声与输入的包络相关系数 0.822 / 0.800（按 44.1kHz 读只有 0.268）。
+fn input_sample_rate(path: &Path) -> Result<Option<u32>, String> {
     let looks_like_wav = path
         .extension()
         .map(|e| e.eq_ignore_ascii_case("wav"))
         .unwrap_or(false);
     match hound::WavReader::open(path) {
         Ok(reader) => {
-            let sr = reader.spec().sample_rate;
-            if sr == 0 {
+            let rate = reader.spec().sample_rate;
+            if rate == 0 {
                 return Err(format!("输入 wav 的采样率为 0：{}", path.display()));
             }
-            Ok(Some(reader.duration() as f64 / sr as f64))
+            Ok(Some(rate))
         }
         Err(e) if looks_like_wav => Err(format!(
-            "输入是 wav 但读不出时长（{}）：{e}。请确认文件没损坏/有权限后重跑。",
+            "输入是 wav 但读不出采样率（{}）：{e}。请确认文件没损坏/有权限后重跑。",
             path.display()
         )),
         Err(_) => Ok(None),
     }
 }
 
-/// 把 wav 裁到指定时长（原地替换：临时文件 + rename）。比目标短就原样不动。
+/// 把 wav 的采样率标签改成 `rate`（样本一个不动、帧数不变）。
 ///
-/// 只处理 16-bit PCM（该模型的产物就是 16-bit）；其它位深原样返回，不让"裁不了"
-/// 变成"分离失败"。
-fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
+/// 上游只错了标签：它喂给模型的是"把输入样本当 44.1kHz 播"的慢放版本，产物的**帧索引与输入
+/// 帧索引对齐**，所以改回输入的标签是无损往返（比真做一次重采样更保真——不引入抗混叠滤波损失）。
+/// 标签已经一样时原样返回；不是 16-bit PCM 也返回（上游 `write_audio` 目前固定写 16-bit，
+/// 这是个理论分支——真出现别的位深时应该先确认标签是否需要修，而不是在这里硬套）。
+fn relabel_wav_sample_rate(path: &Path, rate: u32) -> Result<(), String> {
     let reader =
         hound::WavReader::open(path).map_err(|e| format!("打开 {} 失败：{e}", path.display()))?;
-    let spec = reader.spec();
-    if spec.bits_per_sample != 16 || spec.sample_rate == 0 {
+    let mut spec = reader.spec();
+    // 上游 write_audio 目前固定 16-bit，这个分支今天不可达；保持"跳过"而不是伪造一次修正
+    if spec.sample_rate == rate || spec.bits_per_sample != 16 {
         return Ok(());
     }
-    let keep_frames = (seconds * spec.sample_rate as f64).round().max(0.0) as usize;
-    let total_frames = reader.duration() as usize;
-    if total_frames <= keep_frames {
-        return Ok(());
-    }
-    // 临时文件显式命名（`with_extension("wav.trim")` 作用在 `xxx.wav.part` 上会得到
-    // `xxx.wav.wav.trim`，名字难看也容易误导）。
-    let tmp = path.with_extension("trim");
-    // 写入放在闭包里：**任何**错误（创建/读样本/写样本/finalize）都会走下面的清理；
-    // 只在 rename 失败时清会留下 .trim 残渣（复核指出）。
+    spec.sample_rate = rate;
+    // 临时文件显式命名；写入放进闭包，**任何**错误都清理（只在 rename 失败时清会留渣）。
+    let tmp = path.with_extension("rate");
     let written = (|| -> Result<(), String> {
         let mut writer = hound::WavWriter::create(&tmp, spec)
             .map_err(|e| format!("创建 {} 失败：{e}", tmp.display()))?;
-        let channels = spec.channels as usize;
-        for (i, sample) in reader.into_samples::<i16>().enumerate() {
-            if i / channels >= keep_frames {
-                break;
-            }
+        for sample in reader.into_samples::<i16>() {
             writer
                 .write_sample(sample.map_err(|e| format!("读 {} 失败：{e}", path.display()))?)
                 .map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
@@ -246,7 +243,6 @@ fn trim_wav_to_seconds(path: &Path, seconds: f64) -> Result<(), String> {
     })
 }
 
-/// 两轨输出路径：`<out_dir>/<stem>_vocals.wav` 与 `<out_dir>/<stem>_accompaniment.wav`。
 pub fn output_paths(out_dir: &Path, stem: &str) -> (PathBuf, PathBuf) {
     (
         out_dir.join(format!("{stem}_vocals.wav")),
@@ -365,10 +361,9 @@ pub fn separate_tracks(
 
     // 先写临时名、两个都成了再改名：否则第一步成功、第二步失败会留下"半套结果"
     let (vocals_path, accompaniment_path) = output_paths(&req.out_dir, &req.stem);
-    // 上游按模型分块补齐：产物可能比输入长（本机实测 50.9s 输入 → 55.4s 产物，
-    // 尾巴那 4.5s 是模型为补齐最后一块生成的内容）。输入是 wav 时把两轨裁回输入时长——
-    // 用户拿到的东西该跟他给的音频一样长。mp3/flac 的长度在上游解码器里，我们拿不到，
-    // 这两种输入保持上游产物（文档写明）。裁在 .part 上，再走原来的 rename 发布。
+    // 上游把产物**一律声明成 44.1kHz**（同帧数），48kHz 输入因此被拉慢 1.0884 倍、时长 +8.84%。
+    // 输入是 wav 时把两轨标签改回输入的采样率（样本不动）→ 时长与速度 1:1 还原；
+    // mp3/flac 拿不到输入采样率，保持上游产物并在说明里讲清（文档 §2.7 有实测相关系数）。
     let vocals_tmp = vocals_path.with_extension("wav.part");
     let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     write_stems_with_cleanup(
@@ -395,25 +390,25 @@ pub fn separate_tracks(
                 })
         },
     )?;
-    let trim_note = match input_duration_seconds(&req.input) {
-        Ok(Some(seconds)) => {
+    let rate_note = match input_sample_rate(&req.input) {
+        Ok(Some(rate)) => {
             for part in [&vocals_tmp, &accompaniment_tmp] {
-                if let Err(e) = trim_wav_to_seconds(part, seconds) {
+                if let Err(e) = relabel_wav_sample_rate(part, rate) {
                     let _ = std::fs::remove_file(&vocals_tmp);
                     let _ = std::fs::remove_file(&accompaniment_tmp);
-                    let _ = std::fs::remove_file(part.with_extension("trim"));
-                    return Err(format!("裁齐分离产物失败：{e}"));
+                    let _ = std::fs::remove_file(part.with_extension("rate"));
+                    return Err(format!("修正分离产物采样率失败：{e}"));
                 }
             }
             None
         }
-        // 非 wav：按文档跳过，但把这件事**说出来**（用户可能因此拿到比输入长的产物）
+        // 非 wav：按文档跳过，但把这件事**说出来**（用户可能拿到速度/时长与源不一致的产物）
         Ok(None) => Some(
-            "输入不是 wav：上游按模型分块补齐，产物可能比输入略长（wav 输入会自动裁齐）"
+            "输入不是 wav：采样率未知，产物沿用上游的 44100Hz 标签——时长与速度可能与源不一致"
                 .to_string(),
         ),
-        // wav 却读不出时长：不静默跳过，如实报出来
-        Err(note) => Some(format!("产物未裁齐：{note}")),
+        // wav 却读不出采样率：不静默跳过，如实报出来
+        Err(note) => Some(format!("产物采样率未修正：{note}")),
     };
     // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
     if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
@@ -439,7 +434,7 @@ pub fn separate_tracks(
     Ok(SeparationOutcome::Done(SeparatedTracks {
         vocals: vocals_path,
         accompaniment: accompaniment_path,
-        note: trim_note,
+        note: rate_note,
     }))
 }
 
@@ -519,12 +514,11 @@ mod tests {
         assert!(err.contains("输入音频不存在"), "错误要能直接定位：{err}");
     }
 
-    /// 裁齐：产物比输入长时裁到输入时长；比输入短就原样不动（不能把短的拉长）。
-    /// 这条规则来自真机实测：50.9s 输入 → 55.4s 产物，尾巴 4.5s 是模型补齐最后一块
-    /// 生成的"想象"内容。
+    /// 改标签：`relabel_wav_sample_rate` 只改头里的采样率，**帧数与样本值都不变**；
+    /// 标签已经一样时原样返回（不该白白重写文件）。
     #[test]
-    fn trim_wav_to_seconds_trims_padding_and_keeps_short_files() {
-        let dir = std::env::temp_dir().join(format!("aw-trim-{}", std::process::id()));
+    fn relabel_changes_only_the_declared_sample_rate() {
+        let dir = std::env::temp_dir().join(format!("aw-relabel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let spec = hound::WavSpec {
@@ -533,50 +527,46 @@ mod tests {
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
-
-        // 1.2s 的"产物"，输入只有 1.0s
-        let long = dir.join("long.wav");
+        let path = dir.join("stem.wav");
         {
-            let mut w = hound::WavWriter::create(&long, spec).unwrap();
-            for i in 0..(44_100 * 2 * 12 / 10) {
-                w.write_sample((i % 11) as i16).unwrap();
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..(44_100 * 2) {
+                w.write_sample((i % 101) as i16).unwrap();
             }
             w.finalize().unwrap();
         }
-        trim_wav_to_seconds(&long, 1.0).unwrap();
-        let r = hound::WavReader::open(&long).unwrap();
-        assert_eq!(r.duration(), 44_100, "应裁到 1.0s（44.1kHz）");
-        assert!(
-            r.spec().sample_rate == 44_100 && r.spec().channels == 2,
-            "参数要原样保留"
-        );
+        let before: Vec<i16> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<i16>()
+            .map(|s| s.unwrap())
+            .collect();
 
-        // 0.5s 的"产物"：比目标短，不能被拉长
-        let short = dir.join("short.wav");
-        {
-            let mut w = hound::WavWriter::create(&short, spec).unwrap();
-            for i in 0..(44_100 * 2 / 2) {
-                w.write_sample((i % 7) as i16).unwrap();
-            }
-            w.finalize().unwrap();
-        }
-        trim_wav_to_seconds(&short, 1.0).unwrap();
+        relabel_wav_sample_rate(&path, 48_000).unwrap();
+        let r = hound::WavReader::open(&path).unwrap();
+        assert_eq!(r.spec().sample_rate, 48_000, "标签要改成输入的采样率");
+        assert_eq!(r.duration(), 44_100, "帧数不变（时长按新标签重新解释）");
+        let after: Vec<i16> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<i16>()
+            .map(|s| s.unwrap())
+            .collect();
+        assert_eq!(before, after, "样本一个都不能动");
+
+        // 再改一次（这次标签已经相同）：内容不变
+        relabel_wav_sample_rate(&path, 48_000).unwrap();
         assert_eq!(
-            hound::WavReader::open(&short).unwrap().duration(),
-            22_050,
-            "比目标短就原样不动"
+            hound::WavReader::open(&path).unwrap().spec().sample_rate,
+            48_000
         );
     }
 
-    /// 三态分类：wav 读得出（可裁）、非 wav（跳过裁齐）、扩展名是 wav 但读不出来（要报错，
-    /// 不能静默跳过——静默跳过会让用户拿到比输入长的产物却不知道原因）。
+    /// 三态分类：wav 读得出采样率、非 wav（跳过）、后缀是 wav 但读不出来（要报错）。
     #[test]
-    fn input_duration_classifies_wav_non_wav_and_broken_wav() {
-        let dir = std::env::temp_dir().join(format!("aw-dur-{}", std::process::id()));
+    fn input_sample_rate_classifies_wav_non_wav_and_broken_wav() {
+        let dir = std::env::temp_dir().join(format!("aw-rate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 1. 正常 wav：能拿到时长
         let good = dir.join("good.wav");
         let spec = hound::WavSpec {
             channels: 1,
@@ -586,23 +576,21 @@ mod tests {
         };
         {
             let mut w = hound::WavWriter::create(&good, spec).unwrap();
-            for _ in 0..8_000 {
+            for _ in 0..800 {
                 w.write_sample(0i16).unwrap();
             }
             w.finalize().unwrap();
         }
-        assert_eq!(input_duration_seconds(&good).unwrap(), Some(1.0));
+        assert_eq!(input_sample_rate(&good).unwrap(), Some(8_000));
 
-        // 2. 非 wav（这里用 mp3 后缀的垃圾内容模拟）：跳过裁齐，不算错
         let mp3 = dir.join("song.mp3");
         std::fs::write(&mp3, b"not really an mp3").unwrap();
-        assert_eq!(input_duration_seconds(&mp3).unwrap(), None);
+        assert_eq!(input_sample_rate(&mp3).unwrap(), None, "非 wav 按约定跳过");
 
-        // 3. 后缀是 wav 但内容坏了：必须报错（含路径与建议），不能 None
         let broken = dir.join("broken.wav");
         std::fs::write(&broken, b"definitely not a wav").unwrap();
-        let err = input_duration_seconds(&broken).unwrap_err();
-        assert!(err.contains("wav") && err.contains("broken.wav"), "{err}");
+        let err = input_sample_rate(&broken).unwrap_err();
+        assert!(err.contains("broken.wav") && err.contains("wav"), "{err}");
         assert!(err.contains("损坏") || err.contains("权限"), "{err}");
     }
 

@@ -44,8 +44,8 @@ fn main() {
                 tracks.vocals.display(),
                 tracks.accompaniment.display()
             );
-            // 裁齐相关的说明（非 wav 跳过裁齐 / wav 读不出时长）也要在 CLI 里说出来，
-            // 否则用户只会看到"产物比输入长"却不知道原因。
+            // 采样率修正相关的说明（非 wav 跳过修正 / wav 读不出采样率）也要在 CLI 里说出来，
+            // 否则用户只会看到"产物比输入长、听着慢"却不知道原因。
             if let Some(note) = tracks.note {
                 println!("  说明 = {note}");
             }
