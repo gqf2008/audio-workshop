@@ -2212,10 +2212,6 @@ fn wire_sentence_actions(
             ui.set_status_text("工程已变更：先开始合成，再重录单句".into());
             return;
         }
-        if ui.get_sep_busy() {
-            ui.set_status_text("人声分离进行中：等它结束再重录".into());
-            return;
-        }
         ui.set_selected(i);
         ui.set_busy(true);
         start_task(
