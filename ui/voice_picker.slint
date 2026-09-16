@@ -23,6 +23,8 @@ component VoiceOptionRow inherits Rectangle {
     in property <bool> current: false;
     in property <bool> enabled: true;
     in property <string> use-text: "使用";
+    // 有些行没有独立的"使用"动作（例：参考音频克隆——填了路径就是已切换）
+    in property <bool> show-apply: true;
     callback preview();
     callback apply();
 
@@ -72,6 +74,7 @@ component VoiceOptionRow inherits Rectangle {
             clicked => { root.preview(); }
         }
         PixelButton {
+            visible: root.show-apply;
             width: 108px;
             size: "small";
             variant: root.current ? "default" : "primary";
@@ -85,7 +88,6 @@ component VoiceOptionRow inherits Rectangle {
 export component VoicePanel inherits Rectangle {
     // 当前音色（与旁白块头同一份文案）
     in property <string> voice-label: "";
-    in property <string> voice-source: "";
     // 当前引擎显示名（模型），仅用于说明“内置音色来自哪个引擎”
     in property <string> engine-label: "";
     // 参考音频路径：空=内置，非空=克隆。唯一状态来源。
@@ -141,14 +143,15 @@ export component VoicePanel inherits Rectangle {
         }
 
         // ── 来源二：参考音频克隆 ──
+        //    这一行的"使用"没有独立动作——参考音频路径非空本身就是"切到克隆音色"，
+        //    所以不放"使用"按钮（放了也必然恒禁，等于死按钮）。
         VoiceOptionRow {
             title: "参考音频克隆";
-            detail: "用一段 5–30 秒干净人声克隆成你的音色";
+            detail: "用一段 5–30 秒干净人声克隆成你的音色（填下面路径即切换）";
             current: root.cloning;
             enabled: !root.busy && root.reference-path != "";
-            use-text: "使用克隆音色";
+            show-apply: false;
             preview => { root.preview(); }
-            apply => { /* 当前已是克隆音色即无需动作 */ }
         }
 
         // 参考音频输入：放在克隆行下方，属于这一项的参数

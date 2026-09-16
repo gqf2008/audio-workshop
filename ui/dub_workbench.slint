@@ -1,17 +1,19 @@
 // ============================================================================
 // 音频作坊 · 配音工作台（低密度 / 渐进披露版）
 //
-// 首屏（默认态）只有 11 个元素，逐个用 `// 首屏` 标在声明行上：
-//   稿件输入域（含并进右上角的清空小图标）· 字数/句数行 · 重新切句 · 开始合成
-//   · 句子列表 · 时间轴条 · 总时长 · 标题栏 · 抽屉开关 · 状态栏
+// 首屏（默认态）在**本组件内**贡献 4 个元素，逐个用 `// 首屏` 标在声明行上：
+//   旁白块（块头=当前音色+试听/换音色，块体=稿件）· 状态行 · 高级入口 · 主操作
+//   · 句子列表
+// 外壳另有 3 个（标题栏 / 顶部五 Tab / 状态栏），合计 8 个 ≤ 8。
 // 计数口径与可复现命令见 docs/ui/首屏清单.md：
 //   grep -c '// 首屏$' ui/*.slint
 //
-// 其余全部收进右侧抽屉（默认收起，点标题栏按钮展开）：
-//   工程 / 视图（场景 + 主题）/ 音色 / 任务 / 导出。
+// 本页独有的参数就地展开（默认收起，不占首屏）：音色区在**旁白块内部**展开；
+// 重新切句 / 倍速 / 规范化 / 任务 / 导出在页面级的「高级」盒子里。
+// 跨 Tab 的全局项（外观 / 工程 / 服务 / 模型）在右上角「全局设置」卡片里。
 //
 // 句子行平时只有三个元素「序号 + 文本 + 状态点」；
-// 时长 / 起始 / 试听 / 重录 只在选中该行时展开在行下方（渐进披露）。
+// 状态 / 试听 / 重录 只在选中该行时展开在行下方（渐进披露）。
 //
 // 间距约定：行高 ≥44px、块间 20px、块内与抽屉内 ≥16px、同级并列元素 ≤3 个。
 // 全部控件来自 slint-pixel（@slint_pixel），无 std-widgets 控件。
@@ -180,7 +182,6 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <bool> server-ok: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
-    in property <int> model-count: 0;
     callback apply-server-settings();
     callback rescan-models();
     callback check-server();
@@ -474,7 +475,8 @@ export component DubWorkbench inherits Rectangle {
                                 width: 64px;
                                 size: "small";
                                 text: "试听";
-                                enabled: !root.busy;
+                                Tooltip { text: @markdown("试听当前音色；合成进行中不可试听"); }
+                                enabled: !root.busy && !root.running;
                                 clicked => { root.audition-voice(); }
                             }
                             PixelButton {
@@ -500,7 +502,6 @@ export component DubWorkbench inherits Rectangle {
                         // 就在**块内部**展开（块被撑高），不是块外面的另一个盒子。
                         if root.show-voice : VoicePanel {
                             voice-label: root.voice-label;
-                            voice-source: root.voice-source;
                             engine-label: root.engine-label;
                             reference-path <=> root.voice-ref-path;
                             busy: root.running || root.busy;

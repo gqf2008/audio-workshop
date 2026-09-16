@@ -173,8 +173,6 @@ struct AppSettings {
     host: Option<String>,
     #[serde(default)]
     port: Option<u16>,
-    #[serde(default)]
-    config_path: Option<String>,
     /// 模型目录：本机模型文件的存放位置（默认 <应用工作目录>/models，用户可选）
     #[serde(default)]
     model_dir: Option<String>,
@@ -182,14 +180,16 @@ struct AppSettings {
 
 /// 默认模型目录：应用工作目录下的 models/（打包后即应用目录下的 models/）。
 fn default_model_dir() -> PathBuf {
-    let base = std::env::current_dir()
+    let cwd = std::env::current_dir().ok();
+    let exe_dir = std::env::current_exe()
         .ok()
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    // cwd 是 `/`（Finder 双击启动的常见情况）时退回可执行文件所在目录：
+    // 否则默认值成了 `/models`，界面只说"目录不存在"，看不出根因。
+    let base = match cwd {
+        Some(d) if d != Path::new("/") => d,
+        _ => exe_dir.unwrap_or_else(|| PathBuf::from(".")),
+    };
     base.join("models")
 }
 
@@ -200,6 +200,9 @@ fn model_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(default_model_dir)
 }
+
+/// 目录扫描的条目上限：目录是用户自选的，选到 $HOME 或 / 时不至于把 UI 线程扫死。
+const SCAN_ENTRY_LIMIT: usize = 20_000;
 
 /// 扫模型目录（深度 ≤2，覆盖 `models/<模型名>/*.gguf` 这种常见摆放）：
 /// 返回 (目录是否存在, .gguf 文件数)。
@@ -212,7 +215,7 @@ fn scan_model_dir(dir: &Path) -> (bool, usize) {
             return 0;
         };
         let mut n = 0;
-        for e in entries.flatten() {
+        for e in entries.flatten().take(SCAN_ENTRY_LIMIT) {
             let path = e.path();
             if path.is_dir() {
                 if depth > 0 {
@@ -232,10 +235,7 @@ fn scan_model_dir(dir: &Path) -> (bool, usize) {
 }
 
 /// 模型目录里有多少个清单模型的权重文件（用来判断模型盘挂上没）。
-fn models_under_dir(dir: &Path) -> usize {
-    let cfg = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
+fn models_under_dir(cfg: &Option<ServerConfig>, dir: &Path) -> usize {
     let Some(cfg) = cfg else { return 0 };
     cfg.models
         .iter()
@@ -284,10 +284,11 @@ fn default_config_path() -> PathBuf {
 
 /// 模型清单路径：AW_SERVER_CONFIG > 全局设置 > 默认路径
 fn config_path() -> PathBuf {
+    // 清单路径只在环境变量里可覆盖：UI 上不再暴露"模型清单文件"
+    // （用户口径：全局设置里是**模型目录**，不是清单文件）。
     std::env::var("AW_SERVER_CONFIG")
         .map(PathBuf::from)
         .ok()
-        .or_else(|| settings_snapshot().config_path.map(PathBuf::from))
         .unwrap_or_else(default_config_path)
 }
 
@@ -353,77 +354,75 @@ fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
     (voices, base, String::new())
 }
 
-/// 清单里所有模型的公共父目录：一眼确认模型盘挂上了没。
-fn model_root(paths: &[String]) -> String {
-    let dirs: Vec<PathBuf> = paths
-        .iter()
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| Path::new(p).parent().map(|d| d.to_path_buf()))
-        .collect();
-    let Some(first) = dirs.first() else {
-        return "—".into();
-    };
-    if dirs.iter().all(|d| d == first) {
-        return first.display().to_string();
-    }
-    let mut common = first.to_string_lossy().into_owned();
-    for d in &dirs[1..] {
-        let other = d.to_string_lossy();
-        let mut n = 0;
-        for (a, b) in common.chars().zip(other.chars()) {
-            if a != b {
-                break;
-            }
-            n += a.len_utf8();
-        }
-        common.truncate(n);
-    }
-    match common.rfind('/') {
-        Some(i) => common[..i].to_string(),
-        None => common,
-    }
+/// 清单里的模型总数（读不到清单就是 0，不算错误）。
+fn config_summary() -> usize {
+    read_server_config().map(|c| c.models.len()).unwrap_or(0)
 }
 
-/// 清单摘要：模型总数 + 模型根目录。
-fn config_summary() -> (usize, String) {
-    let cfg = std::fs::read_to_string(config_path())
+/// 读模型清单（读不到就是"没有清单"）。
+fn read_server_config() -> Option<ServerConfig> {
+    std::fs::read_to_string(config_path())
         .ok()
-        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
+        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok())
+}
+
+/// 服务地址解析（纯函数，便于单测三档优先级）。
+///
+/// host / port **各自独立回落**：只改地址不让端口覆盖失效——早期版本要求
+/// `(Some, Some)` 成对，结果是"只改端口"这类单边修改被静默忽略并回滚成清单值。
+/// `env_base`（AW_SERVER）是整串临时覆盖，优先级最高，不做字段合并。
+fn resolve_endpoint(
+    over_host: Option<&str>,
+    over_port: Option<u16>,
+    cfg_host: Option<&str>,
+    cfg_port: Option<u16>,
+    env_base: Option<&str>,
+) -> (String, String, bool) {
+    if let Some(base) = env_base {
+        return (base.to_string(), String::new(), true);
+    }
+    let host = over_host
+        .filter(|h| !h.trim().is_empty())
+        .or(cfg_host)
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let port = over_port.or(cfg_port).unwrap_or(8080);
+    (host, port.to_string(), false)
+}
+
+/// 清单里的 host / port 原样取出（可能缺项，交给 resolve_endpoint 回落）。
+fn split_base(cfg: &Option<ServerConfig>) -> (Option<String>, Option<u16>) {
     match cfg {
-        Some(c) => {
-            let paths: Vec<String> = c.models.iter().map(|m| m.path.clone()).collect();
-            (c.models.len(), model_root(&paths))
-        }
-        None => (0, "—".into()),
+        Some(c) => (c.host.clone(), c.port),
+        None => (None, None),
     }
 }
 
-/// 服务地址回显：全局设置里的覆盖值优先，否则用清单里的 host:port。
-fn server_endpoint() -> (String, String) {
+/// 服务地址回显：AW_SERVER > 全局设置 > 清单；第三个返回值表示"环境变量在生效"。
+fn server_endpoint() -> (String, String, bool) {
     let over = settings_snapshot();
-    if let (Some(h), Some(p)) = (over.host, over.port) {
-        return (h, p.to_string());
-    }
     let cfg = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
-    match cfg {
-        Some(c) => (
-            c.host.unwrap_or_else(|| "127.0.0.1".into()),
-            c.port.unwrap_or(8080).to_string(),
-        ),
-        None => ("127.0.0.1".into(), "8080".into()),
-    }
+    let (cfg_host, cfg_port) = split_base(&cfg);
+    let env_base = std::env::var("AW_SERVER").ok();
+    resolve_endpoint(
+        over.host.as_deref(),
+        over.port,
+        cfg_host.as_deref(),
+        cfg_port,
+        env_base.as_deref(),
+    )
 }
 
 /// 把「全局设置 + 模型清单」的现状回灌到界面。
 fn refresh_settings_view(ui: &MainWindow) {
-    let (host, port) = server_endpoint();
+    let (host, port, from_env) = server_endpoint();
     let dir = model_dir();
     ui.set_model_dir(dir.display().to_string().into());
     let (exists, gguf) = scan_model_dir(&dir);
-    let (total, _) = config_summary();
-    let under = models_under_dir(&dir);
+    let total = config_summary();
+    let under = models_under_dir(&read_server_config(), &dir);
     ui.set_model_dir_info(
         if !exists {
             format!("目录不存在（清单里有 {total} 个模型）")
@@ -432,8 +431,15 @@ fn refresh_settings_view(ui: &MainWindow) {
         }
         .into(),
     );
-    ui.set_server_host(host.into());
-    ui.set_server_port(port.into());
+    // AW_SERVER 生效时不要伪装成"抽屉里的值就是生效值"——回显里标注出来
+    if from_env {
+        ui.set_server_host("(AW_SERVER 覆盖中)".into());
+        ui.set_server_port("".into());
+        ui.set_server_status(format!("环境变量 AW_SERVER 正在覆盖：{host}").into());
+    } else {
+        ui.set_server_host(host.into());
+        ui.set_server_port(port.into());
+    }
 }
 
 /// 重新发现引擎（模型清单）并刷新界面。
@@ -600,12 +606,14 @@ fn worker_loop(ctx: WorkerCtx) {
             } => {
                 let msg = match make_client() {
                     Ok(client) => {
+                        // instruction 与配音链路一致（aw_core 合成恒定传 DEFAULT_INSTRUCTION）：
+                        // 试听听到的语气必须等于成品，否则用户按试听选音色会被误导。
                         match client.synth(
                             &model,
                             &text,
                             Some(BASE_SEED),
                             voice_ref.as_deref(),
-                            None,
+                            Some(aw_core::DEFAULT_INSTRUCTION),
                         ) {
                             Ok(wav) => Msg::VoicePreview {
                                 wav,
@@ -1294,6 +1302,13 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_status_text(
                 "高级：重新切句 / 倍速 / 规范化 / 任务 / 导出（配音独有，放本页）".into(),
             );
+        }
+        "apply" => {
+            // 复现审查的阻塞场景：默认模型目录不存在时点「应用并重连」，
+            // 以前会 early-return 连端口一起丢；现在应写出 settings.json。
+            ui.set_server_host("127.0.0.1".into());
+            ui.set_server_port("8080".into());
+            ui.invoke_apply_server_settings();
         }
         "both" => {
             // 内容超高场景：音色浮层 + 高级区同时展开，验证 Body 区出滚动条而不是顶掉状态栏
@@ -2070,8 +2085,15 @@ fn tick(
         let worker_msg = msg_rx.borrow_mut().try_recv();
         let Ok(worker_msg) = worker_msg else { break };
         // 服务健康检查与工程版本无关：不过滤，否则刚改完设置的结果会被静默丢掉
-        let is_health = matches!(worker_msg.msg, Msg::ServerHealth { .. });
-        if !is_health && !worker_message_is_current(&worker_msg, state.project_revision.get()) {
+        // 与工程版本无关的后台结果（服务健康、目录选择）不过滤：过滤会让"刚选好的目录"
+        // 因为期间编过稿件（revision+1）被静默丢掉，状态永远停在"正在打开系统目录选择框…"。
+        let revision_agnostic = matches!(
+            worker_msg.msg,
+            Msg::ServerHealth { .. } | Msg::ModelDirPicked { .. }
+        );
+        if !revision_agnostic
+            && !worker_message_is_current(&worker_msg, state.project_revision.get())
+        {
             continue;
         }
         match worker_msg.msg {
@@ -2445,18 +2467,17 @@ fn wire_global_settings(
                 }
             }
         };
-        // 留空 = 回到默认（<应用工作目录>/models），不报错
-        if !dir.is_empty() && !Path::new(&dir).is_dir() {
-            ui.set_server_ok(false);
-            ui.set_server_status(format!("模型目录不存在：{dir}").into());
-            return;
-        }
+        // 目录不存在**不阻断保存**：默认目录（进程工作目录下的 models/）在开发与打包
+        // 环境里常常还不存在，阻断会让"只想改端口"的保存连带失败。存在与否只做提示。
+        let dir_missing = !dir.is_empty() && !Path::new(&dir).is_dir();
 
+        // 与默认目录相同时存 None（而不是把当时的绝对路径固化下来）：
+        // 应用以后换位置/换工作目录时，默认值应该跟着走，不该被旧快照钉死。
+        let is_default_dir = Path::new(dir.as_str()) == default_model_dir().as_path();
         let next = AppSettings {
             host: (!host.is_empty()).then_some(host),
             port,
-            config_path: settings_snapshot().config_path,
-            model_dir: (!dir.is_empty()).then_some(dir),
+            model_dir: (!dir.is_empty() && !is_default_dir).then_some(dir.clone()),
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -2467,7 +2488,14 @@ fn wire_global_settings(
             *g = next;
         }
         apply_engine_discovery(&ui, Some((&tx, &st)));
-        ui.set_server_status("设置已保存，正在测试连接…".into());
+        ui.set_server_status(
+            if dir_missing {
+                format!("设置已保存（模型目录还不存在：{dir}）· 正在测试连接…")
+            } else {
+                "设置已保存，正在测试连接…".into()
+            }
+            .into(),
+        );
         spawn_server_check(msg.clone(), st.project_revision.get());
     });
 
@@ -2703,26 +2731,113 @@ fn toast(ui: &MainWindow, text: &str) {
 mod tests {
     use super::*;
 
-    /// 模型根目录：全在同一父目录 → 直接给那个目录；否则给公共前缀且不截断到半截目录名。
+    /// 目录扫描：深度 ≤2（覆盖 `models/<模型名>/*.gguf`），深度 3 的文件不算；
+    /// 目录不存在不能假装扫到东西。
     #[test]
-    fn model_root_handles_mixed_and_shared_parents() {
-        // 同一父目录
-        let same = vec![
-            "/Volumes/DataExt/models/A/x.gguf".to_string(),
-            "/Volumes/DataExt/models/B/y.gguf".to_string(),
-        ];
-        assert_eq!(model_root(&same), "/Volumes/DataExt/models");
+    fn scan_model_dir_honours_depth_and_missing_dir() {
+        let dir = temp_dir("scan");
+        // 直接放一个
+        std::fs::write(dir.join("a.gguf"), b"x").unwrap();
+        // 深度 1：models/<模型名>/x.gguf
+        std::fs::create_dir_all(dir.join("m1")).unwrap();
+        std::fs::write(dir.join("m1/x.gguf"), b"x").unwrap();
+        // 深度 2：models/a/b/z.gguf
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/z.gguf"), b"x").unwrap();
+        // 深度 3：不算
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/too-deep.gguf"), b"x").unwrap();
+        // 非 gguf 不算
+        std::fs::write(dir.join("note.txt"), b"x").unwrap();
 
-        // 不同父目录：公共前缀要退到目录边界，不能给出 ".../mode" 这种半截名
-        let mixed = vec![
-            "/Volumes/DataExt/models/A/x.gguf".to_string(),
-            "/Volumes/DataExt/models-2/B/y.gguf".to_string(),
-        ];
-        assert_eq!(model_root(&mixed), "/Volumes/DataExt");
+        let (exists, n) = scan_model_dir(&dir);
+        assert!(exists);
+        assert_eq!(
+            n, 3,
+            "应数到 a.gguf + m1/x.gguf + a/b/z.gguf，深度 3 与非 .gguf 不算"
+        );
 
-        // 没有 path 时不假装知道根目录
-        assert_eq!(model_root(&[]), "—");
-        assert_eq!(model_root(&["".to_string()]), "—");
+        let missing = dir.join("nope");
+        assert_eq!(scan_model_dir(&missing), (false, 0));
+    }
+
+    /// 「清单里有多少模型落在该目录下」用前缀判定；空 path 不能被算进去。
+    #[test]
+    fn models_under_dir_counts_only_paths_inside_dir() {
+        let cfg = Some(ServerConfig {
+            host: None,
+            port: None,
+            models: vec![
+                ServerModel {
+                    id: "in".into(),
+                    task: "tts".into(),
+                    family: "f".into(),
+                    path: "/models/in/x.gguf".into(),
+                },
+                ServerModel {
+                    id: "out".into(),
+                    task: "tts".into(),
+                    family: "f".into(),
+                    path: "/elsewhere/out/y.gguf".into(),
+                },
+                ServerModel {
+                    id: "empty".into(),
+                    task: "tts".into(),
+                    family: "f".into(),
+                    path: String::new(),
+                },
+            ],
+        });
+        assert_eq!(models_under_dir(&cfg, Path::new("/models")), 1);
+        assert_eq!(models_under_dir(&cfg, Path::new("/elsewhere")), 1);
+        assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
+    }
+
+    /// 服务地址三档优先级：AW_SERVER 整串优先；全局设置 > 清单；host/port **各自独立**回落
+    /// （早期要求成对，导致"只改端口"被静默忽略）。
+    #[test]
+    fn resolve_endpoint_prefers_env_then_settings_then_manifest() {
+        // 环境变量整串覆盖
+        assert_eq!(
+            resolve_endpoint(
+                Some("10.0.0.1"),
+                Some(9999),
+                Some("manifest-host"),
+                Some(1111),
+                Some("http://env:2222")
+            ),
+            ("http://env:2222".to_string(), String::new(), true)
+        );
+
+        // 只覆盖端口：host 回落清单
+        assert_eq!(
+            resolve_endpoint(None, Some(9999), Some("manifest-host"), Some(1111), None),
+            ("manifest-host".to_string(), "9999".to_string(), false)
+        );
+
+        // 只覆盖 host：port 回落清单
+        assert_eq!(
+            resolve_endpoint(
+                Some("10.0.0.1"),
+                None,
+                Some("manifest-host"),
+                Some(1111),
+                None
+            ),
+            ("10.0.0.1".to_string(), "1111".to_string(), false)
+        );
+
+        // 空白 host 视同没填
+        assert_eq!(
+            resolve_endpoint(Some("   "), None, Some("manifest-host"), None, None),
+            ("manifest-host".to_string(), "8080".to_string(), false)
+        );
+
+        // 全空 → 默认
+        assert_eq!(
+            resolve_endpoint(None, None, None, None, None),
+            ("127.0.0.1".to_string(), "8080".to_string(), false)
+        );
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

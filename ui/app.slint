@@ -214,7 +214,7 @@ export component MainWindow inherits Window {
                         mouse-cursor: pointer;
                         clicked => { root.drawer-open = !root.drawer-open; }
                     }
-                    Tooltip { text: @markdown("工作台设置：工程 / 视图 / 音色 / 任务 / 导出"); }
+                    Tooltip { text: @markdown("全局设置：外观 / 工程 / 服务 / 模型（各 Tab 独有参数在各页「高级」）"); }
                 }
             }
 
@@ -499,6 +499,11 @@ export component MainWindow inherits Window {
         width: root.width;
         height: root.height;
         key-pressed(event) => {
+            // Esc 的优先序：全局设置卡片 → 音色区（与 interaction-spec 的"Esc 关闭抽屉"一致）
+            if (event.text == Key.Escape && root.drawer-open) {
+                root.drawer-open = false;
+                return accept;
+            }
             if (event.text == Key.Escape && root.dub-voice) {
                 root.dub-voice = false;
                 return accept;
