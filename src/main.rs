@@ -833,7 +833,6 @@ fn main() -> Result<(), slint::PlatformError> {
         .unwrap_or(-1);
     ui.set_voice_index(default_voice);
     refresh_voice_labels(&ui);
-    refresh_picker_rows(&ui);
 
     ui.set_export_dir(export_dir().into());
     ui.set_project_name(DEFAULT_PROJECT.into());
@@ -881,7 +880,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_theme(&ui);
     wire_script(&ui, &rows, &cmd_tx, &state);
     wire_engine_changes(&ui, &cmd_tx, &state);
-    wire_voice_picker(&ui, &cmd_tx, &state);
+    wire_voice_panel(&ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &state);
@@ -940,11 +939,10 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_theme_scheme("dark".into());
             ui.set_status_text("主题已切换：暗色".into());
         }
-        "picker" => {
-            ui.set_picker_pending(ui.get_voice_index());
-            refresh_picker_rows(ui);
-            ui.set_picker_open(true);
-            ui.set_status_text("换音色：搜索 / 卡片 / 试听，「使用此音色」才真正切换".into());
+        "voice" => {
+            ui.set_dub_voice(true);
+            refresh_voice_labels(ui);
+            ui.set_status_text("音色：内置默认 / 参考音频克隆；换音色不是换模型".into());
         }
         "design" => {
             ui.set_scene(4);
@@ -1251,79 +1249,43 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
     });
 }
 
-/// 音色选择器：打开 / 搜索 / 试听 / 提交 / 新建音色 / 清除参考音。
-fn wire_voice_picker(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
-    let weak = ui.as_weak();
-    ui.on_open_voice_picker(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
-            ui.set_status_text("任务进行中：音色暂不可更换".into());
-            return;
-        }
-        if ui.get_voice_names().row_count() == 0 {
-            ui.set_status_text("没有发现可用音色：先在本机 audio.cpp 服务里配置 tts 模型".into());
-            return;
-        }
-        ui.set_picker_search("".into());
-        ui.set_picker_pending(ui.get_voice_index());
-        refresh_picker_rows(&ui);
-        ui.set_picker_open(true);
-    });
-
-    let weak = ui.as_weak();
-    ui.on_picker_search_edited(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        refresh_picker_rows(&ui);
-    });
-
-    // 使用此音色：与抽屉里换音色走同一套失效逻辑（旧成品标旧版本、BGM 复位）
+/// 配音页内「音色」区：试听当前音色、清除参考音（切回内置音色）。
+///
+/// 概念区分（用户纠偏）：**换音色 ≠ 换模型**。
+/// 音色只有两种来源——模型内置默认音色 / 参考音频克隆出来的音色；
+/// 模型（audio8-tts / index-tts2 / 0.1b / stream…）是**引擎参数**，走 `model-changed`。
+/// 单一事实来源：`voice-ref-path` 为空 = 内置默认音色，非空 = 克隆音色（不设第二个 mode 状态）。
+fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
     let st = state.clone();
-    ui.on_picker_apply(move |i| {
-        let Some(ui) = weak.upgrade() else { return };
-        if i < 0 || i == ui.get_voice_index() {
-            ui.set_picker_open(false);
-            return;
-        }
-        ui.set_voice_index(i);
-        ui.set_picker_open(false);
-        invalidate_worker_project(&tx, &st);
-        reset_bgm(&ui, &st);
-        ui.set_has_result(false);
-        refresh_voice_labels(&ui);
-        ui.set_status_text("音色已更换：请重新开始合成，旧成品已标为旧版本".into());
-    });
-
-    let weak = ui.as_weak();
-    let tx = cmd_tx.clone();
-    let st = state.clone();
-    ui.on_picker_preview(move |i| {
+    ui.on_preview_voice(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() || ui.get_busy() {
             return;
         }
-        let Some(v) = ui.get_voices().row_data(i as usize) else {
-            ui.set_status_text("没有这个音色".into());
+        let idx = ui.get_voice_index();
+        let Some(v) = (idx >= 0)
+            .then(|| ui.get_voices().row_data(idx as usize))
+            .flatten()
+        else {
+            ui.set_status_text("没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型".into());
             return;
         };
         let model = v.name.to_string();
         let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
-        ui.set_status_text(format!("正在合成试听：{model}…").into());
+        let what = if voice_ref.is_some() {
+            "克隆音色"
+        } else {
+            "内置默认音色"
+        };
+        ui.set_status_text(format!("正在合成试听（{what} · {model}）…").into());
         let _ = tx.send(Cmd::PreviewVoice {
             revision: st.project_revision.get(),
             model,
             voice_ref,
             text: VOICE_PREVIEW_TEXT.to_string(),
         });
-    });
-
-    let weak = ui.as_weak();
-    ui.on_picker_new_voice(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        ui.set_picker_open(false);
-        ui.set_scene(4);
-        ui.set_status_text("音色设计：填参考音频路径，回到配音即可试听".into());
     });
 
     let weak = ui.as_weak();
@@ -1339,7 +1301,7 @@ fn wire_voice_picker(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>)
         reset_bgm(&ui, &st);
         ui.set_has_result(false);
         refresh_voice_labels(&ui);
-        ui.set_status_text("参考音已清除：请重新开始合成".into());
+        ui.set_status_text("已切回内置默认音色：请重新开始合成".into());
     });
 }
 
@@ -2095,65 +2057,40 @@ fn play_all(
 /// 不把“稿件为空”等其它原因混进来（那由主按钮与空态承担）。
 fn refresh_voice_labels(ui: &MainWindow) {
     let idx = ui.get_voice_index();
-    if idx < 0 {
-        ui.set_voice_label("未选择".into());
-        ui.set_voice_source("请先选择音色".into());
-        ui.set_voice_hint("选择音色后才能开始配音".into());
-        return;
-    }
-    let name = ui
-        .get_voice_names()
-        .row_data(idx as usize)
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| format!("音色 #{idx}"));
-    ui.set_voice_label(name.into());
-    ui.set_voice_source(if ui.get_voice_ref_path().trim().is_empty() {
-        "内置".into()
+    let engine = (idx >= 0)
+        .then(|| ui.get_voice_names().row_data(idx as usize))
+        .flatten()
+        .map(|n| n.to_string());
+    ui.set_engine_label(engine.clone().unwrap_or_default().into());
+
+    let ref_trimmed = ui.get_voice_ref_path().trim().to_string();
+
+    // 音色名：内置默认音色 / 克隆音色 · <参考音频文件名>（音色 ≠ 模型）
+    if ref_trimmed.is_empty() {
+        ui.set_voice_label("内置默认音色".into());
+        ui.set_voice_source("内置".into());
     } else {
-        "克隆 · 参考音".into()
-    });
-    ui.set_voice_hint("".into());
-}
-
-/// 音色选择器的可见行：按搜索词过滤音色名 / 引擎 / 备注。
-/// index 始终指回 voices 原始下标——过滤后下标会漂移，绝不能拿过滤下标当音色下标。
-fn refresh_picker_rows(ui: &MainWindow) {
-    let voices = ui.get_voices();
-    let rows: Vec<VoiceRow> = filter_voices(&voices, &ui.get_picker_search())
-        .into_iter()
-        .map(|(i, name, engine, note)| VoiceRow {
-            index: i,
-            name,
-            engine,
-            note,
-        })
-        .collect();
-    ui.set_picker_match_count(rows.len() as i32);
-    ui.set_picker_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
-}
-
-/// 音色过滤（纯函数）：按搜索词过滤音色名 / 引擎 / 备注，返回可见行的
-/// `(原始下标, 名称, 引擎, 备注)`。
-///
-/// **不变式**：下标必须是 `voices` 里的**原始下标**。过滤会改变可见顺序与长度，
-/// 若拿过滤后的下标当音色下标回传，`试听` / `使用此音色` 会作用到别的音色上。
-fn filter_voices(
-    voices: &ModelRc<Voice>,
-    query: &str,
-) -> Vec<(i32, SharedString, SharedString, SharedString)> {
-    // 大小写不敏感由本函数自己保证，不依赖调用方先 to_lowercase（调用方忘了就会静默搜不到）
-    let query = query.to_lowercase();
-    let mut rows = Vec::new();
-    for i in 0..voices.row_count() {
-        let Some(v) = voices.row_data(i) else {
-            continue;
-        };
-        let haystack = format!("{} {} {}", v.name, v.engine, v.note).to_lowercase();
-        if query.is_empty() || haystack.contains(&query) {
-            rows.push((i as i32, v.name, v.engine, v.note));
-        }
+        let stem = Path::new(&ref_trimmed)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ref_trimmed.clone());
+        ui.set_voice_label(format!("克隆音色 · {stem}").into());
+        ui.set_voice_source("克隆 · 参考音".into());
     }
-    rows
+
+    // 参考音可用性（决定试听 / 合成能不能开工）
+    let exists = !ref_trimmed.is_empty() && Path::new(&ref_trimmed).is_file();
+    ui.set_reference_exists(exists);
+
+    // 阻断原因只留当前最重要的一条
+    let hint = if engine.is_none() {
+        "没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型"
+    } else if !ref_trimmed.is_empty() && !exists {
+        "参考音频不存在或不可读：修正路径后再开始配音"
+    } else {
+        ""
+    };
+    ui.set_voice_hint(hint.into());
 }
 
 fn selected_model(ui: &MainWindow) -> String {
@@ -2312,49 +2249,6 @@ fn toast(ui: &MainWindow, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn voice(name: &str, engine: &str, note: &str) -> Voice {
-        Voice {
-            name: name.into(),
-            engine: engine.into(),
-            note: note.into(),
-            license: "仅自用".into(),
-        }
-    }
-
-    fn voice_model(items: Vec<Voice>) -> ModelRc<Voice> {
-        ModelRc::from(Rc::new(VecModel::from(items)))
-    }
-
-    /// 过滤后回传的下标必须仍是原始下标：拿过滤下标当音色下标会选错音色。
-    #[test]
-    fn voice_filter_keeps_original_indices() {
-        let voices = voice_model(vec![
-            voice("audio8-tts", "audio8_tts · 本地", "a.gguf"),
-            voice("index-tts2", "index_tts2 · 本地", "b.gguf"),
-            voice("audio8-tts-01b", "audio8_tts · 本地", "c.gguf"),
-        ]);
-
-        // 全量：下标就是 0,1,2
-        let all = filter_voices(&voices, "");
-        assert_eq!(all.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1, 2]);
-
-        // 命中第 2、3 个：下标必须是 1、2，不能变成 0、1
-        let hits = filter_voices(&voices, "index");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, 1);
-        assert_eq!(hits[0].1.as_str(), "index-tts2");
-
-        let hits = filter_voices(&voices, "01b");
-        assert_eq!(hits.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2]);
-
-        // 大小写不敏感（引擎名里是大写 Q8）
-        let hits = filter_voices(&voices, "audio8-TTS");
-        assert_eq!(hits.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 2]);
-
-        // 无命中：空结果，不是“退化成全量”
-        assert!(filter_voices(&voices, "不存在的音色").is_empty());
-    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =

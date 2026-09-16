@@ -24,12 +24,3 @@ export struct Voice {
     note: string,     // 一句话描述，给创作者看
     license: string,  // 许可：可商用 / 仅自用（红线见 CHARTER 第 5 节）
 }
-
-// 音色选择器里的一行：search 过滤后的可见行（index 指回 voices 原始下标，
-// 选择/试听都按原始下标回传给 Rust，避免过滤后下标漂移）。
-export struct VoiceRow {
-    index: int,      // voices 数组里的原始下标
-    name: string,    // 音色名（= 模型 id）
-    engine: string,  // 推理引擎 / 模型档位
-    note: string,    // 一句话描述
-}

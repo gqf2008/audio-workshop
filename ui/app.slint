@@ -23,13 +23,12 @@ import {
     PixelWindowResize,
 } from "@slint_pixel";
 
-import { Sentence, Voice, VoiceRow } from "model.slint";
+import { Sentence, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { GatedTab, VoiceDesignTab } from "extra_tabs.slint";
-import { VoicePicker } from "voice_picker.slint";
 
-export { Sentence, Voice, VoiceRow } from "model.slint";
+export { Sentence, Voice } from "model.slint";
 
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
@@ -80,11 +79,11 @@ export component MainWindow inherits Window {
     in-out property <bool> dub-advanced: false;
 
     // ── 音色选择器（默认收起，从「换音色」打开） ──
-    in-out property <bool> picker-open: false;
-    in-out property <string> picker-search: "";
-    in property <[VoiceRow]> picker-rows: [];
-    in property <int> picker-match-count: 0;
-    in-out property <int> picker-pending: -1;
+    // 配音页内的「音色」区展开态（与「高级」同款，默认收起）
+    in-out property <bool> dub-voice: false;
+    // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
+    in property <string> engine-label: "";
+    in property <bool> reference-exists: false;
 
     in-out property <float> progress: 0.0;
     in-out property <bool> playing: false;
@@ -143,11 +142,7 @@ export component MainWindow inherits Window {
     callback key-toggle();
 
     // ── 音色选择器 / 音色设计事件出口 ──
-    callback open-voice-picker();
-    callback picker-search-edited();
-    callback picker-apply(int);
-    callback picker-preview(int);
-    callback picker-new-voice();
+    callback preview-voice();
     callback clear-voice-reference();
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
@@ -269,12 +264,21 @@ export component MainWindow inherits Window {
                 preview-all => { root.preview-all(); }
                 speed-changed(v) => { root.speed-changed(v); }
                 export-requested => { root.export-requested(); }
-                change-voice => { root.open-voice-picker(); }
+                voice-names: root.voice-names;
+                voice-index <=> root.voice-index;
+                engine-label: root.engine-label;
+                voice-ref-path <=> root.voice-ref-path;
+                reference-exists: root.reference-exists;
+                show-voice <=> root.dub-voice;
+                change-voice => { root.dub-voice = !root.dub-voice; }
+                engine-changed => { root.model-changed(); }
+                audition-voice => { root.preview-voice(); }
+                clear-reference => { root.clear-voice-reference(); }
+                voice-ref-changed => { root.voice-ref-changed(); }
                 new-voice => {
                     root.scene = 4;
                     root.scene-changed(4);
                 }
-                audition-voice => { root.picker-preview(root.voice-index); }
             }
 
             if root.scene == 1 : BgmWorkbench {
@@ -321,7 +325,7 @@ export component MainWindow inherits Window {
                 use-in-dubbing => {
                     root.scene = 0;
                     root.scene-changed(0);
-                    root.open-voice-picker();
+                    root.dub-voice = true;
                 }
             }
 
@@ -367,30 +371,6 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── 音色选择器：全窗遮罩 + 右侧面板，默认收起 ──
-    VoicePicker {
-        x: 2px; y: 2px;
-        width: root.width - 4px;
-        height: root.height - 4px;
-
-        open: root.picker-open;
-        rows: root.picker-rows;
-        match-count: root.picker-match-count;
-        total: root.voices.length;
-        current: root.voice-index;
-        pending <=> root.picker-pending;
-        search <=> root.picker-search;
-        busy: root.running || root.busy;
-        playing: root.playing;
-
-        close => { root.picker-open = false; }
-        search-edited => { root.picker-search-edited(); }
-        apply(i) => { root.picker-apply(i); }
-        preview(i) => { root.picker-preview(i); }
-        stop-preview => { root.stop-preview(); }
-        new-voice => { root.picker-new-voice(); }
-    }
-
     // ── 右侧抽屉：默认收起（渐进披露），点标题栏开关展开 ──
     PixelDrawer {
         x: 2px; y: 2px;
@@ -428,14 +408,14 @@ export component MainWindow inherits Window {
         width: root.width;
         height: root.height;
         key-pressed(event) => {
-            if (event.text == Key.Escape && root.picker-open) {
-                root.picker-open = false;
+            if (event.text == Key.Escape && root.dub-voice) {
+                root.dub-voice = false;
                 return accept;
             }
             if (event.text == Key.UpArrow || event.text == Key.V) {
                 if (event.text == Key.V) {
-                    if (root.scene == 0 && !root.picker-open) {
-                        root.open-voice-picker();
+                    if (root.scene == 0) {
+                        root.dub-voice = !root.dub-voice;
                         return accept;
                     }
                     return reject;

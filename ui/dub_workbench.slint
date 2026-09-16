@@ -18,12 +18,13 @@
 // ============================================================================
 
 import {
-    PixelBadge, PixelButton, PixelSlider, PixelSwitch,
+    PixelBadge, PixelButton, PixelComboBox, PixelSlider, PixelSwitch,
     PixelProgressBar, PixelScrollPanel, PixelSegmentedControl,
     PixelSpinner, PixelTextArea, PixelTextInput, PixelTheme,
 } from "@slint_pixel";
 
 import { Sentence, Voice } from "model.slint";
+import { VoicePanel } from "voice_picker.slint";
 
 // ---------------------------------------------------------------------------
 // 小标题：低密度版用「小号 + 灰字 + 字距」代替面板标题栏（只在抽屉里用）
@@ -240,6 +241,15 @@ export component DubWorkbench inherits Rectangle {
     in property <bool> busy: false;
     in property <bool> playing: false;
 
+    // ── 音色区（页内展开，与「高级」同款；换音色 ≠ 换模型）──
+    in property <string> engine-label: "";
+    in-out property <string> voice-ref-path: "";
+    in property <[string]> voice-names: [];
+    in-out property <int> voice-index: 0;
+    callback engine-changed();
+    in property <bool> reference-exists: false;
+    in-out property <bool> show-voice: false;
+
     // ── 配音页内的高级参数（默认收起；各 Tab 独有的参数就放各自页面上）──
     in-out property <float> speed: 1.0;
     in property <string> speed-label: "1.00x";
@@ -260,8 +270,10 @@ export component DubWorkbench inherits Rectangle {
 
     // ── 事件出口 ──
     callback change-voice();
-    callback new-voice();
     callback audition-voice();
+    callback new-voice();
+    callback clear-reference();
+    callback voice-ref-changed();
     callback script-edited();
     callback use-sample();
     callback clear-script();
@@ -337,18 +349,12 @@ export component DubWorkbench inherits Rectangle {
                                 clicked => { root.audition-voice(); }
                             }
                             PixelButton {
-                                width: 78px;
+                                width: 92px;
                                 size: "small";
-                                text: "换音色";
+                                text: root.show-voice ? "收起音色" : "换音色";
+                                Tooltip { text: @markdown("换的是音色（内置默认 / 参考音频克隆），不是模型"); }
                                 enabled: !root.running && !root.busy;
                                 clicked => { root.change-voice(); }
-                            }
-                            PixelButton {
-                                width: 96px;
-                                size: "small";
-                                text: "新建音色 →";
-                                enabled: !root.running && !root.busy;
-                                clicked => { root.new-voice(); }
                             }
                         }
 
@@ -406,6 +412,20 @@ export component DubWorkbench inherits Rectangle {
                     }
                 }
 
+                // ①b 音色区：与「高级」同款的页内展开盒子
+                if root.show-voice : VoicePanel {
+                    voice-label: root.voice-label;
+                    voice-source: root.voice-source;
+                    engine-label: root.engine-label;
+                    reference-path <=> root.voice-ref-path;
+                    busy: root.running || root.busy;
+                    reference-exists: root.reference-exists;
+                    edited => { root.voice-ref-changed(); }
+                    clear-reference => { root.clear-reference(); }
+                    preview => { root.audition-voice(); }
+                    open-design => { root.new-voice(); }
+                }
+
                 // ② 一行状态 + 高级入口 + 主操作（同级 3 个）
                 HorizontalLayout {
                     spacing: 16px;
@@ -445,6 +465,34 @@ export component DubWorkbench inherits Rectangle {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 12px;
+
+                        // 引擎 / 模型：换音色不是换模型，模型属于技术参数
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "引擎";
+                                width: 40px;
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelComboBox {
+                                width: 260px;
+                                model: root.voice-names;
+                                index <=> root.voice-index;
+                                placeholder: "选择 TTS 引擎（模型）";
+                                enabled: !root.running && !root.busy;
+                                selected(i) => { root.engine-changed(); }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "换引擎是换模型（audio8-tts / index-tts2 / 0.1b / stream…）；换音色在上面的「换音色」里";
+                                color: PixelTheme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
 
                         // 切句
                         HorizontalLayout {
