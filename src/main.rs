@@ -47,8 +47,6 @@ const VOICE_PREVIEW_TEXT: &str = "你好，这是当前音色的试听。";
 
 /// 与 Python `tools/audio_dub.py` 同款链路参数。
 const GAP_MS: u64 = 250;
-/// 句间停顿的上限（毫秒）：再长多半是误输入，夹住比报错好
-const MAX_GAP_MS: u64 = 2000;
 const MAX_CHARS: usize = 80;
 const BASE_SEED: u64 = 831001;
 /// 工程目录与导出目录的根目录名（`~/Documents/音频作坊/`）。
@@ -1174,7 +1172,7 @@ fn sync_auto_normalize_toggle(ui: &MainWindow, state: &Rc<UiState>) {
 fn normalize_gap_ms(text: &str) -> u64 {
     text.trim()
         .parse::<u64>()
-        .map(|v| v.min(MAX_GAP_MS))
+        .map(templates::clamp_gap_ms)
         .unwrap_or(GAP_MS)
 }
 
@@ -1202,13 +1200,16 @@ fn gap_hint_for(raw: &str) -> String {
     }
     if trimmed
         .parse::<u64>()
-        .map(|v| v > MAX_GAP_MS)
+        .map(|v| v > templates::MAX_GAP_MS)
         .unwrap_or(false)
     {
-        return format!("停顿上限 {MAX_GAP_MS} 毫秒：会按 {norm} 应用");
+        return format!("停顿上限 {} 毫秒：会按 {norm} 应用", templates::MAX_GAP_MS);
     }
     if trimmed.parse::<u64>().is_err() {
-        return format!("停顿要填毫秒数（0–{MAX_GAP_MS}）：会按 {norm} 应用");
+        return format!(
+            "停顿要填毫秒数（0–{}）：会按 {norm} 应用",
+            templates::MAX_GAP_MS
+        );
     }
     format!("句间停顿 {norm} 毫秒（改了重新导出就生效）")
 }
@@ -7221,7 +7222,11 @@ mod tests {
         assert_eq!(normalize_gap_ms("0"), 0, "0 = 不留静音，是合法值");
         assert_eq!(normalize_gap_ms(""), GAP_MS, "留空 = 默认");
         assert_eq!(normalize_gap_ms("abc"), GAP_MS, "非数字 = 默认（不阻断）");
-        assert_eq!(normalize_gap_ms("9999"), MAX_GAP_MS, "越界夹到上限");
+        assert_eq!(
+            normalize_gap_ms("9999"),
+            templates::MAX_GAP_MS,
+            "越界夹到上限"
+        );
         assert_eq!(normalize_gap_ms("-5"), GAP_MS, "负数不是合法毫秒，回落默认");
     }
 

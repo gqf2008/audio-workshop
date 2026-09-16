@@ -8,6 +8,18 @@
 
 use std::path::Path;
 
+/// 句间停顿的上限（毫秒）：再长多半是误输入，夹住比报错好。
+///
+/// 放在模板模块里是因为**两条路径都要用它**：UI 输入的归一（`main.rs` 的
+/// `normalize_gap_ms`）与"模板里的值算不算改了"（`apply_effect`）。两处各写一个上限
+/// 迟早漂移。
+pub const MAX_GAP_MS: u64 = 2000;
+
+/// 把毫秒数夹进允许范围（唯一的夹取入口）。
+pub fn clamp_gap_ms(ms: u64) -> u64 {
+    ms.min(MAX_GAP_MS)
+}
+
 /// 一份配音模板。字段刻意是"能真的影响产物（或试听）的那些输入"：
 /// - `model` / `voice_ref`：引擎与音色（换任一都要重录）
 /// - `auto_normalize`：兜底规则开关（改的是 spoken 文本，也要重录）
@@ -85,7 +97,9 @@ pub fn apply_effect(current: &ProjectInputs, template: &DubTemplate) -> ApplyEff
     {
         return ApplyEffect::Resynthesize;
     }
-    if current.gap_ms != template.gap_ms {
+    // 比的是**生效值**：模板里手填了 9999，实际会按 2000 用；当前已经是 2000 时
+    // 就该判"没改"，否则会白清一次 BGM 结果（复核指出的边界）。
+    if current.gap_ms != clamp_gap_ms(template.gap_ms) {
         return ApplyEffect::ReassembleOnly;
     }
     ApplyEffect::AuditionOnly
@@ -241,6 +255,23 @@ mod tests {
                 heavier.name
             );
         }
+
+        // 手写模板填了超上限的 gap：实际生效值等于当前值时，不该当成"改了停顿"
+        let over_cap = tpl("超上限", "audio8-tts", None, 9999, true);
+        let at_cap = ProjectInputs {
+            gap_ms: MAX_GAP_MS,
+            ..current.clone()
+        };
+        assert_eq!(
+            apply_effect(&at_cap, &over_cap),
+            ApplyEffect::AuditionOnly,
+            "比的是夹取后的生效值，不是文件里那个越界数字"
+        );
+        assert_eq!(
+            apply_effect(&current, &over_cap),
+            ApplyEffect::ReassembleOnly,
+            "当前 250、模板实际 2000：确实改了停顿"
+        );
 
         // 同时改了停顿与模型：按最重的那档（重录）
         let both = tpl("都改", "index-tts2", None, 900, true);
