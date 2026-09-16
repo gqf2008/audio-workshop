@@ -4448,7 +4448,8 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let tx = cmd_tx.clone();
     ui.on_template_apply(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if project_editing_blocked(&ui, &st) {
+        // 批量在飞时也算"任务进行中"：应用模板会改输入，而批量用的是提交那一刻的参数
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
             ui.set_status_text("任务进行中：模板等这轮跑完再应用".into());
             return;
         }
@@ -4507,7 +4508,7 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     let st_save = state.clone();
     ui.on_template_save(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if project_editing_blocked(&ui, &st_save) {
+        if project_editing_blocked(&ui, &st_save) || batch_in_flight(&st_save) {
             ui.set_status_text("任务进行中：模板等这轮跑完再存".into());
             return;
         }

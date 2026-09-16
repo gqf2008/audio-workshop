@@ -648,17 +648,19 @@ export component DubWorkbench inherits Rectangle {
                                 model: root.template-names;
                                 index <=> root.template-index;
                                 placeholder: "选择模板";
-                                enabled: !root.running && !root.busy && root.template-names.length > 0;
+                                enabled: !root.running && !root.busy && !root.batch-running
+                                    && root.template-names.length > 0;
                             }
                             PixelButton {
                                 width: 64px;
                                 text: "应用";
-                                enabled: !root.running && !root.busy && root.template-index >= 0;
+                                enabled: !root.running && !root.busy && !root.batch-running
+                                    && root.template-index >= 0;
                                 clicked => { root.template-apply(); }
                             }
                             PixelTextInput {
                                 width: 150px;
-                                enabled: !root.running && !root.busy;
+                                enabled: !root.running && !root.busy && !root.batch-running;
                                 text <=> root.template-name-text;
                                 placeholder: "模板名";
                             }
@@ -666,13 +668,14 @@ export component DubWorkbench inherits Rectangle {
                                 width: 64px;
                                 text: "存为";
                                 Tooltip { text: @markdown("把当前的引擎/音色/语速/停顿/兜底规则存成模板（同名覆盖）"); }
-                                enabled: !root.running && !root.busy;
+                                enabled: !root.running && !root.busy && !root.batch-running;
                                 clicked => { root.template-save(); }
                             }
                             PixelButton {
                                 width: 64px;
                                 text: "删除";
-                                enabled: !root.running && !root.busy && root.template-index >= 0;
+                                enabled: !root.running && !root.busy && !root.batch-running
+                                    && root.template-index >= 0;
                                 clicked => { root.template-delete(); }
                             }
                         }
@@ -781,7 +784,9 @@ export component DubWorkbench inherits Rectangle {
                             }
                             PixelTextInput {
                                 width: 90px;
-                                enabled: !root.running && !root.busy;
+                                // 批量在跑时也锁：批量提交那一刻就把参数定格了，中途改只会
+                                // 造成"界面显示 300、实际按 250 拼装"
+                                enabled: !root.running && !root.busy && !root.batch-running;
                                 text <=> root.gap-ms-text;
                                 placeholder: "250";
                                 edited => { root.gap-edited(); }
