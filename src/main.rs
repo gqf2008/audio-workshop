@@ -741,7 +741,11 @@ fn short_path(p: &str) -> String {
 struct WorkerCtx {
     rx: Receiver<Cmd>,
     tx: Sender<WorkerMsg>,
+    /// 配音 / BGM / 音乐制作共用（它们走同一台 worker 的顺序队列）
     stop: Arc<AtomicBool>,
+    /// 人声分离**单独**一个：与上面分开，避免两边互相把对方的停止请求吃掉
+    /// （审查抓到过：分离运行中点配音停止，会让分离结果被当成"用户停止"丢掉）。
+    sep_stop: Arc<AtomicBool>,
 }
 
 fn worker_loop(ctx: WorkerCtx) {
@@ -971,7 +975,8 @@ fn worker_loop(ctx: WorkerCtx) {
                 chunk_seconds,
             } => {
                 let tx = ctx.tx.clone();
-                let stop = Arc::clone(&ctx.stop);
+                // 读分离**自己的**停止位
+                let stop = Arc::clone(&ctx.sep_stop);
                 let req = aw_core::separate::SeparationRequest {
                     input,
                     out_dir,
@@ -1485,11 +1490,13 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     {
         let stop = Arc::clone(&stop);
+        let sep_stop = Arc::clone(&sep_stop);
         std::thread::spawn(move || {
             worker_loop(WorkerCtx {
                 rx: cmd_rx,
                 tx: msg_tx,
                 stop,
+                sep_stop,
             })
         });
     }
@@ -2198,7 +2205,7 @@ fn wire_sentence_actions(
             return;
         }
         if ui.get_busy() || ui.get_sep_busy() {
-            ui.set_status_text("有任务正在进行：请等当前任务结束再开始配音".into());
+            ui.set_status_text("有任务正在进行：等当前任务结束再重录单句".into());
             return;
         }
         if !state3.project_ready.get() {
@@ -2261,8 +2268,8 @@ fn wire_run(
     let state1 = state.clone();
     ui.on_start_run(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_busy() {
-            ui.set_status_text("重录 / 导出正在进行：请等当前任务结束".into());
+        if ui.get_busy() || ui.get_sep_busy() {
+            ui.set_status_text("有任务正在进行：等当前任务结束再开始配音".into());
             return;
         }
         let n = model4.row_count();

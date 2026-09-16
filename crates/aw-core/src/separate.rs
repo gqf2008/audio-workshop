@@ -272,9 +272,18 @@ pub fn separate_tracks(
         let _ = std::fs::remove_file(&vocals_tmp);
         return Err(format!("写出伴奏轨失败：{e}"));
     }
-    std::fs::rename(&vocals_tmp, &vocals_path).map_err(|e| format!("收尾人声轨失败：{e}"))?;
-    std::fs::rename(&accompaniment_tmp, &accompaniment_path)
-        .map_err(|e| format!("收尾伴奏轨失败：{e}"))?;
+    // rename 失败也要收干净：否则会留下"半套结果"或目录里的 .part 残渣
+    if let Err(e) = std::fs::rename(&vocals_tmp, &vocals_path) {
+        let _ = std::fs::remove_file(&vocals_tmp);
+        let _ = std::fs::remove_file(&accompaniment_tmp);
+        return Err(format!("收尾人声轨失败：{e}"));
+    }
+    if let Err(e) = std::fs::rename(&accompaniment_tmp, &accompaniment_path) {
+        // 人声已经落到最终名了：把它一起删掉，不留半套
+        let _ = std::fs::remove_file(&vocals_path);
+        let _ = std::fs::remove_file(&accompaniment_tmp);
+        return Err(format!("收尾伴奏轨失败：{e}"));
+    }
 
     let _ = local_model;
     Ok(SeparationOutcome::Done(SeparatedTracks {
