@@ -4,8 +4,8 @@
 
 三场景统一设计（配音 / BGM / 歌曲），**配音先行**。立项依据、实测基线、风险与路线图见 [CHARTER.md](CHARTER.md)。
 
-> 当前阶段：**M2** —— 在 M1 配音工作台之上接入 BGM：文本生成 30s 分段、按配音时长
-> 对齐、按句时间轴自动 ducking，并导出 voice / BGM / mixed 三轨。完成判据：一条视频的音频部分全用它。
+> 当前阶段：**M2 已稳定；M4 歌曲彩蛋开发中**。配音 + BGM 主链路已可用；歌曲场景已接入
+> yue2/ACE-Step 与 sheetsage2 翻唱，作为质量未达主线产品级的彩蛋能力。
 
 ## 本仓库（开源层）
 
@@ -55,6 +55,9 @@ cargo run --release        # 打开配音工作台
 # M2 BGM：对已有配音工程跑完整生成/对齐/duck/mix（真服务）
 cargo run -p aw-core --example bgm_run -- ~/Documents/音频作坊/projects/工程名 \
   "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好"
+# M4 歌曲：文生歌 / 翻唱（yue2 实测可用；ACE-Step 当前需更高内存）
+cargo run -p aw-core --example song_run -- yue2 歌词.txt "Mandarin Chinese R&B slow jam" out-dir
+cargo run -p aw-core --example song_cover -- source.wav 歌词.txt "R&B slow jam" out-dir
 ```
 
 ### 模型下载（基础下载器，免费）
