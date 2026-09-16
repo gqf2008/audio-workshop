@@ -88,6 +88,8 @@ export component MainWindow inherits Window {
     in-out property <int> song-model-index: 0;
     in property <bool> song-has-result: false;
     in property <string> song-status-text: "歌曲质量未达主线产品级，作为彩蛋使用。";
+    // 音乐制作页的「高级」展开态（引擎等独有参数在里面）
+    in-out property <bool> song-advanced: false;
 
     // 配音页内的「音色」区展开态（与「高级」同款，默认收起）
     in-out property <bool> dub-voice: false;
@@ -350,6 +352,7 @@ export component MainWindow inherits Window {
                     busy: root.busy || root.running;
                     has-result: root.song-has-result;
                     status-text: root.song-status-text;
+                    show-advanced <=> root.song-advanced;
                     generate => { root.song-generate(); }
                     preview => { root.song-preview(); }
                     export-track => { root.song-export-track(); }

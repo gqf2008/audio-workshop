@@ -1450,6 +1450,11 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_scene(3);
             ui.set_status_text("音乐制作：写歌 / 文生音乐（yue2 · ace-step）".into());
         }
+        "music-adv" => {
+            ui.set_scene(3);
+            ui.set_song_advanced(true);
+            ui.set_status_text("音乐制作·高级：引擎（yue2 / ACE-Step）在这里，不占首屏".into());
+        }
         "bgm" => {
             ui.set_scene(1);
             ui.set_status_text("BGM：按描述生成，自动对齐配音时长并 ducking".into());
