@@ -190,6 +190,7 @@ export component MainWindow inherits Window {
     callback song-preview();
     callback song-export-track();
     callback sep-pick-file();
+    callback sep-path-edited();
     callback sep-run();
     callback sep-stop();
     callback sep-preview-track(int);
@@ -374,6 +375,7 @@ export component MainWindow inherits Window {
                     show-advanced <=> root.sep-advanced;
                     chunk-seconds-text <=> root.sep-chunk-seconds;
                     pick-file => { root.sep-pick-file(); }
+                path-edited => { root.sep-path-edited(); }
                     run => { root.sep-run(); }
                     stop => { root.sep-stop(); }
                     preview-track(i) => { root.sep-preview-track(i); }

@@ -1472,7 +1472,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let msg_tx_ui = msg_tx.clone();
     // 启动即探一次服务：状态栏 / 全局设置里立刻能看到连不连得上
     spawn_server_check(msg_tx_ui.clone(), 0);
+    // 配音/BGM/歌曲共用这一个停止位（它们走同一台 worker 的顺序队列）；
+    // **分离单独一个**：否则一边的停止请求会被另一边的"清零/置位"吃掉
+    // （审查抓到：分离运行中点配音停止，会把分离结果当"用户停止"丢掉）。
     let stop = Arc::new(AtomicBool::new(false));
+    let sep_stop = Arc::new(AtomicBool::new(false));
     let state = Rc::new(UiState {
         // 只有"试听总时长"需要一个非零默认值；其余字段都走 Default，
         // 这样以后加字段不会再打破这里的构造（以及测试里的构造）
@@ -1509,7 +1513,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_song(&ui, &cmd_tx, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
     wire_task_center(&ui, &state);
-    wire_separation(&ui, &msg_tx_ui, &cmd_tx, &state, &player, &stop);
+    wire_separation(&ui, &msg_tx_ui, &cmd_tx, &state, &player, &sep_stop);
 
     // 启动就把"任务 · 空闲"画上（状态栏 chip 与任务中心都读同一份台账）
     refresh_tasks(&ui, &state);
@@ -2193,12 +2197,16 @@ fn wire_sentence_actions(
             ui.set_status_text("合成进行中：等这轮跑完再重录单句".into());
             return;
         }
-        if ui.get_busy() {
-            ui.set_status_text("重录 / 导出正在进行：请等当前任务结束".into());
+        if ui.get_busy() || ui.get_sep_busy() {
+            ui.set_status_text("有任务正在进行：请等当前任务结束再开始配音".into());
             return;
         }
         if !state3.project_ready.get() {
             ui.set_status_text("工程已变更：先开始合成，再重录单句".into());
+            return;
+        }
+        if ui.get_sep_busy() {
+            ui.set_status_text("人声分离进行中：等它结束再重录".into());
             return;
         }
         ui.set_selected(i);
@@ -2447,7 +2455,7 @@ fn wire_bgm(
     let state1 = state.clone();
     ui.on_bgm_generate(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if ui.get_running() || ui.get_busy() || ui.get_sep_busy() {
             ui.set_status_text("任务进行中：等当前任务结束再生成 BGM".into());
             return;
         }
@@ -2553,7 +2561,7 @@ fn wire_song(
     let state1 = state.clone();
     ui.on_song_generate(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
+        if ui.get_running() || ui.get_busy() || ui.get_sep_busy() {
             ui.set_status_text("任务进行中：等当前任务结束再生成歌曲".into());
             return;
         }
@@ -3544,7 +3552,8 @@ fn wire_separation(
     let stop1 = Arc::clone(stop);
     ui.on_sep_run(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_sep_busy() {
+        if ui.get_sep_busy() || ui.get_running() || ui.get_busy() {
+            ui.set_sep_status_text("任务进行中：等当前任务结束再分离".into());
             return;
         }
         let input = ui.get_sep_input_path().trim().to_string();
@@ -3595,6 +3604,21 @@ fn wire_separation(
             finish_task(&ui, &st, &st.sep_task, tasks::TaskState::Failed, note);
             ui.set_sep_status_text(note.into());
         }
+    });
+
+    // 高级里手输/粘贴路径：与"选文件"走同一套 stale 逻辑（否则旧两轨还能导出）
+    let weak = ui.as_weak();
+    let st_edit = state.clone();
+    ui.on_sep_path_edited(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_sep_busy() {
+            return;
+        }
+        let path = ui.get_sep_input_path().trim().to_string();
+        if path.is_empty() {
+            return;
+        }
+        set_separation_input(&ui, &st_edit, path);
     });
 
     // 停止：上游没有取消 API，这里只是"别再落盘"，如实写在状态里

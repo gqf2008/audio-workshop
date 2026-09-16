@@ -25,6 +25,7 @@ export component SeparationWorkbench inherits Rectangle {
     in-out property <string> chunk-seconds-text: "30";
 
     callback pick-file();
+    callback path-edited();
     callback run();
     callback stop();
     callback preview-track(int);
@@ -123,7 +124,7 @@ export component SeparationWorkbench inherits Rectangle {
                         text: root.busy
                             ? "停止"
                             : (root.has-result ? "重新分离" : (root.ready ? "分离人声 / 伴奏" : "选择音频"));
-                        enabled: root.busy || root.ready;
+                        enabled: true;   // 空态也能点：点了就是"选择音频"
                         clicked => {
                             if root.busy { root.stop(); }
                             else if root.ready { root.run(); }
@@ -163,6 +164,7 @@ export component SeparationWorkbench inherits Rectangle {
                                 enabled: !root.busy;
                                 text <=> root.input-path;
                                 placeholder: "也可以直接粘路径，如 ~/Music/song.wav";
+                                edited => { root.path-edited(); }
                             }
                         }
                         HorizontalLayout {

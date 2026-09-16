@@ -71,6 +71,17 @@ fn sink() -> &'static Mutex<Option<Sender<Progress>>> {
     SINK.get_or_init(|| Mutex::new(None))
 }
 
+/// RAII：离开作用域时清掉 SINK，保证"出错/提前 return/子线程 panic"都不会留下槽位。
+struct SinkGuard;
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = sink().lock() {
+            *g = None;
+        }
+    }
+}
+
 fn send_progress(p: Progress) {
     let tx = sink().lock().ok().and_then(|g| g.clone());
     if let Some(tx) = tx {
@@ -140,8 +151,11 @@ pub fn output_paths(out_dir: &Path, stem: &str) -> (PathBuf, PathBuf) {
     )
 }
 
-/// 在本地模型目录里找可用的 `.onnx`（按名字优先，找不到就退而求其次取第一个）。
-/// 返回 None 表示"本地没有，交给上游下载"。
+/// 在本地模型目录里找 htdemucs 权重：**只认文件名包含 `model_name` 的 `.onnx`**。
+///
+/// 不"退而求其次取第一个 .onnx"：模型目录里可能有别的 ONNX（例如某个 tts 的权重），
+/// 拿它当 htdemucs 加载只会得到一句莫名其妙的"分离失败"。名字不匹配就当本地没有、
+/// 交给上游下载（缓存过一次之后就离线了）。
 pub fn find_local_model(model_dir: &Path, model_name: &str) -> Option<PathBuf> {
     if !model_dir.is_dir() {
         return None;
@@ -166,7 +180,6 @@ pub fn find_local_model(model_dir: &Path, model_name: &str) -> Option<PathBuf> {
                 .map(|n| n.to_string_lossy().contains(model_name))
                 .unwrap_or(false)
         })
-        .or_else(|| entries.first())
         .cloned()
 }
 
@@ -216,6 +229,8 @@ pub fn separate_tracks(
     // 当前线程负责把全局槽位里的进度转成本次运行的 on_progress。
     let (tx, rx) = channel::<Progress>();
     *sink().lock().map_err(|_| "进度槽位被污染".to_string())? = Some(tx);
+    // 从这里开始无论怎么返回（失败 / panic / 正常）都会清槽位
+    let _sink_guard = SinkGuard;
     let input = req.input.display().to_string();
 
     let handle = std::thread::spawn(move || {
@@ -241,22 +256,25 @@ pub fn separate_tracks(
         }
     };
 
-    // 运行结束：清掉槽位，避免下一次运行之前的进度发到旧目标
-    if let Ok(mut g) = sink().lock() {
-        *g = None;
-    }
-
     if should_stop() {
         return Ok(SeparationOutcome::Stopped);
     }
 
+    // 先写临时名、两个都成了再改名：否则第一步成功、第二步失败会留下"半套结果"
     let (vocals_path, accompaniment_path) = output_paths(&req.out_dir, &req.stem);
+    let vocals_tmp = vocals_path.with_extension("wav.part");
+    let accompaniment_tmp = accompaniment_path.with_extension("wav.part");
     stems
-        .save(Stem::Vocals, &vocals_path.display().to_string())
+        .save(Stem::Vocals, &vocals_tmp.display().to_string())
         .map_err(|e| format!("写出人声轨失败：{e}"))?;
-    stems
-        .save_mix_except(&[Stem::Vocals], &accompaniment_path.display().to_string())
-        .map_err(|e| format!("写出伴奏轨失败：{e}"))?;
+    if let Err(e) = stems.save_mix_except(&[Stem::Vocals], &accompaniment_tmp.display().to_string())
+    {
+        let _ = std::fs::remove_file(&vocals_tmp);
+        return Err(format!("写出伴奏轨失败：{e}"));
+    }
+    std::fs::rename(&vocals_tmp, &vocals_path).map_err(|e| format!("收尾人声轨失败：{e}"))?;
+    std::fs::rename(&accompaniment_tmp, &accompaniment_path)
+        .map_err(|e| format!("收尾伴奏轨失败：{e}"))?;
 
     let _ = local_model;
     Ok(SeparationOutcome::Done(SeparatedTracks {
@@ -285,18 +303,18 @@ mod tests {
     }
 
     #[test]
-    fn find_local_model_prefers_matching_name_then_falls_back() {
+    fn find_local_model_requires_a_name_match() {
         let dir = std::env::temp_dir().join(format!("aw-sep-model-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 没有 .onnx 时返回 None（不能被别的文件骗到）
         std::fs::write(dir.join("readme.txt"), b"x").unwrap();
         assert_eq!(find_local_model(&dir, DEFAULT_MODEL), None);
-        // 只有一个 .onnx → 用它
-        let a = dir.join("other-model.onnx");
+        // 只有名字不匹配的 .onnx → 不认（避免把别的模型当 htdemucs 加载）
+        let a = dir.join("some-tts-model.onnx");
         std::fs::write(&a, b"x").unwrap();
-        assert_eq!(find_local_model(&dir, DEFAULT_MODEL), Some(a.clone()));
-        // 出现名字匹配的 → 优先它
+        assert_eq!(find_local_model(&dir, DEFAULT_MODEL), None);
+        // 名字匹配的 → 用它
         let b = dir.join(format!("{DEFAULT_MODEL}.onnx"));
         std::fs::write(&b, b"x").unwrap();
         assert_eq!(find_local_model(&dir, DEFAULT_MODEL), Some(b));

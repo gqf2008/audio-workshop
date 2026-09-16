@@ -68,7 +68,13 @@ stems.save_mix_except(&[Stem::Vocals], ".../xxx_accompaniment.wav")?;
 | 端到端 | 4.27s 单声道 44.1k 输入：**131s**（含 200MB 下载 + 首次加载模型）；两轨写出成功 |
 | 分离质量抽样 | 输入是人声 TTS：`vocals` RMS **0.13802**（≈ 输入 0.13820），`accompaniment` RMS **0.00095**（≈ 静音），帧数三者一致（188416）—— 符合"纯语音应全进人声轨"的预期，说明链路真的在分离而不是复制 |
 
-## 4. 接入方案（建议）
+## 4. 接入方案（**已实现**；文件名/消息名以代码为准）
+
+> 实现落地在两处：`crates/aw-core/src/separate.rs`（后端）与 `ui/separation_workbench.slint`
+> + `src/main.rs::wire_separation`（页面与接线）。本节早期版本写的是"改 `ui/extra_tabs.slint`、
+> 消息名 `SeparationProgress|Done|Failed`"，实际改成独立页面文件 + 单一 `Msg::Separation*`
+> 系列；另外停止用的是**分离自己的** `sep_stop` 标志（与配音共用会把两边的停止请求互相吃掉，
+> 审查抓到过）。以下原文保留作设计意图记录。
 
 1. `crates/aw-core` 新增 `separate.rs`，依赖 `stem-splitter-core`：
    - `Separator` 复用（模型只加载一次，避免每次分离都吃一遍模型加载）；
