@@ -2997,9 +2997,10 @@ fn qa_report_markdown(
     let mut out = String::new();
     out.push_str(&format!("# 质检报告 · {project_name}\n\n"));
     out.push_str(&format!("- 回读模型：{model}\n"));
+    // 总句数 = 本次评分的 + 转写失败的（rows 只含评上分的，用 rows.len() 会把失败句漏掉）
     out.push_str(&format!(
         "- 句数：{}（评分 {scored}，转写失败 {asr_failed}）\n",
-        rows.len()
+        rows.len() + asr_failed
     ));
     if scored > 0 {
         out.push_str(&format!("- 平均可懂度：{percent:.1}%\n"));
@@ -3026,33 +3027,38 @@ fn qa_report_markdown(
 /// 质检完成后的摘要文案（抽成纯函数：全失败 / 全一致 / 有最差句三种要分开说，
 /// 否则"0 句评上分"会被说成"平均 0%"甚至"全部一致"——复核抓到过）。
 fn eval_summary_note(summary: &EvalSummary) -> String {
-    if summary.scored == 0 {
-        return format!(
+    // 先出"这次质检的结论"……
+    let mut note = if summary.scored == 0 {
+        format!(
             "质检未能评分：{} 句 ASR 转写都失败了（检查 ASR 模型/服务）",
             summary.asr_failed
+        )
+    } else {
+        let mut n = format!(
+            "质检完成：平均可懂度 {:.1}%（{} 句）",
+            summary.percent, summary.scored
         );
-    }
-    let mut note = format!(
-        "质检完成：平均可懂度 {:.1}%（{} 句）",
-        summary.percent, summary.scored
-    );
-    if summary.asr_failed > 0 {
-        note.push_str(&format!("·{} 句转写失败", summary.asr_failed));
-    }
-    match summary.worst.first() {
-        Some(worst) if worst.snippet.is_empty() => note.push_str(&format!(
-            "·最差 第 {} 句 {:.1}%",
-            worst.index + 1,
-            worst.percent
-        )),
-        Some(worst) => note.push_str(&format!(
-            "·最差 第 {} 句 {:.1}%：{}",
-            worst.index + 1,
-            worst.percent,
-            worst.snippet
-        )),
-        None => note.push_str("·全部一致"),
-    }
+        if summary.asr_failed > 0 {
+            n.push_str(&format!("·{} 句转写失败", summary.asr_failed));
+        }
+        match summary.worst.first() {
+            Some(worst) if worst.snippet.is_empty() => n.push_str(&format!(
+                "·最差 第 {} 句 {:.1}%",
+                worst.index + 1,
+                worst.percent
+            )),
+            Some(worst) => n.push_str(&format!(
+                "·最差 第 {} 句 {:.1}%：{}",
+                worst.index + 1,
+                worst.percent,
+                worst.snippet
+            )),
+            None => n.push_str("·全部一致"),
+        }
+        n
+    };
+    // ……再追加"东西有没有落盘"。**两种分支都要走到这里**：一句都没评上分时报告照样写了，
+    // 写失败/分数没落盘也得让用户看见（复核指出旧写法在 scored==0 时提前 return，把这些吞了）。
     if let Some(warn) = &summary.persist_warning {
         note.push_str(&format!("·（{warn}）"));
     }
@@ -6368,10 +6374,17 @@ mod tests {
         assert!(md.contains("未能评分"), "{md}");
         assert!(!md.contains("平均可懂度：0.0%"), "{md}");
         assert!(md.contains("转写失败 5"), "{md}");
+        assert!(
+            md.contains("句数：5"),
+            "总句数要含转写失败的句子，不能写成 0：{md}"
+        );
     }
 
-    /// 真机（默认 ignored）：把「合成 → 质检」整条 **worker** 路径跑一遍——GUI 走的就是这条。
-    /// 覆盖 Cmd::RunEval → TaskStarted → EvalProgress… → EvalDone(report_path) → qa-report.md 落盘。
+    /// 真机（默认 ignored）：**质检阶段走真实 worker**，覆盖 GUI 用的那条命令通道
+    /// （Cmd::RunEval → TaskStarted → EvalProgress… → EvalDone(report_path) → qa-report.md 落盘）。
+    ///
+    /// 合成准备故意直接用 aw-core（与 app 同一条链路）：走 `Cmd::Run` 会落到用户的
+    /// `~/Documents/音频作坊/projects/<工程名>` 下，测试不该往用户真实数据目录里写东西。
     #[test]
     #[ignore = "需要本机 audiocpp_server + audio8-tts + qwen3-asr"]
     fn worker_eval_writes_report_end_to_end() {
@@ -6449,5 +6462,24 @@ mod tests {
             on_disk.sentences.iter().all(|s| s.eval_percent.is_some()),
             "每句都应写入 eval_percent"
         );
+    }
+
+    /// 一句都没评上分时**也要**把"落盘告警/报告路径"带出来——旧写法在 scored==0 分支提前 return，
+    /// 把报告路径和"报告没写进去"的告警一起吞了（复核指出）。
+    #[test]
+    fn eval_summary_note_keeps_warnings_when_nothing_scored() {
+        let summary = EvalSummary {
+            percent: 0.0,
+            scored: 0,
+            asr_failed: 5,
+            worst: Vec::new(),
+            scores: Vec::new(),
+            persist_warning: Some("质检报告未写入：磁盘空间不足".into()),
+            report_path: Some(std::path::PathBuf::from("/tmp/示例工程/qa-report.md")),
+        };
+        let note = eval_summary_note(&summary);
+        assert!(note.contains("未能评分"), "{note}");
+        assert!(note.contains("质检报告未写入"), "告警不能被吞：{note}");
+        assert!(note.contains("qa-report.md"), "报告路径不能被吞：{note}");
     }
 }
