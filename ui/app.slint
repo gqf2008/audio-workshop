@@ -19,8 +19,8 @@
 // ============================================================================
 
 import {
-    PixelDrawer, PixelEmpty, PixelScrollPanel, PixelTabs, PixelTheme, PixelTitleBar,
-    PixelToast, PixelWindowResize,
+    PixelEmpty, PixelScrollPanel, PixelTabs, PixelTheme, PixelTitleBar, PixelToast,
+    PixelWindowResize,
 } from "@slint_pixel";
 
 import { Sentence, Voice } from "model.slint";
@@ -393,45 +393,94 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── 右侧抽屉：默认收起（渐进披露），点标题栏开关展开 ──
-    //     外面包一层「圆角 + 裁剪」：抽屉自带的面板是直角，直接铺到窗口边会盖住
-    //     根 Rectangle 的 10px 圆角（表现为「开着抽屉时窗口变方」）。
-    Rectangle {
+    // ── 全局设置抽屉（自绘）──
+    //     为什么不用贴边面板：窗口是「无边框 + 10px 圆角」，贴右边、底边到状态栏的面板
+    //     上角能跟窗口圆角走、下角却是内直角，视觉上「上圆下方」跟窗口打架。
+    //     改成**浮动圆角卡片**：四周都 8px 圆角（外 10 − 描边 2），右侧留 10px 呼吸位，
+    //     底部让开 32px（状态栏可见），遮罩单独裁到窗口圆角。
+    if root.drawer-open : Rectangle {
         x: 0px; y: 0px;
         width: 100%; height: 100%;
-        border-radius: 10px;
-        clip: true;
 
-        PixelDrawer {
-            x: 2px; y: 2px;
-            width: root.width - 4px;
-            // 底部让开 30px 状态栏：抽屉是浮层，但不该把全局状态栏盖掉
-            height: root.height - 4px - 30px;
-            open: root.drawer-open;
-        title: "全局设置";
-        drawer-width: 380px;
-        close => { root.drawer-open = false; }
+        // 遮罩：铺满并裁到窗口圆角，避免在黑边框外再露直角
+        Rectangle {
+            x: 0px; y: 0px;
+            width: 100%; height: 100%;
+            border-radius: 10px;
+            clip: true;
+            background: #00000080;
+            TouchArea {
+                width: 100%; height: 100%;
+                clicked => { root.drawer-open = false; }
+            }
+        }
 
-        WorkbenchDrawer {
-            vertical-stretch: 1;
+        // 面板：浮动圆角卡片
+        Rectangle {
+            x: parent.width - 380px - 10px;
+            y: 10px;
+            width: 380px;
+            height: parent.height - 10px - 42px;
+            background: PixelTheme.panel;
+            border-width: 2px;
+            border-color: PixelTheme.edge;
+            border-radius: 8px;
+            clip: true;
 
-            project-name <=> root.project-name;
-            project-edited => { root.project-edited(); }
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
 
-            theme-scheme: root.theme-scheme;
-            theme-picked(s) => { root.theme-picked(s); }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "全局设置";
+                        color: PixelTheme.text;
+                        font-size: 15px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                    }
+                    close-ta := TouchArea {
+                        width: 24px;
+                        height: 24px;
+                        mouse-cursor: pointer;
+                        clicked => { root.drawer-open = false; }
+                        Text {
+                            width: 100%; height: 100%;
+                            text: "×";
+                            color: close-ta.has-hover ? PixelTheme.text : PixelTheme.dim;
+                            font-size: 15px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
 
-            busy: root.busy || root.running;
-            server-host <=> root.server-host;
-            server-port <=> root.server-port;
-            server-status: root.server-status;
-            server-ok: root.server-ok;
-            model-dir <=> root.model-dir;
-            model-dir-info: root.model-dir-info;
-            apply-server-settings => { root.apply-server-settings(); }
-            rescan-models => { root.rescan-models(); }
-            check-server => { root.check-server(); }
-            pick-model-dir => { root.pick-model-dir(); }
+                Rectangle { height: 2px; background: PixelTheme.edge; }
+
+                WorkbenchDrawer {
+                    vertical-stretch: 1;
+
+                    project-name <=> root.project-name;
+                    project-edited => { root.project-edited(); }
+
+                    theme-scheme: root.theme-scheme;
+                    theme-picked(s) => { root.theme-picked(s); }
+
+                    busy: root.busy || root.running;
+                    server-host <=> root.server-host;
+                    server-port <=> root.server-port;
+                    server-status: root.server-status;
+                    server-ok: root.server-ok;
+                    model-dir <=> root.model-dir;
+                    model-dir-info: root.model-dir-info;
+                    apply-server-settings => { root.apply-server-settings(); }
+                    rescan-models => { root.rescan-models(); }
+                    check-server => { root.check-server(); }
+                    pick-model-dir => { root.pick-model-dir(); }
+                }
             }
         }
     }
