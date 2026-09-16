@@ -27,6 +27,7 @@ import { Sentence, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { GatedTab, VoiceDesignTab } from "extra_tabs.slint";
+import { SongWorkbench } from "song_workbench.slint";
 
 export { Sentence, Voice } from "model.slint";
 
@@ -79,6 +80,13 @@ export component MainWindow inherits Window {
     in-out property <bool> dub-advanced: false;
 
     // ── 音色选择器（默认收起，从「换音色」打开） ──
+    // ── 音乐制作（歌曲）场景：歌词 / 风格 / 模型 + 结果 ──
+    in-out property <string> song-lyrics: "";
+    in-out property <string> song-style: "";
+    in-out property <int> song-model-index: 0;
+    in property <bool> song-has-result: false;
+    in property <string> song-status-text: "";
+
     // 配音页内的「音色」区展开态（与「高级」同款，默认收起）
     in-out property <bool> dub-voice: false;
 
@@ -153,6 +161,9 @@ export component MainWindow inherits Window {
     // ── 音色选择器 / 音色设计事件出口 ──
     callback preview-voice();
     callback clear-voice-reference();
+    callback song-generate();
+    callback song-preview();
+    callback song-export-track();
     callback apply-server-settings();
     callback rescan-models();
     callback check-server();
@@ -327,15 +338,19 @@ export component MainWindow inherits Window {
                     ];
                 }
 
-                if root.scene == 3 : GatedTab {
+                // 场景 3 = 音乐制作（歌曲）：链路来自 feat/m4-song（yue2 / ace-step / S2 翻唱）
+                if root.scene == 3 : SongWorkbench {
                     vertical-stretch: 1;
-                    title: "音乐制作";
-                    summary: "写歌 / 文生音乐。yue2、ace-step、S2 翻唱的链路在 feat/m4-song 分支开发，尚未合入本分支。";
-                    requirements: [
-                        "合并 feat/m4-song 的歌曲链路",
-                        "生成中可切 Tab、失败按当前版本重试",
-                        "改歌词/风格只标草稿有新修改，旧版本仍可导出",
-                    ];
+                    horizontal-stretch: 1;
+                    lyrics <=> root.song-lyrics;
+                    style <=> root.song-style;
+                    model-index <=> root.song-model-index;
+                    busy: root.busy || root.running;
+                    has-result: root.song-has-result;
+                    status-text: root.song-status-text;
+                    generate => { root.song-generate(); }
+                    preview => { root.song-preview(); }
+                    export-track => { root.song-export-track(); }
                 }
 
                 if root.scene == 4 : VoiceDesignTab {
