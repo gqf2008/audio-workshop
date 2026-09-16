@@ -59,8 +59,9 @@ pub fn bgm_only_artifacts(dir: &Path, options: &BgmOptions) -> Result<BgmArtifac
         .ok()
         .and_then(|r| {
             let spec = r.spec();
+            // duration() 已是每声道帧数，别再除 channels（立体声会少算一半）
             (spec.sample_rate > 0 && spec.channels > 0)
-                .then(|| r.duration() as f64 / spec.channels as f64 / spec.sample_rate as f64)
+                .then(|| r.duration() as f64 / spec.sample_rate as f64)
         })
         .filter(|d| *d > 0.0)
         .unwrap_or_else(|| options.target_seconds.max(0.1));
@@ -138,7 +139,9 @@ fn segment_path(dir: &Path, index: usize) -> PathBuf {
 fn wav_duration_seconds(path: &Path) -> Option<f64> {
     let reader = hound::WavReader::open(path).ok()?;
     let spec = reader.spec();
-    Some(reader.duration() as f64 / spec.channels as f64 / spec.sample_rate as f64)
+    // duration() 已是每声道帧数；多除一次 channels 会让立体声分段看起来只有一半长，
+    // 续跑时判成"这段没生成"→ 每次都重新合成
+    Some(reader.duration() as f64 / spec.sample_rate as f64)
 }
 
 /// 逐段生成 BGM；已存在且时长足够的段自动跳过，支持中断续跑。
@@ -419,7 +422,8 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
     };
     let mut out =
         hound::WavWriter::create(&tmp, spec).map_err(|e| hound_error_note(&mixed_path, 0, &e))?;
-    let frames = voice.duration() as u64 / vs.channels as u64;
+    // duration() 已是每声道帧数：多除一次 channels 会把立体声人声混成一半长
+    let frames = voice.duration() as u64;
     let mut vi = voice.samples::<i16>();
     let mut bi = bgm.samples::<i16>();
     let fade = (options.fade_ms as f64 / 1000.0).max(0.001);
@@ -525,5 +529,33 @@ mod tests {
             w.write_sample((i % 89) as i16).unwrap();
         }
         w.finalize().unwrap();
+    }
+
+    /// 分段时长也走 `hound::duration()`，而它**已经是每声道帧数**。
+    /// 立体声分段若再除一次 channels，时长正好少一半 → 续跑时"这段时长不够"
+    /// 会被判成没生成，缓存永远用不上（每次续跑都重合成一遍）。
+    #[test]
+    fn wav_duration_seconds_counts_frames_for_stereo_segments() {
+        let dir = std::env::temp_dir().join(format!("aw-bgm-stereo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..(24_000 * 2) {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let secs = wav_duration_seconds(&path).expect("刚写出来的 wav 应该读得出时长");
+        assert!(
+            (secs - 1.0).abs() < 1e-9,
+            "立体声 1 秒应读成 1.0s，实得 {secs}"
+        );
     }
 }

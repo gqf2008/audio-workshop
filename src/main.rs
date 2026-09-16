@@ -6613,4 +6613,201 @@ mod tests {
             srt.display()
         );
     }
+    /// 手写一段最小立体声 PCM wav（48kHz / 16bit）：分离的输入要是**确定的**，
+    /// 而这个 crate 没有 wav 写入依赖（读时长走 aw_core::dub::wav_duration）——
+    /// RIFF 头只有十几行，比为一个测试引依赖划算。
+    fn write_test_tone_wav(path: &std::path::Path, seconds: f64) -> f64 {
+        let rate = 48_000u32;
+        let frames = (rate as f64 * seconds).round() as u32;
+        let mut data = Vec::with_capacity(frames as usize * 4);
+        for i in 0..frames {
+            let t = i as f32 / rate as f32;
+            let l = (t * 440.0 * std::f32::consts::TAU).sin() * 0.4;
+            let r = (t * 660.0 * std::f32::consts::TAU).sin() * 0.4;
+            data.extend_from_slice(&((l * i16::MAX as f32) as i16).to_le_bytes());
+            data.extend_from_slice(&((r * i16::MAX as f32) as i16).to_le_bytes());
+        }
+        let mut out = Vec::with_capacity(data.len() + 44);
+        let byte_rate = rate * 4; // 2 声道 × 16bit
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((36 + data.len()) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // fmt 块长度
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&2u16.to_le_bytes()); // 声道数
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&4u16.to_le_bytes()); // 块对齐
+        out.extend_from_slice(&16u16.to_le_bytes()); // 位深
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).unwrap();
+        frames as f64 / rate as f64
+    }
+
+    /// 从 RIFF 头读采样率（不引解码器：就是 fmt 块第 4 个字段）。
+    fn wav_header_sample_rate(bytes: &[u8]) -> u32 {
+        assert!(bytes.len() > 44, "太短，不是完整 wav");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        // fmt 块从 12 开始：12..16 = "fmt "，+4 = 长度，+8 = 格式，+10 = 声道，+12 = 采样率
+        assert_eq!(&bytes[12..16], b"fmt ");
+        u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]])
+    }
+
+    /// 真机（默认 ignored）：**人声分离走 worker 的命令通道**，覆盖统一队列的两个关键语义——
+    /// ① 排队中被取消的任务在 TaskStarted 之后直接终态、**不加载模型**（硬取消的收益就在这里）；
+    /// ② 正常一条要跑出两轨落盘，且产物采样率标签与输入一致（relabel 那条修复的口径）。
+    ///
+    /// 模型走本机缓存（`~/Library/Caches/dev.StemSplitter.stem-splitter-core`，约 200MB）；
+    /// 没缓存过的机器会先下载，这也是它标 ignored 的原因。
+    #[test]
+    #[ignore = "需要本机 htdemucs 模型（首次约 200MB）"]
+    fn worker_separation_queues_cancels_and_writes_two_tracks() {
+        let root = std::env::temp_dir().join(format!("aw-worker-sep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("tone.wav");
+        let input_seconds = write_test_tone_wav(&input, 3.0);
+
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        // 与 UI 共享的取消登记表：测试就是"另一个持表人"，模拟用户在排队时点了停止
+        let cancel = cancel::CancelRegistry::new();
+        let worker_cancel = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: std::env::temp_dir(),
+                cancel: worker_cancel,
+            })
+        });
+
+        // ① 排队中取消：登记在发送之前（UI 侧是"排队中点停止"同一时刻）
+        let out_cancelled = root.join("cancelled-stems");
+        cancel.cancel(11);
+        cmd_tx
+            .send(Cmd::RunSeparation {
+                revision: 0,
+                task_id: 11,
+                input: input.clone(),
+                out_dir: out_cancelled.clone(),
+                stem: "tone".into(),
+                model_dir: None,
+                chunk_seconds: Some(5),
+            })
+            .unwrap();
+
+        let mut started = false;
+        let mut progress_after_start = 0usize;
+        loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::TaskStarted { task_id: 11 } => started = true,
+                Msg::SeparationProgress { task_id: 11, .. } => progress_after_start += 1,
+                Msg::SeparationStopped { task_id: 11 } => break,
+                Msg::SeparationDone { task_id: 11, .. } => panic!("取消过的任务不该真的跑"),
+                Msg::SeparationFailed { task_id: 11, error } => {
+                    panic!("取消过的任务不该失败：{error}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            started,
+            "终态前必须有一次 TaskStarted（队列靠它把条目抬成运行中）"
+        );
+        assert_eq!(
+            progress_after_start, 0,
+            "排队中取消的任务不该产生进度（产出进度就说明已经加载模型开始跑了）"
+        );
+        assert!(
+            !out_cancelled.exists(),
+            "取消的任务不该留下输出目录：{}",
+            out_cancelled.display()
+        );
+
+        // ② 正常一条：同一 worker 上的第二条，走出两轨
+        let out_dir = root.join("stems");
+        cmd_tx
+            .send(Cmd::RunSeparation {
+                revision: 0,
+                task_id: 12,
+                input: input.clone(),
+                out_dir: out_dir.clone(),
+                stem: "tone".into(),
+                model_dir: None,
+                chunk_seconds: Some(5),
+            })
+            .unwrap();
+
+        let mut started_12 = false;
+        let mut progress_seen = 0usize;
+        let (vocals, accompaniment) = loop {
+            let m = msg_rx.recv().expect("worker 应有消息");
+            match m.msg {
+                Msg::TaskStarted { task_id: 12 } => started_12 = true,
+                Msg::SeparationProgress { task_id: 12, .. } => progress_seen += 1,
+                Msg::SeparationDone {
+                    task_id: 12,
+                    vocals,
+                    accompaniment,
+                } => break (vocals, accompaniment),
+                Msg::SeparationStopped { task_id: 12 } => panic!("没登记取消，不该停"),
+                Msg::SeparationFailed { task_id: 12, error } => panic!("分离失败：{error}"),
+                _ => {}
+            }
+        };
+        drop(cmd_tx);
+        handle.join().unwrap();
+
+        assert!(started_12, "正常那条也要有 TaskStarted");
+        assert!(
+            progress_seen > 0,
+            "真跑应该有进度回调（实得 {progress_seen}）"
+        );
+        assert!(vocals.exists(), "人声轨不存在：{}", vocals.display());
+        assert!(
+            accompaniment.exists(),
+            "伴奏轨不存在：{}",
+            accompaniment.display()
+        );
+
+        let v_bytes = std::fs::read(&vocals).unwrap();
+        let a_bytes = std::fs::read(&accompaniment).unwrap();
+        let v_secs = aw_core::dub::wav_duration(&v_bytes).expect("人声轨应是可解析 wav");
+        let a_secs = aw_core::dub::wav_duration(&a_bytes).expect("伴奏轨应是可解析 wav");
+        assert!(
+            (v_secs - input_seconds).abs() < 0.25,
+            "人声轨时长应贴住输入（{input_seconds:.3}s），实得 {v_secs:.3}s"
+        );
+        assert!(
+            (a_secs - input_seconds).abs() < 0.25,
+            "伴奏轨时长应贴住输入（{input_seconds:.3}s），实得 {a_secs:.3}s"
+        );
+        assert_eq!(
+            wav_header_sample_rate(&v_bytes),
+            48_000,
+            "人声轨采样率标签必须是输入的 48k（relabel 那条修复）"
+        );
+        assert_eq!(
+            wav_header_sample_rate(&a_bytes),
+            48_000,
+            "伴奏轨采样率标签必须是输入的 48k（relabel 那条修复）"
+        );
+        assert_ne!(
+            v_bytes, a_bytes,
+            "两轨内容相同说明根本没分离（拿输入复制了两份）"
+        );
+        eprintln!(
+            "人声轨：{}（{v_secs:.3}s，48kHz）\n伴奏轨：{}（{a_secs:.3}s，48kHz）\n进度回调 {progress_seen} 次",
+            vocals.display(),
+            accompaniment.display()
+        );
+    }
 }
