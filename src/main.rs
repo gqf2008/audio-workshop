@@ -537,11 +537,29 @@ fn settings_path() -> PathBuf {
     documents_dir().join(WORKSHOP_DIR).join("settings.json")
 }
 
+/// 读 settings.json。
+///
+/// **逐字段解析**：某一段坏掉（手改错、版本不兼容）只丢那一段，不要连带把 host/port
+/// 也清掉——整份 `from_str::<AppSettings>` 失败会让用户"设置全没了"。
 fn load_settings() -> AppSettings {
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let Some(raw) = std::fs::read_to_string(settings_path()).ok() else {
+        return AppSettings::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return AppSettings::default();
+    };
+    AppSettings {
+        host: json_field(&v, "host"),
+        port: json_field(&v, "port"),
+        model_dir: json_field(&v, "model_dir"),
+        bgm: json_field(&v, "bgm").unwrap_or_default(),
+    }
+}
+
+/// 取一个字段；缺了或类型不对都返回 None（交给该字段自己的默认值）。
+fn json_field<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str) -> Option<T> {
+    v.get(key)
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
 }
 
 fn save_settings(s: &AppSettings) -> std::io::Result<()> {
@@ -836,10 +854,36 @@ fn save_bgm_settings(ui: &MainWindow) {
 }
 
 /// 当前的 BGM 输入 → 导出层要的上下文（UI 认不认这套结果 + 参数摘要）。
+///
+/// 模式（混音 / 独立生成）看当前工程有没有配音成品——与 worker 的判定同源
+/// （有配音成品就混音，没有就独立生成）。
 fn bgm_context(ui: &MainWindow) -> export::BgmContext {
     export::BgmContext::new(
         bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
+        has_voice_product(ui),
         &ui.get_bgm_prompt(),
+        duck_gain_for(ui.get_bgm_duck_index()),
+        bgm_standalone_seconds(ui.get_bgm_standalone_index()),
+    )
+}
+
+/// 当前工程有没有配音成品（决定 BGM 是混音还是独立生成）。
+fn has_voice_product(ui: &MainWindow) -> bool {
+    let name = file_stem(&ui.get_project_name());
+    project_dir(&name).join("out/final.wav").is_file()
+}
+
+/// 写产物清单时用的摘要：模式由**这次实际的生成结果**给（`mixed` 来自 worker 回报），
+/// 比"再看一眼磁盘"更准。
+fn bgm_digest_now(ui: &MainWindow, mixed: bool) -> String {
+    export::bgm_options_digest(
+        &ui.get_bgm_prompt(),
+        if mixed {
+            export::BgmMode::Mixed
+        } else {
+            export::BgmMode::Standalone
+        },
+        bgm_standalone_seconds(ui.get_bgm_standalone_index()),
         duck_gain_for(ui.get_bgm_duck_index()),
     )
 }
@@ -2976,6 +3020,9 @@ fn wire_theme(ui: &MainWindow) {
     ui.on_scene_changed(move |i| {
         let Some(ui) = weak.upgrade() else { return };
         let note = SCENE_NOTES.get(i.max(0) as usize).copied().unwrap_or("");
+        // 切 Tab 时顺手把 BGM 输入落盘：duck/时长档位没有回调，
+        // 「改了档位但没生成就退出」本来会丢，这里把窗口收窄
+        save_bgm_settings(&ui);
         ui.set_status_text(note.into());
     });
 }
@@ -5292,8 +5339,8 @@ fn tick(
                     .and_then(|p| p.parent())
                     .map(|p| p.to_path_buf());
                 if let Some(dir) = manifest_dir {
-                    let ctx = bgm_context(ui);
-                    if let Err(e) = export::write_result_manifest(&dir, &ctx.options_digest) {
+                    if let Err(e) = export::write_result_manifest(&dir, &bgm_digest_now(ui, mixed))
+                    {
                         ui.set_status_text(
                             format!("BGM 完成，但产物清单没写上（{e}）：下次导出会提示先重新生成")
                                 .into(),
@@ -8313,6 +8360,28 @@ mod tests {
         assert_eq!(d.prompt, DEFAULT_BGM_PROMPT);
         assert_eq!(d.duck_index, 1);
         assert_eq!(d.standalone_index, 1);
+    }
+
+    /// 设置文件里某一段坏了（例如 `bgm.duck_index` 被手改成字符串）：
+    /// **只丢那一段**，host/port 必须保住——整份解析失败等于"设置全没了"。
+    #[test]
+    fn broken_bgm_section_does_not_wipe_other_settings() {
+        let v: serde_json::Value = serde_json::from_str(
+            "{\"host\":\"10.0.0.9\",\"port\":9000,\"bgm\":{\"duck_index\":\"中\"}}",
+        )
+        .unwrap();
+        let host: Option<String> = json_field(&v, "host");
+        let port: Option<u16> = json_field(&v, "port");
+        let bgm: Option<BgmSettings> = json_field(&v, "bgm");
+        assert_eq!(
+            host.as_deref(),
+            Some("10.0.0.9"),
+            "坏的是 bgm，不该连 host 一起丢"
+        );
+        assert_eq!(port, Some(9000));
+        let bgm = bgm.unwrap_or_default();
+        assert_eq!(bgm.prompt, DEFAULT_BGM_PROMPT, "坏掉的那段回落默认");
+        assert_eq!(bgm.duck_index, 1);
     }
 
     /// settings.json 的 BGM 段要能存能读；老文件没有这一段时回落默认值（不能读失败）。

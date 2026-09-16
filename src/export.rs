@@ -121,10 +121,19 @@ pub fn voice_fingerprint(project_dir: &Path) -> Option<String> {
     Some(sha256_hex(&bytes))
 }
 
+/// BGM 产物的**生成模式**：决定哪些输入真的影响了音频。
+///
+/// 判定与 worker 同源：工程里有配音成品（`out/final.wav`）→ 混音模式；没有 → 独立生成。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BgmMode {
+    Mixed,
+    Standalone,
+}
+
 /// 导出分轨时"当前 BGM 设定"的两件事：UI 认不认这套结果（`current`）＋参数摘要。
 ///
-/// 参数摘要（prompt + duck 档位换算出的系数）是**跨会话**判断"这套产物是不是还配套"
-/// 的依据：描述改了、压低强度改了，旧产物就不该再当当前结果。
+/// 参数摘要是**跨会话**判断"这套产物是不是还配套"的依据：描述改了、压低强度改了、
+/// 独立生成的时长档位改了，旧产物就不该再当当前结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BgmContext {
     /// UI 是否认为磁盘上这套 BGM 结果仍是当前结果（改描述会置 stale）
@@ -134,21 +143,55 @@ pub struct BgmContext {
 }
 
 impl BgmContext {
-    pub fn new(current: bool, prompt: &str, duck_gain: f32) -> Self {
+    /// `has_voice`：工程里有没有配音成品（决定模式，与 worker 的判定同源）。
+    pub fn new(
+        current: bool,
+        has_voice: bool,
+        prompt: &str,
+        duck_gain: f32,
+        standalone_seconds: f64,
+    ) -> Self {
+        let mode = if has_voice {
+            BgmMode::Mixed
+        } else {
+            BgmMode::Standalone
+        };
         Self {
             current,
-            options_digest: bgm_options_digest(prompt, duck_gain),
+            options_digest: bgm_options_digest(prompt, mode, standalone_seconds, duck_gain),
         }
     }
 }
 
-/// BGM 参数摘要：只看**影响产物内容**的输入（描述 + 压低强度）。
+/// BGM 参数摘要：只看**这个模式下真的影响产物内容**的输入。
 ///
+/// 为什么不把所有旋钮都塞进来：`duck` 只影响混音轨（它压低的是 BGM），`standalone`
+/// 时长只影响独立生成——多塞进去会造成假过期（改一个与这轨无关的旋钮，好端端的产物
+/// 就被判成旧的）。所以按模式分开取输入：
+///   · 混音模式：描述 + 压低强度（时长由配音成品决定，配音指纹另有一层比对）；
+///   · 独立生成：描述 + 时长档位。
 /// 不把 `current`（UI 标志）算进去——那是"会话内有没有作废"，与"产物是什么参数做出来的"
 /// 是两件事，混在一起就没法跨会话比对了。
-pub fn bgm_options_digest(prompt: &str, duck_gain: f32) -> String {
-    // 用固定小数位而不是 Debug 输出 f32：`0.22_f32` 的 Debug 形态会随格式化细节变化
-    let body = format!("prompt={prompt}\nduck={duck_gain:.4}\n");
+pub fn bgm_options_digest(
+    prompt: &str,
+    mode: BgmMode,
+    standalone_seconds: f64,
+    duck_gain: f32,
+) -> String {
+    // 用固定小数位而不是 Debug 输出 f32/f64：浮点的 Debug 形态会随格式化细节变化
+    let mut body = format!(
+        "mode={}\nprompt={prompt}\n",
+        match mode {
+            BgmMode::Mixed => "mixed",
+            BgmMode::Standalone => "standalone",
+        }
+    );
+    match mode {
+        BgmMode::Mixed => body.push_str(&format!("duck={duck_gain:.4}\n")),
+        BgmMode::Standalone => {
+            body.push_str(&format!("standalone_seconds={standalone_seconds:.1}\n"))
+        }
+    }
     sha256_hex(body.as_bytes())
 }
 
@@ -556,6 +599,11 @@ mod tests {
     /// 测试用的参数摘要（真实摘要由 UI 的 prompt + duck 档算出来，见 `bgm_options_digest`）
     const TEST_DIGEST: &str = "digest-under-test";
 
+    /// 参数摘要（测试用等价物）：按模式取输入，与 `BgmContext::new` 同一口径
+    fn digest(prompt: &str, mode: BgmMode, seconds: f64, duck: f32) -> String {
+        bgm_options_digest(prompt, mode, seconds, duck)
+    }
+
     fn ctx_current() -> BgmContext {
         BgmContext {
             current: true,
@@ -788,27 +836,45 @@ mod tests {
         write_result_manifest(&root.join(name), TEST_DIGEST).unwrap();
     }
 
-    /// 参数摘要：同样输入稳定、改描述或改压低强度就变。它要能跨会话比对，
-    /// 所以必须避开 `{:?}` 那种随格式化细节变化的表示。
+    /// 参数摘要按**模式**取输入：混音模式看描述 + duck；独立生成看描述 + 时长档位。
+    /// 多取输入会造成假过期（改一个与这轨无关的旋钮，好端端的产物被判成旧的）。
     #[test]
-    fn bgm_options_digest_tracks_prompt_and_duck() {
-        let base = bgm_options_digest("温暖口播背景", 0.22);
+    fn bgm_options_digest_tracks_the_inputs_that_matter() {
+        let mixed = digest("温暖口播背景", BgmMode::Mixed, 0.0, 0.22);
         assert_eq!(
-            base,
-            bgm_options_digest("温暖口播背景", 0.22),
+            mixed,
+            digest("温暖口播背景", BgmMode::Mixed, 0.0, 0.22),
             "同样输入要稳定"
         );
         assert_ne!(
-            base,
-            bgm_options_digest("换成摇滚", 0.22),
+            mixed,
+            digest("换成摇滚", BgmMode::Mixed, 0.0, 0.22),
             "描述变了摘要要变"
         );
         assert_ne!(
-            base,
-            bgm_options_digest("温暖口播背景", 0.05),
-            "duck 变了摘要要变"
+            mixed,
+            digest("温暖口播背景", BgmMode::Mixed, 0.0, 0.05),
+            "混音模式下 duck 变了要变"
         );
-        assert_eq!(base.len(), 64, "sha256 十六进制");
+        assert_eq!(
+            mixed,
+            digest("温暖口播背景", BgmMode::Mixed, 30.0, 0.22),
+            "混音模式不该被独立生成的时长档位影响"
+        );
+
+        let alone = digest("温暖口播背景", BgmMode::Standalone, 30.0, 0.22);
+        assert_ne!(
+            alone,
+            digest("温暖口播背景", BgmMode::Standalone, 60.0, 0.22),
+            "独立生成时时长档位变了要变"
+        );
+        assert_eq!(
+            alone,
+            digest("温暖口播背景", BgmMode::Standalone, 30.0, 0.05),
+            "独立生成的 BGM 不受 duck 影响（那是混音那一层的事）"
+        );
+        assert_ne!(mixed, alone, "模式不同，摘要必须不同");
+        assert_eq!(mixed.len(), 64, "sha256 十六进制");
     }
 
     /// 产物清单：参数摘要与配音指纹都要对上才算"当前产物"；
@@ -818,8 +884,8 @@ mod tests {
         let root = temp_dir("manifest");
         make_project(&root, "甲", true); // 只有 out/final.wav/.srt
         let p = root.join("甲");
-        let digest_a = bgm_options_digest("口播背景", 0.22);
-        let digest_b = bgm_options_digest("另一个描述", 0.22);
+        let digest_a = digest("口播背景", BgmMode::Mixed, 0.0, 0.22);
+        let digest_b = digest("另一个描述", BgmMode::Mixed, 0.0, 0.22);
 
         // 没有清单（老工程）→ 不算当前
         assert!(!bgm_result_is_current(&p, &digest_a));
@@ -858,7 +924,7 @@ mod tests {
         let p = root.join("甲");
         let ctx_other = BgmContext {
             current: true,
-            options_digest: bgm_options_digest("换了个描述", 0.22),
+            options_digest: digest("换了个描述", BgmMode::Mixed, 0.0, 0.22),
         };
         match stem_state(&p, Stem::Bgm, &ctx_other) {
             StemState::Stale(reason) => assert!(reason.contains("重新混音"), "{reason}"),
@@ -934,7 +1000,7 @@ mod tests {
         );
         let other = BgmContext {
             current: true,
-            options_digest: bgm_options_digest("另一个描述", 0.22),
+            options_digest: digest("另一个描述", BgmMode::Standalone, 30.0, 0.22),
         };
         assert!(
             matches!(stem_state(&dir, Stem::Bgm, &other), StemState::Stale(_)),
