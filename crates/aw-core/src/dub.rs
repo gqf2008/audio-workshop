@@ -617,7 +617,7 @@ fn sentence_read_note(path: &Path, err: &hound::Error) -> String {
 /// 原子写 + 失败时给出可执行文案。
 ///
 /// 所有落盘都走它：`write_atomic` 的原始 io::Error 直接 `to_string()` 对用户没有可执行信息。
-pub(crate) fn write_atomic_explained(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic_explained(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_atomic(path, data)
         .map_err(|e| std::io::Error::new(e.kind(), write_failure_note(path, data.len(), &e)))
 }

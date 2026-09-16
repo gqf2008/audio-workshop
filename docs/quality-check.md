@@ -58,6 +58,11 @@ CHARTER §5 把「评估台 `audio-eval`（可懂度/耗时/内存 + 回归对�
 「重录」；列表不会自动滚动（长稿还要自己滚一下——Slint 的滚动面板只能设初始偏移，
 没做程序化滚动，宁可少做也不要赌一个没法肉眼确认的行为）。
 
+**质检报告**：每次质检会在工程目录写一份 `qa-report.md`（原子写）——逐句的「参考 / ASR 回读 /
+可懂度 / 首个差异」加汇总（模型、句数、评分句数、转写失败数、平均可懂度）。分数虽然留在
+`project.json` 里，但 **ASR 回读原文只有当场才拿得到**，写成文件才能存档、对比两次改稿、或贴进笔记；
+完成时的状态栏/任务中心会带上报告文件名。报告与分数都写不进时，摘要里会如实报出来。
+
 **分数跨会话留存**：写进工程 `project.json` 的句级字段 `eval_percent`（`#[serde(default)]`，
 旧工程缺这个字段按"没测过"处理）。所以重开应用还能看到上次质检的分数，不必重跑 ASR。
 分数**没能写进工程**时（磁盘满/权限等）会如实报「（分数未写入工程：…）」——分数本身仍然有效，
@@ -129,5 +134,7 @@ cargo test -p aw-core --lib eval::                                   # 口径与
 cargo test -p aw-core --test eval_parity                             # 与 Python 权威实现逐条对照
 cargo test -p aw-core --test asr_mock                                # ASR 请求形状
 cargo test -p aw-core --test e2e_service -- --ignored                # 真机（需服务在跑）
+cargo test -p audio-workshop --bin audio-workshop -- --ignored worker_eval_writes_report
+                                                                    # 真机：合成 → worker 质检 → qa-report.md
 python3 tools/gen_eval_parity_cases.py --check                       # 夹具是否过期
 ```
