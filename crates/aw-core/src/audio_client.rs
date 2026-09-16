@@ -89,10 +89,7 @@ impl Client {
     /// 发送任意 audio.cpp 音频任务并取回 wav 字节。TTS 之外的 gen 场景
     /// （BGM/歌曲）需要自己的 `request_defaults`，由调用方组装 request。
     pub fn run_audio(&self, model: &str, request: Value) -> Result<Vec<u8>, ClientError> {
-        let body = json!({ "model": model, "request": request });
-
-        let resp = self.post_with_retry("/v1/tasks/run", &body)?;
-        // 响应体合法但没有 audio 字段：属于"响应不可用"，不是 HTTP 错误，也不可重试
+        let resp = self.run_json(model, request)?;
         let audio = resp.get("audio").and_then(Value::as_str).ok_or_else(|| {
             ClientError::Decode(format!(
                 "响应缺少 audio 字段: {}",
@@ -100,6 +97,12 @@ impl Client {
             ))
         })?;
         decode_base64(audio).map_err(ClientError::Decode)
+    }
+
+    /// 发送任意 audio.cpp 任务并返回原始 JSON。MIDI/ABC 等非音频产物也走这里。
+    pub fn run_json(&self, model: &str, request: Value) -> Result<Value, ClientError> {
+        let body = json!({ "model": model, "request": request });
+        self.post_with_retry("/v1/tasks/run", &body)
     }
 
     /// 是否可用（/health）
