@@ -877,7 +877,10 @@ fn usable_voice_seconds(project_dir: &Path) -> Option<f64> {
     std::fs::read(project_dir.join("out/final.wav"))
         .ok()
         .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
-        .filter(|d| *d > 0.0)
+        // `is_finite` 不是多余的：畸形 wav（采样率写成 0）会让时长算成 `inf`，
+        // 只判 `> 0.0` 会把它当可用，随后 BGM 在算段数时炸在一个看不出根因的地方。
+        // 这一类"数值上是正数但不是可用值"的边界，判据要写成"有限且为正"。
+        .filter(|d| d.is_finite() && *d > 0.0)
 }
 
 /// 当前工程有没有可用的配音成品（决定 BGM 是混音还是独立生成）。
@@ -8395,6 +8398,18 @@ mod tests {
         // 0 帧的 wav 同样不可用
         write_test_tone_wav(&dir.join("out/final.wav"), 0.0);
         assert_eq!(usable_voice_seconds(&dir), None, "0 帧不算可用");
+
+        // 采样率 0 的畸形 wav：时长会算成 inf，只判 `> 0.0` 会把它当可用
+        write_test_tone_wav(&dir.join("out/final.wav"), 1.0);
+        let path = dir.join("out/final.wav");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes()); // fmt 块的采样率字段
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            usable_voice_seconds(&dir),
+            None,
+            "采样率 0（时长 inf）不算可用——否则后面会在算段数时炸"
+        );
     }
 
     /// 反例回归（复核给的）：`out/final.wav` 损坏时 worker 走独立生成、清单里写的是
