@@ -1563,16 +1563,23 @@ fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<
             new.sentences[i].index,
             std::process::id()
         )));
+        // 复用 = 把旧工程的 wav 复制进新工程：失败文案要说清是哪一句、哪个文件、做什么
         std::fs::copy(&src, &temp.0).map_err(|e| {
             format!(
-                "复用第 {} 句失败（{}）: {e}",
+                "复用第 {} 句失败：{}",
                 old_sentence.index,
-                src.display()
+                aw_core::dub::write_failure_note(&temp.0, 0, &e)
             )
         })?;
         std::fs::File::open(&temp.0)
             .and_then(|f| f.sync_all())
-            .map_err(|e| format!("复用第 {} 句落盘失败: {e}", old_sentence.index))?;
+            .map_err(|e| {
+                format!(
+                    "复用第 {} 句落盘失败：{}",
+                    old_sentence.index,
+                    aw_core::dub::write_failure_note(&temp.0, 0, &e)
+                )
+            })?;
         staged.push(StagedReuse {
             new_index: i,
             temp,
@@ -1583,8 +1590,12 @@ fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<
 
     let mut reused = 0;
     for staged in staged {
-        std::fs::rename(&staged.temp.0, &staged.dst)
-            .map_err(|e| format!("复用句落到 {} 失败: {e}", staged.dst.display()))?;
+        std::fs::rename(&staged.temp.0, &staged.dst).map_err(|e| {
+            format!(
+                "复用句落盘失败：{}",
+                aw_core::dub::write_failure_note(&staged.dst, 0, &e)
+            )
+        })?;
         let sentence = &mut new.sentences[staged.new_index];
         sentence.seed = staged.old_sentence.seed;
         sentence.duration = staged.old_sentence.duration;
@@ -1607,7 +1618,9 @@ fn load_resumable(
         Some(path) => Some(sha256_file(Path::new(path))?),
         None => None,
     };
-    let saved = Project::load(dir).ok();
+    // 损坏的工程在这里必须**中止**：`.ok()` 会把它当成"没有工程"，已合成句全变待合成，
+    // 随后第一次落盘还会覆盖掉损坏文件（现场丢失）。见 Project::load_if_present。
+    let saved = Project::load_if_present(dir)?;
     if let Some(saved) = saved.as_ref() {
         if saved.model == model
             && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
@@ -2002,8 +2015,15 @@ fn restore_project(
 ) {
     let stem = file_stem(&ui.get_project_name());
     let dir = project_dir(&stem);
-    let Ok(project) = Project::load(&dir) else {
-        return;
+    let project = match Project::load_if_present(&dir) {
+        Ok(Some(p)) => p,
+        Ok(None) => return, // 没有工程文件：全新开始，正常路径
+        Err(note) => {
+            // 读不了就说清路径与处置建议。以前这里静默 return，用户看到的是
+            // "进度凭空消失"，连哪里坏了都不知道。
+            ui.set_status_text(note.into());
+            return;
+        }
     };
     *state.project_dir.borrow_mut() = Some(dir.clone());
     // 输入框与列表同源：把保存的句子文本回填到输入框。
@@ -3041,19 +3061,19 @@ fn wire_bgm(
         };
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            ui.set_status_text(format!("导出目录不可写（{}）：{e}", dir.display()).into());
+            ui.set_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
             return;
         }
         let dst = dir.join(format!(
             "{}_{suffix}.wav",
             file_stem(&ui.get_project_name())
         ));
-        match std::fs::copy(&src, &dst) {
+        match aw_core::dub::copy_atomic(&src, &dst) {
             Ok(_) => {
                 ui.set_status_text(format!("已导出：{}", dst.display()).into());
                 toast(&ui, &format!("已导出 {}", file_label(&dst)));
             }
-            Err(e) => ui.set_status_text(format!("导出失败：{e}").into()),
+            Err(e) => ui.set_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into()),
         }
     });
 }
@@ -3065,12 +3085,12 @@ fn export_song(ui: &MainWindow, state: &Rc<UiState>) {
     };
     let dir = PathBuf::from(ui.get_export_dir().to_string());
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        ui.set_status_text(format!("导出目录不可写（{}）: {e}", dir.display()).into());
+        ui.set_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
         return;
     }
     let dst = dir.join(format!("{}_song.wav", stem_of(ui)));
-    if let Err(e) = std::fs::copy(&source, &dst) {
-        ui.set_status_text(format!("导出 {} 失败: {e}", dst.display()).into());
+    if let Err(e) = aw_core::dub::copy_atomic(&source, &dst) {
+        ui.set_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into());
         return;
     }
     toast(ui, &format!("已导出 {}", dst.display()));
@@ -3456,7 +3476,13 @@ fn tick(
                         Err(e) => ui.set_status_text(format!("试听失败：{e}").into()),
                     },
                     Err(e) => {
-                        ui.set_status_text(format!("试听临时文件写入失败：{e}").into());
+                        ui.set_status_text(
+                            format!(
+                                "试听临时文件写入失败：{}",
+                                aw_core::dub::write_failure_note(&path, wav.len(), &e)
+                            )
+                            .into(),
+                        );
                     }
                 }
             }
@@ -3761,20 +3787,20 @@ fn export_copies(
         return ExportOutcome::NoneSelected;
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
-        return ExportOutcome::Failed(format!("导出目录不可写（{}）: {e}", dir.display()));
+        return ExportOutcome::Failed(aw_core::dub::write_failure_note(dir, 0, &e));
     }
     let mut written: Vec<String> = Vec::new();
     if wav_on {
         let t = dir.join(format!("{stem}.wav"));
-        if let Err(e) = std::fs::copy(wav, &t) {
-            return ExportOutcome::Failed(format!("复制 {} 失败: {e}", t.display()));
+        if let Err(e) = aw_core::dub::copy_atomic(wav, &t) {
+            return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
         }
         written.push(t.display().to_string());
     }
     if srt_on {
         let t = dir.join(format!("{stem}.srt"));
-        if let Err(e) = std::fs::copy(srt, &t) {
-            return ExportOutcome::Failed(format!("复制 {} 失败: {e}", t.display()));
+        if let Err(e) = aw_core::dub::copy_atomic(srt, &t) {
+            return ExportOutcome::Failed(aw_core::dub::write_failure_note(&t, 0, &e));
         }
         written.push(t.display().to_string());
     }
@@ -4372,19 +4398,19 @@ fn wire_separation(
         };
         let dir = PathBuf::from(ui.get_export_dir().to_string());
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            ui.set_sep_status_text(format!("导出目录不可写（{}）：{e}", dir.display()).into());
+            ui.set_sep_status_text(aw_core::dub::write_failure_note(&dir, 0, &e).into());
             return;
         }
         let dst = dir.join(format!(
             "{}_{suffix}.wav",
             file_stem(&ui.get_project_name())
         ));
-        match std::fs::copy(&src, &dst) {
+        match aw_core::dub::copy_atomic(&src, &dst) {
             Ok(_) => {
                 ui.set_sep_status_text(format!("已导出：{}", dst.display()).into());
                 toast(&ui, &format!("已导出 {}", file_label(&dst)));
             }
-            Err(e) => ui.set_sep_status_text(format!("导出失败：{e}").into()),
+            Err(e) => ui.set_sep_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into()),
         }
     });
 }
@@ -5227,5 +5253,30 @@ mod tests {
             assert!(chip.contains("40%"), "{kind:?} 的 chip 实得 {chip}");
         }
         assert!(!tasks::TaskKind::Song.reports_progress());
+    }
+
+    /// 工程损坏时开始合成必须**中止**而不是静默重建：以前 `Project::load(dir).ok()` 会把它
+    /// 当成"没有工程"，已合成句全变待合成且没有一句解释；更糟的是随后落盘会覆盖掉损坏
+    /// 文件——那是唯一可人工恢复的现场。这里同时守住"缺文件仍是全新工程"这条回归。
+    #[test]
+    fn corrupt_project_aborts_the_run_and_keeps_the_file() {
+        let dir = temp_dir("corrupt-project");
+        let broken = br#"{"sentences": [{"index": 1,"#;
+        std::fs::write(dir.join("project.json"), broken).unwrap();
+
+        let err = load_resumable(&dir, "第一句。第二句。", "audio8-tts", None).unwrap_err();
+        assert!(err.contains("工程文件损坏"), "实得 {err}");
+        assert!(err.contains("project.json"), "要说清哪个文件：{err}");
+        assert!(err.contains("没有自动重建"), "要明确不替用户做决定：{err}");
+        assert_eq!(
+            std::fs::read(dir.join("project.json")).unwrap(),
+            broken,
+            "损坏的工程文件必须原样留着（不能被新工程覆盖）"
+        );
+
+        // 回归：没有 project.json 的目录仍然按全新工程走，不能被这条守卫误伤
+        let fresh = temp_dir("fresh-project");
+        let loaded = load_resumable(&fresh, "第一句。第二句。", "audio8-tts", None).unwrap();
+        assert_eq!(loaded.project.sentences.len(), 2);
     }
 }

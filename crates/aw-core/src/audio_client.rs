@@ -20,10 +20,13 @@ pub enum ClientError {
     Server(u16, String),
     /// 响应解析失败
     Decode(String),
+    /// **本地**失败（落盘、读文件、编码等）：与网络无关，但走同一条错误上抛通道。
+    /// 文案由调用方给全（哪个路径、要多少空间、下一步做什么），见 `dub::write_failure_note`。
+    Local(String),
 }
 
 impl ClientError {
-    /// HTTP 状态码；传输/解析错误没有状态码
+    /// HTTP 状态码；传输/解析/本地错误没有状态码
     pub fn status(&self) -> Option<u16> {
         match self {
             ClientError::Server(code, _) => Some(*code),
@@ -38,6 +41,8 @@ impl std::fmt::Display for ClientError {
             ClientError::Http(e) => write!(f, "请求失败: {e}"),
             ClientError::Server(code, body) => write!(f, "服务端拒绝: HTTP {code} {body}"),
             ClientError::Decode(e) => write!(f, "响应解析失败: {e}"),
+            // 本地失败已经带全上下文（路径 / 需要多少空间），不再加前缀把话说两遍
+            ClientError::Local(e) => write!(f, "{e}"),
         }
     }
 }
