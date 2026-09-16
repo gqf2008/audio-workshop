@@ -496,6 +496,21 @@ export component DubWorkbench inherits Rectangle {
                             wrap: word-wrap;
                         }
 
+                        // 音色下拉：换音色按钮属于这个旁白块，所以它的选择区
+                        // 就在**块内部**展开（块被撑高），不是块外面的另一个盒子。
+                        if root.show-voice : VoicePanel {
+                            voice-label: root.voice-label;
+                            voice-source: root.voice-source;
+                            engine-label: root.engine-label;
+                            reference-path <=> root.voice-ref-path;
+                            busy: root.running || root.busy;
+                            reference-exists: root.reference-exists;
+                            edited => { root.voice-ref-changed(); }
+                            clear-reference => { root.clear-reference(); }
+                            preview => { root.audition-voice(); }
+                            open-design => { root.new-voice(); }
+                        }
+
                         // 块体：稿件（清空并入输入域右上角，不单占一行）
                         HorizontalLayout {
                             horizontal-stretch: 1;
@@ -539,20 +554,6 @@ export component DubWorkbench inherits Rectangle {
                             }
                         }
                     }
-                }
-
-                // ①b 音色区：与「高级」同款——整行盒子，就地自然展开（不遮内容）
-                if root.show-voice : VoicePanel {
-                    voice-label: root.voice-label;
-                    voice-source: root.voice-source;
-                    engine-label: root.engine-label;
-                    reference-path <=> root.voice-ref-path;
-                    busy: root.running || root.busy;
-                    reference-exists: root.reference-exists;
-                    edited => { root.voice-ref-changed(); }
-                    clear-reference => { root.clear-reference(); }
-                    preview => { root.audition-voice(); }
-                    open-design => { root.new-voice(); }
                 }
 
                 // ② 一行状态 + 高级入口 + 主操作（同级 3 个）
