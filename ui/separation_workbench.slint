@@ -7,7 +7,8 @@
 //
 // 两处必须如实写在界面上、不能藏的能力边界：
 //   1. 首次使用要下载模型（约 200MB）——进度里会显示"下载模型"，之后离线可用；
-//   2. 上游没有取消 API：点「停止」= 丢弃结果不落盘，已经跑掉的分块停不下来。
+//   2. 上游没有取消 API：点「停止」= 整轮跑完再丢弃结果、不落盘（耗时照算）。
+//      `should_stop` 在 aw-core 的 separate_tracks 里只在 Separator::separate 返回后被查一次。
 // ============================================================================
 import { PixelButton, PixelProgressBar, PixelScrollPanel, PixelTextInput, PixelTheme } from "@slint_pixel";
 

@@ -3465,7 +3465,8 @@ fn tick(
                     ui.set_sep_progress(0.0);
                     ui.set_sep_has_result(false);
                     // 上游没有取消 API：已经跑掉的算力收不回，这里如实说
-                    let note = "已停止（本次不落盘；已经跑过的分块无法中断）".to_string();
+                    let note = "已停止（本轮结果已丢弃，没有落盘；分离跑完前无法中断，耗时照算）"
+                        .to_string();
                     ui.set_sep_status_text(note.clone().into());
                     ui.set_status_text(note.clone().into());
                     finish_task(ui, state, &state.sep_task, tasks::TaskState::Stopped, note);
@@ -4197,7 +4198,9 @@ fn wire_separation(
             return;
         }
         stop2.store(true, Ordering::Relaxed);
-        ui.set_sep_status_text("停止中：当前分块跑完才停（上游没有中断接口）…".into());
+        // 如实说：上游没有取消 API，should_stop 只在整轮分离返回后被查（aw-core
+        // separate_tracks 的实现），所以这里只是"跑完丢弃、不落盘"，耗时照算
+        ui.set_sep_status_text("停止中：本轮分离跑完才会丢弃结果（上游没有取消接口）…".into());
     });
 
     // 两轨试听（0 = 人声，1 = 伴奏）
