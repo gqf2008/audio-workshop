@@ -10,6 +10,7 @@
 pub mod audio_client;
 pub mod bgm;
 pub mod dub;
+pub mod separate;
 pub mod song;
 pub mod text_layer;
 
@@ -18,6 +19,10 @@ pub use bgm::{assemble_bgm, generate_segments, mix_project, BgmArtifacts, BgmOpt
 pub use dub::{
     split_sentences, srt_timestamp, Assembled, Project, Sentence, DEFAULT_INSTRUCTION,
     DEFAULT_PUNCTUATION, REDO_SEED_STEP,
+};
+pub use separate::{
+    separate_tracks, Progress as SeparationProgress, SeparatedTracks, SeparationOutcome,
+    SeparationRequest, DEFAULT_MODEL as DEFAULT_SEPARATION_MODEL,
 };
 pub use song::{generate_cover, generate_song, transcribe_abc, SongModel, SongOptions};
 pub use text_layer::{apply_dictionary, cardinal, digits_zh, normalize, verbalize};
