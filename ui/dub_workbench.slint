@@ -376,6 +376,8 @@ export component DubWorkbench inherits Rectangle {
     in property <bool> running: false;
     /// 批量面板是否展开（面板本身在 app.slint 里画，这里只管入口按钮）
     in property <bool> batch-open: false;
+    /// 批量是否在跑：批量 worker 自己会拼装 → 与批量导出争成对产物，按钮要一起灰掉
+    in property <bool> batch-running: false;
     in property <bool> busy: false;
     in property <bool> playing: false;
 
@@ -778,7 +780,7 @@ export component DubWorkbench inherits Rectangle {
                                 width: 92px;
                                 text: "批量导出";
                                 Tooltip { text: @markdown("把 projects/ 下所有有成品的工程按上面的格式导到导出目录（正在合成也能导：成品是原子写出来的）"); }
-                                enabled: (root.export-wav-on || root.export-srt-on) && !root.busy;
+                                enabled: (root.export-wav-on || root.export-srt-on) && !root.busy && !root.batch-running;
                                 clicked => { root.batch-export(); }
                             }
                         }

@@ -357,6 +357,7 @@ export component MainWindow inherits Window {
                     export-srt-on <=> root.export-srt-on;
                     show-advanced <=> root.dub-advanced;
                     batch-open: root.batch-open;
+                    batch-running: root.batch-running;
                     batch-toggle => {
                         root.batch-open = !root.batch-open;
                         // 与任务中心同一个锚点：开批量就收起任务中心，免得两张卡片叠在一起

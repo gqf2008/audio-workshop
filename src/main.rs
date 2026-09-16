@@ -898,6 +898,24 @@ fn pick_audio_blocking() -> Option<String> {
     pick_output_to_path(out)
 }
 
+/// 批量导出的互斥判据：**有别的写 `out/final.*` 的动作在飞时不导**。
+///
+/// 原因不是"读会读到半截文件"——`final.wav` 是原子写出来的；而是 `assemble` 是
+/// **先发布 final.wav、再写 final.srt**：中间那一瞬扫过去，会看到新 WAV 配旧 SRT
+/// （或把新工程误报成"缺字幕"）。两处写者：
+///   · 单篇拼装/导出 → UI 的 `busy`（导出按钮自己也是这个标志）；
+///   · 批量 worker 的 `assemble` → 在跑的那一行是 Running（`batch_in_flight`）。
+/// 都排除掉，成对产物就一定是同一次拼装写出来的。
+fn batch_export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> {
+    if batch_in_flight {
+        return Some("批量任务正在跑：等它跑完再批量导出（避免导到刚写了一半的成对产物）");
+    }
+    if ui_busy {
+        return Some("拼装/导出正在进行：等它结束再批量导出");
+    }
+    None
+}
+
 /// 批量导出：扫 projects/ 下有成品的工程，按导出开关复制到导出目录。
 ///
 /// 放后台线程而不是 worker：导出只读磁盘上**已经拼好**的成品（`out/final.wav` 是原子写），
@@ -4397,11 +4415,8 @@ fn wire_export(
             ui.set_status_text("批量导出还在进行…".into());
             return;
         }
-        // 单篇拼装/导出在飞时不做批量导出：`assemble` 是**先发布 final.wav、再写
-        // final.srt**，中间那一瞬扫过去会把正在拼装的工程误报成「缺字幕」（复核指出）。
-        // 等这一下（亚秒级）没有代价，报错才是错的。
-        if ui.get_busy() {
-            ui.set_status_text("拼装/导出正在进行：等它结束再批量导出".into());
+        if let Some(refusal) = batch_export_refusal(ui.get_busy(), batch_in_flight(&st)) {
+            ui.set_status_text(refusal.into());
             return;
         }
         let wav_on = ui.get_export_wav_on();
@@ -8057,6 +8072,23 @@ mod tests {
             accompaniment.display()
         );
     }
+    /// 批量导出的互斥判据：两个写者（单篇拼装/导出、批量 worker 的拼装）任何一个在飞
+    /// 都不许导——`assemble` 先发布 final.wav 再写 final.srt，中间扫过去会配错成对产物。
+    #[test]
+    fn batch_export_refuses_while_any_publisher_is_in_flight() {
+        assert_eq!(batch_export_refusal(false, false), None, "都空闲才允许");
+        let by_batch = batch_export_refusal(false, true).expect("批量在跑要拒绝");
+        assert!(by_batch.contains("批量任务正在跑"), "{by_batch}");
+        assert!(by_batch.contains("成对产物"), "要说清为什么等：{by_batch}");
+        let by_busy = batch_export_refusal(true, false).expect("单篇拼装要拒绝");
+        assert!(by_busy.contains("拼装/导出正在进行"), "{by_busy}");
+        // 两个都在飞时以批量那条为准（先判的那条）
+        assert_eq!(
+            batch_export_refusal(true, true).map(|s| s.contains("批量任务正在跑")),
+            Some(true)
+        );
+    }
+
     /// 多选文件框的输出解析：取消（退出码非 0）必须是空表，空行要滤掉——
     /// 否则一次"取消"会被批量导入记成"跳过了 1 篇（读不到）"。
     #[test]
