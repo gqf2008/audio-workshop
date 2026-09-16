@@ -60,7 +60,9 @@ cargo run --release        # 打开配音工作台
 # M2 BGM：对已有配音工程跑完整生成/对齐/duck/mix（真服务）
 cargo run -p aw-core --example bgm_run -- ~/Documents/音频作坊/projects/工程名 \
   "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好"
-# M4 歌曲：文生歌 / 翻唱（yue2 实测可用；ACE-Step 当前需更高内存）
+# M4 歌曲：文生歌 / 翻唱（yue2 / S2 翻唱实测可用；ACE-Step 本机内存不够）
+# ACE-Step：引擎估算 8.77 GiB + 1 GiB 余量 = 9.77 GiB；16GB Mac 实测可用
+#   7.32 GiB（TTS+ASR 常驻）/ 8.24 GiB（全部卸载后）→ 预检拒绝，需更大机器或 CUDA 主机
 cargo run -p aw-core --example song_run -- yue2 歌词.txt "Mandarin Chinese R&B slow jam" out-dir
 cargo run -p aw-core --example song_cover -- source.wav 歌词.txt "R&B slow jam" out-dir
 ```

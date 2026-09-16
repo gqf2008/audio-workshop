@@ -122,10 +122,13 @@ export component SongWorkbench inherits Rectangle {
                                 options: ["yue2（歌词成歌）", "ACE-Step（文生音乐）"];
                                 index <=> root.model-index;
                                 enabled: !root.busy;
+                                Tooltip {
+                                    text: @markdown("ACE-Step 权重约 8.8GB（引擎还要留 1GB 余量）：可用内存不足时引擎会直接拒绝并报出可用值。16GB 机器实测可用 8.2GB（卸掉常驻模型后）→ 装不下，需要更大的机器或 CUDA 主机。");
+                                }
                             }
                             Text {
                                 horizontal-stretch: 1;
-                                text: "换引擎是换模型：yue2 咬字更稳更慢；ACE-Step 支持时长控制、不唱中文词";
+                                text: "换引擎是换模型：yue2 咬字更稳更慢；ACE-Step 支持时长控制、不唱中文词，但需要约 9.8GB 可用内存";
                                 color: PixelTheme.dim;
                                 font-size: 11px;
                                 vertical-alignment: center;
