@@ -157,7 +157,7 @@ export component BgmWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 96px;
                         text: root.show-advanced ? "收起高级" : "高级";
-                        Tooltip { text: @markdown("BGM 独有参数：duck 强度（人声段压低多少）"); }
+                        Tooltip { text: @markdown("BGM 独有参数：时长（无配音成品时生效）、duck 强度（人声段压低多少）"); }
                         clicked => { root.show-advanced = !root.show-advanced; }
                     }
                 }

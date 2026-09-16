@@ -53,7 +53,17 @@ pub fn bgm_only_artifacts(dir: &Path, options: &BgmOptions) -> Result<BgmArtifac
     if !bgm.is_file() {
         return Err("缺少 bgm/bgm.wav".into());
     }
-    let seconds = options.target_seconds.max(0.1);
+    // 时长以**实际写出的 wav** 为准（assemble_bgm 会按目标帧数截断，两者通常一致；
+    // 但读回来更稳：万一将来对齐逻辑变了，界面显示的仍是真实产物时长）。
+    let seconds = hound::WavReader::open(&bgm)
+        .ok()
+        .and_then(|r| {
+            let spec = r.spec();
+            (spec.sample_rate > 0 && spec.channels > 0)
+                .then(|| r.duration() as f64 / spec.channels as f64 / spec.sample_rate as f64)
+        })
+        .filter(|d| *d > 0.0)
+        .unwrap_or_else(|| options.target_seconds.max(0.1));
     Ok(BgmArtifacts {
         voice: None,
         bgm,

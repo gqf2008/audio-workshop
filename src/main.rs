@@ -1761,6 +1761,9 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_scene(1);
             ui.set_bgm_has_result(true);
             ui.set_bgm_stale(false);
+            // 三轨都存在（这个态就是用来核对三轨结果区的）
+            ui.set_bgm_has_voice_track(true);
+            ui.set_bgm_has_mixed_track(true);
             ui.set_bgm_voice_label("人声 · 示例工程 · 频道口播_voice.wav".into());
             ui.set_bgm_track_label("BGM · 示例工程 · 频道口播_bgm.wav".into());
             ui.set_bgm_mixed_label("混音 · 示例工程 · 频道口播_mixed.wav".into());
