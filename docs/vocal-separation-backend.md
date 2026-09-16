@@ -79,8 +79,11 @@ stems.save_mix_except(&[Stem::Vocals], ".../xxx_accompaniment.wav")?;
 1. `crates/aw-core` 新增 `separate.rs`，依赖 `stem-splitter-core`：
    - `Separator` 复用（模型只加载一次，避免每次分离都吃一遍模型加载）；
    - `set_split_progress_callback` / `set_download_progress_callback` → 转发成我们自己的进度事件；
-   - 支持**停止**：上游没有 stop 参数，需在 chunk 粒度或线程粒度做取消（待验证其回调能否中断），
-     最坏情况是把分离放进独立线程、停止=丢弃结果 + 不再排队后续 chunk（止损不彻底，需在 UI 文案上如实写）。
+   - 支持**停止**：上游没有 stop 参数。**2026-09-17 已核实**：`stem-splitter-core` rev `9120251`
+     的 `src/core/splitter.rs` 里没有任何 `cancel` / `AtomicBool` / `should_stop`（grep 无命中），
+     所以"chunk 粒度取消"做不到——实现是把它放进独立线程，`should_stop` 只在整轮
+     `Separator::separate` 返回后查一次（`separate_tracks`）：停止 = **跑完整轮再丢弃结果、不落盘**，
+     耗时照算。UI 文案必须照这个写，不能说成"当前分块跑完就停"。
 2. 模型来源两条路，都接到全局设置：
    - 首次使用：上游自动下载到用户目录（带进度，需联网一次）；
    - 离线/内网：用全局设置的**模型目录**放 `*.onnx`，走 `SplitOptions.model_path` 跳过下载。
@@ -125,7 +128,7 @@ stems.save_mix_except(&[Stem::Vocals], ".../xxx_accompaniment.wav")?;
 | 首次联网下载 ~200MB | 与"本地优先"口径需要一句话说明 | UI 明写"首次使用需下载模型（约 200MB），之后离线"；给下载进度 |
 | 内存/显存 | 官方建议 4GB+ RAM；本机是共享显存的 Apple Silicon | 用 `chunk_seconds` 控制；失败时给可执行原因（内存不足） |
 | ~~无内置"伴奏"轨~~ | **已澄清：上游有 `mix_except`**，不需要自己求和 | 直接用 `save_mix_except(&[Stem::Vocals])` |
-| 停止不彻底 | 上游无 stop API | 先按"停止=不再排队 + 丢弃结果"实现，UI 文案写清"正在处理的分块会跑完" |
+| 停止不彻底 | 上游无 stop API（已核实：splitter.rs 无任何取消入口） | 实现为"停止 = 整轮跑完再丢弃结果、不落盘"；UI 文案写"本轮分离跑完才会丢弃结果（上游没有取消接口）" |
 | 模型许可 | 上游代码 MIT/Apache；**模型权重许可是另一件事**，需单独核对后再对外分发 | 接入前核对模型 manifest 里的许可字段；不确定就不随包分发、只走用户侧下载 |
 
 ## 6. 复现本结论的命令
