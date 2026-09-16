@@ -1,0 +1,217 @@
+// ============================================================================
+// 音频作坊 · 配音页内「音色」区
+//
+// 与「高级」同款：页内展开、2px 边框盒子、默认收起，不是右侧遮罩抽屉。
+//
+// 概念区分（用户纠偏）：**换音色 ≠ 换模型**。
+//   · 音色 = 发声身份：只有两种来源——模型内置默认音色 / 参考音频克隆出来的音色。
+//   · 模型（audio8-tts / index-tts2 / 0.1b / stream…）是**引擎参数**，放在「高级」里。
+//   判定口径来自本机事实：`GET /v1/audio/voices?model=<id>` 对所有 tts 模型都只返回
+//   `["default"]`，即这台机器上每个模型只带一个内置音色；多音色库（P4）尚未接入。
+//
+// 单一事实来源：参考音频路径为空 = 内置默认音色；非空 = 克隆音色。
+// 因此这里不引入第二个 mode 状态，避免两处状态漂移。
+// ============================================================================
+import { PixelButton, PixelTextInput, PixelTheme } from "@slint_pixel";
+
+// ---------------------------------------------------------------------------
+// 一个音色来源行：标题 + 说明 + 当前标记 + 试听 + 使用
+// ---------------------------------------------------------------------------
+component VoiceOptionRow inherits Rectangle {
+    in property <string> title: "";
+    in property <string> detail: "";
+    in property <bool> current: false;
+    in property <bool> enabled: true;
+    in property <string> use-text: "使用";
+    // 有些行没有独立的"使用"动作（例：参考音频克隆——填了路径就是已切换）
+    in property <bool> show-apply: true;
+    callback preview();
+    callback apply();
+
+    height: 52px;
+    background: root.current ? PixelTheme.hover : transparent;
+    border-width: 2px;
+    border-color: root.current ? PixelTheme.accent : PixelTheme.edge;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+
+        // 当前态：实心点；颜色之外还有“✓ 当前”文字，不靠颜色单独承载信息
+        Rectangle {
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: root.current ? PixelTheme.accent : transparent;
+            border-width: 2px;
+            border-color: root.current ? PixelTheme.accent : PixelTheme.dim;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.title + (root.current ? "   ✓ 当前" : "");
+                color: PixelTheme.text;
+                font-size: 13px;
+                font-weight: root.current ? 700 : 400;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.detail;
+                color: PixelTheme.dim;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+        PixelButton {
+            width: 64px;
+            size: "small";
+            text: "试听";
+            enabled: root.enabled;
+            clicked => { root.preview(); }
+        }
+        PixelButton {
+            visible: root.show-apply;
+            width: 108px;
+            size: "small";
+            variant: root.current ? "default" : "primary";
+            text: root.current ? "正在用" : root.use-text;
+            enabled: root.enabled && !root.current;
+            clicked => { root.apply(); }
+        }
+    }
+}
+
+export component VoicePanel inherits Rectangle {
+    // 当前音色（与旁白块头同一份文案）
+    in property <string> voice-label: "";
+    // 当前引擎显示名（模型），仅用于说明“内置音色来自哪个引擎”
+    in property <string> engine-label: "";
+    // 参考音频路径：空=内置，非空=克隆。唯一状态来源。
+    in-out property <string> reference-path: "";
+    in property <bool> busy: false;
+    in property <bool> reference-exists: false;
+
+    callback edited();
+    callback clear-reference();
+    callback preview();
+    callback open-design();
+
+    property <bool> cloning: root.reference-path != "";
+
+    // 与「高级」同款：整行宽、自然高度，跟着页面排版展开（不做浮层）
+    width: 100%;
+    background: PixelTheme.bg;
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 12px;
+        alignment: start;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                horizontal-stretch: 1;
+                text: "音色";
+                color: PixelTheme.text;
+                font-size: 13px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "当前：" + root.voice-label;
+                color: PixelTheme.dim;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+
+        // ── 来源一：模型内置默认音色 ──
+        VoiceOptionRow {
+            title: "内置默认音色";
+            detail: root.engine-label + " · 免参考音，开箱可用";
+            current: !root.cloning;
+            enabled: !root.busy && root.engine-label != "";
+            use-text: "使用内置音色";
+            preview => { root.preview(); }
+            apply => { root.clear-reference(); }
+        }
+
+        // ── 来源二：参考音频克隆 ──
+        //    这一行的"使用"没有独立动作——参考音频路径非空本身就是"切到克隆音色"，
+        //    所以不放"使用"按钮（放了也必然恒禁，等于死按钮）。
+        VoiceOptionRow {
+            title: "参考音频克隆";
+            detail: "用一段 5–30 秒干净人声克隆成你的音色（填下面路径即切换）";
+            current: root.cloning;
+            enabled: !root.busy && root.reference-path != "";
+            show-apply: false;
+            preview => { root.preview(); }
+        }
+
+        // 参考音频输入：放在克隆行下方，属于这一项的参数
+        HorizontalLayout {
+            spacing: 10px;
+            Text {
+                width: 56px;
+                text: "参考音频";
+                color: PixelTheme.dim;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+            PixelTextInput {
+                horizontal-stretch: 1;
+                enabled: !root.busy;
+                text <=> root.reference-path;
+                placeholder: "参考音频路径，如 ~/Documents/ref.wav";
+                edited => { root.edited(); }
+            }
+            PixelButton {
+                width: 64px;
+                text: "清除";
+                enabled: root.reference-path != "" && !root.busy;
+                clicked => { root.clear-reference(); }
+            }
+            PixelButton {
+                width: 110px;
+                text: "试听";
+                enabled: !root.busy;
+                clicked => { root.preview(); }
+            }
+        }
+
+        // 状态与出口：能力边界写清楚，不承诺没接入的音色库
+        Text {
+            text: root.cloning
+                ? (root.reference-exists
+                    ? "已选克隆音色：换新参考音频会重录受影响句子，旧成品标记为旧版本。"
+                    : "参考音频路径填了，但文件还不存在或不可读；改好再开始配音。")
+                : "正在用内置默认音色。想换成自己的声音，就选一段参考音频走克隆。";
+            color: root.cloning && !root.reference-exists ? PixelTheme.danger : PixelTheme.dim;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            Text {
+                horizontal-stretch: 1;
+                text: "本机每个引擎当前只带 1 个内置音色；音色库存档（多音色）还没接入。";
+                color: PixelTheme.dim;
+                font-size: 11px;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+            PixelButton {
+                width: 130px;
+                text: "去音色设计 →";
+                enabled: !root.busy;
+                clicked => { root.open-design(); }
+            }
+        }
+    }
+}

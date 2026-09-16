@@ -1,0 +1,250 @@
+// ============================================================================
+// 音频作坊 · 音色设计 Tab + 能力未接入占位 Tab
+//
+// 诚实原则（见 docs/ui/redesign-v1/competitive-analysis.md「不采用清单」）：
+//   后端没有的能力一律显示“未接入 + 缺什么”，不放假按钮、不装成已完成。
+//   · 参考音频克隆：真实可用（配音链路 voice_ref → index-tts2）
+//   · 文本描述生成音色：后端未接入（audio.cpp 无 voice design 任务）
+//   · 人声分离 / 音乐制作：本分支未接入
+// ============================================================================
+import { PixelBadge, PixelButton, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
+
+// ---------------------------------------------------------------------------
+// 音色设计：v1 只做真实可用的「参考音频克隆」，文本生成音色明确标注未接入
+// ---------------------------------------------------------------------------
+export component VoiceDesignTab inherits Rectangle {
+    in-out property <string> reference-path: "";
+    in property <bool> busy: false;
+
+    callback edited();
+    callback clear-reference();
+    callback use-in-dubbing();
+
+    HorizontalLayout {
+        horizontal-stretch: 1;
+        vertical-stretch: 1;
+        Rectangle { horizontal-stretch: 1; }
+
+        Rectangle {
+            width: 720px;
+            vertical-stretch: 1;
+            background: transparent;
+
+            VerticalLayout {
+                width: 100%;
+                padding-top: 20px;
+                padding-bottom: 16px;
+                spacing: 16px;
+                alignment: start;
+
+                Text {
+                    text: "音色设计";
+                    color: PixelTheme.text;
+                    font-size: 22px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "用一段参考音频克隆音色，直接用于配音。没有参考音频时，配音仍可用内置模型音色。";
+                    color: PixelTheme.dim;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                // ── 可用：参考音频克隆 ──
+                Rectangle {
+                    width: 100%;
+                    vertical-stretch: 0;
+                    background: PixelTheme.panel;
+                    border-width: 2px;
+                    border-color: PixelTheme.edge;
+
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "参考音频克隆";
+                                color: PixelTheme.text;
+                                font-size: 15px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            PixelBadge {
+                                text: "可用";
+                                width: 46px;
+                                height: 20px;
+                            }
+                        }
+                        Text {
+                            text: "选一段 5–30 秒干净人声（无背景音乐）。本机用它克隆音色，逐句配音时无需联网。";
+                            color: PixelTheme.dim;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        PixelTextInput {
+                            width: 100%;
+                            enabled: !root.busy;
+                            text <=> root.reference-path;
+                            placeholder: "参考音频路径，如 ~/Documents/ref.wav";
+                            edited => { root.edited(); }
+                        }
+                        Text {
+                            text: "本版直接填路径（还没接系统文件框）。改完路径会把旧的合成结果标为旧版本，需重新生成。";
+                            color: PixelTheme.dim;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            PixelButton {
+                                width: 100px;
+                                text: "清除";
+                                enabled: root.reference-path != "" && !root.busy;
+                                clicked => { root.clear-reference(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            PixelButton {
+                                width: 150px;
+                                variant: "primary";
+                                text: "去配音使用";
+                                enabled: !root.busy;
+                                clicked => { root.use-in-dubbing(); }
+                            }
+                        }
+                    }
+                }
+
+                // ── 未接入：文本描述生成音色（ElevenLabs Voice Design 那一套）──
+                Rectangle {
+                    width: 100%;
+                    vertical-stretch: 0;
+                    background: PixelTheme.bg;
+                    border-width: 2px;
+                    border-color: PixelTheme.edge;
+
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "文本描述生成音色";
+                                color: PixelTheme.dim;
+                                font-size: 15px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            PixelBadge {
+                                text: "未接入";
+                                width: 64px;
+                                height: 20px;
+                                face: PixelTheme.dim;
+                                border: PixelTheme.dim;
+                            }
+                        }
+                        Text {
+                            text: "输入音色描述（如“沙哑的老年巫师”）直接合成新音色。本机 audio.cpp 目前没有 voice design 任务，这一块不做假按钮。";
+                            color: PixelTheme.dim;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        PixelTextArea {
+                            width: 100%;
+                            height: 64px;
+                            frame-height: 64px;
+                            enabled: false;
+                            placeholder: "音色描述（未接入）";
+                        }
+                        PixelButton {
+                            width: 150px;
+                            text: "生成音色";
+                            enabled: false;
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 未接入占位：人声分离 / 音乐制作。写清“缺什么”，不画假控件。
+// ---------------------------------------------------------------------------
+export component GatedTab inherits Rectangle {
+    in property <string> title: "";
+    in property <string> summary: "";
+    in property <string> badge: "未接入";
+    in property <[string]> requirements: [];
+
+    HorizontalLayout {
+        horizontal-stretch: 1;
+        vertical-stretch: 1;
+        Rectangle { horizontal-stretch: 1; }
+
+        VerticalLayout {
+            width: 620px;
+            vertical-stretch: 1;
+            alignment: center;
+            spacing: 14px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                Text {
+                    text: root.title;
+                    color: PixelTheme.text;
+                    font-size: 22px;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+                PixelBadge {
+                    text: root.badge;
+                    width: 64px;
+                    height: 20px;
+                    face: PixelTheme.dim;
+                    border: PixelTheme.dim;
+                }
+            }
+            Text {
+                text: root.summary;
+                color: PixelTheme.dim;
+                font-size: 13px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+            Rectangle {
+                width: 100%;
+                background: PixelTheme.panel;
+                border-width: 2px;
+                border-color: PixelTheme.edge;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+                    Text {
+                        text: "接入前还缺：";
+                        color: PixelTheme.text;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    for r in root.requirements : Text {
+                        text: "· " + r;
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+    }
+}
