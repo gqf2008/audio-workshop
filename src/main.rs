@@ -136,6 +136,10 @@ enum Msg {
         ok: bool,
         detail: String,
     },
+    /// 全局设置里「选择模型目录」的结果
+    ModelDirPicked {
+        path: Option<String>,
+    },
     /// 音色试听失败（保留音色名，便于在状态栏说清是哪个音色挂了）
     VoicePreviewFailed {
         label: String,
@@ -171,6 +175,72 @@ struct AppSettings {
     port: Option<u16>,
     #[serde(default)]
     config_path: Option<String>,
+    /// 模型目录：本机模型文件的存放位置（默认 <应用工作目录>/models，用户可选）
+    #[serde(default)]
+    model_dir: Option<String>,
+}
+
+/// 默认模型目录：应用工作目录下的 models/（打包后即应用目录下的 models/）。
+fn default_model_dir() -> PathBuf {
+    let base = std::env::current_dir()
+        .ok()
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("models")
+}
+
+/// 当前生效的模型目录（设置 > 默认）。
+fn model_dir() -> PathBuf {
+    settings_snapshot()
+        .model_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_model_dir)
+}
+
+/// 扫模型目录（深度 ≤2，覆盖 `models/<模型名>/*.gguf` 这种常见摆放）：
+/// 返回 (目录是否存在, .gguf 文件数)。
+fn scan_model_dir(dir: &Path) -> (bool, usize) {
+    if !dir.is_dir() {
+        return (false, 0);
+    }
+    fn count_gguf(dir: &Path, depth: usize) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut n = 0;
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if depth > 0 {
+                    n += count_gguf(&path, depth - 1);
+                }
+            } else if path
+                .extension()
+                .map(|x| x.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false)
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+    (true, count_gguf(dir, 2))
+}
+
+/// 模型目录里有多少个清单模型的权重文件（用来判断模型盘挂上没）。
+fn models_under_dir(dir: &Path) -> usize {
+    let cfg = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok());
+    let Some(cfg) = cfg else { return 0 };
+    cfg.models
+        .iter()
+        .filter(|m| !m.path.is_empty() && Path::new(&m.path).starts_with(dir))
+        .count()
 }
 
 /// 设置文件：与工程产物同目录，便于用户找到与备份。
@@ -349,12 +419,21 @@ fn server_endpoint() -> (String, String) {
 /// 把「全局设置 + 模型清单」的现状回灌到界面。
 fn refresh_settings_view(ui: &MainWindow) {
     let (host, port) = server_endpoint();
+    let dir = model_dir();
+    ui.set_model_dir(dir.display().to_string().into());
+    let (exists, gguf) = scan_model_dir(&dir);
+    let (total, _) = config_summary();
+    let under = models_under_dir(&dir);
+    ui.set_model_dir_info(
+        if !exists {
+            format!("目录不存在（清单里有 {total} 个模型）")
+        } else {
+            format!("目录内 {gguf} 个 .gguf · 清单 {total} 个模型，其中 {under} 个在这个目录下")
+        }
+        .into(),
+    );
     ui.set_server_host(host.into());
     ui.set_server_port(port.into());
-    ui.set_model_config_path(config_path().display().to_string().into());
-    let (count, root) = config_summary();
-    ui.set_model_count(count as i32);
-    ui.set_model_root(root.into());
 }
 
 /// 重新发现引擎（模型清单）并刷新界面。
@@ -404,6 +483,59 @@ fn apply_engine_discovery(ui: &MainWindow, invalidate: Option<(&Sender<Cmd>, &Rc
     }
     if !note.is_empty() {
         ui.set_status_text(format!("模型清单：{note}").into());
+    }
+}
+
+/// 系统目录选择框：阻塞式原生对话框，必须放后台线程，结果回消息通道。
+///
+/// macOS 用 osascript 的 choose folder；Windows 用 PowerShell 的
+/// FolderBrowserDialog；Linux 用 zenity。用户取消 → None，不静默失败。
+fn spawn_folder_pick(msg_tx: Sender<WorkerMsg>, revision: u64) {
+    std::thread::spawn(move || {
+        let path = pick_folder_blocking();
+        let _ = msg_tx.send(WorkerMsg {
+            revision,
+            msg: Msg::ModelDirPicked { path },
+        });
+    });
+}
+
+fn pick_folder_blocking() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose folder with prompt \"选择模型目录\")",
+        ])
+        .output()
+        .ok()?;
+
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+             $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             if ($d.ShowDialog() -eq \"OK\") { Write-Output $d.SelectedPath }",
+        ])
+        .output()
+        .ok()?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let out = std::process::Command::new("zenity")
+        .args(["--file-selection", "--directory", "--title=选择模型目录"])
+        .output()
+        .ok()?;
+
+    if !out.status.success() {
+        return None; // 取消时退出码非 0
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.trim_end_matches('/').to_string())
     }
 }
 
@@ -1162,6 +1294,12 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_status_text(
                 "高级：重新切句 / 倍速 / 规范化 / 任务 / 导出（配音独有，放本页）".into(),
             );
+        }
+        "both" => {
+            // 内容超高场景：音色浮层 + 高级区同时展开，验证 Body 区出滚动条而不是顶掉状态栏
+            ui.set_dub_voice(true);
+            ui.set_dub_advanced(true);
+            ui.set_status_text("音色 + 高级同时展开：Body 区应出垂直滚动条".into());
         }
         "bgm" => {
             ui.set_scene(1);
@@ -1995,6 +2133,17 @@ fn tick(
                 ui.set_busy(false);
                 ui.set_status_text(error.into());
             }
+            Msg::ModelDirPicked { path } => match path {
+                Some(p) => {
+                    ui.set_model_dir(p.clone().into());
+                    ui.set_status_text(
+                        format!("已选中模型目录：{p}（点「应用并重连」生效）").into(),
+                    );
+                }
+                None => {
+                    ui.set_status_text("取消了选择模型目录".into());
+                }
+            },
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());
                 ui.set_server_ok(ok);
@@ -2282,7 +2431,7 @@ fn wire_global_settings(
         let Some(ui) = weak.upgrade() else { return };
         let host = ui.get_server_host().trim().to_string();
         let port_raw = ui.get_server_port().trim().to_string();
-        let cfg = ui.get_model_config_path().trim().to_string();
+        let dir = ui.get_model_dir().trim().to_string();
 
         let port = if port_raw.is_empty() {
             None
@@ -2296,16 +2445,18 @@ fn wire_global_settings(
                 }
             }
         };
-        if !cfg.is_empty() && !Path::new(&cfg).is_file() {
+        // 留空 = 回到默认（<应用工作目录>/models），不报错
+        if !dir.is_empty() && !Path::new(&dir).is_dir() {
             ui.set_server_ok(false);
-            ui.set_server_status(format!("模型清单不存在：{cfg}").into());
+            ui.set_server_status(format!("模型目录不存在：{dir}").into());
             return;
         }
 
         let next = AppSettings {
             host: (!host.is_empty()).then_some(host),
             port,
-            config_path: (!cfg.is_empty()).then_some(cfg),
+            config_path: settings_snapshot().config_path,
+            model_dir: (!dir.is_empty()).then_some(dir),
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -2327,6 +2478,18 @@ fn wire_global_settings(
         let Some(ui) = weak.upgrade() else { return };
         apply_engine_discovery(&ui, Some((&tx, &st)));
         ui.set_server_status("已重新扫描模型清单".into());
+    });
+
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let msg = msg_tx.clone();
+    ui.on_pick_model_dir(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_busy() || ui.get_running() {
+            return;
+        }
+        ui.set_status_text("正在打开系统目录选择框…".into());
+        spawn_folder_pick(msg.clone(), st.project_revision.get());
     });
 
     let weak = ui.as_weak();

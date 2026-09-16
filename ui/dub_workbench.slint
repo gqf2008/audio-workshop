@@ -178,12 +178,13 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in-out property <string> server-port: "";
     in property <string> server-status: "还没测过连接";
     in property <bool> server-ok: false;
-    in-out property <string> model-config-path: "";
-    in property <string> model-root: "";
+    in-out property <string> model-dir: "";
+    in property <string> model-dir-info: "";
     in property <int> model-count: 0;
     callback apply-server-settings();
     callback rescan-models();
     callback check-server();
+    callback pick-model-dir();
 
     // 细分隔线：比面板边框轻，只做分组不制造方框
     property <color> hairline: PixelTheme.hover;
@@ -293,47 +294,37 @@ export component WorkbenchDrawer inherits VerticalLayout {
 
             Rectangle { height: 2px; background: root.hairline; }
 
-            // ── 模型：从哪份清单读、模型放在哪 ──
+            // ── 模型：模型目录（本机模型文件放哪儿）──
             VerticalLayout {
                 vertical-stretch: 0;
                 spacing: 12px;
                 SectionLabel { text: "模型"; }
                 Text {
-                    text: "模型清单（server.json）";
+                    text: "模型目录";
                     color: PixelTheme.text;
                     font-size: 12px;
                 }
                 PixelTextInput {
-                    text <=> root.model-config-path;
-                    placeholder: "模型清单路径，如 ~/.local/opt/audio.cpp/server.json";
+                    text <=> root.model-dir;
+                    placeholder: "模型目录，默认 <应用工作目录>/models";
                     enabled: !root.busy;
                 }
                 HorizontalLayout {
                     spacing: 10px;
-                    Text {
-                        text: "模型根目录";
-                        width: 80px;
-                        color: PixelTheme.dim;
-                        font-size: 12px;
-                        vertical-alignment: center;
+                    PixelButton {
+                        width: 96px;
+                        text: "选择目录…";
+                        enabled: !root.busy;
+                        clicked => { root.pick-model-dir(); }
                     }
-                    Text {
-                        horizontal-stretch: 1;
-                        text: root.model-root;
-                        color: PixelTheme.text;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                        overflow: elide;
+                    PixelButton {
+                        width: 72px;
+                        text: "用默认";
+                        Tooltip { text: @markdown("清空即用默认目录 <应用工作目录>/models"); }
+                        enabled: !root.busy;
+                        clicked => { root.model-dir = ""; }
                     }
-                    Text {
-                        text: "共 " + root.model-count + " 个模型";
-                        color: PixelTheme.dim;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
                     PixelButton {
                         width: 100px;
                         variant: "primary";
@@ -341,15 +332,15 @@ export component WorkbenchDrawer inherits VerticalLayout {
                         enabled: !root.busy;
                         clicked => { root.apply-server-settings(); }
                     }
-                    PixelButton {
-                        width: 96px;
-                        text: "重新扫描";
-                        enabled: !root.busy;
-                        clicked => { root.rescan-models(); }
-                    }
                 }
                 Text {
-                    text: "根目录取清单里各模型 path 的公共父目录，用来确认模型盘挂上没；单个模型的实际路径仍以清单为准。";
+                    text: root.model-dir-info;
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "默认是应用工作目录下的 models/。目录只描述模型文件放在哪，用于核对模型盘挂上没；引擎仍按服务清单里的 id 加载。";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;
@@ -548,20 +539,6 @@ export component DubWorkbench inherits Rectangle {
                             }
                         }
                     }
-                }
-
-                // ①b 音色区：与「高级」同款的页内展开盒子
-                if root.show-voice : VoicePanel {
-                    voice-label: root.voice-label;
-                    voice-source: root.voice-source;
-                    engine-label: root.engine-label;
-                    reference-path <=> root.voice-ref-path;
-                    busy: root.running || root.busy;
-                    reference-exists: root.reference-exists;
-                    edited => { root.voice-ref-changed(); }
-                    clear-reference => { root.clear-reference(); }
-                    preview => { root.audition-voice(); }
-                    open-design => { root.new-voice(); }
                 }
 
                 // ② 一行状态 + 高级入口 + 主操作（同级 3 个）
@@ -796,4 +773,25 @@ export component DubWorkbench inherits Rectangle {
         }
 
     }
+
+        // ①c 音色浮层：锚在「换音色」按钮正下方，浮在内容之上（不把下面的内容顶下去）。
+        //     声明在最后 → 画在最上层；只占浮层，不参与排版、不把下面内容顶下去。
+        //     坐标按版心算：内容列恒定 880px 居中，旁白块内边距 12px，
+        //     「换音色」是块头最后一个控件 → 浮层右缘对齐到块右内缘。
+        if root.show-voice : VoicePanel {
+            width: 560px;
+            x: Math.max(8px, (root.width - 880px) / 2 + 880px - 12px - self.width);
+            y: 64px;
+
+            voice-label: root.voice-label;
+            voice-source: root.voice-source;
+            engine-label: root.engine-label;
+            reference-path <=> root.voice-ref-path;
+            busy: root.running || root.busy;
+            reference-exists: root.reference-exists;
+            edited => { root.voice-ref-changed(); }
+            clear-reference => { root.clear-reference(); }
+            preview => { root.audition-voice(); }
+            open-design => { root.new-voice(); }
+        }
 }

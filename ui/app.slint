@@ -19,8 +19,8 @@
 // ============================================================================
 
 import {
-    PixelDrawer, PixelEmpty, PixelTabs, PixelTheme, PixelTitleBar, PixelToast,
-    PixelWindowResize,
+    PixelDrawer, PixelEmpty, PixelScrollPanel, PixelTabs, PixelTheme, PixelTitleBar,
+    PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
 import { Sentence, Voice } from "model.slint";
@@ -87,9 +87,8 @@ export component MainWindow inherits Window {
     in-out property <string> server-port: "";
     in property <string> server-status: "还没测过连接";
     in property <bool> server-ok: false;
-    in-out property <string> model-config-path: "";
-    in property <string> model-root: "";
-    in property <int> model-count: 0;
+    in-out property <string> model-dir: "";
+    in property <string> model-dir-info: "";
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
@@ -156,6 +155,7 @@ export component MainWindow inherits Window {
     callback apply-server-settings();
     callback rescan-models();
     callback check-server();
+    callback pick-model-dir();
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
@@ -231,114 +231,123 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // ── 当前 Tab 主画布（一屏一事）──
-            if root.scene == 0 : DubWorkbench {
+            // ── Body 区：整块可垂直滚动 ──
+            //     展开音色区 / 高级区后内容会超过窗口高度，之前会把底部的状态栏顶出窗口；
+            //     这里统一交给 ScrollView（内容超高才出滚动条，短内容不受影响）。
+            PixelScrollPanel {
                 vertical-stretch: 1;
                 horizontal-stretch: 1;
+                panel-bg: PixelTheme.bg;
+                edge: transparent;
 
-                script-text <=> root.script-text;
+                if root.scene == 0 : DubWorkbench {
+                    vertical-stretch: 1;
+                    horizontal-stretch: 1;
 
-                sentences <=> root.sentences;
-                selected <=> root.selected;
-                done-count: root.done-count;
+                    script-text <=> root.script-text;
 
-                running: root.running;
-                busy: root.busy;
-                playing: root.playing;
+                    sentences <=> root.sentences;
+                    selected <=> root.selected;
+                    done-count: root.done-count;
 
-                // 旁白块头：当前音色 + 来源 + 禁用原因
-                voice-label: root.voice-label;
-                voice-source: root.voice-source;
-                voice-hint: root.voice-hint;
-                voice-ready: root.voice-index >= 0;
+                    running: root.running;
+                    busy: root.busy;
+                    playing: root.playing;
 
-                // 配音页内的高级参数（默认收起，不在抽屉里）
-                speed <=> root.speed;
-                speed-label: root.speed-label;
-                auto-normalize <=> root.auto-normalize;
-                progress: root.progress;
-                has-result: root.has-result;
-                export-dir: root.export-dir;
-                export-wav-on <=> root.export-wav-on;
-                export-srt-on <=> root.export-srt-on;
-                show-advanced <=> root.dub-advanced;
+                    // 旁白块头：当前音色 + 来源 + 禁用原因
+                    voice-label: root.voice-label;
+                    voice-source: root.voice-source;
+                    voice-hint: root.voice-hint;
+                    voice-ready: root.voice-index >= 0;
 
-                script-edited => { root.script-edited(); }
-                use-sample => { root.use-sample(); }
-                clear-script => { root.clear-script(); }
-                select-sentence(i) => { root.select-sentence(i); }
-                preview-one(i) => { root.preview-one(i); }
-                redo-one(i) => { root.redo-one(i); }
-                start-run => { root.start-run(); }
-                stop-run => { root.stop-run(); }
-                stop-preview => { root.stop-preview(); }
-                resplit => { root.resplit(); }
-                preview-all => { root.preview-all(); }
-                speed-changed(v) => { root.speed-changed(v); }
-                export-requested => { root.export-requested(); }
-                voice-names: root.voice-names;
-                voice-index <=> root.voice-index;
-                engine-label: root.engine-label;
-                voice-ref-path <=> root.voice-ref-path;
-                reference-exists: root.reference-exists;
-                show-voice <=> root.dub-voice;
-                change-voice => { root.dub-voice = !root.dub-voice; }
-                engine-changed => { root.model-changed(); }
-                audition-voice => { root.preview-voice(); }
-                clear-reference => { root.clear-voice-reference(); }
-                voice-ref-changed => { root.voice-ref-changed(); }
-                new-voice => {
-                    root.scene = 4;
-                    root.scene-changed(4);
+                    // 配音页内的高级参数（默认收起，不在抽屉里）
+                    speed <=> root.speed;
+                    speed-label: root.speed-label;
+                    auto-normalize <=> root.auto-normalize;
+                    progress: root.progress;
+                    has-result: root.has-result;
+                    export-dir: root.export-dir;
+                    export-wav-on <=> root.export-wav-on;
+                    export-srt-on <=> root.export-srt-on;
+                    show-advanced <=> root.dub-advanced;
+
+                    script-edited => { root.script-edited(); }
+                    use-sample => { root.use-sample(); }
+                    clear-script => { root.clear-script(); }
+                    select-sentence(i) => { root.select-sentence(i); }
+                    preview-one(i) => { root.preview-one(i); }
+                    redo-one(i) => { root.redo-one(i); }
+                    start-run => { root.start-run(); }
+                    stop-run => { root.stop-run(); }
+                    stop-preview => { root.stop-preview(); }
+                    resplit => { root.resplit(); }
+                    preview-all => { root.preview-all(); }
+                    speed-changed(v) => { root.speed-changed(v); }
+                    export-requested => { root.export-requested(); }
+                    voice-names: root.voice-names;
+                    voice-index <=> root.voice-index;
+                    engine-label: root.engine-label;
+                    voice-ref-path <=> root.voice-ref-path;
+                    reference-exists: root.reference-exists;
+                    show-voice <=> root.dub-voice;
+                    change-voice => { root.dub-voice = !root.dub-voice; }
+                    engine-changed => { root.model-changed(); }
+                    audition-voice => { root.preview-voice(); }
+                    clear-reference => { root.clear-voice-reference(); }
+                    voice-ref-changed => { root.voice-ref-changed(); }
+                    new-voice => {
+                        root.scene = 4;
+                        root.scene-changed(4);
+                    }
                 }
-            }
 
-            if root.scene == 1 : BgmWorkbench {
-                vertical-stretch: 1;
-                horizontal-stretch: 1;
-                prompt <=> root.bgm-prompt;
-                progress: root.bgm-progress;
-                busy: root.busy || root.running;
+                if root.scene == 1 : BgmWorkbench {
+                    vertical-stretch: 1;
+                    horizontal-stretch: 1;
+                    prompt <=> root.bgm-prompt;
+                    progress: root.bgm-progress;
+                    busy: root.busy || root.running;
 
-                has-result: root.bgm-has-result;
-                status-text: root.bgm-status-text;
-                generate => { root.bgm-generate(); }
-                preview => { root.bgm-preview(); }
-                export-tracks => { root.bgm-export-tracks(); }
-            }
+                    has-result: root.bgm-has-result;
+                    status-text: root.bgm-status-text;
+                    generate => { root.bgm-generate(); }
+                    preview => { root.bgm-preview(); }
+                    export-tracks => { root.bgm-export-tracks(); }
+                }
 
-            if root.scene == 2 : GatedTab {
-                vertical-stretch: 1;
-                title: "人声分离";
-                summary: "把一首歌拆成人声与伴奏两轨。本分支还没接入分离后端，先用占位页把位置留给它。";
-                requirements: [
-                    "audio.cpp 侧新增人声/伴奏分离任务（当前只有 tts / gen）",
-                    "两轨结果的试听与导出路径",
-                    "源文件更换后的 stale 规则（旧两轨默认禁止导出）",
-                ];
-            }
+                if root.scene == 2 : GatedTab {
+                    vertical-stretch: 1;
+                    title: "人声分离";
+                    summary: "把一首歌拆成人声与伴奏两轨。本分支还没接入分离后端，先用占位页把位置留给它。";
+                    requirements: [
+                        "audio.cpp 侧新增人声/伴奏分离任务（当前只有 tts / gen）",
+                        "两轨结果的试听与导出路径",
+                        "源文件更换后的 stale 规则（旧两轨默认禁止导出）",
+                    ];
+                }
 
-            if root.scene == 3 : GatedTab {
-                vertical-stretch: 1;
-                title: "音乐制作";
-                summary: "写歌 / 文生音乐。yue2、ace-step、S2 翻唱的链路在 feat/m4-song 分支开发，尚未合入本分支。";
-                requirements: [
-                    "合并 feat/m4-song 的歌曲链路",
-                    "生成中可切 Tab、失败按当前版本重试",
-                    "改歌词/风格只标草稿有新修改，旧版本仍可导出",
-                ];
-            }
+                if root.scene == 3 : GatedTab {
+                    vertical-stretch: 1;
+                    title: "音乐制作";
+                    summary: "写歌 / 文生音乐。yue2、ace-step、S2 翻唱的链路在 feat/m4-song 分支开发，尚未合入本分支。";
+                    requirements: [
+                        "合并 feat/m4-song 的歌曲链路",
+                        "生成中可切 Tab、失败按当前版本重试",
+                        "改歌词/风格只标草稿有新修改，旧版本仍可导出",
+                    ];
+                }
 
-            if root.scene == 4 : VoiceDesignTab {
-                vertical-stretch: 1;
-                reference-path <=> root.voice-ref-path;
-                busy: root.busy || root.running;
-                edited => { root.voice-ref-changed(); }
-                clear-reference => { root.clear-voice-reference(); }
-                use-in-dubbing => {
-                    root.scene = 0;
-                    root.scene-changed(0);
-                    root.dub-voice = true;
+                if root.scene == 4 : VoiceDesignTab {
+                    vertical-stretch: 1;
+                    reference-path <=> root.voice-ref-path;
+                    busy: root.busy || root.running;
+                    edited => { root.voice-ref-changed(); }
+                    clear-reference => { root.clear-voice-reference(); }
+                    use-in-dubbing => {
+                        root.scene = 0;
+                        root.scene-changed(0);
+                        root.dub-voice = true;
+                    }
                 }
             }
 
@@ -388,7 +397,8 @@ export component MainWindow inherits Window {
     PixelDrawer {
         x: 2px; y: 2px;
         width: root.width - 4px;
-        height: root.height - 4px;
+        // 底部让开 30px 状态栏：抽屉是浮层，但不该把全局状态栏盖掉
+        height: root.height - 4px - 30px;
         open: root.drawer-open;
         title: "全局设置";
         drawer-width: 380px;
@@ -408,12 +418,12 @@ export component MainWindow inherits Window {
             server-port <=> root.server-port;
             server-status: root.server-status;
             server-ok: root.server-ok;
-            model-config-path <=> root.model-config-path;
-            model-root: root.model-root;
-            model-count: root.model-count;
+            model-dir <=> root.model-dir;
+            model-dir-info: root.model-dir-info;
             apply-server-settings => { root.apply-server-settings(); }
             rescan-models => { root.rescan-models(); }
             check-server => { root.check-server(); }
+            pick-model-dir => { root.pick-model-dir(); }
         }
     }
 
