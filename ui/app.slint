@@ -213,6 +213,7 @@ export component MainWindow inherits Window {
     callback batch-clear();
     callback stop-preview();
     callback export-requested();
+    callback batch-export();
     callback quality-check();
     // 键盘翻句（FocusScope 转发）：上一句 / 下一句 / 播放·停止
     callback key-prev();
@@ -375,6 +376,7 @@ export component MainWindow inherits Window {
                     preview-all => { root.preview-all(); }
                     speed-changed(v) => { root.speed-changed(v); }
                     export-requested => { root.export-requested(); }
+                    batch-export => { root.batch-export(); }
                     quality-check => { root.quality-check(); }
                     voice-names: root.voice-names;
                     voice-index <=> root.voice-index;

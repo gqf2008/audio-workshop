@@ -427,6 +427,8 @@ export component DubWorkbench inherits Rectangle {
     callback preview-all();
     callback speed-changed(float);
     callback export-requested();
+    /// 批量导出：projects/ 下所有有成品的工程 → 导出目录（P6 的一部分）
+    callback batch-export();
     // 质检：把已合成句逐句交给 ASR 回读、算可懂度。入口放「高级」里
     // （配音页首屏元素已有 5 个，加一个就破 ≤8 的密度红线；导出也在这个盒子里）
     callback quality-check();
@@ -771,6 +773,13 @@ export component DubWorkbench inherits Rectangle {
                                 text: "导出";
                                 enabled: root.has-result && (root.export-wav-on || root.export-srt-on) && !root.busy;
                                 clicked => { root.export-requested(); }
+                            }
+                            PixelButton {
+                                width: 92px;
+                                text: "批量导出";
+                                Tooltip { text: @markdown("把 projects/ 下所有有成品的工程按上面的格式导到导出目录（正在合成也能导：成品是原子写出来的）"); }
+                                enabled: root.export-wav-on || root.export-srt-on;
+                                clicked => { root.batch-export(); }
                             }
                         }
                     }
