@@ -322,3 +322,67 @@ fn standalone_bgm_produces_only_the_bgm_track() {
     let empty = temp_dir("standalone-missing");
     assert!(bgm_only_artifacts(&empty, &options).is_err());
 }
+
+/// 立体声人声按**真实帧数**混：`hound::duration()` 已经是每声道帧数，多除一次
+/// channels 会把 2 秒人声混成 1 秒（BGM 成品整体被截半）。配音源目前是单声道，
+/// 所以这条错被单声道夹具藏了很久。
+#[test]
+fn mix_keeps_full_length_for_stereo_voice() {
+    let mock = support::Mock::start(vec![
+        (200, support::audio_response(&mono_8k(&vec![1000; 8000]))),
+        (200, support::audio_response(&mono_8k(&vec![1000; 8000]))),
+    ]);
+    let client = Client::new(&mock.base).with_retry(1, std::time::Duration::from_millis(1));
+    let dir = temp_dir("stereo-voice");
+    let options = BgmOptions {
+        prompt: "测试 BGM".into(),
+        segment_seconds: 1.0,
+        // BGM 要够长（混音按人声帧数逐帧取 BGM 样本，短了会被判帧数不足）
+        target_seconds: 2.0,
+        ..Default::default()
+    };
+    generate_segments(&client, &dir, &options, |_, _, _| {}).unwrap();
+    assemble_bgm(&dir, &options).unwrap();
+
+    // 2 秒立体声人声：16000 帧 × 2 声道
+    let voice = wav(
+        &vec![0i16; 16_000 * 2],
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    );
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::write(dir.join("out/final.wav"), &voice).unwrap();
+    std::fs::write(
+        dir.join("out/final.srt"),
+        "1\n00:00:00,000 --> 00:00:02,000\n测试\n",
+    )
+    .unwrap();
+    // mix_project 会读工程（按句时间轴算 duck 段），但没有工程就不给混音
+    let mut project = Project::new(
+        "测试句。",
+        "audio8-tts",
+        0,
+        1,
+        None,
+        aw_core::DEFAULT_PUNCTUATION,
+        80,
+        |t| t.to_string(),
+    );
+    project.sentences[0].start = Some(0.2);
+    project.sentences[0].duration = Some(1.0);
+    project.save(&dir).unwrap();
+
+    let artifacts = mix_project(&dir, &options).unwrap();
+    assert!(
+        (artifacts.duration - 2.0).abs() < 0.01,
+        "2 秒人声混音后仍应是 2 秒，实得 {}",
+        artifacts.duration
+    );
+    let mixed =
+        hound::WavReader::open(artifacts.mixed.as_ref().expect("混音成功必然有 mixed 轨")).unwrap();
+    assert_eq!(mixed.duration(), 16_000, "立体声 2 秒 = 16000 帧");
+}

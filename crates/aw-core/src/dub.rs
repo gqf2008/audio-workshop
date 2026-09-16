@@ -643,7 +643,11 @@ pub fn wav_duration(wav: &[u8]) -> Result<f64, ClientError> {
     let r = hound::WavReader::new(std::io::Cursor::new(wav))
         .map_err(|e| ClientError::Decode(e.to_string()))?;
     let spec = r.spec();
-    let frames = r.duration() as f64 / spec.channels as f64;
+    // `hound::WavReader::duration()` 返回的**已经是每声道帧数**（内部就是
+    // `num_samples / channels`），这里不能再除一次 channels：多除一次会让所有
+    // 立体声 wav 的时长正好少一半。配音链路一直是单声道（除不除都一样），
+    // 歌曲成品 / 分离两轨是立体声——真机分离 e2e 才把这个错照出来。
+    let frames = r.duration() as f64;
     Ok(frames / spec.sample_rate as f64)
 }
 
@@ -967,5 +971,52 @@ mod tests {
             "rename 失败也要清临时文件：{leftovers:?}"
         );
         assert!(err.raw_os_error().is_some(), "应是真实 io 错误：{err}");
+    }
+
+    /// `wav_duration` 的声道口径：`hound` 的 `duration()` 返回的**已经是每声道帧数**
+    /// （内部就是 `num_samples / channels`），所以不能再除一次 channels。
+    /// 配音链路一直是单声道（除不除都一样），立体声的歌曲成品 / 分离两轨才把它露出来：
+    /// 真机分离 e2e 里 3.000s 的立体声轨被算成 1.500s。
+    #[test]
+    fn wav_duration_counts_frames_not_samples_for_stereo() {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = hound::WavWriter::new(&mut buf, spec).unwrap();
+            for _ in 0..(48_000 * 2) {
+                // 1 秒 × 两声道
+                w.write_sample(0i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let secs = wav_duration(buf.get_ref()).unwrap();
+        assert!(
+            (secs - 1.0).abs() < 1e-9,
+            "立体声 1 秒应读成 1.0s，实得 {secs}"
+        );
+
+        // 单声道不能被这次修改带歪（配音链路走的就是它）
+        let mono = hound::WavSpec {
+            channels: 1,
+            ..spec
+        };
+        let mut mbuf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = hound::WavWriter::new(&mut mbuf, mono).unwrap();
+            for _ in 0..48_000 {
+                w.write_sample(0i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let mono_secs = wav_duration(mbuf.get_ref()).unwrap();
+        assert!(
+            (mono_secs - 1.0).abs() < 1e-9,
+            "单声道 1 秒应读成 1.0s，实得 {mono_secs}"
+        );
     }
 }
