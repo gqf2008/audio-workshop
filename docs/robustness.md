@@ -1,0 +1,66 @@
+# 落盘与工程读取的可执行错误
+
+> 2026-09-17。对应 thread `cc-ai-audio-workshop-robustness`。
+> 本文只记录**用户实际看到的行为**与复现命令，不写设计愿景。
+
+## 1. 为什么专门做这一批
+
+`docs/product-plan.md` 自己标了三处「待补」（v0.3 修订 ②、步骤 4 失败⑦、步骤 7 失败①④）。
+对着当前 main 的 Rust 实现核了一遍，其中两条是会真丢东西的：
+
+1. **工程损坏被静默重建**：`restore_project` 是 `let Ok(project) = Project::load(&dir) else { return }`、
+   `load_resumable` 是 `Project::load(dir).ok()`——`project.json` 存在但损坏（截断 / 半截 JSON）
+   时与「文件不存在」走同一条路：当作全新工程重建，用户已合成的句子全部显示为待合成，
+   **而且没有一句解释**；更糟的是随后第一次落盘把损坏的 `project.json` 覆盖掉，
+   唯一可人工恢复的现场就没了。
+2. **落盘失败不可执行**：`write_atomic` 的错误被塞进 `ClientError::Http(e.to_string())`，
+   用户看到的是 `合成中止: No space left on device (os error 28)`——不说哪个路径、
+   要释放多少、下一步做什么。
+
+## 2. 现在的行为（逐条可核）
+
+| 场景 | 用户看到什么 | 证据 |
+|---|---|---|
+| 写句子 wav / srt / `project.json` / BGM manifest / 歌曲 wav / 导出拷贝时空间不足 | `磁盘空间不足（需要 0.6 MB）：请释放空间后重跑，已完成的句子会自动跳过。路径：<完整路径>（原文件未受损）` | `aw_core::dub::write_failure_note` + 测试 `write_failure_note_is_actionable_per_error_kind` |
+| 拼装 `final.wav`（hound 流式写）空间不足 | 同上，但因为拿不到确切字节数，文案**不提**"需要多少"（不会写"需要 0.0 MB"） | `hound_error_note` + 测试 `zero_byte_write_note_omits_size_and_hound_errors_are_classified` |
+| 权限不足 / 路径不存在 | `没有写入权限：检查该目录权限，或把工程/导出目录换到有权限的位置。路径：<路径>` / `路径不存在（父目录可能被删除或移动）：重建目录后再重跑。路径：<路径>` | 同上 |
+| 工程状态是「已合成」但句子 wav 丢了 | `句子音频丢失：sentences/007.wav（工程里这句状态是「已合成」）。请重录该句，或把工程目录恢复回来。完整路径：<绝对路径>` | `sentence_read_note` + 测试 `missing_sentence_wav_says_which_file_is_gone` |
+| `project.json` 读不了（截断 / 半截 JSON / 权限） | 启动时与开跑时都明确报 `工程文件损坏：没有自动重建，也没有覆盖它——请把 project.json 改名或移走后重开…完整路径：<路径>。解析错误：…`；**开跑会中止，不覆盖现场** | `Project::load_if_present` + 测试 `load_if_present_separates_missing_from_corrupt_project`、main 侧 `corrupt_project_aborts_the_run_and_keeps_the_file` |
+| `project.json` 不存在 | 照旧按全新工程从零开始（这一条是回归守卫，不能被上面那条误伤） | 同上两条测试 |
+
+**文案顺序是有意的**：状态栏与任务中心的行都是 `overflow: elide`，长文案会被截尾。
+所以每条错误都按「发生了什么 → 该做什么 → 完整路径」排：被截断时丢掉的是路径尾巴，
+而不是动作。测试里用 `find(动作) < find(完整路径)` 把这条顺序钉住了
+（`write_failure_note_is_actionable_per_error_kind`、`missing_sentence_wav_says_which_file_is_gone`）。
+
+数据安全结论（原子写 `write_atomic` 的形状没变）：失败发生在**临时文件阶段**，
+目标文件要么还是旧内容、要么是新内容，不会留下写了一半的成品——
+所以"原文件未被破坏"这句写在文案里是有依据的，不是安抚。
+
+## 3. 本轮**没有**做的（别按已实现宣传）
+
+- **写前用 `statvfs` 预检剩余空间**：需要新依赖，而且"失败后给出准确字节数"已经覆盖了
+  可执行性。产品方案步骤 7 失败①里的"写前检查 + 报需要 X MB"这一半仍未实现。
+- **逐句标 `error: ENOSPC` 后继续跑**：当前语义是**整轮中止**（继续跑只会每句都失败）。
+  工程里那句仍是「待合成」，所以释放空间后重跑会跳过已完成句、只重做没做完的部分——
+  结果等价，但工程文件里不会留下 `error: ENOSPC` 这条记录。
+- **`settings.json` 的原子写**：损坏时回落默认值，损失可忽略，本批不动。
+
+## 4. 复现命令
+
+```console
+# 错误分类与文案（不需要真的把磁盘写满）
+cargo test -p aw-core --lib dub::tests::write_failure_note_is_actionable_per_error_kind
+cargo test -p aw-core --lib dub::tests::zero_byte_write_note_omits_size_and_hound_errors_are_classified
+cargo test -p aw-core --lib dub::tests::missing_sentence_wav_says_which_file_is_gone
+
+# 工程损坏：不重建、不覆盖
+cargo test -p audio-workshop corrupt_project_aborts_the_run_and_keeps_the_file
+cargo test -p aw-core --lib dub::tests::load_if_present_separates_missing_from_corrupt_project
+
+# 手工复现（真的造一个坏工程文件）
+PROJ="$HOME/Documents/音频作坊/projects/示例工程 · 频道口播"
+printf '{"sentences": [{"index": 1,' > "$PROJ/project.json"
+# 重开应用：状态栏应给出「工程文件损坏：<路径>（JSON 解析失败…）」，且文件字节不变
+# 复核它没被覆盖：ls -l "$PROJ/project.json"  # 大小应与刚写入的一致
+```

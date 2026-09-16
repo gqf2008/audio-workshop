@@ -1,7 +1,7 @@
 //! BGM 链路：文本生成分段 → 拼接/循环到配音时长 → 按句时间轴 duck → 三轨导出。
 
 use crate::audio_client::{Client, ClientError};
-use crate::dub::{write_atomic, Project};
+use crate::dub::{write_atomic_explained, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -167,7 +167,7 @@ pub fn generate_segments_stoppable(
     if !reuse_cache {
         let pending = serde_json::to_vec(&BgmManifest::pending(options))
             .map_err(|e| ClientError::Decode(e.to_string()))?;
-        write_atomic(&manifest_path(dir), &pending)
+        write_atomic_explained(&manifest_path(dir), &pending)
             .map_err(|e| ClientError::Http(e.to_string()))?;
     }
     for i in 0..total {
@@ -189,7 +189,8 @@ pub fn generate_segments_stoppable(
     // 全部段都在，才把 manifest 落成"有效"（中途停止不写，下次仍视为未完成）
     let manifest = serde_json::to_vec(&BgmManifest::from_options(options))
         .map_err(|e| ClientError::Decode(e.to_string()))?;
-    write_atomic(&manifest_path(dir), &manifest).map_err(|e| ClientError::Http(e.to_string()))?;
+    write_atomic_explained(&manifest_path(dir), &manifest)
+        .map_err(|e| ClientError::Local(e.to_string()))?;
     Ok(BgmRun::Done(total))
 }
 
@@ -234,7 +235,7 @@ fn generate_one_segment(
     if reader.duration() == 0 {
         return Err(ClientError::Decode("BGM 段为 0 帧".into()));
     }
-    write_atomic(path, &wav).map_err(|e| ClientError::Http(e.to_string()))
+    write_atomic_explained(path, &wav).map_err(|e| ClientError::Local(e.to_string()))
 }
 
 /// 将 N 个 30s 段拼接；不足目标时长时循环，最终严格截到目标帧数。
@@ -403,7 +404,7 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
 
     let voice_copy = dir.join("out/voice.wav");
     let voice_bytes = std::fs::read(&voice_path).map_err(|e| e.to_string())?;
-    write_atomic(&voice_copy, &voice_bytes).map_err(|e| e.to_string())?;
+    write_atomic_explained(&voice_copy, &voice_bytes).map_err(|e| e.to_string())?;
 
     let mixed_path = dir.join("out/mixed.wav");
     let tmp = dir.join(format!("out/mixed.wav.tmp{}", std::process::id()));

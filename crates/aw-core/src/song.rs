@@ -1,7 +1,7 @@
 //! 歌曲彩蛋链路：yue2 / ace-step 文生歌，以及 sheetsage2 → yue2 翻唱。
 
 use crate::audio_client::{Client, ClientError};
-use crate::dub::write_atomic;
+use crate::dub::write_atomic_explained;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -113,7 +113,7 @@ pub fn generate_song(
     validate(options).map_err(ClientError::Http)?;
     let wav = client.run_audio(options.model.id(), request_for(options))?;
     let path = dir.join(format!("{file_name}.wav"));
-    write_atomic(&path, &wav).map_err(|e| ClientError::Http(e.to_string()))?;
+    write_atomic_explained(&path, &wav).map_err(|e| ClientError::Local(e.to_string()))?;
     Ok(path)
 }
 

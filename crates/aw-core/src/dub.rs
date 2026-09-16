@@ -234,7 +234,8 @@ impl Project {
             ) {
                 Ok(wav) => {
                     let path = dir.join(format!("sentences/{index:03}.wav"));
-                    write_atomic(&path, &wav).map_err(|e| ClientError::Http(e.to_string()))?;
+                    write_atomic_explained(&path, &wav)
+                        .map_err(|e| ClientError::Local(e.to_string()))?;
                     let d = wav_duration(&wav)?;
                     let s = &mut self.sentences[i];
                     s.duration = Some(d);
@@ -367,7 +368,8 @@ impl Project {
         // 成品走"临时文件 + fsync + 原子替换"：旧成品在写完前不受影响，
         // 掉电不会留下 rename 到位的空文件（Python cmd_assemble 同款）。
         let final_tmp = out_dir.join(format!("final.wav.tmp{}", std::process::id()));
-        let mut writer = hound::WavWriter::create(&final_tmp, spec).map_err(|e| e.to_string())?;
+        let mut writer = hound::WavWriter::create(&final_tmp, spec)
+            .map_err(|e| hound_error_note(&final_wav, 0, &e))?;
 
         let gap_frames = (spec.sample_rate as u64 * self.gap_ms / 1000) as usize;
         let mut cursor_frames: u64 = 0;
@@ -381,14 +383,16 @@ impl Project {
                 continue;
             }
             let path = dir.join(format!("sentences/{:03}.wav", s.index));
-            let mut r = hound::WavReader::open(&path).map_err(|e| e.to_string())?;
+            let mut r = hound::WavReader::open(&path).map_err(|e| sentence_read_note(&path, &e))?;
             // 参数/截断校验已在拼装前统一做过；这里只读数据
             let samples: Vec<i16> = r
                 .samples::<i16>()
                 .collect::<Result<_, _>>()
                 .map_err(|e| e.to_string())?;
             for v in &samples {
-                writer.write_sample(*v).map_err(|e| e.to_string())?;
+                writer
+                    .write_sample(*v)
+                    .map_err(|e| hound_error_note(&final_wav, 0, &e))?;
             }
             let frames = samples.len() / spec.channels as usize;
             let start = cursor_frames as f64 / spec.sample_rate as f64;
@@ -396,7 +400,9 @@ impl Project {
             cursor_frames += frames as u64;
             if k != last {
                 for _ in 0..(gap_frames * spec.channels as usize) {
-                    writer.write_sample(0i16).map_err(|e| e.to_string())?;
+                    writer
+                        .write_sample(0i16)
+                        .map_err(|e| hound_error_note(&final_wav, 0, &e))?;
                 }
                 cursor_frames += gap_frames as u64;
             }
@@ -412,14 +418,17 @@ impl Project {
                 s.text
             ));
         }
-        writer.finalize().map_err(|e| e.to_string())?;
+        writer
+            .finalize()
+            .map_err(|e| hound_error_note(&final_wav, 0, &e))?;
         // 关文件后补一次 fsync 再 rename（wave 关闭不落盘到点，掉电可能留下空成品）
         std::fs::File::open(&final_tmp)
             .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())?;
-        std::fs::rename(&final_tmp, &final_wav).map_err(|e| e.to_string())?;
+            .map_err(|e| write_failure_note(&final_wav, 0, &e))?;
+        std::fs::rename(&final_tmp, &final_wav)
+            .map_err(|e| write_failure_note(&final_wav, 0, &e))?;
         let srt_path = out_dir.join("final.srt");
-        write_atomic(&srt_path, srt.as_bytes()).map_err(|e| e.to_string())?;
+        write_atomic_explained(&srt_path, srt.as_bytes()).map_err(|e| e.to_string())?;
         // 时间轴落进 project.json：下次打开工程/重录单句都从这里续
         self.save(dir).map_err(|e| e.to_string())?;
         Ok(Assembled {
@@ -434,7 +443,7 @@ impl Project {
     /// 工程落盘（原子写：临时文件 + fsync + rename）。
     /// 崩溃/磁盘满时不会留下写了一半的 project.json。
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        write_atomic(
+        write_atomic_explained(
             &dir.join("project.json"),
             serde_json::to_string_pretty(self).unwrap().as_bytes(),
         )
@@ -445,6 +454,113 @@ impl Project {
         serde_json::from_str(&raw)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    /// 读取工程，**把「没有工程」与「工程读不了」分开**。
+    ///
+    /// - `Ok(None)`：`project.json` 不存在 → 全新工程，照旧从零建。
+    /// - `Err(msg)`：文件在但读不了（截断 / 半截 JSON / 权限）→ 明确报错 + 路径 + 处置建议。
+    ///
+    /// 为什么不能像以前那样 `.ok()` 一丢了事：那等于把"工程损坏"当成"没有工程"，
+    /// 用户已合成的句子会全部显示成待合成（且没有一句解释），随后第一次落盘还会把
+    /// 损坏的 `project.json` 覆盖掉——唯一可人工恢复的现场就没了。
+    pub fn load_if_present(dir: &Path) -> Result<Option<Self>, String> {
+        let path = dir.join("project.json");
+        match Self::load(dir) {
+            Ok(p) => Ok(Some(p)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            // 与落盘文案同一条规矩：动作在前（界面会 elide），完整路径在后，解析细节最后
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(format!(
+                "工程文件损坏：没有自动重建，也没有覆盖它——请把 project.json 改名或移走后重开\
+                 （那样会按当前稿件从零合成），或先修好它。完整路径：{}。解析错误：{e}",
+                path.display()
+            )),
+            Err(e) => Err(format!(
+                "工程文件读不了：检查文件权限后重试；修不好就把它改名或移走再重开。\
+                 完整路径：{}。原因：{e}",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// 落盘失败的可执行文案：说清**哪个路径、要多少空间、下一步做什么**。
+///
+/// 原先的 `e.to_string()` 只会给出 `No space left on device (os error 28)`——
+/// 用户既不知道是哪个目录（模型目录？导出目录？工程目录？），也不知道要释放多少。
+pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    let need = if bytes == 0 {
+        String::new()
+    } else {
+        format!("（需要 {mb:.1} MB）")
+    };
+    match err.kind() {
+        // POSIX ENOSPC=28 / Windows ERROR_DISK_FULL=112：Rust 都归到 StorageFull。
+        // 这条错误发生在临时文件阶段（write_atomic），目标文件与旧内容都还在。
+        // 文案顺序是有意的：界面（状态栏 / 任务中心）都是 overflow: elide，
+        // 先说"发生了什么 + 该做什么"，完整路径放最后——被截断时丢的是路径而不是动作。
+        std::io::ErrorKind::StorageFull => format!(
+            "磁盘空间不足{need}：请释放空间后重跑，已完成的句子会自动跳过。路径：{}（原文件未受损）",
+            path.display()
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "没有写入权限：检查该目录权限，或把工程/导出目录换到有权限的位置。路径：{}",
+            path.display()
+        ),
+        std::io::ErrorKind::NotFound => format!(
+            "路径不存在（父目录可能被删除或移动）：重建目录后再重跑。路径：{}",
+            path.display()
+        ),
+        _ => format!("写入失败：{err}。路径：{}", path.display()),
+    }
+}
+
+/// hound（wav 读写）的错误 → 可执行文案：`IoError` 能按 io 分类的就分类，
+/// 其余原样带路径透出。拼装的流式写拿不到确切字节数，`bytes` 传 0，文案里就不提"需要多少"。
+pub fn hound_error_note(path: &Path, bytes: usize, err: &hound::Error) -> String {
+    match err {
+        hound::Error::IoError(io) => write_failure_note(path, bytes, io),
+        other => format!("音频写入失败：{}（{other}）", path.display()),
+    }
+}
+
+/// 路径的"最后两级"（`sentences/007.wav`）：被 elide 截断时，这比完整绝对路径更有用。
+fn file_label(path: &Path) -> String {
+    let mut parts: Vec<String> = path
+        .components()
+        .rev()
+        .take(2)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.is_empty() {
+        return path.display().to_string();
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+/// 读句子 wav 失败（文件丢失 / 损坏）时的可执行文案。
+///
+/// 这条只在工程里该句状态是 `done` 时才会走到——也就是"状态说已合成，文件却不在"，
+/// 必须说清是哪一句的哪个文件，否则用户只看到 `No such file or directory (os error 2)`。
+fn sentence_read_note(path: &Path, err: &hound::Error) -> String {
+    match err {
+        // 同样按 elide 排序：先文件名（用户据此知道是哪一句），动作第二，完整路径最后
+        hound::Error::IoError(io) if io.kind() == std::io::ErrorKind::NotFound => format!(
+            "句子音频丢失：{}（工程里这句状态是「已合成」）。请重录该句，或把工程目录恢复回来。完整路径：{}",
+            file_label(path),
+            path.display()
+        ),
+        other => format!("句子音频读不了：{}（{other}）。完整路径：{}", file_label(path), path.display()),
+    }
+}
+
+/// 原子写 + 失败时给出可执行文案。
+///
+/// 所有落盘都走它：`write_atomic` 的原始 io::Error 直接 `to_string()` 对用户没有可执行信息。
+pub(crate) fn write_atomic_explained(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomic(path, data)
+        .map_err(|e| std::io::Error::new(e.kind(), write_failure_note(path, data.len(), &e)))
 }
 
 /// 原子写：同目录临时文件 + fsync + rename（Python `write_atomic` 同款）。
@@ -475,6 +591,11 @@ pub fn wav_duration(wav: &[u8]) -> Result<f64, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 与 main.rs 同一个文本规范化入口（测试里只需要一个能跑的实例）。
+    fn aw_crate_normalize(t: &str) -> String {
+        crate::normalize(t, &Default::default())
+    }
 
     #[test]
     fn splits_on_sentence_punctuation() {
@@ -518,5 +639,149 @@ mod tests {
         assert_eq!(srt_timestamp(2.479), "00:00:02,479");
         assert_eq!(srt_timestamp(61.5), "00:01:01,500");
         assert_eq!(srt_timestamp(3661.25), "01:01:01,250");
+    }
+
+    /// 落盘失败的文案必须可执行：说清哪个路径、要多少空间、下一步做什么。
+    /// 尤其 ENOSPC——原来的 `e.to_string()` 只有 `No space left on device (os error 28)`。
+    #[test]
+    fn write_failure_note_is_actionable_per_error_kind() {
+        let path = Path::new("/tmp/音频作坊/projects/demo/sentences/012.wav");
+
+        // POSIX ENOSPC=28（Rust 归到 StorageFull）；这条要先钉住错误映射本身，
+        // 否则换工具链后 kind() 变了，测试会在别处莫名其妙地挂
+        let enospc = std::io::Error::from_raw_os_error(28);
+        assert_eq!(enospc.kind(), std::io::ErrorKind::StorageFull);
+        let note = write_failure_note(path, 600 * 1024, &enospc);
+        assert!(note.contains("磁盘空间不足"), "实得 {note}");
+        assert!(note.contains("sentences/012.wav"), "要说清路径：{note}");
+        assert!(note.contains("0.6 MB"), "要说清需要多少：{note}");
+        assert!(
+            note.contains("已完成的句子会自动跳过"),
+            "要给出下一步：{note}"
+        );
+        // 动作必须排在完整路径前面：状态栏/任务中心都是 elide，截断时丢的是尾巴
+        let action_at = note.find("请释放空间").expect("要有动作");
+        let path_at = note.find("/tmp/音频作坊").expect("要有完整路径");
+        assert!(action_at < path_at, "动作不能排在长路径后面：{note}");
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let note = write_failure_note(path, 1024, &denied);
+        assert!(
+            note.contains("没有写入权限") && note.contains("012.wav"),
+            "{note}"
+        );
+
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let note = write_failure_note(path, 1024, &missing);
+        assert!(
+            note.contains("路径不存在") && note.contains("012.wav"),
+            "{note}"
+        );
+
+        // 其他错误原样带上（不吞细节），但仍要说清路径
+        let other = std::io::Error::other("未知的 IO 故障");
+        let note = write_failure_note(path, 1024, &other);
+        assert!(
+            note.contains("写入失败") && note.contains("未知的 IO 故障"),
+            "{note}"
+        );
+    }
+
+    /// 原子写失败时要把分类文案一起带出来（调用方 to_string 后就有可执行信息）。
+    #[test]
+    fn write_atomic_explained_carries_the_actionable_note() {
+        let dir = std::env::temp_dir().join(format!("aw-robust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 故意不建父目录：写临时文件必然失败
+        let target = dir.join("nope/sentences/001.wav");
+        let err = write_atomic_explained(&target, b"data").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("路径不存在"), "实得 {msg}");
+        assert!(msg.contains("001.wav"), "实得 {msg}");
+    }
+
+    /// 「没有工程」与「工程坏了」必须分开：前者是从零开始，后者必须报错（不能静默重建，
+    /// 否则已合成句全变待合成，而且下一次落盘会覆盖掉损坏文件这份现场）。
+    #[test]
+    fn load_if_present_separates_missing_from_corrupt_project() {
+        let dir = std::env::temp_dir().join(format!("aw-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 没有 project.json：全新工程
+        assert!(Project::load_if_present(&dir).unwrap().is_none());
+
+        // 截断的 JSON：必须报错，且带上路径与处置建议
+        let tool = |t: &str| aw_crate_normalize(t);
+        let project = Project::new(
+            "第一句。第二句。",
+            "audio8-tts",
+            250,
+            831001,
+            None,
+            DEFAULT_PUNCTUATION,
+            80,
+            tool,
+        );
+        project.save(&dir).unwrap();
+        let good = Project::load_if_present(&dir).unwrap().unwrap();
+        assert_eq!(good.sentences.len(), 2, "正常工程照旧能读");
+
+        std::fs::write(dir.join("project.json"), b"{\"sentences\": [{\"index\": 1,").unwrap();
+        let err = Project::load_if_present(&dir).unwrap_err();
+        assert!(err.contains("工程文件损坏"), "实得 {err}");
+        assert!(err.contains("project.json"), "要说清哪个文件：{err}");
+        assert!(err.contains("没有自动重建"), "要说清不会替他做决定：{err}");
+        let action_at = err.find("请把 project.json").expect("要有动作");
+        let path_at = err.find(&dir.display().to_string()).expect("要有完整路径");
+        assert!(
+            action_at < path_at,
+            "动作要排在完整路径前（界面会 elide）：{err}"
+        );
+
+        // 读不了的场景里，损坏文件必须原样留着（本函数只读，不写）
+        let raw = std::fs::read(dir.join("project.json")).unwrap();
+        assert!(raw.starts_with(b"{\"sentences\""), "损坏文件不该被改写");
+    }
+
+    /// bytes=0（拼装是流式写，拿不到确切字节数）时不能写"需要 0.0 MB"；
+    /// hound 的 IoError 也要能分类到磁盘满。
+    #[test]
+    fn zero_byte_write_note_omits_size_and_hound_errors_are_classified() {
+        let path = Path::new("/tmp/音频作坊/projects/demo/out/final.wav");
+        let enospc = std::io::Error::from_raw_os_error(28);
+        let note = write_failure_note(path, 0, &enospc);
+        assert!(note.contains("磁盘空间不足"), "{note}");
+        assert!(!note.contains("MB"), "拿不到字节数就别提大小：{note}");
+        assert!(note.contains("final.wav"), "{note}");
+
+        let hound_err = hound::Error::IoError(std::io::Error::from_raw_os_error(28));
+        let note = hound_error_note(path, 0, &hound_err);
+        assert!(
+            note.contains("磁盘空间不足") && note.contains("final.wav"),
+            "{note}"
+        );
+    }
+
+    /// 状态是 done 但句子 wav 不在：必须说清是哪一句的哪个文件（原来是裸的 os error 2）。
+    #[test]
+    fn missing_sentence_wav_says_which_file_is_gone() {
+        let path = Path::new("/tmp/音频作坊/projects/demo/sentences/007.wav");
+        let missing = hound::Error::IoError(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let note = sentence_read_note(path, &missing);
+        assert!(note.contains("句子音频丢失"), "{note}");
+        assert!(note.contains("sentences/007.wav"), "先给文件名：{note}");
+        assert!(note.contains("已合成"), "要说清状态与文件不一致：{note}");
+        let name_at = note.find("sentences/007.wav").unwrap();
+        let full_at = note.find("/tmp/音频作坊").unwrap();
+        assert!(name_at < full_at, "短标签要排在完整路径前：{note}");
+
+        // 非 NotFound 也要带路径（损坏的 wav 同样要能定位）
+        let broken = hound::Error::FormatError("bad header");
+        let note = sentence_read_note(path, &broken);
+        assert!(
+            note.contains("句子音频读不了") && note.contains("007.wav"),
+            "{note}"
+        );
     }
 }

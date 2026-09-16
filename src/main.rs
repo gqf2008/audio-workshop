@@ -1607,7 +1607,9 @@ fn load_resumable(
         Some(path) => Some(sha256_file(Path::new(path))?),
         None => None,
     };
-    let saved = Project::load(dir).ok();
+    // 损坏的工程在这里必须**中止**：`.ok()` 会把它当成"没有工程"，已合成句全变待合成，
+    // 随后第一次落盘还会覆盖掉损坏文件（现场丢失）。见 Project::load_if_present。
+    let saved = Project::load_if_present(dir)?;
     if let Some(saved) = saved.as_ref() {
         if saved.model == model
             && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
@@ -2002,8 +2004,15 @@ fn restore_project(
 ) {
     let stem = file_stem(&ui.get_project_name());
     let dir = project_dir(&stem);
-    let Ok(project) = Project::load(&dir) else {
-        return;
+    let project = match Project::load_if_present(&dir) {
+        Ok(Some(p)) => p,
+        Ok(None) => return, // 没有工程文件：全新开始，正常路径
+        Err(note) => {
+            // 读不了就说清路径与处置建议。以前这里静默 return，用户看到的是
+            // "进度凭空消失"，连哪里坏了都不知道。
+            ui.set_status_text(note.into());
+            return;
+        }
     };
     *state.project_dir.borrow_mut() = Some(dir.clone());
     // 输入框与列表同源：把保存的句子文本回填到输入框。
@@ -5227,5 +5236,30 @@ mod tests {
             assert!(chip.contains("40%"), "{kind:?} 的 chip 实得 {chip}");
         }
         assert!(!tasks::TaskKind::Song.reports_progress());
+    }
+
+    /// 工程损坏时开始合成必须**中止**而不是静默重建：以前 `Project::load(dir).ok()` 会把它
+    /// 当成"没有工程"，已合成句全变待合成且没有一句解释；更糟的是随后落盘会覆盖掉损坏
+    /// 文件——那是唯一可人工恢复的现场。这里同时守住"缺文件仍是全新工程"这条回归。
+    #[test]
+    fn corrupt_project_aborts_the_run_and_keeps_the_file() {
+        let dir = temp_dir("corrupt-project");
+        let broken = br#"{"sentences": [{"index": 1,"#;
+        std::fs::write(dir.join("project.json"), broken).unwrap();
+
+        let err = load_resumable(&dir, "第一句。第二句。", "audio8-tts", None).unwrap_err();
+        assert!(err.contains("工程文件损坏"), "实得 {err}");
+        assert!(err.contains("project.json"), "要说清哪个文件：{err}");
+        assert!(err.contains("没有自动重建"), "要明确不替用户做决定：{err}");
+        assert_eq!(
+            std::fs::read(dir.join("project.json")).unwrap(),
+            broken,
+            "损坏的工程文件必须原样留着（不能被新工程覆盖）"
+        );
+
+        // 回归：没有 project.json 的目录仍然按全新工程走，不能被这条守卫误伤
+        let fresh = temp_dir("fresh-project");
+        let loaded = load_resumable(&fresh, "第一句。第二句。", "audio8-tts", None).unwrap();
+        assert_eq!(loaded.project.sentences.len(), 2);
     }
 }
