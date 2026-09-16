@@ -15,7 +15,10 @@ pub mod song;
 pub mod text_layer;
 
 pub use audio_client::{Client, ClientError};
-pub use bgm::{assemble_bgm, generate_segments, mix_project, BgmArtifacts, BgmOptions};
+pub use bgm::{
+    assemble_bgm, generate_segments, generate_segments_stoppable, mix_project, BgmArtifacts,
+    BgmOptions, BgmRun,
+};
 pub use dub::{
     split_sentences, srt_timestamp, Assembled, Project, Sentence, DEFAULT_INSTRUCTION,
     DEFAULT_PUNCTUATION, REDO_SEED_STEP,

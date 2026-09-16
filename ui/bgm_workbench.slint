@@ -18,7 +18,8 @@ export component BgmWorkbench inherits Rectangle {
     in property <float> progress: 0.0;
     in property <bool> busy: false;
     in property <bool> has-result: false;
-    // 配音成品是否就绪：没有它仍可只生成 BGM，只是不能混音
+    // 配音**成品**（out/final.wav）是否就绪：BGM 依赖它定目标时长与 duck 时间轴，
+    // 没有它主操作禁用（独立生成 BGM 是后续项，见 screens.md §3.3 的差异说明）
     in property <bool> voice-ready: false;
     // 改过 prompt 之后旧产物是"旧版本"（仍可试听，不再作为当前结果）
     in property <bool> stale: false;

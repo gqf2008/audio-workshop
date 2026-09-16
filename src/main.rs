@@ -26,8 +26,8 @@ use std::time::Duration;
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use aw_core::{
-    assemble_bgm, generate_segments, generate_song, mix_project, BgmArtifacts, BgmOptions, Client,
-    Project, SongModel, SongOptions, DEFAULT_PUNCTUATION,
+    assemble_bgm, generate_segments_stoppable, generate_song, mix_project, BgmArtifacts,
+    BgmOptions, BgmRun, Client, Project, SongModel, SongOptions, DEFAULT_PUNCTUATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -154,6 +154,10 @@ enum Msg {
         segments: usize,
     },
     BgmFailed(String),
+    /// BGM 在段间被用户停止（已完成 `done` 段）；与失败区分开，不说成"完成"。
+    BgmStopped {
+        done: usize,
+    },
     /// 音色试听合成完成（wav 字节 + 展示用音色名）
     VoicePreview {
         wav: Vec<u8>,
@@ -999,23 +1003,38 @@ fn worker_loop(ctx: WorkerCtx) {
                     ..Default::default()
                 };
                 let tx = ctx.tx.clone();
-                let segments =
-                    match generate_segments(&client, dir, &options, |done, total, note| {
+                let stop = Arc::clone(&ctx.stop);
+                let segments = match generate_segments_stoppable(
+                    &client,
+                    dir,
+                    &options,
+                    |done, total, note| {
                         let _ = tx.send(WorkerMsg {
                             revision,
                             msg: Msg::BgmProgress { done, total },
                         });
                         let _ = note;
-                    }) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = ctx.tx.send(WorkerMsg {
-                                revision,
-                                msg: Msg::BgmFailed(format!("BGM 生成失败: {e}")),
-                            });
-                            continue;
-                        }
-                    };
+                    },
+                    || stop.load(Ordering::Relaxed),
+                ) {
+                    Ok(BgmRun::Done(n)) => n,
+                    Ok(BgmRun::Stopped(done)) => {
+                        // 段间停止：不混音、不产出成品；已完成的分段留在目录里，
+                        // 下次同 prompt 再生成时按 manifest 复用（manifest 未写成有效）。
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::BgmStopped { done },
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::BgmFailed(format!("BGM 生成失败: {e}")),
+                        });
+                        continue;
+                    }
+                };
                 if let Err(e) = assemble_bgm(dir, &options) {
                     let _ = ctx.tx.send(WorkerMsg {
                         revision,
@@ -1600,6 +1619,8 @@ fn main() -> Result<(), slint::PlatformError> {
     refresh_tasks(&ui, &state);
     #[cfg(debug_assertions)]
     seed_shot_tasks(&ui, &state);
+    #[cfg(debug_assertions)]
+    seed_shot_bgm_artifacts(&ui, &state);
 
     // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
     apply_shot_state(&ui);
@@ -1886,6 +1907,8 @@ fn invalidate_worker_project(cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
         .project_revision
         .set(state.project_revision.get().wrapping_add(1));
     state.assembled.borrow_mut().take();
+    // 工程作废 → 配音成品也不再可用（BGM 的混音前置条件随之失效）
+    // 注意：调用方是否持有 ui 不一定，所以这里只清状态，UI 侧的 flag 由调用点刷新。
     let _ = cmd_tx.send(Cmd::InvalidateProject);
 }
 
@@ -2076,6 +2099,40 @@ fn wire_script(
 /// （那里已经知道该重试什么参数，任务中心不复制这套状态）。
 /// 截图/演示用：`AW_UI_STATE=tasks` 时灌三条示例任务并打开任务中心
 /// （仅 debug 构建存在，release 被编译掉）。
+/// `AW_UI_STATE=bgm-done` 时给结果区塞一份**真实存在的** wav 当三轨：
+/// 示例态下点「试听」「导出」也能真跑，而不只是渲染核对。
+/// （找不到样例文件就什么都不做，界面仍显示标签，只是点了会提示"还没有成品"。）
+#[cfg(debug_assertions)]
+fn seed_shot_bgm_artifacts(ui: &MainWindow, state: &Rc<UiState>) {
+    if std::env::var("AW_UI_STATE").as_deref() != Ok("bgm-done") {
+        return;
+    }
+    let candidates = [
+        PathBuf::from("/tmp/aw-sep-src.wav"),
+        project_dir(&file_stem(&ui.get_project_name())).join("out/final.wav"),
+    ];
+    let Some(sample) = candidates.into_iter().find(|p| p.is_file()) else {
+        return;
+    };
+    *state.bgm_artifacts.borrow_mut() = Some(artifacts_like(&sample));
+}
+
+#[cfg(not(debug_assertions))]
+#[allow(dead_code)]
+fn seed_shot_bgm_artifacts(_ui: &MainWindow, _state: &Rc<UiState>) {}
+
+#[cfg(debug_assertions)]
+fn artifacts_like(sample: &Path) -> BgmArtifacts {
+    BgmArtifacts {
+        voice: sample.to_path_buf(),
+        bgm: sample.to_path_buf(),
+        mixed: sample.to_path_buf(),
+        srt: sample.with_extension("srt"),
+        duration: 4.27,
+        segments: 5,
+    }
+}
+
 #[cfg(debug_assertions)]
 fn seed_shot_tasks(ui: &MainWindow, state: &Rc<UiState>) {
     if std::env::var("AW_UI_STATE").as_deref() != Ok("tasks") {
@@ -2502,36 +2559,6 @@ fn wire_export(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
     });
 }
 
-fn export_bgm_tracks(ui: &MainWindow, state: &Rc<UiState>) {
-    let Some(artifacts) = state.bgm_artifacts.borrow().clone() else {
-        ui.set_status_text("还没有 BGM 成品：先生成并混音".into());
-        return;
-    };
-    let dir = PathBuf::from(ui.get_export_dir().to_string());
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        ui.set_status_text(format!("导出目录不可写（{}）: {e}", dir.display()).into());
-        return;
-    }
-    let stem = stem_of(ui);
-    let jobs = [
-        (artifacts.voice, format!("{stem}_voice.wav")),
-        (artifacts.bgm, format!("{stem}_bgm.wav")),
-        (artifacts.mixed, format!("{stem}_mixed.wav")),
-        (artifacts.srt, format!("{stem}.srt")),
-    ];
-    let mut last = PathBuf::new();
-    for (src, name) in jobs {
-        let dst = dir.join(name);
-        if let Err(e) = std::fs::copy(&src, &dst) {
-            ui.set_status_text(format!("导出 {} 失败: {e}", dst.display()).into());
-            return;
-        }
-        last = dst;
-    }
-    toast(ui, &format!("已导出三轨：{}", last.display()));
-    ui.set_status_text(format!("已导出 voice / bgm / mixed / srt 到 {}", dir.display()).into());
-}
-
 fn wire_bgm(
     ui: &MainWindow,
     cmd_tx: &Sender<Cmd>,
@@ -2542,6 +2569,7 @@ fn wire_bgm(
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
     let state1 = state.clone();
+    let stop1 = Arc::clone(stop);
     ui.on_bgm_generate(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_running() || ui.get_busy() || ui.get_sep_busy() {
@@ -2559,6 +2587,8 @@ fn wire_bgm(
         }
         reset_bgm(&ui, &state1);
         ui.set_busy(true);
+        // 清停止位：否则上一轮遗留的 stop 会让新任务在第一次段间检查时立刻停掉
+        stop1.store(false, Ordering::Relaxed);
         // 新的一轮开始：旧产物不再是"当前结果"（has_result 由 reset_bgm 清掉），stale 也一并复位
         ui.set_bgm_stale(false);
         start_task(
@@ -2608,6 +2638,9 @@ fn wire_bgm(
     let weak = ui.as_weak();
     ui.on_bgm_prompt_edited(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_busy() || ui.get_running() {
+            return;
+        }
         if ui.get_bgm_has_result() && !ui.get_bgm_stale() {
             ui.set_bgm_stale(true);
             ui.set_bgm_status_text(
@@ -2641,12 +2674,7 @@ fn wire_bgm(
         }
     });
 
-    let weak = ui.as_weak();
-    let state3 = state.clone();
-    ui.on_bgm_export_tracks(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        export_bgm_tracks(&ui, &state3);
-    });
+    // 旧的两个入口（整包试听/整包导出）已随结果区改造下线：试听/导出都按轨走。
 
     // 单独导出某一轨（结果区每行一个导出）
     let weak = ui.as_weak();
@@ -3056,6 +3084,15 @@ fn tick(
                 ui.set_status_text(note.into());
                 *state.bgm_artifacts.borrow_mut() = Some(artifacts);
             }
+            Msg::BgmStopped { done } => {
+                ui.set_busy(false);
+                ui.set_bgm_has_result(false);
+                ui.set_bgm_progress(0.0);
+                let note = format!("已停止：完成了 {done} 段（未混音；下次同描述可复用已完成段）");
+                ui.set_bgm_status_text(note.clone().into());
+                ui.set_status_text(note.clone().into());
+                finish_task(ui, state, &state.bgm_task, tasks::TaskState::Stopped, note);
+            }
             Msg::BgmFailed(error) => {
                 ui.set_busy(false);
                 finish_task(
@@ -3225,6 +3262,11 @@ fn tick(
             ui.set_has_result(true);
         }
     }
+
+    // ── 配音成品就绪 → UI（BGM 的混音前置条件）──
+    // 单一真相是 state.assembled（拼装成功时置、作废工程时清），每 tick 同步一次；
+    // 值没变时 Slint 不会重绘。
+    ui.set_dub_product_ready(state.assembled.borrow().is_some());
 
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {

@@ -143,6 +143,9 @@ export component MainWindow inherits Window {
     in property <bool> bgm-stale: false;
     in-out property <int> bgm-duck-index: 1;
     in property <string> status-text: "就绪";
+    // 配音**成品**是否就绪（out/final.wav 已拼装）——BGM 的混音依赖它。
+    // 不能用 has-result 代替：那是「任意一句合成成功」，不足以做混音。
+    in property <bool> dub-product-ready: false;
     // 服务后端（metal / cuda / cpu…），来自 /health；与音色面板的 engine-label（模型名）不是一回事
     in property <string> backend-label: "audio.cpp";
     in property <string> export-dir: "";
@@ -175,8 +178,6 @@ export component MainWindow inherits Window {
     callback clear-script();
     callback resplit();
     callback bgm-generate();
-    callback bgm-preview();
-    callback bgm-export-tracks();
     callback bgm-stop();
     callback bgm-prompt-edited();
     callback bgm-preview-track(int);
@@ -364,7 +365,7 @@ export component MainWindow inherits Window {
                     prompt <=> root.bgm-prompt;
                     progress: root.bgm-progress;
                     busy: root.busy || root.running;
-                    voice-ready: root.has-result;
+                    voice-ready: root.dub-product-ready;
                     stale: root.bgm-stale;
                     has-result: root.bgm-has-result;
                     status-text: root.bgm-status-text;
