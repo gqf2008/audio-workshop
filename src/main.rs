@@ -3282,6 +3282,15 @@ fn project_editing_blocked(ui: &MainWindow, state: &Rc<UiState>) -> bool {
     ui.get_running() || ui.get_busy() || state.eval_task.get().is_some()
 }
 
+/// 导出分轨时，"这一套 BGM 结果还算不算当前"。
+///
+/// 判据是 `has_result && !stale`：改 BGM 描述后 UI 只置 `stale`（结果还在、还能试听），
+/// 所以光看 `has_result` 会把旧结果当当前成品导出去（复核指出）。从磁盘恢复的那套
+/// 一律按 stale 处理（见 `restore_bgm_from_disk`）。
+fn bgm_result_exportable(has_result: bool, stale: bool) -> bool {
+    has_result && !stale
+}
+
 /// 把一套 BGM 产物灌进界面（含"有哪几轨显示哪几轨"）。
 ///
 /// 抽出来是为了让**从磁盘恢复**（重开应用打开旧工程）与"刚跑完混音"走同一段界面更新，
@@ -3324,9 +3333,13 @@ fn restore_bgm_from_disk(ui: &MainWindow, state: &Rc<UiState>, dir: &Path) {
     }
     if let Ok(artifacts) = aw_core::bgm_artifacts_from_disk(dir) {
         apply_bgm_artifacts(ui, state, &artifacts);
+        // 恢复出来的这套**只作查看/试听**：上次会话用的是什么描述、什么参数，重开后
+        // 判不出来（BGM 描述还没持久化），那就不能假装它是"当前结果"。
+        // 要导分轨就重新生成并混音——分段有缓存，通常几秒。
+        ui.set_bgm_stale(true);
         ui.set_bgm_status_text(
             format!(
-                "已恢复上次的 BGM 产物：{} 段 · 成品 {:.1}s",
+                "上次的 BGM 产物（{} 段 · {:.1}s）仅供查看/试听；要导分轨请重新生成并混音（分段有缓存）",
                 artifacts.segments, artifacts.duration
             )
             .into(),
@@ -4515,10 +4528,14 @@ fn wire_export(
         }
         let name = file_stem(&ui.get_project_name());
         let dir = PathBuf::from(ui.get_export_dir().to_string());
-        // `bgm_has_result`：UI 认为磁盘上的 BGM/混音仍是当前结果（改稿、改 BGM 描述后
-        // 会被清掉）。描述改没改只有 UI 知道，磁盘那层只看"配没配上这份配音成品"。
-        let outcome =
-            export::export_stems(&name, &project_dir(&name), &dir, ui.get_bgm_has_result());
+        // 判据：UI 认为这套 BGM 结果仍是当前结果（改描述会置 stale、从磁盘恢复的也是 stale）。
+        // 描述改没改只有 UI 知道，磁盘那层只看"配没配上这份配音成品"。
+        let outcome = export::export_stems(
+            &name,
+            &project_dir(&name),
+            &dir,
+            bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
+        );
         let text = match &outcome {
             export::StemExportOutcome::Done(s) => {
                 if let Some(first) = s.written.first() {
@@ -4677,7 +4694,7 @@ fn wire_bgm(
             &project,
             &dir,
             stem_for_track(i),
-            ui.get_bgm_has_result(),
+            bgm_result_exportable(ui.get_bgm_has_result(), ui.get_bgm_stale()),
         ) {
             export::StemExportOutcome::Done(s) => {
                 let Some(path) = s.written.first() else {
@@ -8183,6 +8200,20 @@ mod tests {
             accompaniment.display()
         );
     }
+    /// "这套 BGM 结果还算不算当前"：`has_result && !stale`。
+    /// 改描述后只置 stale（结果还在、能试听），光看 has_result 会把旧结果当当前导出；
+    /// 从磁盘恢复的那套一律 stale（重开后判不出上次用的描述）。
+    #[test]
+    fn bgm_result_is_exportable_only_when_current() {
+        assert!(bgm_result_exportable(true, false), "会话内刚混完的才算当前");
+        assert!(
+            !bgm_result_exportable(true, true),
+            "描述改过/磁盘恢复的不能导"
+        );
+        assert!(!bgm_result_exportable(false, false), "没有结果当然不能导");
+        assert!(!bgm_result_exportable(false, true));
+    }
+
     /// 导出的互斥判据：两个写者（UI 侧在飞的拼装/混音/导出、批量 worker 每篇的拼装）
     /// 任何一个在飞都不许导——`assemble` 先发布 final.wav 再写 final.srt，混音也是先写
     /// voice/mixed 再落盘，中间导出去就会配错成对产物。
