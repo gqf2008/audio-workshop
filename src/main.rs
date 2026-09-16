@@ -5205,6 +5205,18 @@ fn tick(
                 ui.set_status_text(error.into());
             }
             Msg::BatchScriptsPicked { paths } => {
+                // 用户在文件框里按了取消（= 没选到任何路径）：这是 no-op，不能把已经
+                // 导入好的那份列表清掉——"取消"不该有破坏性副作用（复核提的 UX 残留）。
+                if paths.is_empty() {
+                    let note = if state.batch_rows.borrow().is_empty() {
+                        "没有选稿件".to_string()
+                    } else {
+                        "已取消选择，列表不变".to_string()
+                    };
+                    refresh_batch_summary(ui, state, &note);
+                    ui.set_status_text(note.into());
+                    continue;
+                }
                 // 一次导入 N 篇：读文件、跳过有问题的、按顺序建行（纯逻辑在 batch.rs）
                 let outcome = batch::import_scripts(&paths, file_stem);
                 {
