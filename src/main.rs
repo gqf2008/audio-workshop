@@ -2520,8 +2520,7 @@ fn seed_shot_tasks(ui: &MainWindow, state: &Rc<UiState>) {
         .tasks
         .borrow_mut()
         .progress(running, 0.35, "第 12/34 句已完成");
-    // 槽位也要对上：任务中心的「停止」按钮判据是"这条是不是该 Tab 在飞那条"
-    state.dub_task.set(Some(running));
+
     let failed = state
         .tasks
         .borrow_mut()
@@ -2539,12 +2538,12 @@ fn seed_shot_tasks(ui: &MainWindow, state: &Rc<UiState>) {
         .tasks
         .borrow_mut()
         .finish(done, tasks::TaskState::Done, "成品 168.0s");
-    // 排队中的条目：截图/演示也要能看到「排队中 #N」这一档（且它可停 → 显示停止按钮）
-    let queued = state
+    // 排队中的条目：截图/演示也要能看到「排队中 #N」这一档
+    // （**不**占真实槽位：演示任务不是真在飞，占了会让启动守卫把它当成真任务）
+    state
         .tasks
         .borrow_mut()
         .enqueue(tasks::TaskKind::Separation, "人声分离 · 频道口播");
-    state.sep_task.set(Some(queued));
     ui.set_task_center_open(true);
     refresh_tasks(ui, state);
     ui.set_status_text("任务中心：跨 Tab 任务台账（示例数据，切 Tab 不会取消任务）".into());
@@ -2622,6 +2621,27 @@ fn stop_song(ui: &MainWindow, state: &Rc<UiState>) {
 ///
 /// 每个 Tab 同时最多一条在飞，所以"这条任务的 id 是否等于该 Tab 槽位里的 id"
 /// 就足以确认点的是同一条；对不上（例如列表里更早的那条）就什么都不做。
+/// 任务中心「停止」要停哪一类（纯判定，便于单测"错误的 task_id 不会停当前任务"）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StopTarget {
+    Dub,
+    Bgm,
+    Separation,
+    Song,
+}
+
+/// 判定 (task_id, kind) 对应哪个停止位。**必须同时匹配槽位**——列表里更早的那条
+/// 任务 id 不等于该 Tab 槽位里的 id，那种点击什么都不该发生。
+fn stop_target(task_id: u32, kind: tasks::TaskKind, slots: &TaskSlots) -> Option<StopTarget> {
+    match kind {
+        tasks::TaskKind::Dub if slots.dub == Some(task_id) => Some(StopTarget::Dub),
+        tasks::TaskKind::Bgm if slots.bgm == Some(task_id) => Some(StopTarget::Bgm),
+        tasks::TaskKind::Separation if slots.sep == Some(task_id) => Some(StopTarget::Separation),
+        tasks::TaskKind::Song if slots.song == Some(task_id) => Some(StopTarget::Song),
+        _ => None,
+    }
+}
+
 fn stop_task_from_center(
     ui: &MainWindow,
     state: &Rc<UiState>,
@@ -2629,26 +2649,19 @@ fn stop_task_from_center(
     sep_stop: &Arc<AtomicBool>,
     task_id: u32,
 ) {
+    let slots = TaskSlots::from_state(state);
     let kind = state
         .tasks
         .borrow()
         .tasks_newest_first()
         .find(|t| t.id == task_id)
         .map(|t| t.kind);
-    match kind {
-        Some(tasks::TaskKind::Dub) if state.dub_task.get() == Some(task_id) => {
-            stop_dub_run(ui, stop)
-        }
-        Some(tasks::TaskKind::Bgm) if state.bgm_task.get() == Some(task_id) => {
-            stop_bgm_run(ui, stop)
-        }
-        Some(tasks::TaskKind::Separation) if state.sep_task.get() == Some(task_id) => {
-            stop_separation(ui, state, sep_stop)
-        }
-        Some(tasks::TaskKind::Song) if state.song_task.get() == Some(task_id) => {
-            stop_song(ui, state)
-        }
-        _ => {}
+    match kind.and_then(|k| stop_target(task_id, k, &slots)) {
+        Some(StopTarget::Dub) => stop_dub_run(ui, stop),
+        Some(StopTarget::Bgm) => stop_bgm_run(ui, stop),
+        Some(StopTarget::Separation) => stop_separation(ui, state, sep_stop),
+        Some(StopTarget::Song) => stop_song(ui, state),
+        None => {}
     }
 }
 
@@ -2674,7 +2687,7 @@ fn wire_task_center(
     });
 
     let weak = ui.as_weak();
-    ui.on_task_jump(move |tab| {
+    ui.on_task_jump(move |tab, state| {
         let Some(ui) = weak.upgrade() else { return };
         let tab = tab.clamp(0, ui.get_scenes().row_count() as i32 - 1);
         ui.set_scene(tab);
@@ -2684,7 +2697,15 @@ fn wire_task_center(
             .row_data(tab as usize)
             .map(|s| s.to_string())
             .unwrap_or_default();
-        ui.set_status_text(format!("已切到「{name}」：任务在后台继续跑").into());
+        // 说对话：失败/已停止的任务不会"在后台继续跑"（复核抓到无条件文案与按钮不符）
+        let note = if state == "失败" {
+            format!("已切到「{name}」：在那里点开始/重录重试")
+        } else if state == "运行中" || state.starts_with("排队中") {
+            format!("已切到「{name}」：任务在后台继续跑")
+        } else {
+            format!("已切到「{name}」")
+        };
+        ui.set_status_text(note.into());
     });
 
     let weak = ui.as_weak();
@@ -5455,5 +5476,44 @@ mod tests {
             ..TaskSlots::default()
         };
         assert!(!task_rows(&q4, &slots4)[0].can_stop, "失败条目不能停");
+    }
+
+    /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。
+    /// 列表里可能同时有更早的同类任务（例如上一条已停止的配音），点它必须什么都不做。
+    #[test]
+    fn stop_target_requires_the_slot_to_match() {
+        let slots = TaskSlots {
+            dub: Some(10),
+            bgm: Some(20),
+            sep: Some(30),
+            song: Some(40),
+        };
+        assert_eq!(
+            stop_target(10, tasks::TaskKind::Dub, &slots),
+            Some(StopTarget::Dub)
+        );
+        assert_eq!(
+            stop_target(20, tasks::TaskKind::Bgm, &slots),
+            Some(StopTarget::Bgm)
+        );
+        assert_eq!(
+            stop_target(30, tasks::TaskKind::Separation, &slots),
+            Some(StopTarget::Separation)
+        );
+        assert_eq!(
+            stop_target(40, tasks::TaskKind::Song, &slots),
+            Some(StopTarget::Song)
+        );
+
+        // 同类但 id 不是当前在飞那条（更早的任务）→ 不派发
+        assert_eq!(stop_target(9, tasks::TaskKind::Dub, &slots), None);
+        assert_eq!(stop_target(19, tasks::TaskKind::Bgm, &slots), None);
+        assert_eq!(stop_target(29, tasks::TaskKind::Separation, &slots), None);
+        assert_eq!(stop_target(39, tasks::TaskKind::Song, &slots), None);
+        // 槽位为空时也不能派发（例如任务已经收尾）
+        assert_eq!(
+            stop_target(10, tasks::TaskKind::Dub, &TaskSlots::default()),
+            None
+        );
     }
 }
