@@ -34,4 +34,5 @@ export struct TaskRow {
     detail: string,   // 进度或失败原因
     progress: float,  // 0..1
     tab: int,         // 「跳转」切到哪个主 Tab
+    can_stop: bool,   // 这条现在能不能停（按种类能力 × 状态 × 是否本 Tab 在飞那条）
 }
