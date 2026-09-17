@@ -16,11 +16,30 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 /// 读盘缓冲区：64 KiB 在进度粒度与系统调用次数之间取平衡。
 const CHUNK: usize = 64 * 1024;
+
+/// 网络超时。用**单次 socket 读超时**而不是 ureq 的总超时：总超时会把"下 2 GB 权重"
+/// 整条判失败，读超时只判"连接还在但一直不给数据"——正是"服务端卡住，用户点了取消
+/// 却一直等"的场景（ureq 2 默认**没有任何超时**，会一直阻塞在 read 上）。
+#[derive(Clone, Copy, Debug)]
+pub struct Timeouts {
+    pub connect: Duration,
+    pub read: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            connect: Duration::from_secs(15),
+            read: Duration::from_secs(30),
+        }
+    }
+}
 
 /// `Downloader::cancel` 的结果（UI 要据此说对话，不能把"其实已经结束"说成"已取消"）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,12 +188,26 @@ pub fn part_path(dest: &Path) -> PathBuf {
 pub fn download(
     spec: &TaskSpec,
     cancel: &AtomicBool,
+    on_progress: impl FnMut(&Snapshot),
+) -> Result<Outcome, DownloadError> {
+    download_with(spec, cancel, Timeouts::default(), on_progress)
+}
+
+/// 同 [`download`]，但可注入超时（单测用它把"服务端卡住"压到毫秒级）。
+pub fn download_with(
+    spec: &TaskSpec,
+    cancel: &AtomicBool,
+    timeouts: Timeouts,
     mut on_progress: impl FnMut(&Snapshot),
 ) -> Result<Outcome, DownloadError> {
     // 还没开始就被取消：一个网络请求都不发（取消排队中的任务走这条）
     if cancel.load(Ordering::Relaxed) {
         return Err(DownloadError::Cancelled);
     }
+    let agent = ureq::builder()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .build();
     if let Some(parent) = spec.dest.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -191,7 +224,7 @@ pub fn download(
     let mut allow_retry = offset > 0;
 
     let (mut reader, mut writer, mut downloaded, total, resumed) = loop {
-        let resp = send_get(&spec.url, offset)?;
+        let resp = send_get(&agent, &spec.url, offset)?;
         let status = resp.status();
         match status {
             206 if offset > 0 => {
@@ -336,8 +369,8 @@ pub fn download(
 
 /// 发一次 GET；`offset > 0` 时带 Range 头。`Accept-Encoding: identity` 保证
 /// 字节流与 Content-Length 对齐（透明 gzip 会让续传的偏移全错）。
-fn send_get(url: &str, offset: u64) -> Result<ureq::Response, DownloadError> {
-    let mut req = ureq::get(url).set("Accept-Encoding", "identity");
+fn send_get(agent: &ureq::Agent, url: &str, offset: u64) -> Result<ureq::Response, DownloadError> {
+    let mut req = agent.get(url).set("Accept-Encoding", "identity");
     if offset > 0 {
         req = req.set("Range", &format!("bytes={offset}-"));
     }
@@ -609,6 +642,12 @@ mod tests {
         range: Option<String>,
     }
 
+    /// 服务端行为：`stall` 让服务端发完头就不写 body（钉读超时）。
+    struct ServeBehavior {
+        honor_range: bool,
+        stall_body: Option<Duration>,
+    }
+
     /// 极简 HTTP/1.1 mock：每个 GET 回一次响应；`honor_range` 决定认不认 Range。
     struct MockServer {
         addr: std::net::SocketAddr,
@@ -618,6 +657,27 @@ mod tests {
 
     impl MockServer {
         fn start(body: Vec<u8>, honor_range: bool) -> MockServer {
+            Self::start_with(
+                body,
+                ServeBehavior {
+                    honor_range,
+                    stall_body: None,
+                },
+            )
+        }
+
+        /// 发完响应头就停住不写 body，`stall` 之后才关连接（B2：读超时必须生效）。
+        fn start_stalling(len: usize, stall: Duration) -> MockServer {
+            Self::start_with(
+                vec![0u8; len],
+                ServeBehavior {
+                    honor_range: false,
+                    stall_body: Some(stall),
+                },
+            )
+        }
+
+        fn start_with(body: Vec<u8>, behavior: ServeBehavior) -> MockServer {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(Mutex::new(Vec::new()));
@@ -630,7 +690,7 @@ mod tests {
                         break;
                     }
                     let Ok(mut stream) = stream else { break };
-                    serve_one(&mut stream, &body, honor_range, &hits_srv);
+                    serve_one(&mut stream, &body, &behavior, &hits_srv);
                 }
             });
             MockServer { addr, hits, stop }
@@ -653,7 +713,12 @@ mod tests {
         }
     }
 
-    fn serve_one(stream: &mut TcpStream, body: &[u8], honor_range: bool, hits: &Mutex<Vec<Hit>>) {
+    fn serve_one(
+        stream: &mut TcpStream,
+        body: &[u8],
+        behavior: &ServeBehavior,
+        hits: &Mutex<Vec<Hit>>,
+    ) {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -687,7 +752,21 @@ mod tests {
             path,
             range: range.clone(),
         });
+        // 卡住模式：只发头，body 一直不写，`stall` 之后才关连接
+        if let Some(stall) = behavior.stall_body {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            use std::io::Write as _;
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            std::thread::sleep(stall);
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
 
+        let honor_range = behavior.honor_range;
         let start = range
             .as_deref()
             .and_then(|r| r.strip_prefix("bytes="))
@@ -931,6 +1010,38 @@ mod tests {
             CancelOutcome::Finished,
             "任务已收尾，不能再报「已取消」"
         );
+    }
+
+    /// B2（复核阻塞项）：服务端发完响应头就卡住不写 body 时，读超时必须生效——否则
+    /// 取消（以及后面排队的任务）会一直等下去。ureq 2 默认**没有任何超时**。
+    ///
+    /// 这条对旧实现会红：不设超时时读会一直阻塞到 mock 8 秒后关连接，`elapsed < 5s` 不成立。
+    #[test]
+    fn stalled_read_hits_the_timeout_instead_of_hanging() {
+        let root = temp_dir("stall");
+        let srv = MockServer::start_stalling(32 * 1024, Duration::from_secs(8));
+        let dest = root.join("model.bin");
+        let s = spec(srv.url("/m/model.bin"), dest.clone(), &[]);
+        let start = Instant::now();
+        let r = download_with(
+            &s,
+            &AtomicBool::new(false),
+            Timeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_millis(300),
+            },
+            |_| {},
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(r, Err(DownloadError::Http(_))),
+            "卡住的读应报网络错误，实际 {r:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "读超时没生效：卡了 {elapsed:?}（默认无超时时会一直等到服务端关连接）"
+        );
+        assert!(!dest.exists());
     }
 
     #[test]
