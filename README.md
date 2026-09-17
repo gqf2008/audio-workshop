@@ -32,6 +32,13 @@
 （macOS 保留 `~/.local/opt/audio.cpp/server.json`，Linux 用 `~/.config/audio.cpp/server.json`，
 Windows 用 `%APPDATA%\\audio.cpp\\server.json`）。
 
+**平台要求（系统对话框）**：应用里的「选文件 / 选目录」用各平台**自带**的程序拉起——
+macOS `osascript`、Windows PowerShell、Linux **`zenity`**（不随本应用分发，要自己装）：
+Debian/Ubuntu `sudo apt install zenity`、Fedora `sudo dnf install zenity`、
+Arch `sudo pacman -S zenity`。缺了它**不会**静默失败：状态行会如实说「系统对话框不可用」
+并给出这条安装命令；macOS 上被「系统设置 → 隐私与安全性 → 自动化」拒绝时同样会给授权指引
+（用户取消与选择器起不来是两回事，判定与文案都在 `src/picker.rs` 一处）。
+
 ```bash
 cargo run --release        # 打开配音工作台
 ```
