@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_PUNCTUATION: &str = "。！？；…";
-/// Python 侧 cmd_synth 恒发这条 instruction（不是可选装饰：不发音色/语气线索时读法更飘）
-pub const DEFAULT_INSTRUCTION: &str = "自然、清晰的叙述语气";
 /// 重录时的 seed 步进（Python `cmd_redo`：`s["seed"] += 1000`）
 pub const REDO_SEED_STEP: u64 = 1000;
 
@@ -216,10 +214,9 @@ impl Project {
         client: &Client,
         dir: &Path,
         only: Option<&[usize]>,
-        instruction: Option<&str>,
         on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
-        self.synthesize_stoppable(client, dir, only, instruction, None, on_progress)
+        self.synthesize_stoppable(client, dir, only, None, on_progress)
     }
 
     /// 带协作取消的合成：UI 的「停止合成」置 `stop` 位，句间检查（正在合成的那句
@@ -229,12 +226,10 @@ impl Project {
         client: &Client,
         dir: &Path,
         only: Option<&[usize]>,
-        instruction: Option<&str>,
         stop: Option<&std::sync::atomic::AtomicBool>,
         mut on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
         std::fs::create_dir_all(dir.join("sentences")).ok();
-        let instruction = instruction.unwrap_or(DEFAULT_INSTRUCTION);
         // 前置拦截：克隆音色必须成对给出音频与文本。放在**循环之前**——放在循环里会让
         // 每一句都重复撞同一个错误，用户看到的是 N 条一模一样的 `error:`。
         // 唯一判据在 `VoiceClone::new`，这里只是提前调用它（不另写一份 trim 判断）。
@@ -284,7 +279,6 @@ impl Project {
                 Some(seed),
                 // clone 在循环外已校验过；这里只是把它成对传下去
                 clone,
-                Some(instruction),
             ) {
                 Ok(wav) => {
                     let path = dir.join(format!("sentences/{index:03}.wav"));
@@ -341,7 +335,7 @@ impl Project {
     /// **必须换 seed**：不换的话"重录"回来的是同一条不满意的音频。
     /// 重录后要刷新成品，调用方接着调 [`Project::assemble`]（Python 的 cmd_redo 也顺手重拼）。
     /// 返回值同 [`Project::synthesize`]：失败的句数。
-    // 参数多与 `Project::new` 同理：client/dir/序号/新文本/规范化/instruction/回调
+    // 参数多与 `Project::new` 同理：client/dir/序号/新文本/规范化/回调
     // 都是调用方必须显式给出的决策，包成配置结构体只会让调用点更啰嗦
     #[allow(clippy::too_many_arguments)]
     pub fn redo(
@@ -351,7 +345,6 @@ impl Project {
         index: usize,
         new_text: Option<&str>,
         normalize: impl Fn(&str) -> String,
-        instruction: Option<&str>,
         on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
         if let Some(t) = new_text {
@@ -375,7 +368,7 @@ impl Project {
         // 未保存的文本/seed 修改会被静默丢弃，"重录"回来还是旧文本）。
         self.save(dir)
             .map_err(|e| ClientError::Local(format!("重录前落盘失败: {e}")))?;
-        self.synthesize(client, dir, Some(&[index]), instruction, on_progress)
+        self.synthesize(client, dir, Some(&[index]), on_progress)
     }
 
     /// 拼装成品 + SRT（句子级时间轴）。返回值带**跳过的句数**，不再静默丢句。

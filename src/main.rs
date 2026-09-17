@@ -2955,8 +2955,9 @@ fn worker_loop(ctx: WorkerCtx) {
             } => {
                 let msg = match make_client() {
                     Ok(client) => {
-                        // instruction 与配音链路一致（aw_core 合成恒定传 DEFAULT_INSTRUCTION）：
-                        // 试听听到的语气必须等于成品，否则用户按试听选音色会被误导。
+                        // 试听与成品必须走**同一次请求组装**（`aw_core` 里唯一的
+                        // `build_synth_request` + 同一份参数白名单）：否则试听听到的
+                        // 语气/音色不是成品的那一条，用户按试听选音色会被误导。
                         //
                         // 克隆同理**必须成对**：只发 voice_ref 的话试听永远 500，
                         // 用户以为自己选的音色不行，其实是少发了 reference_text。
@@ -2965,22 +2966,12 @@ fn worker_loop(ctx: WorkerCtx) {
                                 path,
                                 voice_ref_text.as_deref().unwrap_or_default(),
                             ) {
-                                Ok(clone) => client.synth(
-                                    &model,
-                                    &text,
-                                    Some(BASE_SEED),
-                                    Some(clone),
-                                    Some(aw_core::DEFAULT_INSTRUCTION),
-                                ),
+                                Ok(clone) => {
+                                    client.synth(&model, &text, Some(BASE_SEED), Some(clone))
+                                }
                                 Err(e) => Err(e),
                             },
-                            None => client.synth(
-                                &model,
-                                &text,
-                                Some(BASE_SEED),
-                                None,
-                                Some(aw_core::DEFAULT_INSTRUCTION),
-                            ),
+                            None => client.synth(&model, &text, Some(BASE_SEED), None),
                         };
                         match outcome {
                             Ok(wav) => Msg::VoicePreview {
@@ -3093,7 +3084,6 @@ fn worker_loop(ctx: WorkerCtx) {
                     &client,
                     &dir,
                     only_failed.as_deref(),
-                    None,
                     Some(&ctx.stop),
                     |idx, note| {
                         // 优先把 OOM 留作整轮摘要；若第一条只是普通失败、
@@ -3271,7 +3261,6 @@ fn worker_loop(ctx: WorkerCtx) {
                     let run = project.synthesize_stoppable(
                         &client,
                         &dir,
-                        None,
                         None,
                         Some(&stop),
                         |_, note| {
@@ -3906,7 +3895,6 @@ fn worker_loop(ctx: WorkerCtx) {
                     index,
                     None,
                     |t| aw_core::normalize(t, &Default::default()),
-                    None,
                     |idx, note| {
                         report_progress(&tx, revision, &mut started.borrow_mut(), idx, note);
                     },
@@ -13329,7 +13317,7 @@ mod tests {
             |t| t.to_string(),
         );
         let failed = project
-            .synthesize(&client, &dir, None, None, |_, _| {})
+            .synthesize(&client, &dir, None, |_, _| {})
             .expect("合成调用本身不应失败");
         assert_eq!(failed, 0, "不该有失败句");
         project.save(&dir).unwrap();

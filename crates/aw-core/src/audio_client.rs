@@ -285,6 +285,50 @@ pub struct Client {
     backoff: Duration,
 }
 
+/// `synth` 请求体 `options` 里**允许**出现的键（白名单）。
+///
+/// 依据是服务端 spec 的 `options.request`（`~/.local/opt/audio.cpp/model_specs/*.json`）：
+/// 本 App 选得到的两个 TTS 引擎（`audio8_tts` / `index_tts2`）都**没有** `instruction`
+/// —— 声明了它的只有 breeze_tts / cosyvoice3 / dots_tts / firered_audio / fireredtts3 /
+/// irodori_tts，本 App 一个都选不到。后端不认的键不报错、只是被忽略，所以"发了但没接"
+/// 只能靠这条白名单挡住。真机对照（同 seed、同文本，只改 instruction）两个输出的
+/// sha256 完全相同：`214f41f3…`。
+///
+/// 加键之前先核对服务端 spec 的 `options.request`，否则用户会以为那个旋钮生效。
+pub const SYNTH_REQUEST_OPTIONS: &[&str] = &["seed", "reference_text"];
+
+/// 白名单的唯一判据。
+fn synth_option_allowed(key: &str) -> bool {
+    SYNTH_REQUEST_OPTIONS.contains(&key)
+}
+
+/// 把 `(键, 值)` 按白名单放进 `options`；白名单外的键**丢弃**。
+///
+/// 丢弃而不是报错：调用方无从知道远端服务支持什么，报错只会把"应用自己写错"变成
+/// 用户可见的失败；这里要保证的是"发出去的每个键都站得住"。
+fn insert_whitelisted(options: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
+    if synth_option_allowed(key) {
+        options.insert(key.to_string(), value);
+    }
+}
+
+/// 组装 `/v1/tasks/run` 的 TTS 请求体：**唯一**组装点，白名单在这里生效。
+///
+/// `voice_ref` 是顶层字段（服务端 spec 里属 capabilities，不在 `options` 里）。
+fn build_synth_request(text: &str, seed: Option<u64>, clone: Option<VoiceClone<'_>>) -> Value {
+    let mut options = serde_json::Map::new();
+    if let Some(s) = seed {
+        insert_whitelisted(&mut options, "seed", json!(s.to_string()));
+    }
+    let mut request = json!({ "text": text, "options": Value::Object(options) });
+    if let Some(c) = clone {
+        // 两行必须同进同出：只发 voice_ref 就是那个"每句都 500"的老 bug（见 VoiceClone）。
+        request["voice_ref"] = json!(c.path());
+        request["reference_text"] = json!(c.reference_text());
+    }
+    request
+}
+
 impl Client {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
@@ -302,6 +346,10 @@ impl Client {
 
     /// 合成一句话，返回 wav 字节。seed 固定可复现（audio8-* 支持）。
     ///
+    /// 请求体只由 [`build_synth_request`] 组装——那里的白名单是**唯一**决定
+    /// "哪个键能发给后端"的地方。本函数不再收 `instruction` 这类自由旋钮：后端 spec
+    /// 没声明的键发过去**不报错、直接忽略**，从调用点看不出来（见 `SYNTH_REQUEST_OPTIONS`）。
+    ///
     /// `clone` 为 `Some` 时**成对**发送 `voice_ref` + `reference_text`
     /// ——服务端硬要求两者同时给，见 `VoiceClone`。
     pub fn synth(
@@ -310,22 +358,8 @@ impl Client {
         text: &str,
         seed: Option<u64>,
         clone: Option<VoiceClone<'_>>,
-        instruction: Option<&str>,
     ) -> Result<Vec<u8>, ClientError> {
-        let mut options = serde_json::Map::new();
-        if let Some(s) = seed {
-            options.insert("seed".into(), json!(s.to_string()));
-        }
-        if let Some(i) = instruction {
-            options.insert("instruction".into(), json!(i));
-        }
-        let mut request = json!({ "text": text, "options": Value::Object(options) });
-        if let Some(c) = clone {
-            // 两行必须同进同出：只发 voice_ref 就是那个"每句都 500"的老 bug。
-            request["voice_ref"] = json!(c.path());
-            request["reference_text"] = json!(c.reference_text());
-        }
-        self.run_audio(model, request)
+        self.run_audio(model, build_synth_request(text, seed, clone))
     }
 
     /// 发送任意 audio.cpp 音频任务并取回 wav 字节。TTS 之外的 gen 场景
@@ -522,6 +556,49 @@ mod tests {
     #[test]
     fn base64_rejects_invalid() {
         assert!(decode_base64("****").is_err());
+    }
+
+    /// 白名单**有牙**：后端 spec 没声明的旋钮进不了请求体。
+    /// 把 `insert_whitelisted` 的 `if` 去掉（或把 instruction 加回白名单）→ 本用例红。
+    #[test]
+    fn synth_option_whitelist_drops_knobs_the_backend_never_declared() {
+        let mut options = serde_json::Map::new();
+        insert_whitelisted(&mut options, "seed", json!("7"));
+        insert_whitelisted(&mut options, "instruction", json!("悲伤、缓慢、低沉"));
+        insert_whitelisted(&mut options, "style", json!("念白"));
+        assert!(
+            options.contains_key("seed"),
+            "seed 在 spec 白名单里，应放行"
+        );
+        assert!(
+            !options.contains_key("instruction"),
+            "audio8_tts / index_tts2 的 spec 都没有 instruction，不该发（实测输出字节相同）"
+        );
+        assert!(!options.contains_key("style"), "越白名单的键一律丢弃");
+    }
+
+    /// 组装出来的请求体逐键核对白名单——**不是**拿单个 helper 自证。
+    /// 真机曾经的请求体：`{"text":"…","options":{"seed":"7","instruction":"自然、清晰的叙述语气"}}`。
+    #[test]
+    fn synth_request_body_only_carries_whitelisted_options() {
+        let body = build_synth_request("你好。", Some(7), None);
+        let options = body["options"].as_object().expect("options 应是对象");
+        for key in options.keys() {
+            assert!(
+                SYNTH_REQUEST_OPTIONS.contains(&key.as_str()),
+                "请求体出现白名单外的键 `{key}`（后端会静默忽略它）"
+            );
+        }
+        assert_eq!(options.get("seed").and_then(Value::as_str), Some("7"));
+        assert!(
+            !body.to_string().contains("instruction"),
+            "请求体不该再出现 instruction: {body}"
+        );
+        // voice_ref 走顶层，不进 options（服务端 spec 的 capabilities 在 options 之外）
+        let clone = VoiceClone::new("/tmp/ref.wav", "参考音念的内容").unwrap();
+        let with_ref = build_synth_request("你好。", None, Some(clone));
+        assert_eq!(with_ref["voice_ref"], json!("/tmp/ref.wav"));
+        assert!(with_ref["options"].as_object().unwrap().is_empty());
     }
 
     /// 真机 503 body（本机 16 GiB / qwen3-asr 装不下）必须能解析出模型名与三个数字。

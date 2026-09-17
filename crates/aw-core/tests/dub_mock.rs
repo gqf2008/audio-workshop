@@ -1,11 +1,11 @@
 //! 合成/拼装的**失败可见性**与默认参数（评审第 10/11 条），用进程内 mock 跑真链路：
-//! - 每个请求都必须带默认 instruction（Python `cmd_synth` 恒发）
+//! - 请求体的 `options` 只许出现后端 spec 声明过的键（`instruction` 不在其中）
 //! - 全句失败时 `synthesize` 必须返回失败句数，而不是 `Ok(())` 的假成功
 //! - `assemble` 必须报出被跳过的句数，而不是静默丢句
 
 mod support;
 
-use aw_core::{Client, Project, DEFAULT_INSTRUCTION};
+use aw_core::{Client, Project};
 use std::time::Duration;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -33,7 +33,7 @@ fn client(base: &str) -> Client {
 }
 
 #[test]
-fn sends_default_instruction_and_counts_failures() {
+fn request_options_stay_whitelisted_and_failures_are_counted() {
     let wav = support::tiny_wav(&[0i16; 800]);
     let mock = support::Mock::start(vec![
         (200, support::audio_response(&wav)),
@@ -43,7 +43,7 @@ fn sends_default_instruction_and_counts_failures() {
     let dir = temp_dir("failure-count");
     let mut prj = project();
     let failed = prj
-        .synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+        .synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap();
 
     // 第 11 条：全句失败也要有聚合信号（这里是 1 句失败，不是 Ok(())）
@@ -54,15 +54,38 @@ fn sends_default_instruction_and_counts_failures() {
     );
     assert_eq!(prj.sentences[0].status, "done");
 
-    // 第 10 条：默认 instruction 必须发出去（Python `cmd_synth` 恒发）
+    // 第 10 条：发出去的每个 options 键都必须在后端 spec 的白名单里。
+    // 这一条钉的是**真链路**（mock 收到的那份报文），不是 `build_synth_request` 的自证：
+    // 真机曾经在这里发 `instruction`，而后端 spec 根本没这个旋钮 → 改了 instruction
+    // 输出字节也完全相同（空转）。把 instruction 加回去 → 本用例红。
     let bodies = mock.bodies();
     assert_eq!(bodies.len(), 3);
     for b in &bodies {
+        let body: serde_json::Value = serde_json::from_str(b).expect("mock 收到的请求体是 JSON");
+        // 客户端发的是 `{"model":…, "request":{…}}`，options 在 request 里
+        let options = body["request"]["options"]
+            .as_object()
+            .expect("request.options 应是对象");
+        // 这里**故意写死字面量**、不引用 `SYNTH_REQUEST_OPTIONS`：拿被测代码自己的常量去校验
+        // 被测代码，改常量时两边一起改，等于没测——变异测试里"把 instruction 放回白名单"
+        // 那次就正好漏过去了。字面量依据是服务端 spec 的 `options.request`
+        // （audio8_tts / index_tts2 只有 reference_text / multi_reference_cond / max_tokens /
+        // text_chunk_size / text_chunk_mode / top_p / top_k / temperature / seed，没有 instruction）。
+        const SPEC_DECLARED: &[&str] = &["seed", "reference_text"];
+        for key in options.keys() {
+            assert!(
+                SPEC_DECLARED.contains(&key.as_str()),
+                "请求体出现 spec 没声明的键 `{key}`（后端会静默忽略它，用户以为旋钮生效）: {b}"
+            );
+        }
         assert!(
-            b.contains(&format!(r#""instruction":"{DEFAULT_INSTRUCTION}""#)),
-            "请求应带默认 instruction: {b}"
+            options
+                .get("seed")
+                .and_then(|v| v.as_str())
+                .map(|s| s.parse::<u64>().is_ok())
+                .unwrap_or(false),
+            "seed 应逐句固定可复现（base_seed + index）: {b}"
         );
-        assert!(b.contains(r#""seed":"#), "seed 应逐句固定可复现: {b}");
     }
     assert!(bodies[0].contains("第一句。"), "首句文本应落在请求里");
 
@@ -89,9 +112,7 @@ fn oom_sentence_is_marked_and_retry_only_reruns_failed_sentence() {
     let mut prj = project();
     let c = client(&mock.base);
 
-    let failed = prj
-        .synthesize(&c, &dir, None, None, |_, _| {})
-        .expect("首轮合成");
+    let failed = prj.synthesize(&c, &dir, None, |_, _| {}).expect("首轮合成");
     assert_eq!(failed, 1, "只有内存不足的那一句失败，不能报成整轮全失败");
     assert_eq!(mock.hit_count(), 3, "OOM 不自动重试；其余两句各发一次");
     assert!(
@@ -114,7 +135,7 @@ fn oom_sentence_is_marked_and_retry_only_reruns_failed_sentence() {
     let retry = prj.failed_sentence_indices();
     assert_eq!(retry, vec![0], "继续时只选失败句");
     let failed = prj
-        .synthesize(&c, &dir, Some(&retry), None, |_, _| {})
+        .synthesize(&c, &dir, Some(&retry), |_, _| {})
         .expect("只重跑失败句");
     assert_eq!(failed, 0);
     assert_eq!(
@@ -134,7 +155,7 @@ fn all_sentences_failing_is_reported_not_silent() {
     let dir = temp_dir("all-failed");
     let mut prj = project();
     let failed = prj
-        .synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+        .synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap();
     assert_eq!(failed, prj.sentences.len(), "全失败要如实报数");
     let err = prj.assemble(&dir).unwrap_err();
@@ -155,9 +176,7 @@ fn redo_bumps_seed_and_normalizes_new_text() {
     let dir = temp_dir("redo");
     let mut prj = project();
     let c = client(&mock.base);
-    let failed = prj
-        .synthesize(&c, &dir, None, None, |_, _| {})
-        .expect("首轮合成");
+    let failed = prj.synthesize(&c, &dir, None, |_, _| {}).expect("首轮合成");
     assert_eq!(failed, 0);
     let seed_before = prj.sentences[1].seed;
 
@@ -168,7 +187,6 @@ fn redo_bumps_seed_and_normalizes_new_text() {
             1,
             Some("改后的这一句 2026 年。"),
             |t| aw_core::normalize(t, &Default::default()),
-            None,
             |_, _| {},
         )
         .expect("重录调用");
@@ -189,7 +207,7 @@ fn redo_bumps_seed_and_normalizes_new_text() {
 
     // 重录编号不存在要报错，不能静默什么都不做
     assert!(prj
-        .redo(&c, &dir, 99, None, |t| t.to_string(), None, |_, _| {})
+        .redo(&c, &dir, 99, None, |t| t.to_string(), |_, _| {})
         .is_err());
 }
 
@@ -202,7 +220,7 @@ fn project_is_saved_after_every_sentence() {
     let dir = temp_dir("save-per-sentence");
     let mut prj = project();
     let dir_c = dir.clone();
-    prj.synthesize(&client(&mock.base), &dir, None, None, move |idx, msg| {
+    prj.synthesize(&client(&mock.base), &dir, None, move |idx, msg| {
         if msg.starts_with("done") {
             // 在「下一句合成完成之前」，磁盘上的 project.json 必须已反映这句 done
             let on_disk = aw_core::Project::load(&dir_c).expect("project.json 应已存在");
@@ -224,7 +242,7 @@ fn truncated_sentence_file_aborts_assemble() {
     let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
     let dir = temp_dir("truncated");
     let mut prj = project();
-    prj.synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+    prj.synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap();
 
     // 把第 0 句截掉一半（hound 的 44 字节头还在，所以"头检查"看不出问题）
@@ -252,7 +270,7 @@ fn redo_persists_before_resynthesis() {
     let dir = temp_dir("redo-persist");
     let mut prj = project();
     let c = client(&mock.base);
-    prj.synthesize(&c, &dir, None, None, |_, _| {}).unwrap();
+    prj.synthesize(&c, &dir, None, |_, _| {}).unwrap();
 
     prj.redo(
         &c,
@@ -260,7 +278,6 @@ fn redo_persists_before_resynthesis() {
         2,
         Some("全新文本 2026 年。"),
         |t| aw_core::normalize(t, &Default::default()),
-        None,
         |_, _| {},
     )
     .unwrap();
@@ -281,7 +298,7 @@ fn assemble_leaves_no_tmp_files() {
     let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
     let dir = temp_dir("no-tmp");
     let mut prj = project();
-    prj.synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+    prj.synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap();
     prj.assemble(&dir).unwrap();
     for entry in std::fs::read_dir(dir.join("out")).unwrap() {
@@ -300,7 +317,7 @@ fn stoppable_synthesize_keeps_done_and_stops() {
     let stop = std::sync::atomic::AtomicBool::new(false);
     let c = client(&mock.base);
     let mut done_seen = 0usize;
-    prj.synthesize_stoppable(&c, &dir, None, None, Some(&stop), |_, msg| {
+    prj.synthesize_stoppable(&c, &dir, None, Some(&stop), |_, msg| {
         if msg.starts_with("done") {
             done_seen += 1;
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -337,7 +354,7 @@ fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
     let mut prj = loaded;
     prj.sentences[1].eval_percent = Some(50.0);
     let failed = prj
-        .synthesize(&client(&mock.base), &dir, Some(&[1]), None, |_, _| {})
+        .synthesize(&client(&mock.base), &dir, Some(&[1]), |_, _| {})
         .unwrap();
     assert_eq!(failed, 0);
     assert_eq!(
@@ -366,7 +383,7 @@ fn failed_resynthesis_leaves_no_score_on_disk() {
     // mock 返回 500：这一句合成失败
     let mock = support::Mock::start(vec![(500, r#"{"error":"模型没加载"}"#.into())]);
     let failed = prj
-        .synthesize(&client(&mock.base), &dir, Some(&[0]), None, |_, _| {})
+        .synthesize(&client(&mock.base), &dir, Some(&[0]), |_, _| {})
         .unwrap();
     assert_eq!(failed, 1);
     assert_eq!(prj.sentences[0].eval_percent, None, "内存里要清");

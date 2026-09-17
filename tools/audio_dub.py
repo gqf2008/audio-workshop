@@ -133,8 +133,9 @@ def cmd_synth(a):
     print(f"  合成 {len(todo)} 句 · 模型 {prj['model']}")
     t0 = time.time()
     for s in todo:
-        raw, err = synth_one(s["spoken"], prj["model"], s["seed"], prj.get("voice_ref"),
-                             {"instruction": "自然、清晰的叙述语气"})
+        # 不带 instruction：audio8_tts / index_tts2 的 spec（options.request）都没这个旋钮，
+        # 发了只会被静默忽略（真机同 seed 同文本改 instruction，输出字节完全相同）。
+        raw, err = synth_one(s["spoken"], prj["model"], s["seed"], prj.get("voice_ref"))
         if err:
             s["status"] = f"error: {err}"; print(f"    [{s['index']:>3}] ❌ {err[:70]}"); continue
         path = os.path.join(a.dir, s["wav"])

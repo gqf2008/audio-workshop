@@ -65,7 +65,10 @@ models:
     precision_preference: [q8_0, q4_0]      # 按机器显存挑，缺档则降级
     text_overrides:
       normalization: enforce                # 本模型不接 TN → 配置层强制先做
-    request_defaults: { instruction: "自然、清晰的叙述语气" }
+    # 故意不给 request_defaults：audio8_tts 的 spec（options.request）里没有 instruction
+    # 这个旋钮——声明了它的只有 breeze_tts / cosyvoice3 / dots_tts / firered_audio /
+    # fireredtts3 / irodori_tts，本产品一个都选不到。写在这里会渲染成服务端不认的键，
+    # 让"我们有语气控制"看起来像真的（真机实测改 instruction 输出字节相同）。
     limits: { max_chars_per_request: 300 }
     known_issues:                           # 让产品"知道自己站在什么上"
       - "数字/电话/金额读法不稳定，必须依赖 text.normalization"

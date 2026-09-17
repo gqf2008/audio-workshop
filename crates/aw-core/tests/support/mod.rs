@@ -2,7 +2,7 @@
 
 //! 测试支撑：进程内 mock audiocpp_server。
 //!
-//! 有了它，"重试策略/失败计数/默认 instruction"这些**策略**可以确定性验证，
+//! 有了它，"重试策略/失败计数/请求参数白名单"这些**策略**可以确定性验证，
 //! 不必依赖真机服务（真机 e2e 只在 `--ignored` 时跑，见 tests/e2e_service.rs）。
 
 use std::io::{BufRead, BufReader, Read, Write};

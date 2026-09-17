@@ -44,7 +44,7 @@ fn clone_sends_reference_text_paired_with_voice_ref() {
 
     let clone = VoiceClone::new("/tmp/ref.wav", "这是一段参考音频。").unwrap();
     client(&mock.base)
-        .synth("audio8-tts", "你好。", Some(1), Some(clone), None)
+        .synth("audio8-tts", "你好。", Some(1), Some(clone))
         .unwrap();
 
     let bodies = mock.bodies();
@@ -95,7 +95,7 @@ fn project_synthesize_refuses_clone_without_text_before_touching_the_network() {
 
     let mut prj = project(Some("/tmp/ref.wav"), None);
     let err = prj
-        .synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+        .synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap_err();
 
     assert_eq!(
@@ -123,7 +123,7 @@ fn project_with_reference_text_sends_the_pair_on_every_sentence() {
 
     let mut prj = project(Some("/tmp/ref.wav"), Some("参考音频的内容。"));
     let failed = prj
-        .synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+        .synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap();
 
     assert_eq!(failed, 0);
@@ -143,7 +143,7 @@ fn builtin_voice_sends_neither_field() {
     let dir = temp_dir("builtin");
 
     let mut prj = project(None, None);
-    prj.synthesize(&client(&mock.base), &dir, None, None, |_, _| {})
+    prj.synthesize(&client(&mock.base), &dir, None, |_, _| {})
         .unwrap();
 
     for b in &mock.bodies() {
