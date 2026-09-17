@@ -21,8 +21,10 @@ rodio = { version = "0.20", default-features = false, features = ["wav"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-# 模型权重下载（M4-P7）：流式读响应写到 .part，支持 Range 续传。aw-core 已经用了
-# ureq 2，这里直接复用同一版（Cargo.lock 里已有，不引入新下载）。
+# HTTP 客户端：**与 aw-core 共用同一份 ureq 2.x**，别再引第三个 HTTP 栈。
+#   · 模型权重下载（M4-P7）：流式读响应写到 .part，支持 Range 续传；
+#   · 检查更新（M4-P8）：只读拉一份发布清单。
+# 两条路径都只用 ureq 2 的 timeout_connect / timeout_read（per-read），**不设总超时**。
 ureq = "2"
 dirs = "6"
 # Linux: 让 Slint/fontique 运行时 dlopen fontconfig，避免发布包硬链某一版

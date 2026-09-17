@@ -200,6 +200,19 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <bool> backup-blocked: false;
     callback backup-all();
 
+    // ── 更新：v1 只做「知道」与「拿到」——比对版本、给发布页链接（M4-P8 的另一半）──
+    in property <string> update-current: "";
+    in-out property <string> update-manifest-url: "";
+    in property <string> update-info: "";
+    in property <bool> update-running: false;
+    /// 能不能点「检查更新」：**Rust 侧 `update_blocked` 的投影**，与点击回调同一份判据。
+    /// 不要在 Slint 里另拼条件——按钮与回调各说各话这一步已经被复核抓过三次。
+    in property <bool> update-blocked: false;
+    /// 有没有可打开的发布页：**Rust 侧同一个 Option 的投影**（没有新版时不该能点）
+    in property <bool> update-has-release: false;
+    callback check-update();
+    callback open-release-page();
+
     // 细分隔线：比面板边框轻，只做分组不制造方框
     property <color> hairline: PixelTheme.hover;
 
@@ -449,6 +462,53 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
                 Text {
                     text: root.backup-info;
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+
+            Rectangle { height: 2px; background: root.hairline; }
+
+            // ── 更新：当前版本 / 检查更新 / 打开发布页（只读，不改本机任何文件）──
+            VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 12px;
+                SectionLabel { text: "更新"; }
+                Text {
+                    text: "当前版本 " + root.update-current;
+                    color: PixelTheme.text;
+                    font-size: 12px;
+                }
+                Text {
+                    text: "只检查有没有新版本并给出发布页，不会自动下载或安装。留空用官方地址，内网/镜像可在这里换成自己的清单。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                PixelTextInput {
+                    text <=> root.update-manifest-url;
+                    placeholder: "发布清单地址，默认 GitHub 最新 Release";
+                    enabled: !root.update-blocked;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    PixelButton {
+                        width: 120px;
+                        text: root.update-running ? "检查中…" : "检查更新";
+                        enabled: !root.update-blocked;
+                        clicked => { root.check-update(); }
+                    }
+                    PixelButton {
+                        width: 120px;
+                        text: "打开发布页";
+                        enabled: root.update-has-release;
+                        clicked => { root.open-release-page(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Text {
+                    text: root.update-info;
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;

@@ -21,6 +21,8 @@ mod player;
 mod sep_history;
 mod tasks;
 mod templates;
+/// 检查更新（M4-P8 的另一半）：版本比对 + 发布页链接。逻辑都在那里，这里只接线。
+mod update;
 mod versions;
 mod voices;
 
@@ -297,6 +299,12 @@ enum Msg {
     BackupDone {
         result: Result<String, String>,
     },
+    /// 检查更新的终态。后台线程发回、与工程版本无关（检查只读网络，和稿件没关系），
+    /// 所以必须进 `message_ignores_revision`：否则改一次稿就会把结果静默丢掉，
+    /// 界面永远停在「检查中…」。
+    UpdateCheckDone {
+        result: Result<update::UpdateCheck, String>,
+    },
     /// 人声分离进度 / 终态（都带 task_id 以便与当前任务对齐）
     SeparationProgress {
         task_id: u32,
@@ -458,6 +466,10 @@ struct AppSettings {
     /// 两件事一起解决（判据见 src/export.rs 的产物清单）。
     #[serde(default)]
     bgm: BgmSettings,
+    /// 「检查更新」的发布清单地址覆盖（给内网/镜像留的口子）。
+    /// 缺省 = `src/update.rs::DEFAULT_MANIFEST_URL`（GitHub 最新 Release API）。
+    #[serde(default)]
+    update_url: Option<String>,
 }
 
 /// BGM 的默认描述：**与 ui/app.slint 里 `bgm-prompt` 的默认值必须一致**
@@ -1121,6 +1133,7 @@ fn load_settings() -> AppSettings {
         model_dir: json_field(&v, "model_dir"),
         dictionary: json_field(&v, "dictionary"),
         bgm: json_field(&v, "bgm").unwrap_or_default(),
+        update_url: json_field(&v, "update_url"),
     }
 }
 
@@ -1399,6 +1412,38 @@ fn apply_bgm_settings(ui: &MainWindow) {
     ui.set_bgm_standalone_index(bgm.standalone_index);
 }
 
+/// 启动时把「更新」区画成初始态：当前版本（编译期常量，单一来源）+ 持久化的清单地址。
+fn apply_update_settings(ui: &MainWindow) {
+    ui.set_update_current(update::CURRENT_VERSION.into());
+    ui.set_update_manifest_url(settings_snapshot().update_url.unwrap_or_default().into());
+    ui.set_update_info("还没检查过（只读检查：不会自动下载或安装）".into());
+}
+
+/// 把「更新」区的清单地址写回 settings.json。
+///
+/// 触发点：点「检查更新」。内网/镜像地址只填一次，重启还在。
+/// 与官方默认地址相同 / 空的都存成 `None`（回落默认），免得以后换默认地址时被旧值钉住。
+/// 写失败只提示、不阻断——丢的是"下次的默认值"，不是这次检查。
+fn save_update_url(url: &str) {
+    let trimmed = url.trim();
+    let want = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(update::DEFAULT_MANIFEST_URL) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    let snapshot = {
+        let Ok(mut guard) = settings().lock() else {
+            return;
+        };
+        if guard.update_url == want {
+            return; // 值没变别写盘
+        }
+        guard.update_url = want;
+        guard.clone()
+    };
+    let _ = save_settings(&snapshot);
+}
+
 /// 把当前界面上的 BGM 输入写回 settings.json。
 ///
 /// 触发点：描述编辑（用户可能没生成就退出）、点生成（档位改动没有回调，只能在这里收）。
@@ -1647,6 +1692,54 @@ fn spawn_backup(msg_tx: Sender<WorkerMsg>, workshop_dir: PathBuf) {
     });
 }
 
+/// 检查更新：网络请求走**后台线程**，界面不冻。
+///
+/// 与备份同一形状：只把终态消息（`Msg::UpdateCheckDone`）发回来，tick 里收。
+/// **只读**——拉一份清单、比对版本，不碰本机任何文件，所以它不需要
+/// `backup_refusal` 那套"别抄到写了一半的产物"守卫（理由见 `update_refusal`）。
+fn spawn_update_check(msg_tx: Sender<WorkerMsg>, url: String, current: String) {
+    std::thread::spawn(move || {
+        let result = update::check(&url, &current);
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::UpdateCheckDone { result },
+        });
+    });
+}
+
+/// 用系统默认浏览器打开一个 **http(s)** 地址（发布页）。
+///
+/// 地址来自外部清单，不能把 `file://` / 自定义 scheme 丢给系统打开器
+/// （`open` 会把它们当本地路径/协议处理）。判据走 `update::is_http_url`——
+/// **不要在别处再写一遍前缀判断**（两份实现必然漂移）。
+fn open_external_url(url: &str) -> Result<(), String> {
+    if !update::is_http_url(url) {
+        return Err(
+            "发布页地址不是 http(s)：为了不让系统打开本地路径/自定义协议，这次不打开".into(),
+        );
+    }
+    let url = url.trim();
+    #[cfg(target_os = "macos")]
+    let (program, args): (&str, Vec<&str>) = ("open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let (program, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (program, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
+
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("没能拉起系统浏览器（{program}: {e}）——发布页：{url}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "系统浏览器没打开（{program} 退出码 {:?}）——发布页：{url}",
+            out.status.code()
+        ))
+    }
+}
+
 /// 选一段待分离音频（系统文件框，后台线程 + 消息回传）。
 fn spawn_file_pick(msg_tx: Sender<WorkerMsg>) {
     std::thread::spawn(move || {
@@ -1855,6 +1948,32 @@ fn refresh_backup_availability(ui: &MainWindow, state: &Rc<UiState>) {
         batch_in_flight(state),
         state.backup_running.get(),
     ));
+}
+
+/// 「检查更新」能不能点：**唯一判据**——按钮的 `update-blocked` 就是它的投影，
+/// 点击回调也走它（两处各写一份必然漂移，见
+/// `LESSON_同一语义两处实现必然漂移回显需与真实行为同源.md`）。
+///
+/// 只有"上一次检查还在飞"需要拦：这是**只读**网络请求，不写任何工程/产物文件，
+/// 所以合成/BGM/分离/批量在跑时照样可以查更新（别把它塞进 `backup_refusal` 那套
+/// "别抄到写了一半的产物"里——那是写盘守卫，与只读检查无关）。
+fn update_refusal(update_running: bool) -> Option<&'static str> {
+    if update_running {
+        return Some("上一次检查还没回来：等结果出来再点（网络慢时可能要等几十秒）");
+    }
+    None
+}
+
+fn update_blocked(update_running: bool) -> bool {
+    update_refusal(update_running).is_some()
+}
+
+/// 把它投影到 UI（每 tick 同步一次；值没变时 Slint 不会重绘）。
+fn refresh_update_availability(ui: &MainWindow, state: &Rc<UiState>) {
+    ui.set_update_blocked(update_blocked(state.update_running.get()));
+    // 「打开发布页」能不能点 = 当前手里有没有一个待打开的发布页，
+    // 就是 `state.update_release` 这一个 Option 的投影（同一个来源，不另设条件）
+    ui.set_update_has_release(state.update_release.borrow().is_some());
 }
 
 /// 批量导出：扫 projects/ 下有成品的工程，按导出开关复制到导出目录。
@@ -3868,6 +3987,12 @@ struct UiState {
     /// 防连点起一堆线程、两批同时往同一个目标目录里写。这是真相，
     /// ui 的 `backup-running` 只是它的投影（按钮据此禁用）。
     backup_running: std::cell::Cell<bool>,
+    /// 检查更新是否在飞（后台线程）：防连点。这是真相，
+    /// ui 的 `update-running` 与按钮的 `update-blocked` 都只是它的投影。
+    update_running: std::cell::Cell<bool>,
+    /// 手里那份"有新版"的发布清单（None = 当前没有可打开的发布页）。
+    /// 「打开发布页」能不能点就是这个 Option 的投影——**再存一个 bool 必然漂移**。
+    update_release: RefCell<Option<update::Release>>,
     /// 当前启用的发音词典：库内文件名（None = 不启用）与词条内容（送给 worker 的那份）。
     active_dict_file: RefCell<Option<String>>,
     active_dict: RefCell<std::collections::BTreeMap<String, String>>,
@@ -3896,6 +4021,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     ui.set_export_dir(export_dir().into());
     apply_bgm_settings(&ui);
+    apply_update_settings(&ui);
     ui.set_backend_label(backend_label(base.as_deref()).into());
     ui.set_project_name(DEFAULT_PROJECT.into());
     ui.set_sentences(ModelRc::from(rows.clone()));
@@ -4001,7 +4127,7 @@ fn main() -> Result<(), slint::PlatformError> {
     seed_shot_bgm_artifacts(&ui, &state);
 
     // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
-    apply_shot_state(&ui);
+    apply_shot_state(&ui, &state);
 
     // ── 主循环 ──
     let timer = Timer::default();
@@ -4036,7 +4162,7 @@ fn ready_note(base: Option<&str>) -> String {
 /// 产截图 / 演示用初始态（`AW_UI_STATE=selected|drawer|dark`；仅 debug 构建存在，
 /// release 整个函数被编译掉，验证：`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0）
 #[cfg(debug_assertions)]
-fn apply_shot_state(ui: &MainWindow) {
+fn apply_shot_state(ui: &MainWindow, ui_state: &Rc<UiState>) {
     let Ok(state) = std::env::var("AW_UI_STATE") else {
         return;
     };
@@ -4124,6 +4250,23 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_dub_advanced(true);
             ui.set_status_text("音色 + 高级同时展开：Body 区应出垂直滚动条".into());
         }
+        "update" => {
+            // 有新版的样子（**不真发请求**）。真相必须在 `state` 里：
+            // tick 的 refresh_update_availability 每拍都按 state 重投影，
+            // 只改 UI 的话「打开发布页」会被立刻按下——演示态不是只有截图才用的边角
+            // （见 LESSON_同一语义两处实现必然漂移 的补充实例）。
+            ui.set_drawer_open(true);
+            let demo = update::Release {
+                version: "v0.2.0".into(),
+                notes: "示例：立体声时长修正 / 音色库 / 词典库".into(),
+                url: "https://github.com/gqf2008/audio-workshop/releases".into(),
+                sha256: None,
+                size: Some(48 * 1024 * 1024),
+            };
+            ui.set_update_info(demo.summary().into());
+            *ui_state.update_release.borrow_mut() = Some(demo);
+            ui.set_status_text("更新：有新版（演示态）".into());
+        }
         "sep" => {
             ui.set_scene(2);
             ui.set_status_text("人声分离：选一段音频，本地模型拆人声 / 伴奏".into());
@@ -4199,7 +4342,7 @@ fn apply_shot_state(ui: &MainWindow) {
 }
 
 #[cfg(not(debug_assertions))]
-fn apply_shot_state(_ui: &MainWindow) {}
+fn apply_shot_state(_ui: &MainWindow, _state: &Rc<UiState>) {}
 
 fn apply_project_to_rows(
     ui: &MainWindow,
@@ -7114,6 +7257,9 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BatchExportDone { .. }
         // 模型下载同理：后台队列线程发回，与工程版本无关（下载权重和稿子无关）
         | Msg::DownloadUpdate(_)
+        // 检查更新：后台线程的结果，用户点按钮那一刻与工程版本无关；
+        // 用 revision 0 发回来，按版本过滤就会「点完永远停在检查中…」
+        | Msg::UpdateCheckDone { .. }
     )
 }
 
@@ -7315,6 +7461,19 @@ fn tick(
                     Ok(note) => ui.set_backup_info(note.into()),
                     Err(error) => ui.set_backup_info(format!("备份失败：{error}").into()),
                 }
+            }
+            Msg::UpdateCheckDone { result } => {
+                // 终态一定要把在飞标志放掉：它同时是按钮的禁用条件与"检查中…"文案，
+                // 忘了放就等于把「检查更新」永久锁死
+                state.update_running.set(false);
+                ui.set_update_running(false);
+                // 「显示什么 + 留不留发布页」由 update::outcome_view 一处决定（有单测钉住
+                // 三种结果；尤其 UpToDate/Err 必须交出 None，否则按钮亮着点开是旧版本）。
+                // 这里只做赋值，不再自己写第二份判断。
+                let (info, release) = update::outcome_view(update::CURRENT_VERSION, result);
+                ui.set_update_info(info.into());
+                // 发布页按钮的可用性 = 这个 Option 在不在（tick 里投影给 UI）
+                *state.update_release.borrow_mut() = release;
             }
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());
@@ -7975,6 +8134,9 @@ fn tick(
     // ── 一键备份能不能点：与点击回调同一份判据（改动见 backup_blocked 的注释）──
     refresh_backup_availability(ui, state);
 
+    // ── 检查更新/打开发布页能不能点：同上，只做投影 ──
+    refresh_update_availability(ui, state);
+
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
         ui.set_playing(false);
@@ -8157,6 +8319,8 @@ fn wire_global_settings(
             bgm: prev.bgm,
             // 词典选择也不在这里改（有自己的落盘点），原样带上
             dictionary: prev.dictionary,
+            // 「更新」的清单地址也不在这里改（有自己的落盘点 save_update_url），原样带上
+            update_url: prev.update_url,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -8228,6 +8392,49 @@ fn wire_global_settings(
         ui.set_backup_running(true);
         ui.set_backup_info("正在打开系统目录选择框…".into());
         spawn_backup(msg.clone(), workshop_dir());
+    });
+
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let msg = msg_tx.clone();
+    ui.on_check_update(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        // 按钮的 enabled 与这里必须用**同一份判据**（改动见 update_refusal 的注释）
+        if let Some(refusal) = update_refusal(st.update_running.get()) {
+            ui.set_update_info(refusal.into());
+            return;
+        }
+        // 在飞标志在**点下去那一刻**就要置位：网络请求是后台线程，不置位就能连点起一堆
+        st.update_running.set(true);
+        ui.set_update_running(true);
+        // 上一次的发布页立刻作废：新检查没回来之前，那份已经不代表现在的判断
+        *st.update_release.borrow_mut() = None;
+        // 清单地址：界面上的值优先，留空回落官方地址；顺手存下来（内网镜像只填一次）
+        let typed = ui.get_update_manifest_url().trim().to_string();
+        let url = if typed.is_empty() {
+            update::DEFAULT_MANIFEST_URL.to_string()
+        } else {
+            typed
+        };
+        save_update_url(&url);
+        ui.set_update_info(format!("正在检查 {url} …").into());
+        spawn_update_check(msg.clone(), url, update::CURRENT_VERSION.to_string());
+    });
+
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_open_release_page(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        // 判据与按钮的 enabled 同源：手里没有待打开的发布页就什么都不做
+        let url = st.update_release.borrow().as_ref().map(|r| r.url.clone());
+        let Some(url) = url else {
+            ui.set_update_info("还没有可打开的发布页：先点「检查更新」".into());
+            return;
+        };
+        match open_external_url(&url) {
+            Ok(()) => ui.set_update_info(format!("已在浏览器打开：{url}").into()),
+            Err(error) => ui.set_update_info(error.into()),
+        }
     });
 
     let weak = ui.as_weak();
@@ -9188,6 +9395,7 @@ mod tests {
             model_dir: None,
             dictionary: None,
             bgm: Default::default(),
+            update_url: None,
         };
         assert_eq!(
             resolve_base(&over_port, &cfg, None).0,
@@ -9201,6 +9409,7 @@ mod tests {
             model_dir: None,
             dictionary: None,
             bgm: Default::default(),
+            update_url: None,
         };
         assert_eq!(
             resolve_base(&over_host, &cfg, None).0,
@@ -11089,6 +11298,92 @@ mod tests {
             assert!(
                 !button.contains(forbidden),
                 "按钮不该自己拼忙判据（出现 `{forbidden}`）：{button}"
+            );
+        }
+    }
+
+    /// 检查更新的终态消息必须**不过滤 revision**（本仓已因漏这条被复核抓过两次）。
+    ///
+    /// 检查走后台线程、用 revision 0 发回来；一旦被版本过滤掉，界面就永远停在
+    /// 「检查中…」并且按钮永久禁用。
+    #[test]
+    fn update_messages_survive_revision_changes() {
+        let msgs = vec![
+            Msg::UpdateCheckDone {
+                result: Ok(update::UpdateCheck::Newer(update::Release {
+                    version: "0.2.0".into(),
+                    notes: "n".into(),
+                    url: "https://example.com/r".into(),
+                    sha256: None,
+                    size: None,
+                })),
+            },
+            Msg::UpdateCheckDone {
+                result: Ok(update::UpdateCheck::UpToDate),
+            },
+            // 失败路径更不能当成"过期消息"丢掉，否则状态行停在正在检查
+            Msg::UpdateCheckDone {
+                result: Err("超时：30 秒内没读到数据".into()),
+            },
+        ];
+        let names = [
+            "UpdateCheckDone(Newer)",
+            "UpdateCheckDone(UpToDate)",
+            "UpdateCheckDone(Err)",
+        ];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
+    /// 按钮的禁用态必须**就是**回调用那份判据的投影（同 backup 那条的姊妹）。
+    /// 只要 Slint 里另拼一套条件，就会出现「亮着却点不动 / 灰着其实没事」。
+    #[test]
+    fn update_button_state_is_the_projection_of_the_same_refusal() {
+        for running in [false, true] {
+            assert_eq!(
+                update_blocked(running),
+                update_refusal(running).is_some(),
+                "按钮灰不灰必须与回调判据同源：running={running}"
+            );
+        }
+        // 空闲必须能点（别为了"同源"把按钮钉死）
+        assert!(!update_blocked(false));
+        // 注意：`update_refusal` 只吃 `update_running` 一个参数，签名本身就保证了
+        // "只读检查不因为别的任务在跑而变灰"（与 backup_refusal 那套写盘守卫无关）。
+    }
+
+    /// 两个按钮的 `enabled` 只能来自 Rust 投影，不许在 Slint 里另拼条件（源码级守卫）。
+    #[test]
+    fn update_buttons_enabled_do_not_recompute_in_slint() {
+        let src = include_str!("../ui/dub_workbench.slint");
+        let at = src
+            .find("text: root.update-running ? \"检查中…\" : \"检查更新\";")
+            .expect("检查更新按钮的文案行必须在（改了就同步改这条用例）");
+        let block = &src[at..(at + 500).min(src.len())];
+        assert!(
+            block.contains("enabled: !root.update-blocked;"),
+            "检查更新按钮的 enabled 必须直接吃 Rust 投影 update-blocked：{block}"
+        );
+        assert!(
+            block.contains("enabled: root.update-has-release;"),
+            "打开发布页按钮的 enabled 必须直接吃 Rust 投影 update-has-release：{block}"
+        );
+        for forbidden in [
+            "root.busy",
+            "task-running",
+            "task-pending",
+            "tasks-busy",
+            "root.update-info !=",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "按钮不该自己拼判据（出现 `{forbidden}`）：{block}"
             );
         }
     }
