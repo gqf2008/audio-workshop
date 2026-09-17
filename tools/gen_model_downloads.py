@@ -41,21 +41,39 @@ P7 的下载队列（串行 / 断点续传 / 校验后提交）已经能跑，�
 `strip_prefix` 这条与上游 `tools/model_manager_v2.py::stripped_path` 逐字一致——
 它就是上游决定"文件落在 target_directory 下哪一层"的那条规则（本机磁盘布局已核对）。
 
+## 体积（`bytes`）从哪来
+- **默认离线**：不联网。每个文件的 `bytes` **沿用盘上清单里已有的值**（按 URL 对齐），
+  没有就留 `null`——不填 0、不拿别的档累加、不猜。
+- `--fetch-sizes`：联网对每个文件发一次 `HTTP HEAD`，把最终落点的 `Content-Length` 写进
+  `files[].bytes`；包级 `packages[].bytes` 是文件之和，**任一文件未知就是 `null`**
+  （不拿"已知的那几个"冒充整包体积）。取不到（404 / 没头 / 超时 / 跳转成环）一律 `null`，
+  失败原因在跑完的汇总里逐条打印。
+- **只认最终 2xx 那跳的头**：HF 的 `/resolve/` 先回 302，那一跳的 `content-length` 是
+  *跳转响应体*的长度（实测 1038 B）——拿它当权重体积会得到"每个模型都是 1 KB"这种
+  看起来正常、实际全错的数字（脚本自己跟跳转，且**不把 HEAD 降级成 GET**）。
+- `sha256` 仍然一律留空（生成不下载权重、不算哈希）。
+- **辅助权重**（`session_options`，如 `qwen3_asr.forced_aligner_model_path`）也会折成
+  `aux_bytes`：它们常常是**另一个 family** 的包，按落点在全部 spec 里反查；查不到就把键名
+  记进 `aux_unresolved`，不做无根据的估算。
+
 ## 稳定输出
-- **不联网**：`size` / `sha256` 一律留空（下载器退化成按响应 Content-Length 校验）。
-  生成必须离线可复现，否则同一份输入每次跑出的字节都不一样。
 - 键序固定（`sort_keys`）+ 固定缩进 + 行尾换行 → 同输入两次运行逐字节相同。
-- `--check` 只重算不写盘，与盘上的文件比对；不一致退出 1（发现"改了 spec 忘了重生成"）。
+- `--check` 只重算不写盘（**也不联网**：体积沿用盘上已有的值），与盘上的文件比对；
+  不一致退出 1（发现"改了 spec 忘了重生成"）。`--check` 与 `--fetch-sizes` 互斥。
 
 用法:
-  python3 tools/gen_model_downloads.py            # 生成 config/model-downloads.json
-  python3 tools/gen_model_downloads.py --check    # 校验已提交的清单是否与上游一致
+  python3 tools/gen_model_downloads.py                 # 离线生成（体积沿用盘上已有值）
+  python3 tools/gen_model_downloads.py --fetch-sizes   # 联网补体积后生成
+  python3 tools/gen_model_downloads.py --check         # 校验已提交的清单是否与上游一致
   AUDIOCPP_DIR=/path/to/audio.cpp python3 tools/gen_model_downloads.py
 """
 
 import argparse
 import json
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
@@ -153,13 +171,48 @@ def download_url(download: dict, remote: str):
     return f"{HF_ENDPOINT}/{repo}/resolve/{rev}/{path}"
 
 
-def package_view(spec: dict, package: dict) -> dict:
+def package_bytes(files: list):
+    """包级体积 = 文件之和；**任一文件未知就是 None**（不拿已知项冒充整包）。"""
+    if not files:
+        return None
+    total = 0
+    for f in files:
+        n = f.get("bytes")
+        if not isinstance(n, int):
+            return None
+        total += n
+    return total
+
+
+def package_view(spec: dict, package: dict, size_of, *, want_sizes=None) -> dict:
+    """一个包的投影。
+
+    `want_sizes`：这个包要不要去向 `size_of` 要体积。默认 = "可下载才要" ——
+    不可下载的包（gated / 上游不支持）匿名 HEAD 必然 401，白跑还会在日志里制造噪音。
+    辅助权重（`resolve_aux`）显式传 `True`：它们不是产品模型，但估算要用。
+    """
     download = merged_download(spec, package)
-    files = []
-    for remote in package.get("files") or []:
-        files.append({"remote_path": remote, "url": download_url(download, remote)})
     kind = str(download.get("kind") or "")
     gated = bool(download.get("gated", False))
+    urls = [download_url(download, remote) for remote in package.get("files") or []]
+    # 「有没有一个真的能点的下载入口」= 认识这个 kind + 有 repo + 没有 gated + 每个文件都拼得出 URL
+    downloadable = bool(
+        kind in DOWNLOADABLE_KINDS
+        and str(download.get("repo") or "").strip()
+        and not gated
+        and urls
+        and all(urls)
+    )
+    fetch = downloadable if want_sizes is None else want_sizes
+    files = [
+        {
+            "remote_path": remote,
+            "url": url,
+            # 取不到就是 None：调用方只管填值，不编造
+            "bytes": size_of(url) if (fetch and url) else None,
+        }
+        for remote, url in zip(package.get("files") or [], urls)
+    ]
     return {
         "id": package.get("id", ""),
         "display_name": package.get("display_name", ""),
@@ -174,15 +227,177 @@ def package_view(spec: dict, package: dict) -> dict:
         "gated": gated,
         "reason": str(download.get("reason") or ""),
         "files": files,
-        # 「有没有一个真的能点的下载入口」= 认识这个 kind + 有 repo + 没有 gated + 每个文件都拼得出 URL
-        "downloadable": bool(
-            kind in DOWNLOADABLE_KINDS
-            and str(download.get("repo") or "").strip()
-            and not gated
-            and files
-            and all(f["url"] for f in files)
-        ),
+        # 包级总计（见 package_bytes：不完整就是 null）
+        "bytes": package_bytes(files),
+        "downloadable": downloadable,
     }
+
+
+# ---------------------------------------------------------------------------
+# 体积：HTTP HEAD（自己跟跳转，只认最终 2xx 那跳的头）
+# ---------------------------------------------------------------------------
+SIZE_TIMEOUT_SECONDS = 20.0
+SIZE_MAX_HOPS = 6
+SIZE_UA = "audio-workshop-gen-model-downloads/1.0"
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不自动跟跳转：urllib 的跳转处理器会把 HEAD 降级成 GET，
+
+    对着 2 GB 权重跑就等于"为了量体积把整份下回来"。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_SIZER = urllib.request.build_opener(_NoRedirect)
+
+
+def _linked_size(headers):
+    """HF 的 `/resolve/` 会在 302 上带 `x-linked-size`（被链接文件的真实字节数）。"""
+    raw = headers.get("x-linked-size") if headers else None
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def head_content_length(url, *, timeout=SIZE_TIMEOUT_SECONDS, opener=None):
+    """HEAD 取最终落点的 Content-Length；取不到 → (None, 原因)。
+
+    **只看最终 2xx 那跳的头**：302 那跳的 `content-length` 是**跳转响应体**的长度
+    （实测 1038 B），拿它当权重体积，每个模型都会"恰好 1 KB"——静默全错。
+    最终落点没给 `Content-Length` 时，退回跳转链上 HF 给的 `x-linked-size`。
+    """
+    opener = opener or _SIZER
+    seen = set()
+    current = url
+    linked = None
+    for _ in range(SIZE_MAX_HOPS):
+        if current in seen:
+            return None, "跳转成环"
+        seen.add(current)
+        request = urllib.request.Request(
+            current, method="HEAD", headers={"User-Agent": SIZE_UA}
+        )
+        try:
+            response = opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            linked = linked if linked is not None else _linked_size(error.headers)
+            code = error.code
+            location = error.headers.get("Location") if error.headers else None
+            # 只要头，但得显式关掉：不然每次 4xx/跳转都留一个没关的响应体句柄
+            error.close()
+            if code in REDIRECT_CODES:
+                if not location:
+                    return None, f"HTTP {code} 没带 Location"
+                current = urllib.parse.urljoin(current, location)
+                continue
+            return None, f"HTTP {code}"
+        except Exception as error:  # noqa: BLE001 —— 网络层任何异常都如实记原因
+            return None, type(error).__name__
+        with response:
+            if response.status != 200:
+                return None, f"HTTP {response.status}"
+            raw = response.headers.get("Content-Length")
+            if raw is None:
+                if linked is not None:
+                    return linked, "x-linked-size"
+                return None, "没有 Content-Length"
+            try:
+                size = int(raw)
+            except ValueError:
+                return None, f"Content-Length 不是整数：{raw}"
+            return (size, "content-length") if size >= 0 else (None, "Content-Length 为负")
+    return None, f"跳转超过 {SIZE_MAX_HOPS} 跳"
+
+
+def read_existing_sizes(path) -> dict:
+    """盘上清单里的 `URL → bytes`：离线生成时"体积沿用已有的值"就靠它。"""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    sizes = {}
+
+    def remember(entries):
+        for entry in entries or []:
+            url, size = entry.get("url"), entry.get("bytes")
+            if url and isinstance(size, int) and size >= 0:
+                sizes[url] = size
+
+    for model in payload.get("models") or []:
+        for package in model.get("packages") or []:
+            remember(package.get("files"))
+        # 辅助权重不在 models[].packages 里（它是**别的 family** 的包），
+        # 单列一份，离线重生成时才有地方把它的体积沿用回来。
+        remember(model.get("aux_files"))
+    return sizes
+
+
+# ---------------------------------------------------------------------------
+# 辅助权重：session_options 的落点 → 包（可能跨 family）
+# ---------------------------------------------------------------------------
+def package_local_index(specs: dict):
+    """`落点 → [(family, 包)]` 的全局索引。
+
+    辅助权重常常是**另一个 family** 的包（`qwen3_asr.forced_aligner_model_path`
+    指向 `qwen3_forced_aligner` 的权重），所以索引要跨全部 spec 建。
+    """
+    by_path, by_dir = {}, {}
+    for family in sorted(specs):
+        for package in specs[family].get("packages") or []:
+            target = str(package.get("target_directory", "")).strip("/")
+            by_dir.setdefault(target, []).append((family, package))
+            for local in package_local_paths(package):
+                by_path.setdefault(local, []).append((family, package))
+    return by_path, by_dir
+
+
+def aux_local_path(declared, model_tail: str):
+    """`session_options` 的值 → 相对模型根的落点；生成期推不出来就返回 None。"""
+    raw = str(declared or "").strip()
+    if not raw:
+        return None
+    prefix = "${models_root}/"
+    if raw.startswith(prefix):
+        return raw[len(prefix):].strip("/") or None
+    # 绝对路径 / 其它占位符 / 向上跳：生成期推不出服务会去哪找，如实不解析
+    if raw.startswith("${") or raw.startswith("/") or ".." in raw.split("/"):
+        return None
+    # 相对路径：服务按"path 指文件就用它的父目录、指目录就用它自己"解析
+    name = model_tail.rsplit("/", 1)[-1]
+    base = model_tail.rsplit("/", 1)[0] if "." in name else model_tail
+    return f"{base}/{raw}".strip("/") if base else raw
+
+
+def resolve_aux(schema_model: dict, model_tail: str, specs: dict, by_path, by_dir, size_of):
+    """把辅助权重折成 `(字节合计, 未解析的键名, 已解析的文件表)`。
+
+    一个落点对上多个包（同目录多量化档）时**不猜**服务会加载哪个，记进未解析。
+    文件表（`aux_files`）要写进产物：辅助权重是**别的 family** 的包，不出现在
+    `models[].packages` 里，不单列一份的话离线重生成就没有地方沿用它的体积。
+    """
+    options = schema_model.get("session_options") or {}
+    total = 0
+    unresolved = []
+    files = []
+    for key in sorted(options):
+        local = aux_local_path(options[key], model_tail)
+        hits = (by_path.get(local) or by_dir.get(local) or []) if local else []
+        if len(hits) != 1:
+            unresolved.append(key)
+            continue
+        family, package = hits[0]
+        view = package_view(specs[family], package, size_of, want_sizes=True)
+        if view["bytes"] is None:
+            unresolved.append(key)
+            continue
+        total += view["bytes"]
+        files.extend({"url": f["url"], "bytes": f["bytes"]} for f in view["files"])
+    return total, unresolved, files
 
 
 def path_tail(raw: str) -> str:
@@ -217,11 +432,22 @@ def choose_package(candidates: list, tail: str, precision_preference: list):
     return None, f"{matched_by}但同处有多个量化档且挑不出唯一一个：{ids}"
 
 
-def build_model(schema_model: dict, model_id: str, specs: dict) -> dict:
+def build_model(
+    schema_model: dict,
+    model_id: str,
+    specs: dict,
+    size_of,
+    by_path=None,
+    by_dir=None,
+) -> dict:
     family = str(schema_model.get("family") or "").strip()
     tail = path_tail(schema_model.get("path", ""))
     preference = list(schema_model.get("precision_preference") or [])
     spec = specs.get(family)
+    # 辅助权重：任何返回分支都带上（它们在界面上是"估算偏低"的依据）
+    aux_bytes, aux_unresolved, aux_files = resolve_aux(
+        schema_model, tail, specs, by_path or {}, by_dir or {}, size_of
+    )
 
     if spec is None:
         where = f"family={family}" if family else "（schema 也没登记 family）"
@@ -234,9 +460,12 @@ def build_model(schema_model: dict, model_id: str, specs: dict) -> dict:
             "note": f"上游 model_specs 里没有 {where} 的 spec —— 暂无下载源，不猜地址",
             "entry": None,
             "packages": [],
+            "aux_bytes": aux_bytes,
+            "aux_unresolved": aux_unresolved,
+            "aux_files": aux_files,
         }
 
-    packages = [package_view(spec, p) for p in spec.get("packages") or []]
+    packages = [package_view(spec, p, size_of) for p in spec.get("packages") or []]
     candidates = [p for p in packages if p["downloadable"]]
     if not candidates:
         reasons = sorted({p["reason"] for p in packages if p["reason"]})
@@ -252,6 +481,9 @@ def build_model(schema_model: dict, model_id: str, specs: dict) -> dict:
             "note": note,
             "entry": None,
             "packages": packages,
+            "aux_bytes": aux_bytes,
+            "aux_unresolved": aux_unresolved,
+            "aux_files": aux_files,
         }
 
     entry, why = choose_package(candidates, tail, preference)
@@ -267,13 +499,26 @@ def build_model(schema_model: dict, model_id: str, specs: dict) -> dict:
         "note": why,
         "entry": entry,
         "packages": packages,
+        "aux_bytes": aux_bytes,
+        "aux_unresolved": aux_unresolved,
+        "aux_files": aux_files,
     }
 
 
-def build(schema: dict, specs: dict) -> dict:
+def build(schema: dict, specs: dict, size_of) -> dict:
+    by_path, by_dir = package_local_index(specs)
     models = []
     for model_id in sorted(schema.get("models") or {}):
-        models.append(build_model(schema["models"][model_id], model_id, specs))
+        models.append(
+            build_model(
+                schema["models"][model_id],
+                model_id,
+                specs,
+                size_of,
+                by_path=by_path,
+                by_dir=by_dir,
+            )
+        )
     # 自检：标了 downloadable 就必须有一条能点的入口，且入口有落点与 URL
     for m in models:
         if m["status"] == "downloadable":
@@ -290,7 +535,10 @@ def build(schema: dict, specs: dict) -> dict:
             "specs": "model_specs/*.json",
             "spec_count": len(specs),
             "schema": "config/models.schema.yaml",
-            "note": "由生成脚本产出，勿手改；size/sha256 刻意留空（生成不联网）",
+            "note": (
+                "由生成脚本产出，勿手改；sha256 一律留空（生成不下载权重）；"
+                "bytes 来自 HTTP HEAD，取不到就是 null（不填 0、不拿别的档推算）"
+            ),
         },
         "models": models,
     }
@@ -303,16 +551,61 @@ def render(payload: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成随应用分发的模型下载清单")
-    ap.add_argument("--check", action="store_true", help="只校验盘上的清单是否与上游一致，不写盘")
+    ap.add_argument("--check", action="store_true", help="只校验盘上的清单是否与上游一致，不写盘、不联网")
+    ap.add_argument(
+        "--fetch-sizes",
+        action="store_true",
+        help="联网对每个文件发 HTTP HEAD 取真实体积（默认离线：沿用盘上清单里已有的值）",
+    )
     ap.add_argument("--out", default=str(OUT_PATH), help=f"输出路径（默认 {OUT_PATH}）")
     a = ap.parse_args()
+    if a.check and a.fetch_sizes:
+        sys.exit("--check 不联网（体积沿用盘上已有值），不能和 --fetch-sizes 一起用")
 
     upstream = find_upstream()
     specs_dir = Path(upstream) / "model_specs"
     schema = load_schema()
     specs = load_specs(specs_dir)
-    text = render(build(schema, specs))
     out = Path(a.out)
+
+    if a.fetch_sizes:
+        # 第一趟不联网：只**记账**——`package_view` 会告诉我们要问哪些 URL
+        # （可下载的包 + 辅助权重），这一步把集合收下来，避免对 gated 仓库白跑 HEAD。
+        wanted = set()
+
+        def collect(url):
+            if url:
+                wanted.add(url)
+            return None
+
+        build(schema, specs, collect)
+        fetched, failed = {}, {}
+
+        def size_of(url):
+            if not url:
+                return None
+            size, how = head_content_length(url)
+            if size is None:
+                failed[url] = how
+            else:
+                fetched[url] = size
+            return size
+
+    else:
+        existing = read_existing_sizes(out)
+        kept, missing = {}, []
+
+        def size_of(url):
+            if not url:
+                return None
+            size = existing.get(url)
+            if size is None:
+                missing.append(url)
+            else:
+                kept[url] = size
+            return size
+
+    text = render(build(schema, specs, size_of))
 
     if a.check:
         current = out.read_text(encoding="utf-8") if out.exists() else ""
@@ -326,6 +619,22 @@ def main() -> int:
     payload = json.loads(text)
     n = sum(1 for m in payload["models"] if m["status"] == "downloadable")
     print(f"已写出 {out}：{len(payload['models'])} 个产品模型，其中 {n} 个有下载入口")
+    if a.fetch_sizes:
+        nulls = sum(
+            1
+            for m in payload["models"]
+            for p in m["packages"]
+            for f in p["files"]
+            if f["bytes"] is None
+        )
+        print(
+            f"体积：{len(wanted)} 条需要体积，其中 {len(fetched)} 条取到、{len(failed)} 条取不到；"
+            f"产物里共 {nulls} 条为 null（含不可下载的包，那些根本没去探）"
+        )
+        for url in sorted(failed):
+            print(f"  null ← {failed[url]}  {url}", file=sys.stderr)
+    else:
+        print(f"体积：**这次没联网**，{len(kept)} 条沿用清单里已有的值；{len(set(missing))} 条清单里没有 → null")
     return 0
 
 

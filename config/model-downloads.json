@@ -1,12 +1,17 @@
 {
   "models": [
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 6185460032,
         "default": false,
         "display_name": "ACE-Step 1.5 Turbo Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 6185460032,
             "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
           }
@@ -29,11 +34,13 @@
       "note": "落点精确匹配：ace_step_turbo_q8_0",
       "packages": [
         {
+          "bytes": 6185460032,
           "default": false,
           "display_name": "ACE-Step 1.5 Turbo Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 6185460032,
               "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
             }
@@ -52,11 +59,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 10090398272,
           "default": true,
           "display_name": "ACE-Step 1.5 Turbo BF16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 10090398272,
               "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf"
             }
@@ -75,11 +84,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 6185458880,
           "default": false,
           "display_name": "ACE-Step 1.5 Base Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 6185458880,
               "remote_path": "ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf"
             }
@@ -98,11 +109,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 10090397120,
           "default": false,
           "display_name": "ACE-Step 1.5 Base BF16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 10090397120,
               "remote_path": "ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf"
             }
@@ -121,11 +134,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 15277379424,
           "default": false,
           "display_name": "ACE-Step 1.5 XL Turbo BF16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 15277379424,
               "remote_path": "ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf"
             }
@@ -144,11 +159,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 15277585088,
           "default": false,
           "display_name": "ACE-Step 1.5 XL SFT BF16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 15277585088,
               "remote_path": "ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf"
             }
@@ -167,11 +184,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 10710565056,
           "default": false,
           "display_name": "ACE-Step 1.5 XL Turbo Q8_0 DiT GGUF (BF16 planner)",
           "downloadable": true,
           "files": [
             {
+              "bytes": 10710565056,
               "remote_path": "ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf"
             }
@@ -190,11 +209,13 @@
           "target_directory": "ACE-Step1.5-GGUF"
         },
         {
+          "bytes": 10710562816,
           "default": false,
           "display_name": "ACE-Step 1.5 XL SFT Q8_0 DiT GGUF (BF16 planner)",
           "downloadable": true,
           "files": [
             {
+              "bytes": 10710562816,
               "remote_path": "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf"
             }
@@ -218,17 +239,22 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": null,
       "family": "audio8_asr",
       "id": "audio8-asr",
       "note": "没有落点等于 Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf 的包（该 family 的可下载包：audio8_asr_0_1b_safetensors） —— 暂无下载入口，不猜地址",
       "packages": [
         {
+          "bytes": null,
           "default": true,
           "display_name": "Audio8-ASR-0.1B Q8_0 GGUF",
           "downloadable": false,
           "files": [
             {
+              "bytes": null,
               "remote_path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf",
               "url": null
             }
@@ -247,11 +273,13 @@
           "target_directory": "Audio8-ASR-0.1B-GGUF"
         },
         {
+          "bytes": null,
           "default": false,
           "display_name": "Audio8-ASR-0.1B F16 GGUF",
           "downloadable": false,
           "files": [
             {
+              "bytes": null,
               "remote_path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-f16.gguf",
               "url": null
             }
@@ -270,39 +298,48 @@
           "target_directory": "Audio8-ASR-0.1B-GGUF"
         },
         {
+          "bytes": 663908188,
           "default": false,
           "display_name": "Audio8-ASR-0.1B HF Safetensors",
           "downloadable": true,
           "files": [
             {
+              "bytes": 6163,
               "remote_path": "config.json",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/config.json"
             },
             {
+              "bytes": 147,
               "remote_path": "generation_config.json",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/generation_config.json"
             },
             {
+              "bytes": 434,
               "remote_path": "preprocessor_config.json",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/preprocessor_config.json"
             },
             {
+              "bytes": 11419524,
               "remote_path": "tokenizer.json",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/tokenizer.json"
             },
             {
+              "bytes": 2234,
               "remote_path": "tokenizer_config.json",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/tokenizer_config.json"
             },
             {
+              "bytes": 2776833,
               "remote_path": "vocab.json",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/vocab.json"
             },
             {
+              "bytes": 1671853,
               "remote_path": "merges.txt",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/merges.txt"
             },
             {
+              "bytes": 648031000,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/model.safetensors"
             }
@@ -333,12 +370,17 @@
       "status": "no-source"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 1429545312,
         "default": true,
         "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 1429545312,
             "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
             "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
           }
@@ -361,11 +403,13 @@
       "note": "落点精确匹配：audio8_tts_preview_0_6b_q8_0",
       "packages": [
         {
+          "bytes": 1429545312,
           "default": true,
           "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
@@ -389,17 +433,22 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": null,
       "family": "audio8_tts",
       "id": "audio8-tts-01b",
       "note": "没有落点等于 Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf 的包（该 family 的可下载包：audio8_tts_preview_0_6b_q8_0） —— 暂无下载入口，不猜地址",
       "packages": [
         {
+          "bytes": 1429545312,
           "default": true,
           "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
@@ -423,17 +472,22 @@
       "status": "no-source"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": null,
       "family": "audio8_tts",
       "id": "audio8-tts-01b-stream",
       "note": "没有落点等于 Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf 的包（该 family 的可下载包：audio8_tts_preview_0_6b_q8_0） —— 暂无下载入口，不猜地址",
       "packages": [
         {
+          "bytes": 1429545312,
           "default": true,
           "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
@@ -457,12 +511,17 @@
       "status": "no-source"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 1429545312,
         "default": true,
         "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 1429545312,
             "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
             "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
           }
@@ -485,11 +544,13 @@
       "note": "落点精确匹配：audio8_tts_preview_0_6b_q8_0",
       "packages": [
         {
+          "bytes": 1429545312,
           "default": true,
           "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
@@ -513,12 +574,17 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 1045334432,
         "default": true,
         "display_name": "Fun-ASR-Nano-2512 Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 1045334432,
             "remote_path": "fun-asr-nano-2512-q8_0.gguf",
             "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-q8_0.gguf"
           }
@@ -541,11 +607,13 @@
       "note": "落点精确匹配：fun_asr_nano_2512_q8_0",
       "packages": [
         {
+          "bytes": 1045334432,
           "default": true,
           "display_name": "Fun-ASR-Nano-2512 Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1045334432,
               "remote_path": "fun-asr-nano-2512-q8_0.gguf",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-q8_0.gguf"
             }
@@ -564,11 +632,13 @@
           "target_directory": "Fun-ASR-Nano-2512-GGUF"
         },
         {
+          "bytes": 1675708832,
           "default": false,
           "display_name": "Fun-ASR-Nano-2512 F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1675708832,
               "remote_path": "fun-asr-nano-2512-f16.gguf",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-f16.gguf"
             }
@@ -587,35 +657,43 @@
           "target_directory": "Fun-ASR-Nano-2512-GGUF"
         },
         {
+          "bytes": 1671205126,
           "default": false,
           "display_name": "Fun-ASR-Nano-2512 HF Safetensors",
           "downloadable": true,
           "files": [
             {
+              "bytes": 536,
               "remote_path": "chat_template.jinja",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/chat_template.jinja"
             },
             {
+              "bytes": 2327,
               "remote_path": "config.json",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/config.json"
             },
             {
+              "bytes": 210,
               "remote_path": "generation_config.json",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/generation_config.json"
             },
             {
+              "bytes": 1659778184,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/model.safetensors"
             },
             {
+              "bytes": 482,
               "remote_path": "processor_config.json",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/processor_config.json"
             },
             {
+              "bytes": 11422650,
               "remote_path": "tokenizer.json",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/tokenizer.json"
             },
             {
+              "bytes": 737,
               "remote_path": "tokenizer_config.json",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/tokenizer_config.json"
             }
@@ -645,12 +723,17 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 3502955328,
         "default": false,
         "display_name": "IndexTTS2.5 Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 3502955328,
             "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
           }
@@ -673,11 +756,13 @@
       "note": "落点精确匹配：index_tts2_5_q8_0",
       "packages": [
         {
+          "bytes": 3633888608,
           "default": true,
           "display_name": "IndexTTS2 Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 3633888608,
               "remote_path": "IndexTTS2-GGUF/index-tts2-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-q8_0.gguf"
             }
@@ -696,11 +781,13 @@
           "target_directory": "IndexTTS2-GGUF"
         },
         {
+          "bytes": 4646898304,
           "default": false,
           "display_name": "IndexTTS2 F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 4646898304,
               "remote_path": "IndexTTS2-GGUF/index-tts2-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-f16.gguf"
             }
@@ -719,11 +806,13 @@
           "target_directory": "IndexTTS2-GGUF"
         },
         {
+          "bytes": 8084552000,
           "default": false,
           "display_name": "IndexTTS2 Original-Dtype GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 8084552000,
               "remote_path": "IndexTTS2-GGUF/index-tts2-orig.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-orig.gguf"
             }
@@ -742,19 +831,23 @@
           "target_directory": "IndexTTS2-GGUF"
         },
         {
+          "bytes": 3484956803,
           "default": false,
           "display_name": "IndexTTS2 Safetensors",
           "downloadable": true,
           "files": [
             {
+              "bytes": 2882,
               "remote_path": "config.yaml",
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/config.yaml"
             },
             {
+              "bytes": 475997,
               "remote_path": "bpe.model",
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/bpe.model"
             },
             {
+              "bytes": 3484477924,
               "remote_path": "gpt.safetensors",
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/gpt.safetensors"
             }
@@ -775,11 +868,13 @@
           "target_directory": "IndexTTS-2"
         },
         {
+          "bytes": 3502955328,
           "default": false,
           "display_name": "IndexTTS2.5 Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 3502955328,
               "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
             }
@@ -798,11 +893,13 @@
           "target_directory": "IndexTTS2.5-GGUF"
         },
         {
+          "bytes": 4547355072,
           "default": false,
           "display_name": "IndexTTS2.5 F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 4547355072,
               "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-f16.gguf"
             }
@@ -821,11 +918,13 @@
           "target_directory": "IndexTTS2.5-GGUF"
         },
         {
+          "bytes": 7885093440,
           "default": false,
           "display_name": "IndexTTS2.5 Original-Dtype GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 7885093440,
               "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-orig.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-orig.gguf"
             }
@@ -849,12 +948,24 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 1129966496,
+      "aux_files": [
+        {
+          "bytes": 1129966496,
+          "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ForcedAligner-0.6B-GGUF/qwen3-forced-aligner-0.6b-q8_0.gguf"
+        }
+      ],
+      "aux_unresolved": [
+        "qwen3_asr.vad_model_path"
+      ],
       "entry": {
+        "bytes": 1151272416,
         "default": false,
         "display_name": "Qwen3-ASR 0.6B Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 1151272416,
             "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
           }
@@ -877,11 +988,13 @@
       "note": "落点精确匹配：qwen3_asr_0_6b_q8_0",
       "packages": [
         {
+          "bytes": 2473010048,
           "default": true,
           "display_name": "Qwen3-ASR 1.7B Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 2473010048,
               "remote_path": "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf"
             }
@@ -900,11 +1013,13 @@
           "target_directory": "Qwen3-ASR-1.7B-GGUF"
         },
         {
+          "bytes": 4087653248,
           "default": false,
           "display_name": "Qwen3-ASR 1.7B F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 4087653248,
               "remote_path": "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf"
             }
@@ -923,11 +1038,13 @@
           "target_directory": "Qwen3-ASR-1.7B-GGUF"
         },
         {
+          "bytes": 1151272416,
           "default": false,
           "display_name": "Qwen3-ASR 0.6B Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1151272416,
               "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
             }
@@ -946,11 +1063,13 @@
           "target_directory": "Qwen3-ASR-0.6B-GGUF"
         },
         {
+          "bytes": 1880642016,
           "default": false,
           "display_name": "Qwen3-ASR 0.6B F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1880642016,
               "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf"
             }
@@ -969,31 +1088,38 @@
           "target_directory": "Qwen3-ASR-0.6B-GGUF"
         },
         {
+          "bytes": 4087626782,
           "default": false,
           "display_name": "Qwen3-ASR 1.7B HF Safetensors",
           "downloadable": true,
           "files": [
             {
+              "bytes": 2399,
               "remote_path": "config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/config.json"
             },
             {
+              "bytes": 165,
               "remote_path": "generation_config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/generation_config.json"
             },
             {
+              "bytes": 4076193080,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/model.safetensors"
             },
             {
+              "bytes": 487,
               "remote_path": "processor_config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/processor_config.json"
             },
             {
+              "bytes": 998,
               "remote_path": "tokenizer_config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/tokenizer_config.json"
             },
             {
+              "bytes": 11429653,
               "remote_path": "tokenizer.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/tokenizer.json"
             }
@@ -1017,27 +1143,33 @@
           "target_directory": "Qwen3-ASR-1.7B-hf"
         },
         {
+          "bytes": 1876110856,
           "default": false,
           "display_name": "Qwen3-ASR 0.6B Safetensors",
           "downloadable": true,
           "files": [
             {
+              "bytes": 6193,
               "remote_path": "config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/config.json"
             },
             {
+              "bytes": 142,
               "remote_path": "generation_config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/generation_config.json"
             },
             {
+              "bytes": 1876091704,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/model.safetensors"
             },
             {
+              "bytes": 330,
               "remote_path": "preprocessor_config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/preprocessor_config.json"
             },
             {
+              "bytes": 12487,
               "remote_path": "tokenizer_config.json",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/tokenizer_config.json"
             }
@@ -1065,6 +1197,9 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": null,
       "family": "sheetsage2",
       "id": "sheetsage2",
@@ -1075,12 +1210,17 @@
       "status": "no-source"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 175662720,
         "default": true,
         "display_name": "Sortformer Diar 4spk v1 Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 175662720,
             "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
           }
@@ -1103,11 +1243,13 @@
       "note": "落点精确匹配：sortformer_diar_4spk_v1_q8_0",
       "packages": [
         {
+          "bytes": 175662720,
           "default": true,
           "display_name": "Sortformer Diar 4spk v1 Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 175662720,
               "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
             }
@@ -1126,11 +1268,13 @@
           "target_directory": "Sortformer-Diar-4spk-v1-GGUF"
         },
         {
+          "bytes": 247915232,
           "default": false,
           "display_name": "Sortformer Diar 4spk v1 F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 247915232,
               "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf"
             }
@@ -1149,19 +1293,23 @@
           "target_directory": "Sortformer-Diar-4spk-v1-GGUF"
         },
         {
+          "bytes": 494208765,
           "default": false,
           "display_name": "Sortformer Diar 4spk v1 Safetensors",
           "downloadable": true,
           "files": [
             {
+              "bytes": 2096,
               "remote_path": "config.json",
               "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/config.json"
             },
             {
+              "bytes": 494206256,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/model.safetensors"
             },
             {
+              "bytes": 413,
               "remote_path": "processor_config.json",
               "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/processor_config.json"
             }
@@ -1187,12 +1335,17 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": {
+        "bytes": 1683570752,
         "default": false,
         "display_name": "Stable Audio 3 Small Music Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
+            "bytes": 1683570752,
             "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
           }
@@ -1215,11 +1368,13 @@
       "note": "目录匹配（模型 path 指目录），同处多个量化档且 schema 未声明 precision_preference，按 q8_0 优先选中 stable_audio_3_small_music_q8_0",
       "packages": [
         {
+          "bytes": 3582595584,
           "default": true,
           "display_name": "Stable Audio 3 Medium Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 3582595584,
               "remote_path": "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf"
             }
@@ -1238,11 +1393,13 @@
           "target_directory": "Stable-Audio-3-Medium-GGUF"
         },
         {
+          "bytes": 5834360000,
           "default": false,
           "display_name": "Stable Audio 3 Medium F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 5834360000,
               "remote_path": "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf"
             }
@@ -1261,11 +1418,13 @@
           "target_directory": "Stable-Audio-3-Medium-GGUF"
         },
         {
+          "bytes": 1683570752,
           "default": false,
           "display_name": "Stable Audio 3 Small Music Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1683570752,
               "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
             }
@@ -1284,11 +1443,13 @@
           "target_directory": "Stable-Audio-3-Small-Music-GGUF"
         },
         {
+          "bytes": 2358467232,
           "default": false,
           "display_name": "Stable Audio 3 Small Music F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 2358467232,
               "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf"
             }
@@ -1307,11 +1468,13 @@
           "target_directory": "Stable-Audio-3-Small-Music-GGUF"
         },
         {
+          "bytes": 1683570688,
           "default": false,
           "display_name": "Stable Audio 3 Small SFX Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 1683570688,
               "remote_path": "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf"
             }
@@ -1330,11 +1493,13 @@
           "target_directory": "Stable-Audio-3-Small-SFX-GGUF"
         },
         {
+          "bytes": 2358467168,
           "default": false,
           "display_name": "Stable Audio 3 Small SFX F16 GGUF",
           "downloadable": true,
           "files": [
             {
+              "bytes": 2358467168,
               "remote_path": "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf"
             }
@@ -1353,15 +1518,18 @@
           "target_directory": "Stable-Audio-3-Small-SFX-GGUF"
         },
         {
+          "bytes": null,
           "default": false,
           "display_name": "Stable Audio 3 Medium Safetensors",
           "downloadable": false,
           "files": [
             {
+              "bytes": null,
               "remote_path": "model_config.json",
               "url": "https://huggingface.co/stabilityai/stable-audio-3-medium/resolve/main/model_config.json"
             },
             {
+              "bytes": null,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/stabilityai/stable-audio-3-medium/resolve/main/model.safetensors"
             }
@@ -1381,15 +1549,18 @@
           "target_directory": "stable-audio-3-medium"
         },
         {
+          "bytes": null,
           "default": false,
           "display_name": "Stable Audio 3 Small Music Safetensors",
           "downloadable": false,
           "files": [
             {
+              "bytes": null,
               "remote_path": "model_config.json",
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/resolve/main/model_config.json"
             },
             {
+              "bytes": null,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/resolve/main/model.safetensors"
             }
@@ -1409,15 +1580,18 @@
           "target_directory": "stable-audio-3-small-music"
         },
         {
+          "bytes": null,
           "default": false,
           "display_name": "Stable Audio 3 Small SFX Safetensors",
           "downloadable": false,
           "files": [
             {
+              "bytes": null,
               "remote_path": "model_config.json",
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/resolve/main/model_config.json"
             },
             {
+              "bytes": null,
               "remote_path": "model.safetensors",
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/resolve/main/model.safetensors"
             }
@@ -1442,6 +1616,12 @@
       "status": "downloadable"
     },
     {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [
+        "yue2.model_gguf",
+        "yue2.vae_gguf"
+      ],
       "entry": null,
       "family": "yue2",
       "id": "yue2",
@@ -1454,7 +1634,7 @@
   ],
   "source": {
     "generated_by": "tools/gen_model_downloads.py",
-    "note": "由生成脚本产出，勿手改；size/sha256 刻意留空（生成不联网）",
+    "note": "由生成脚本产出，勿手改；sha256 一律留空（生成不下载权重）；bytes 来自 HTTP HEAD，取不到就是 null（不填 0、不拿别的档推算）",
     "schema": "config/models.schema.yaml",
     "spec_count": 72,
     "specs": "model_specs/*.json"
