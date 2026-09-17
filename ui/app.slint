@@ -23,14 +23,14 @@ import {
     PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
-import { BatchRow, Sentence, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
+import { BatchRow, Sentence, SeparationHistoryRow, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { VoiceDesignTab } from "extra_tabs.slint";
 import { SeparationWorkbench } from "separation_workbench.slint";
 import { SongWorkbench } from "song_workbench.slint";
 
-export { BatchRow, Sentence, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
+export { BatchRow, Sentence, SeparationHistoryRow, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
 
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
@@ -105,10 +105,13 @@ export component MainWindow inherits Window {
     in property <float> sep-progress: 0.0;
     in property <string> sep-status-text: "支持本地 wav / mp3 / flac";
     in property <bool> sep-has-result: false;
+    in property <bool> sep-result-available: false;
     in property <string> sep-vocals-label: "人声";
     in property <string> sep-accompaniment-label: "伴奏";
     in-out property <bool> sep-advanced: false;
     in-out property <string> sep-chunk-seconds: "30";
+    in property <[SeparationHistoryRow]> sep-history-rows: [];
+    in property <string> sep-history-status: "还没有分离历史";
 
     // ── 音乐制作（歌曲）场景：歌词 / 风格 / 模型 + 结果 ──
     //    预填示例歌词与风格：这个 Tab 一进去就能"生成歌曲"跑通，不留空态；
@@ -272,6 +275,7 @@ export component MainWindow inherits Window {
     callback sep-stop();
     callback sep-preview-track(int);
     callback sep-export-track(int);
+    callback sep-history-open(int);
     // 带状态是为了说对话：失败条目是"去重试"，运行中的是"后台继续跑"——
     // 无条件说"任务在后台继续跑"会把已经终态的失败任务说成还在跑（复核抓到）
     callback task-jump(int, string);
@@ -502,16 +506,20 @@ export component MainWindow inherits Window {
                     progress: root.sep-progress;
                     status-text: root.sep-status-text;
                     has-result: root.sep-has-result;
+                    result-available: root.sep-result-available;
                     vocals-label: root.sep-vocals-label;
                     accompaniment-label: root.sep-accompaniment-label;
                     show-advanced <=> root.sep-advanced;
                     chunk-seconds-text <=> root.sep-chunk-seconds;
+                    history-rows: root.sep-history-rows;
+                    history-status: root.sep-history-status;
                     pick-file => { root.sep-pick-file(); }
                 path-edited => { root.sep-path-edited(); }
                     run => { root.sep-run(); }
                     stop => { root.sep-stop(); }
                     preview-track(i) => { root.sep-preview-track(i); }
                     export-track(i) => { root.sep-export-track(i); }
+                    history-open(i) => { root.sep-history-open(i); }
                 }
 
                 // 场景 3 = 音乐制作（歌曲）：链路来自 feat/m4-song（yue2 / ace-step / S2 翻唱）

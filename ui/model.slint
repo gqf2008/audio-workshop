@@ -19,6 +19,15 @@ export struct Sentence {
     eval-label: string,
 }
 
+// 人声分离历史的一行：只用于回看，不提供历史删除/重命名。
+export struct SeparationHistoryRow {
+    index: int,          // Rust 侧解析结果下标（点击时回传）
+    created: string,     // 相对时间，如「2 小时前」
+    input: string,       // 输入音频的展示名（不是用于读盘的可信路径）
+    detail: string,      // 两轨文件名 + 时长，或文件不可用原因
+    available: bool,     // 两轨都通过安全解析才允许试听/导出
+}
+
 // 音色：本地模型 + 参考音频，不联网（CHARTER 第 4 节平台策略）。
 export struct Voice {
     name: string,     // 显示名（同时是下拉框选项文案）

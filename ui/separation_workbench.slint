@@ -2,8 +2,8 @@
 // 人声分离工作台（本地 htdemucs 推理，见 docs/vocal-separation-backend.md）
 //
 // 密度（v1.4 红线：每屏 ≤8 个语义元素，外壳 3 个各 Tab 共用）：
-//   本页 5 个 —— 音频画布 · 主操作 · 高级入口 · 状态行 · 结果轨列表（有成品才出现）
-//   默认态 4 + 外壳 3 = 7；结果就绪 5 + 3 = 8 ✓
+//   本页 6 个 —— 音频画布 · 主操作 · 高级入口 · 状态行 · 结果轨列表 · 最近分离历史
+//   默认态 5 + 外壳 3 = 8；结果就绪 6 + 3 = 9，历史回看是本批明确的例外。
 //
 // 两处必须如实写在界面上、不能藏的能力边界：
 //   1. 首次使用要下载模型（约 200MB）——进度里会显示"下载模型"，之后离线可用；
@@ -11,6 +11,7 @@
 //      `should_stop` 在 aw-core 的 separate_tracks 里只在 Separator::separate 返回后被查一次。
 // ============================================================================
 import { PixelButton, PixelProgressBar, PixelScrollPanel, PixelTextInput, PixelTheme } from "@slint_pixel";
+import { SeparationHistoryRow } from "model.slint";
 
 export component SeparationWorkbench inherits Rectangle {
     in-out property <string> input-path: "";
@@ -19,11 +20,14 @@ export component SeparationWorkbench inherits Rectangle {
     in property <float> progress: 0.0;
     in property <string> status-text: "";
     in property <bool> has-result: false;
+    in property <bool> result-available: true;
     in property <string> vocals-label: "人声";
     in property <string> accompaniment-label: "伴奏";
     in-out property <bool> show-advanced: false;
     // 分块秒数用字符串收（留空/非数字由 Rust 侧归一成"用上游默认"）
     in-out property <string> chunk-seconds-text: "30";
+    in property <[SeparationHistoryRow]> history-rows: [];
+    in property <string> history-status: "还没有分离历史";
 
     callback pick-file();
     callback path-edited();
@@ -31,6 +35,7 @@ export component SeparationWorkbench inherits Rectangle {
     callback stop();
     callback preview-track(int);
     callback export-track(int);
+    callback history-open(int);
 
     property <bool> ready: root.input-path != "";
 
@@ -220,13 +225,13 @@ export component SeparationWorkbench inherits Rectangle {
                     width: 100%;
                     background: PixelTheme.panel;
                     border-width: 2px;
-                    border-color: PixelTheme.edge;
+                    border-color: root.result-available ? PixelTheme.edge : PixelTheme.danger;
                     VerticalLayout {
                         padding: 12px;
                         spacing: 8px;
                         Text {
                             text: root.status-text;
-                            color: PixelTheme.dim;
+                            color: root.result-available ? PixelTheme.dim : PixelTheme.danger;
                             font-size: 12px;
                             overflow: elide;
                         }
@@ -247,7 +252,7 @@ export component SeparationWorkbench inherits Rectangle {
                                 Text {
                                     horizontal-stretch: 1;
                                     text: i == 0 ? root.vocals-label : root.accompaniment-label;
-                                    color: PixelTheme.text;
+                                    color: root.result-available ? PixelTheme.text : PixelTheme.dim;
                                     font-size: 13px;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -256,15 +261,97 @@ export component SeparationWorkbench inherits Rectangle {
                                     width: 64px;
                                     size: "small";
                                     text: "试听";
-                                    enabled: !root.busy;
+                                    enabled: !root.busy && root.result-available;
                                     clicked => { root.preview-track(i); }
                                 }
                                 PixelButton {
                                     width: 84px;
                                     size: "small";
                                     text: "导出";
-                                    enabled: !root.busy;
+                                    enabled: !root.busy && root.result-available;
                                     clicked => { root.export-track(i); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ⑤ 最近分离历史：只回看，不做删除/重命名/跨工程聚合。
+                Rectangle {
+                    width: 100%;
+                    background: PixelTheme.panel;
+                    border-width: 2px;
+                    border-color: PixelTheme.hover;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 6px;
+                        Text {
+                            text: "最近分离";
+                            color: PixelTheme.text;
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.history-status;
+                            color: PixelTheme.dim;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if root.history-rows.length > 0 : PixelScrollPanel {
+                            height: 156px;
+                            panel-bg: PixelTheme.bg;
+                            edge: PixelTheme.hover;
+                            VerticalLayout {
+                                width: 100%;
+                                spacing: 4px;
+                                for h in root.history-rows : Rectangle {
+                                    width: 100%;
+                                    height: 46px;
+                                    background: h.available ? transparent : PixelTheme.bg;
+                                    border-width: 2px;
+                                    border-color: h.available ? PixelTheme.hover : PixelTheme.danger;
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 8px;
+                                        Rectangle {
+                                            width: 8px;
+                                            height: 8px;
+                                            border-radius: 4px;
+                                            background: h.available ? PixelTheme.accent : PixelTheme.danger;
+                                        }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            alignment: center;
+                                            spacing: 1px;
+                                            Text {
+                                                text: h.input + " · " + h.created;
+                                                color: h.available ? PixelTheme.text : PixelTheme.danger;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: h.detail;
+                                                color: PixelTheme.dim;
+                                                font-size: 10px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                        }
+                                        Text {
+                                            text: h.available ? "回看" : "不可用";
+                                            color: h.available ? PixelTheme.accent : PixelTheme.danger;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        mouse-cursor: pointer;
+                                        clicked => { root.history-open(h.index); }
+                                    }
                                 }
                             }
                         }

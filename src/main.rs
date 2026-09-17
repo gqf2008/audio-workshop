@@ -16,6 +16,7 @@ mod cancel;
 mod dictionaries;
 mod export;
 mod player;
+mod sep_history;
 mod tasks;
 mod templates;
 mod versions;
@@ -293,6 +294,10 @@ enum Msg {
     },
     SeparationDone {
         task_id: u32,
+        /// 本次任务的输入音频（只写入历史元数据；回看两轨不依赖它）
+        input: PathBuf,
+        /// 本次任务的工程内输出目录（成功记录必须落在它下面的 history.json）
+        out_dir: PathBuf,
         vocals: PathBuf,
         accompaniment: PathBuf,
     },
@@ -2500,6 +2505,10 @@ fn worker_loop(ctx: WorkerCtx) {
                 let tx = ctx.tx.clone();
                 // 读分离**自己的**停止位
                 let stop = Arc::clone(&ctx.sep_stop);
+                // 终态要带回“提交时”的输入与工程内输出目录：期间改工程名不能把
+                // 成功记录写到另一个工程目录里。
+                let history_input = input.clone();
+                let history_out_dir = out_dir.clone();
                 let req = aw_core::separate::SeparationRequest {
                     input,
                     out_dir,
@@ -2525,6 +2534,8 @@ fn worker_loop(ctx: WorkerCtx) {
                 let msg = match result {
                     Ok(aw_core::separate::SeparationOutcome::Done(t)) => Msg::SeparationDone {
                         task_id,
+                        input: history_input,
+                        out_dir: history_out_dir,
                         vocals: t.vocals,
                         accompaniment: t.accompaniment,
                     },
@@ -3386,6 +3397,13 @@ struct BatchRowState {
     out: Option<(PathBuf, PathBuf)>,
 }
 
+/// 人声分离历史在 UI 侧的只读快照：条目 + 已经过安全解析的两轨。
+#[derive(Clone)]
+struct SepHistoryItem {
+    entry: sep_history::SeparationHistoryEntry,
+    tracks: sep_history::TrackResolution,
+}
+
 #[derive(Default)]
 struct UiState {
     /// 最近一次拼装结果（导出复制 / 全篇试听用）
@@ -3405,6 +3423,8 @@ struct UiState {
     /// 人声分离：当前输入路径（用于 stale 判定）与两轨产物
     sep_input: RefCell<Option<String>>,
     sep_tracks: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// 最近分离历史的只读快照（最多 5 条，路径已经过工程内白名单校验）
+    sep_history: RefCell<Vec<SepHistoryItem>>,
     sep_task: std::cell::Cell<Option<u32>>,
     /// 质检任务的 id（配音页那一条）
     eval_task: std::cell::Cell<Option<u32>>,
@@ -3653,6 +3673,7 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_sep_input_path("/tmp/aw-sep-src.wav".into());
             ui.set_sep_input_summary("待分离：aw-sep-src.wav".into());
             ui.set_sep_has_result(true);
+            ui.set_sep_result_available(true);
             ui.set_sep_vocals_label("人声 · cli_vocals.wav".into());
             ui.set_sep_accompaniment_label("伴奏 · cli_accompaniment.wav".into());
             ui.set_sep_status_text("两轨已生成 · 可分别试听和导出".into());
@@ -3663,6 +3684,7 @@ fn apply_shot_state(ui: &MainWindow) {
             ui.set_scene(2);
             ui.set_sep_input_path("/tmp/aw-sep-src.wav".into());
             ui.set_sep_input_summary("待分离：aw-sep-src.wav".into());
+            ui.set_sep_result_available(false);
             ui.set_sep_chunk_seconds("30".into());
             ui.invoke_sep_run();
         }
@@ -4361,6 +4383,10 @@ fn wire_script(
         invalidate_worker_project(&tx, &state0);
         reset_bgm(&ui, &state0);
         ui.set_has_result(false);
+        // 分离结果和历史都属于工程目录；换工程名后要切到新目录，
+        // 不能把上一个工程的两轨当成当前结果继续试听/导出。
+        clear_separation_result(&ui, &state0);
+        refresh_separation_history(&ui, &state0);
         refresh_versions(&ui, &state0);
         ui.set_status_text(format!("工程名：{}", ui.get_project_name()).into());
     });
@@ -4615,6 +4641,8 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
         ui.set_sep_busy(false);
         ui.set_sep_progress(0.0);
         ui.set_sep_has_result(false);
+        ui.set_sep_result_available(false);
+        state.sep_tracks.borrow_mut().take();
         let note = "已从队列中移除（还没开始跑，没有消耗算力）".to_string();
         ui.set_sep_status_text(note.clone().into());
         ui.set_status_text(note.clone().into());
@@ -6696,22 +6724,43 @@ fn tick(
             }
             Msg::SeparationDone {
                 task_id,
+                input,
+                out_dir,
                 vocals,
                 accompaniment,
             } => {
                 if state.sep_task.get() == Some(task_id) {
+                    // 先落盘历史，再提交 UI 结果：写失败时如实报错，但分离本身的两轨
+                    // 已经成功，仍可试听/导出；不把“历史写失败”伪装成“历史已写入”。
+                    let history_note = match sep_history::record_success(
+                        &out_dir,
+                        now_ms(),
+                        &input,
+                        &vocals,
+                        &accompaniment,
+                    ) {
+                        Ok(_) => "两轨已生成 · 已写入分离历史 · 可分别试听和导出".to_string(),
+                        Err(e) => format!("两轨已生成，但分离历史写入失败：{e}"),
+                    };
                     ui.set_sep_busy(false);
                     ui.set_sep_progress(1.0);
                     ui.set_sep_has_result(true);
+                    ui.set_sep_result_available(true);
                     ui.set_sep_vocals_label(format!("人声 · {}", file_label(&vocals)).into());
                     ui.set_sep_accompaniment_label(
                         format!("伴奏 · {}", file_label(&accompaniment)).into(),
                     );
-                    let note = "两轨已生成 · 可分别试听和导出".to_string();
-                    ui.set_sep_status_text(note.clone().into());
-                    ui.set_status_text(note.clone().into());
-                    finish_task(ui, state, &state.sep_task, tasks::TaskState::Done, note);
+                    ui.set_sep_status_text(history_note.clone().into());
+                    ui.set_status_text(history_note.clone().into());
+                    finish_task(
+                        ui,
+                        state,
+                        &state.sep_task,
+                        tasks::TaskState::Done,
+                        history_note,
+                    );
                     *state.sep_tracks.borrow_mut() = Some((vocals, accompaniment));
+                    refresh_separation_history(ui, state);
                 }
             }
             Msg::SeparationStopped { task_id } => {
@@ -6719,6 +6768,7 @@ fn tick(
                     ui.set_sep_busy(false);
                     ui.set_sep_progress(0.0);
                     ui.set_sep_has_result(false);
+                    ui.set_sep_result_available(false);
                     // 上游没有取消 API：已经跑掉的算力收不回，这里如实说
                     let note = "已停止（本轮结果已丢弃，没有落盘；分离跑完前无法中断，耗时照算）"
                         .to_string();
@@ -6732,6 +6782,7 @@ fn tick(
                     ui.set_sep_busy(false);
                     ui.set_sep_progress(0.0);
                     ui.set_sep_has_result(false);
+                    ui.set_sep_result_available(false);
                     ui.set_sep_status_text(error.clone().into());
                     ui.set_status_text(format!("人声分离失败：{error}").into());
                     finish_task(ui, state, &state.sep_task, tasks::TaskState::Failed, error);
@@ -7572,6 +7623,104 @@ fn file_label(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// 清掉分离 Tab 的“当前结果”槽位；历史列表和索引不在这里动。
+fn clear_separation_result(ui: &MainWindow, state: &Rc<UiState>) {
+    state.sep_tracks.borrow_mut().take();
+    ui.set_sep_has_result(false);
+    ui.set_sep_result_available(false);
+    ui.set_sep_progress(0.0);
+}
+
+/// 读取当前工程目录下的历史，只投影最近 5 条；每条的两轨在投影前已做安全解析。
+fn refresh_separation_history(ui: &MainWindow, state: &Rc<UiState>) {
+    let stems_dir = project_dir(&file_stem(&ui.get_project_name())).join("stems");
+    let mut items = Vec::new();
+    let mut ui_rows = Vec::new();
+    let status = match sep_history::load(&stems_dir) {
+        Ok(sep_history::HistoryLoad::Missing) => "还没有分离历史".to_string(),
+        Ok(sep_history::HistoryLoad::Loaded(mut entries)) => {
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_ms));
+            let now = now_ms();
+            for entry in entries.into_iter().take(5) {
+                let tracks = sep_history::resolve_tracks(&stems_dir, &entry);
+                let input = file_label(Path::new(&entry.input_path));
+                let detail = if tracks.available() {
+                    let media = match (entry.duration_secs, entry.sample_rate_hz) {
+                        (Some(duration), Some(rate)) => format!(" · {duration:.1}s / {rate}Hz"),
+                        (Some(duration), None) => format!(" · {duration:.1}s"),
+                        (None, Some(rate)) => format!(" · {rate}Hz"),
+                        (None, None) => String::new(),
+                    };
+                    format!(
+                        "人声 {} · 伴奏 {}{media}",
+                        entry.vocals_file, entry.accompaniment_file
+                    )
+                } else {
+                    tracks.note.clone()
+                };
+                ui_rows.push(SeparationHistoryRow {
+                    index: items.len() as i32,
+                    created: relative_time(now, entry.created_at_ms).into(),
+                    input: input.into(),
+                    detail: detail.into(),
+                    available: tracks.available(),
+                });
+                items.push(SepHistoryItem { entry, tracks });
+            }
+            if ui_rows.is_empty() {
+                "还没有分离历史".to_string()
+            } else {
+                format!("最近 {} 条（时间倒序）", ui_rows.len())
+            }
+        }
+        Err(e) => {
+            // 坏索引不能显示成“没有历史”：状态行保留损坏原因，列表为空。
+            format!("分离历史读不出来：{e}")
+        }
+    };
+
+    *state.sep_history.borrow_mut() = items;
+    ui.set_sep_history_rows(ModelRc::from(Rc::new(VecModel::from(ui_rows))));
+    ui.set_sep_history_status(status.into());
+}
+
+/// 试听/导出前重新检查“当前结果”的两轨：文件可能已被删除，或缓存快照已过期。
+fn current_separation_tracks_usable(ui: &MainWindow, state: &Rc<UiState>) -> bool {
+    // 文件可能在应用运行期间被手动删除/替换；每次试听/导出前重新解析，
+    // 不只相信列表初次加载时的快照。
+    refresh_separation_history(ui, state);
+    let Some((vocals, accompaniment)) = state.sep_tracks.borrow().clone() else {
+        ui.set_sep_status_text("还没有分离结果".into());
+        return false;
+    };
+    let Some(stems_dir) = vocals.parent() else {
+        ui.set_sep_result_available(false);
+        ui.set_sep_status_text("分离结果路径不完整，不能试听/导出".into());
+        return false;
+    };
+    if accompaniment.parent() != Some(stems_dir) {
+        ui.set_sep_result_available(false);
+        ui.set_sep_status_text("两轨不在同一个工程目录，拒绝试听/导出".into());
+        return false;
+    }
+    let (Some(vocals_file), Some(accompaniment_file)) = (
+        vocals.file_name().and_then(|name| name.to_str()),
+        accompaniment.file_name().and_then(|name| name.to_str()),
+    ) else {
+        ui.set_sep_result_available(false);
+        ui.set_sep_status_text("两轨文件名不是 UTF-8，不能试听/导出".into());
+        return false;
+    };
+    let resolution = sep_history::resolve_track_names(stems_dir, vocals_file, accompaniment_file);
+    if resolution.available() {
+        true
+    } else {
+        ui.set_sep_result_available(false);
+        ui.set_sep_status_text(resolution.note.clone().into());
+        false
+    }
+}
+
 /// 切换/粘贴待分离音频：输入变了就把旧两轨标为过期（导出与试听都要求 has-result）。
 fn set_separation_input(ui: &MainWindow, state: &Rc<UiState>, path: String) {
     let same = state.sep_input.borrow().as_deref() == Some(path.as_str());
@@ -7582,9 +7731,7 @@ fn set_separation_input(ui: &MainWindow, state: &Rc<UiState>, path: String) {
         return;
     }
     *state.sep_input.borrow_mut() = Some(path);
-    state.sep_tracks.borrow_mut().take();
-    ui.set_sep_has_result(false);
-    ui.set_sep_progress(0.0);
+    clear_separation_result(ui, state);
     ui.set_sep_status_text("已就绪，可分离".into());
 }
 
@@ -7696,8 +7843,7 @@ fn wire_separation(
         let out_dir = project_dir(&stem).join("stems");
         stop1.store(false, Ordering::Relaxed);
         ui.set_sep_busy(true);
-        ui.set_sep_has_result(false);
-        ui.set_sep_progress(0.0);
+        clear_separation_result(&ui, &st);
         let id = enqueue_task(
             &ui,
             &st,
@@ -7760,6 +7906,17 @@ fn wire_separation(
     let player2 = player.clone();
     ui.on_sep_preview_track(move |i| {
         let Some(ui) = weak.upgrade() else { return };
+        if !ui.get_sep_has_result() {
+            ui.set_sep_status_text("还没有分离结果".into());
+            return;
+        }
+        if !ui.get_sep_result_available() {
+            ui.set_sep_status_text("这条分离结果的两轨文件不在了，不能试听".into());
+            return;
+        }
+        if !current_separation_tracks_usable(&ui, &st2) {
+            return;
+        }
         let Some((vocals, accompaniment)) = st2.sep_tracks.borrow().clone() else {
             ui.set_sep_status_text("还没有分离结果".into());
             return;
@@ -7783,6 +7940,17 @@ fn wire_separation(
     let st3 = state.clone();
     ui.on_sep_export_track(move |i| {
         let Some(ui) = weak.upgrade() else { return };
+        if !ui.get_sep_has_result() {
+            ui.set_sep_status_text("还没有分离结果".into());
+            return;
+        }
+        if !ui.get_sep_result_available() {
+            ui.set_sep_status_text("这条分离结果的两轨文件不在了，不能导出".into());
+            return;
+        }
+        if !current_separation_tracks_usable(&ui, &st3) {
+            return;
+        }
         let Some((vocals, accompaniment)) = st3.sep_tracks.borrow().clone() else {
             ui.set_sep_status_text("还没有分离结果".into());
             return;
@@ -7809,6 +7977,55 @@ fn wire_separation(
             Err(e) => ui.set_sep_status_text(aw_core::dub::write_failure_note(&dst, 0, &e).into()),
         }
     });
+
+    // 历史回看：只使用已解析成功的安全路径；缺失/软链条目仍可点击看到原因。
+    let weak = ui.as_weak();
+    let st_history = state.clone();
+    ui.on_sep_history_open(move |index| {
+        let Some(ui) = weak.upgrade() else { return };
+        // 用户可能在应用运行期间删掉音频；点击时先重读索引并重新解析，
+        // 让“文件不在了”的提示和按钮禁用状态来自当前磁盘，不来自旧快照。
+        refresh_separation_history(&ui, &st_history);
+        let Some(item) = st_history.sep_history.borrow().get(index as usize).cloned() else {
+            ui.set_sep_status_text("历史条目已刷新，请重新点击".into());
+            return;
+        };
+        let entry = item.entry;
+        let tracks = item.tracks;
+        ui.set_sep_input_path(entry.input_path.clone().into());
+        ui.set_sep_input_summary(
+            format!("已回看：{}", file_label(Path::new(&entry.input_path))).into(),
+        );
+        *st_history.sep_input.borrow_mut() = Some(entry.input_path.clone());
+        ui.set_sep_has_result(true);
+        ui.set_sep_progress(1.0);
+        ui.set_sep_result_available(tracks.available());
+        ui.set_sep_vocals_label(format!("人声 · {}", entry.vocals_file).into());
+        ui.set_sep_accompaniment_label(format!("伴奏 · {}", entry.accompaniment_file).into());
+        if let Some((vocals, accompaniment)) = tracks.paths() {
+            *st_history.sep_tracks.borrow_mut() =
+                Some((vocals.to_path_buf(), accompaniment.to_path_buf()));
+            let note = format!(
+                "历史结果：{} · 可试听/导出",
+                file_label(Path::new(&entry.input_path))
+            );
+            ui.set_sep_status_text(note.into());
+            ui.set_status_text(
+                format!(
+                    "已切到分离历史：{}",
+                    file_label(Path::new(&entry.input_path))
+                )
+                .into(),
+            );
+        } else {
+            st_history.sep_tracks.borrow_mut().take();
+            ui.set_sep_status_text(tracks.note.clone().into());
+            ui.set_status_text(format!("这条分离历史不可用：{}", tracks.note).into());
+        }
+    });
+
+    // 启动/接线时先读一次当前工程的历史；换工程名时也会刷新。
+    refresh_separation_history(ui, state);
 }
 
 fn file_stem(name: &str) -> String {
@@ -10317,6 +10534,7 @@ mod tests {
                     task_id: 12,
                     vocals,
                     accompaniment,
+                    ..
                 } => break (vocals, accompaniment),
                 Msg::SeparationStopped { task_id: 12 } => panic!("没登记取消，不该停"),
                 Msg::SeparationFailed { task_id: 12, error } => panic!("分离失败：{error}"),
