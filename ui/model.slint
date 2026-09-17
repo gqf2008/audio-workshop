@@ -8,6 +8,7 @@
 
 // 一句话：配音的最小单位。
 export struct Sentence {
+    index: int,              // 工程里的真实下标（从 0 开始；排序后仍靠它回指工程句子）
     no: int,                 // 句序号（从 1 开始）
     text: string,            // 句子文本
     status: string,          // 待合成 / 合成中 / 已合成 / 失败
@@ -17,6 +18,11 @@ export struct Sentence {
     start-label: string,     // 展示用，如 "0:12"
     // 质检分数（""= 没测过/已失效）。并进展开行的状态文案显示，不新增元素
     eval-label: string,
+    // 质检视图动作的元数据。qa-enabled/qa-sorted 只由第 0 行承载；
+    // qa-scroll-y 会广播到每一行，排序换行后滚动目标也不会漂移。
+    qa-enabled: bool,
+    qa-sorted: bool,
+    qa-scroll-y: length,
 }
 
 // 人声分离历史的一行：只用于回看，不提供历史删除/重命名。
