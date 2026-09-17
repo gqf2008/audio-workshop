@@ -8337,6 +8337,38 @@ mod tests {
         }
     }
 
+    /// 复核抓到的竞态：**文件框打开后再起别的任务**（歌曲/分离这类不设全局
+    /// `running`/`busy`，只进台账），回调到达时必须据此拒绝导入。
+    /// 这里钉判据本身：台账里有任务在飞 / 批量在飞 → 词典控件判定为忙。
+    #[test]
+    fn dictionary_controls_are_busy_when_any_task_is_in_flight() {
+        let state = Rc::new(UiState::default());
+        assert!(state_dictionary_idle(&state), "什么都没跑时应空闲");
+
+        // 歌曲/分离这类任务只进台账（不设全局 running/busy）
+        state
+            .tasks
+            .borrow_mut()
+            .enqueue(tasks::TaskKind::Song, "音乐制作 · 生成歌曲");
+        assert!(
+            !state_dictionary_idle(&state),
+            "台账里有任务在飞时，词典控件必须算忙（否则文件框回调会偷偷换词典）"
+        );
+
+        // 批量在飞：在跑那一行是 Running
+        let batch_state = Rc::new(UiState::default());
+        batch_state.batch_rows.borrow_mut().push(BatchRowState {
+            name: "甲".into(),
+            script: String::new(),
+            sentences: 1,
+            task_id: Some(1),
+            state: batch::ItemState::Running,
+            detail: String::new(),
+            out: None,
+        });
+        assert!(!state_dictionary_idle(&batch_state), "批量在跑也算忙");
+    }
+
     /// 复核抓到的：没启用词典时导入，若库里已有同名词典，**必须合并而不是覆盖**
     /// （否则原词条被同名覆盖语义吃掉）。这里直接测"合并策略"这段逻辑本身。
     #[test]

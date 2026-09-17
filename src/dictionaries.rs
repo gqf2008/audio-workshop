@@ -118,7 +118,24 @@ pub fn list(root: &Path) -> (Vec<Entry>, usize) {
             .cmp(&a.updated_at)
             .then_with(|| b.file.cmp(&a.file))
     });
-    (rows, broken)
+    // **同名词典只认最新的那份**：库没有索引，同名覆盖时旧文件万一没删掉（权限/占用），
+    // 列表里就会出现两条同名条目 —— 选中/合并可能落到旧词条上。这里按名字（忽略大小写）
+    // 去重、保留 `updated_at` 最大的那份；被忽略的旧副本计入计数，界面要如实说。
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut deduped: Vec<Entry> = Vec::new();
+    let mut stale = 0usize;
+    for row in rows {
+        // `insert` 返回旧值：None = 这个名字第一次出现（保留它），Some = 旧副本（计数后丢）
+        if seen
+            .insert(row.name.to_lowercase(), deduped.len())
+            .is_none()
+        {
+            deduped.push(row);
+        } else {
+            stale += 1;
+        }
+    }
+    (deduped, broken + stale)
 }
 
 /// 保存一套词典（同名覆盖）：**写新文件 → 落盘成功 → 才清理旧文件**。
@@ -157,16 +174,30 @@ pub fn save(
     aw_core::dub::write_atomic_explained(&dst, &body)
         .map_err(|e| format!("词典写入失败（{}）：{e}", dst.display()))?;
 
-    // 清理同名旧文件（只删"库内、普通文件、名字合法"的那种）
-    let (rows, _) = list(root);
-    for old in rows.iter().filter(|r| r.name.eq_ignore_ascii_case(name)) {
-        if old.file == file || !file_is_safe(&old.file) {
-            continue;
-        }
-        let old_path = dir.join(&old.file);
-        if let Ok(meta) = std::fs::symlink_metadata(&old_path) {
-            if !meta.file_type().is_symlink() && meta.is_file() {
-                let _ = std::fs::remove_file(&old_path);
+    // 清理同名旧文件（只删"库内、普通文件、名字合法"的那种）。
+    // **直接扫目录而不是走 `list`**：`list` 会按名字去重，旧副本根本不会出现在结果里，
+    // 那样就永远清不掉了（清理失败时列表仍会去重，不会误导用户选到旧词条）。
+    if let Ok(dir_entries) = std::fs::read_dir(&dir) {
+        for e in dir_entries.flatten() {
+            let Some(other) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if other == file
+                || Path::new(&other).extension().and_then(|x| x.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Ok(d) = load_file(root, &other) else {
+                continue;
+            };
+            if !d.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            let other_path = dir.join(&other);
+            if let Ok(meta) = std::fs::symlink_metadata(&other_path) {
+                if !meta.file_type().is_symlink() && meta.is_file() {
+                    let _ = std::fs::remove_file(&other_path);
+                }
             }
         }
     }
@@ -399,6 +430,32 @@ mod tests {
         let (rows, broken) = list(&root);
         assert_eq!(rows.len(), 1);
         assert_eq!(broken, 1, "坏文件要计数");
+    }
+
+    /// 同名两份（例如清理旧文件失败留下的副本）：列表只认最新的那份，并把旧副本计数报出来
+    /// —— 否则 UI/自动合并可能选中旧词条（复核指出的清理失败静默问题）。
+    #[test]
+    fn list_keeps_only_the_newest_of_duplicate_names() {
+        let root = temp_dir("dupes");
+        let old = save(&root, "甲", entries(&[("a", "旧")]), 10, sanitize).unwrap();
+        // 手造一份更新的同名条目（不同文件名，模拟旧文件没删掉 + 又存了一次）
+        let newer = Dictionary {
+            name: "甲".into(),
+            entries: entries(&[("a", "新")]),
+            updated_at: 20,
+        };
+        std::fs::write(
+            library_dir(&root).join("甲-手动.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+
+        let (rows, stale) = list(&root);
+        assert_eq!(rows.len(), 1, "同名只该留一份：{rows:?}");
+        assert_eq!(rows[0].updated_at, 20, "留最新的那份");
+        assert_eq!(stale, 1, "被忽略的旧副本要计数");
+        assert_ne!(rows[0].file, old.file);
+        let _ = newer;
     }
 
     #[test]
