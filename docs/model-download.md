@@ -1,14 +1,69 @@
-# 模型下载器（M4-P7 第一段：队列 / 校验 / 断点续传）
+# 模型下载器（M4-P7）
 
-> 2026-09-17。对应 issue thread `cc-ai-audio-workshop-model-download`。
-> 只写**已经实现**的行为与边界，不写愿景。第二段（按机器推荐量化档 / 并行 / 镜像）明确没做。
+> 2026-09-17。第一段（队列 / 校验 / 断点续传）见 §3–§4，对应 issue thread
+> `cc-ai-audio-workshop-model-download`；第二段（**下载源**）见 §1–§2，对应
+> `cc-ai-audio-workshop-model-sources`。
+> 只写**已经实现**的行为与边界，不写愿景。按机器推荐量化档 / 并行 / 镜像仍明确没做。
 
 ## 1. 入口与数据来源
 
-「全局设置」抽屉的 **模型** 区新增「可下载模型」列表：清单里**带 `url`** 的模型各一行，
-一行一条队列状态 + 进度条 + 「下载 / 取消 / 重下」按钮。
+「全局设置」抽屉的 **模型** 区是「可下载模型」列表，**每一行都会出现**，三类：
 
-模型来自服务清单 `server.json`（`src/main.rs::read_server_config`）。P7 给每个模型加了三个可选字段：
+| 行的状态 | 含义 | 按钮 |
+|---|---|---|
+| 未下载 / 排队 / 下载中 / 校验中 / 已完成 / 失败 / 已取消 / 已就位 | 真的能下（或已经下过） | 下载 / 取消 / 重下 / 重试 |
+| **没有下载源** | 下不了，且**写明为什么** | **不显示**（不给点了必然失败的入口） |
+
+下载地址有两个来源，**按行的 `detail` 前缀如实标出**：
+
+1. `来源：server.json（服务清单）` —— 服务清单里**显式**给了 `url`，**以服务为准**
+   （服务侧可以覆盖内置清单：内网镜像、自建仓库）。
+2. `来源：内置下载清单` —— 服务清单没给 `url` 时，查随应用分发的
+   `config/model-downloads.json`（`include_str!` 打进二进制）。
+
+### 1.1 内置清单从哪来、怎么生成
+
+上游 `audio.cpp` 的 `model_specs/*.json` 是下载链接的 source of truth（CHARTER §6），
+它不在用户机器上，所以由 `tools/gen_model_downloads.py` 投影成一份**提交进仓库**的
+`config/model-downloads.json`：
+
+```sh
+python3 tools/gen_model_downloads.py           # 生成（AUDIOCPP_DIR 可覆盖上游位置）
+python3 tools/gen_model_downloads.py --check   # 与上游比对，不一致退出 1（发现"改了 spec 忘了重生成"）
+```
+
+- **不联网**：`size` / `sha256` 一律留空（生成必须离线可复现），下载器退化成按响应
+  `Content-Length` 校验大小。
+- **逐字节稳定**：固定键序 + 固定缩进 + 行尾换行；同一份输入跑两次 `diff` 为空。
+
+### 1.2 映射规则：**按落点，不按 family**
+
+产品 id → 上游包的映射**不是**「family → 上游默认包」。上游 `packages[].default` 在几个
+本产品登记过的 family 上指向**别的权重**（对着 spec 实测）：
+
+| 产品 id | family | 上游 default 包 | 本产品 `path` 指向 | 只按 family 会下到 |
+|---|---|---|---|---|
+| audio8-tts | audio8_tts | 0.6B q8_0 | 0.6B | ✅ 一致 |
+| index-tts2 | index_tts2 | **2.0** q8_0 | **2.5** | ❌ 2.0 |
+| qwen3-asr | qwen3_asr | **1.7B** q8_0 | **0.6B** | ❌ 1.7B |
+| stable-audio-small-music | stable_audio | **medium** q8_0 | **small-music** | ❌ medium |
+
+（这正是 `tools/model_fetch.py` 现有口径在本产品上会取错的那几处——生成脚本因此改用
+产品自己的 ground truth，理由写在脚本头部注释里。）
+
+规则：`config/models.schema.yaml` 里该模型 `path` 去掉 `${models_root}/` 的那一段，
+必须等于包的 `target_directory` + （`files[i]` 去掉 `strip_prefix`）——后者与上游
+`model_manager_v2.py::stripped_path` 逐字一致，就是上游决定文件落在哪一层的规则。
+
+- 相等 → 就是它（能区分 0.1B/0.6B、2.0/2.5、medium/small-music）。
+- `path` 正好等于 `target_directory`（gen 类模型 path 指目录）→ 目录匹配；同处多个量化档
+  时按 `precision_preference` → `q8_0` 的顺序挑，**挑的理由写进该行的 `note`**。
+- 匹配不上 / 上游包没有公开下载源（`kind: unsupported`，如 `audio8-asr` 是
+  CC-BY-NC-4.0 需本地转换）→ `status = "no-source"`，界面显示原因，**不猜地址**。
+
+### 1.3 服务清单的字段
+
+P7 给每个模型加了三个可选字段：
 
 ```json
 {
@@ -22,15 +77,32 @@
 }
 ```
 
-- **`url` 缺失 = 不可下载**：该模型不进列表，页面上不显示假下载入口（清单里没有下载源就是没有）。
+- **`url` 缺失**：退到内置下载清单；内置清单也没有 → 该行显示「没有下载源」+ 原因，**不给按钮**。
 - **`sha256` 缺失**：退化成按大小校验（见 §3）。
 - **`size` 缺失**：按响应的 `Content-Length` 校验。
 
-## 2. 下载到哪
+## 2. 下载到哪 + 落点校验
 
-目标目录一律取**全局设置的「模型目录」**（`model_dir()`，默认 `<应用工作目录>/models`），
-**不写死、也不跟清单 `path` 的目录走**。文件名优先沿用清单 `path` 的文件名（服务才能按原路径找到），
-没有就取 `url` 末段（剥掉 query），最后退回 `<id>.gguf`。目录不存在会自动创建。
+目标一律是 **`<模型目录>/<相对落点>`**，`<模型目录>` 取全局设置的「模型目录」
+（`model_dir()`，默认 `<应用工作目录>/models`），目录不存在会自动创建。**相对落点**：
+
+- 内置清单知道这个模型 → 用它的 `local_paths[0]`（上游 `target_directory + strip_prefix`
+  的布局，与 `server.json` 的 `path` 同源）；
+- 否则用服务清单 `path` 相对模型目录的那一段；再没有就取 `path` 的文件名、
+  `url` 末段（剥 query），最后 `<id>.gguf`。
+
+**落点校验（`⚠ 落点与 server.json 对不上`）**：算出来的落点与 `server.json` 声明的 `path`
+按**真实路径**（解析 `..` 与软链）比，不一致时把两边都写在行上，例如：
+
+```
+来源：内置下载清单 · /Users/me/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
+· ⚠ 落点与 server.json 对不上：清单 path 是 /Volumes/DataExt/models/…，
+  本次会下到 /Users/me/models/… —— 下完服务仍可能加载不到（把「模型目录」指到清单所在的位置，
+  或把清单 path 改成实际落点）
+```
+
+`path` 指目录（gen 类模型，如 `Stable-Audio-3-Small-Music-GGUF`）时，文件落在这个目录里
+**不算冲突**。没写 `path` 就没有可比的声明，不报。
 
 > 注意：下载只是把权重放到模型目录。要让 `audiocpp_server` 加载它，清单里的 `path` 得指向这个文件
 > （或服务侧重新扫描）；本批不做"下载完自动改服务清单"。
@@ -81,12 +153,26 @@
   队列串行**顺序**（第二条的 Queued 要晚于第一条的 Done）、排队中取消被跳过、
   `cancel` 如实区分 首次请求取消 / 已在取消中 / 其实已收尾。
   另有 UI 侧的点击语义测试（取消未收尾期间再点不会再排一条）。
-- UI 冒烟：`AW_UI_STATE=drawer cargo run`（模型区渲染）、`AW_UI_STATE=downloads cargo run`（灌四种状态核对进度/按钮）。
+- 生成脚本：输出逐字节稳定（同输入跑两次 `diff` 为空）、`--check` 能发现被改过的产物。
+- 规划纯函数（`src/model_sources.rs`）四类各有能红的用例：
+  **服务清单带 url 时以服务为准**、**gated / 没有源不给入口**、**内置清单读不出来 ≠ 没有源**、
+  **映射歧义**（同一个 `audio8_tts` family 下 0.6B 有包、0.1B 没有；`index_tts2` 选 2.5 而非
+  2.0；`qwen3_asr` 选 0.6B 而非 1.7B；`stable_audio` 选 small-music 而非 medium）。
+  另有落点校验（清单 path 在模型目录外 → 报冲突；path 指目录 → 不报）。
+- UI 冒烟：`AW_UI_STATE=drawer cargo run`（模型区渲染）、`AW_UI_STATE=downloads cargo run`
+  （灌下载中/排队/已完成/失败/落点警告/没有下载源六种状态核对进度与按钮）、
+  `AW_UI_STATE=model-sources cargo run`（**真机态**：按 `server.json ∪ 内置清单` 实渲，
+  状态行直接报"几个有入口、几个标了没有源"）。
 - 门禁：`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`。
 
 ## 6. 本批没做（别按已实现宣传）
 
-- **按机器推荐量化档**（读 RAM / 显存）——留给下一批。
+- **按机器推荐量化档**（读 RAM / 显存）——内置清单里**已经带上每个 family 的全部可下载
+  量化档**（`packages[]`），但界面还不会按机器挑、也只给**单文件包**下载入口；
+  多文件包（safetensors 等）不在本批范围。
+- **下载完自动改服务清单 / 重启服务**：下载只是把文件放到模型目录（见 §2 的落点校验）。
+- `size` / `sha256` 内置清单里**没有**（生成不联网），所以校验退化成按 `Content-Length` 核大小；
+  要强校验只能由 `server.json` 显式给 `sha256`。
 - **并行多任务**：现在刻意串行。
 - **下载源镜像选择**；断点下载也没有"定时重试/弱网重试"。
 - **下载完自动改服务清单 / 重启服务**。
