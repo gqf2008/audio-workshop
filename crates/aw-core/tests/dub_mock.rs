@@ -101,6 +101,13 @@ fn oom_sentence_is_marked_and_retry_only_reruns_failed_sentence() {
     );
     assert!(prj.sentences[0].status.contains("卸载空闲模型"));
     assert!(prj.sentences[0].status.contains("3.84 GiB"));
+    let on_disk = aw_core::Project::load(&dir).expect("OOM 句必须逐句落盘");
+    assert!(
+        on_disk.sentences[0].status.starts_with("error: oom:"),
+        "磁盘上的队列标记也要可识别：{}",
+        on_disk.sentences[0].status
+    );
+    assert!(on_disk.failed_sentence_indices().contains(&0));
     assert_eq!(prj.sentences[1].status, "done");
     assert_eq!(prj.sentences[2].status, "done");
 
