@@ -43,9 +43,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
+          # libssl-dev 是显式的：stem-splitter-core → reqwest → hyper-tls →
+          # native-tls → openssl-sys 在 Linux 上会真编 openssl。ubuntu-24.04 runner
+          # 恰好预装了它，但依赖 runner 镜像的隐式预装是脆的，写出来。
           sudo apt-get install -y -qq \
             pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
-            libasound2-dev libfontconfig1-dev clang
+            libasound2-dev libfontconfig1-dev libssl-dev clang
 
       # components 里带上 rustfmt/clippy —— 否则下面两条会以「命令不存在」失败，
       # 那会被误读成代码有问题。
