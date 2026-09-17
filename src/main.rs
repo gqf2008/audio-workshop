@@ -10727,6 +10727,101 @@ mod tests {
         }
     }
 
+    /// **清单键名契约**：`server.json` 的键名 → `ServerModel` 的 serde 字段名必须一一对上。
+    ///
+    /// 单独立一条的理由：Python 侧（`tools/audio_config.py::to_server`）与这里的字段名
+    /// 一旦漂移（`requires` 改名、`requires.voice_ref` 换键、`known_issues` 拼错），
+    /// serde 会**静默**取默认值 —— 于是"被排除的模型"照旧出现在下拉里、
+    /// "引擎硬要求参考音"这条规则悄悄消失。那正是本批要修的最坏形态
+    /// （选了不报错、产出听不懂的音频），而**纯函数用例永远发现不了**：
+    /// 它们喂的是 Rust 结构体，不经过 JSON。
+    ///
+    /// 阳性对照：把 `ServerModel` 的 `requires` 改成 `#[serde(rename = "requiresX")]`
+    /// （或把 `ModelRequires::voice_ref` 改名）→ 本用例红。
+    #[test]
+    fn server_json_keys_match_the_serde_field_names() {
+        // 与真实 server.json 形状一致的最小片段（键名逐字取自 schema 的渲染落点）
+        let raw = r#"{
+            "host": "127.0.0.1",
+            "port": 8080,
+            "models": [
+                {
+                    "id": "audio8-tts-01b",
+                    "task": "tts",
+                    "family": "audio8_tts",
+                    "path": "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
+                    "mode": "offline",
+                    "product_excluded": true
+                },
+                {
+                    "id": "index-tts2",
+                    "task": "tts",
+                    "family": "index_tts2",
+                    "path": "/models/IndexTTS2.5-GGUF/i.gguf",
+                    "mode": "offline",
+                    "requires": { "voice_ref": true },
+                    "known_issues": ["不接 voice_ref 会直接报错"]
+                },
+                {
+                    "id": "audio8-tts-01b-stream",
+                    "task": "tts",
+                    "family": "audio8_tts",
+                    "path": "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
+                    "mode": "streaming",
+                    "role": "streaming",
+                    "product_excluded": true
+                },
+                {
+                    "id": "qwen3-asr",
+                    "task": "asr",
+                    "family": "qwen3_asr",
+                    "path": "/models/Qwen3-ASR-0.6B-GGUF/q.gguf",
+                    "mode": "offline",
+                    "role": "scoring"
+                }
+            ]
+        }"#;
+
+        let cfg: ServerConfig = serde_json::from_str(raw).expect("最小清单要能解析");
+        assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cfg.port, Some(8080));
+        assert_eq!(cfg.models.len(), 4);
+
+        assert!(
+            cfg.models[0].product_excluded,
+            "product_excluded 必须解析到（漂移就会静默变成 false=照旧暴露）"
+        );
+        assert!(
+            cfg.models[1].requires_voice_ref(),
+            "requires.voice_ref 必须解析到（漂移就会静默变成 false=不拦）"
+        );
+        assert_eq!(
+            cfg.models[1].known_issues_note(),
+            "不接 voice_ref 会直接报错",
+            "known_issues 必须解析到（漂移就会静默变成空）"
+        );
+        assert!(
+            cfg.models[2].is_streaming_only(),
+            "mode / role = streaming 必须解析到"
+        );
+        assert_eq!(cfg.models[3].role, "scoring", "role 必须解析到");
+
+        // 端到端：判据作用在"从 JSON 来的"清单上，结果要和 Rust 结构体的一致
+        let names: Vec<String> = tts_engine_voices(&cfg.models)
+            .iter()
+            .map(|v| v.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["index-tts2"],
+            "JSON 来的清单走同一条过滤：0.1b 被排除、stream 只走流式"
+        );
+        assert!(
+            tts_engine_voices(&cfg.models)[0].requires_voice_ref,
+            "能力也要穿过 JSON 到达下拉行"
+        );
+    }
+
     /// 源码级守卫：配音主按钮的可用性必须**消费 Rust 的投影**，不能在 Slint 里
     /// 重拼条件（改前是 `root.voice-index >= 0`，于是"这个引擎必须给参考音"
     /// 这条能力在按钮可用性上完全看不见）。
