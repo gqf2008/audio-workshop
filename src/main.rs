@@ -21,6 +21,7 @@ mod export;
 mod model_sources;
 /// 路径比较的唯一入口（`..` / 软链都按真实路径消解）。
 mod paths;
+mod picker;
 mod player;
 mod sep_history;
 mod tasks;
@@ -312,13 +313,13 @@ enum Msg {
         ok: bool,
         detail: String,
     },
-    /// 全局设置里「选择模型目录」的结果
+    /// 全局设置里「选择模型目录」的结果（三态：选到 / 用户取消 / 选择器不可用）
     ModelDirPicked {
-        path: Option<String>,
+        pick: picker::Outcome<String>,
     },
-    /// 一键备份：目标目录选择结果（`None` = 用户取消）
+    /// 一键备份：目标目录选择结果（三态——**用户取消与"选择器不可用"不是一回事**）
     BackupDirPicked {
-        path: Option<String>,
+        pick: picker::Outcome<String>,
     },
     /// 一键备份终态：`Ok(note)` 是给状态行的那句话，`Err` 是**可执行**的失败原因。
     /// 后台线程发回、与工程版本无关（用户点按钮那一刻和稿件版本没关系）。
@@ -364,19 +365,19 @@ enum Msg {
     },
     /// 选完要导入的词条文件（.tsv/.csv/.txt）
     DictFilePicked {
-        path: Option<String>,
+        pick: picker::Outcome<String>,
     },
     /// 选完要导入的音色目录（里面有 voice.json + 音频）
     VoiceImportDirPicked {
-        path: Option<String>,
+        pick: picker::Outcome<String>,
     },
-    /// 批量：系统文件框选完的多篇稿件（取消 = 空表）
+    /// 批量：系统文件框选完的多篇稿件（三态；取消与"选择器不可用"分开）
     BatchScriptsPicked {
-        paths: Vec<PathBuf>,
+        pick: picker::Outcome<Vec<PathBuf>>,
     },
-    /// 选择待分离音频的结果
+    /// 选择待分离音频的结果（三态）
     SeparationInputPicked {
-        path: Option<String>,
+        pick: picker::Outcome<String>,
     },
     /// 音色试听失败（保留音色名，便于在状态栏说清是哪个音色挂了）
     VoicePreviewFailed {
@@ -919,10 +920,10 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
         ui.set_status_text("正在打开目录选择框（选导出的那个音色目录）…".into());
         let msg = msg.clone();
         std::thread::spawn(move || {
-            let path = pick_folder_with_prompt("选择要导入的音色目录");
+            let pick = picker::pick_folder("选择要导入的音色目录");
             let _ = msg.send(WorkerMsg {
                 revision: 0,
-                msg: Msg::VoiceImportDirPicked { path },
+                msg: Msg::VoiceImportDirPicked { pick },
             });
         });
     });
@@ -970,10 +971,10 @@ fn wire_dictionary(
         ui.set_status_text("正在打开文件选择框（词条 .tsv/.csv/.txt）…".into());
         let msg = msg.clone();
         std::thread::spawn(move || {
-            let path = pick_text_file_blocking();
+            let pick = pick_text_file_blocking();
             let _ = msg.send(WorkerMsg {
                 revision: 0,
-                msg: Msg::DictFilePicked { path },
+                msg: Msg::DictFilePicked { pick },
             });
         });
     });
@@ -1978,52 +1979,28 @@ fn apply_engine_discovery(ui: &MainWindow, invalidate: Option<(&Sender<Cmd>, &Rc
 }
 
 /// 选一个词条文件（系统文件框，后台线程 + 消息回传）。
-fn pick_text_file_blocking() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    let out = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "POSIX path of (choose file with prompt \"选择词条文件（.tsv/.csv/.txt）\")",
-        ])
-        .output()
-        .ok()?;
-
-    #[cfg(target_os = "windows")]
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
-             $d = New-Object System.Windows.Forms.OpenFileDialog; \
-             $d.Filter = '词条文件|*.tsv;*.csv;*.txt|所有文件|*.*'; \
-             if ($d.ShowDialog() -eq \"OK\") { Write-Output $d.FileName }",
-        ])
-        .output()
-        .ok()?;
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let out = std::process::Command::new("zenity")
-        .args([
-            "--file-selection",
-            "--title=选择词条文件",
-            "--file-filter=词条文件 | *.tsv *.csv *.txt",
-        ])
-        .output()
-        .ok()?;
-
-    pick_output_to_path(out)
+///
+/// 平台分叉（osascript / powershell / zenity）与"取消 / 起不来"的判定都在
+/// `picker` 模块一处；这里只给提示语与过滤器。返回三态：`Picked` 才是选到了。
+fn pick_text_file_blocking() -> picker::Outcome<String> {
+    picker::pick_file(
+        "选择词条文件（.tsv/.csv/.txt）",
+        "词条文件",
+        &["*.tsv", "*.csv", "*.txt"],
+    )
 }
 
 /// 系统目录选择框：阻塞式原生对话框，必须放后台线程，结果回消息通道。
 ///
 /// macOS 用 osascript 的 choose folder；Windows 用 PowerShell 的
-/// FolderBrowserDialog；Linux 用 zenity。用户取消 → None，不静默失败。
+/// FolderBrowserDialog；Linux 用 zenity。**三态结论由 `picker` 模块给**
+/// （选到 / 用户取消 / 选择器不可用）——这里不再把后者塌成 `None`。
 fn spawn_folder_pick(msg_tx: Sender<WorkerMsg>, revision: u64) {
     std::thread::spawn(move || {
-        let path = pick_folder_blocking();
+        let pick = picker::pick_folder("选择模型目录");
         let _ = msg_tx.send(WorkerMsg {
             revision,
-            msg: Msg::ModelDirPicked { path },
+            msg: Msg::ModelDirPicked { pick },
         });
     });
 }
@@ -2035,14 +2012,15 @@ fn spawn_folder_pick(msg_tx: Sender<WorkerMsg>, revision: u64) {
 /// "正在备份到 <路径>"，而不是让人对着"正在打开目录选择框…"猜有没有开始。
 fn spawn_backup(msg_tx: Sender<WorkerMsg>, workshop_dir: PathBuf) {
     std::thread::spawn(move || {
-        let picked = pick_folder_with_prompt("选择备份目标目录");
+        let pick = picker::pick_folder("选择备份目标目录");
         let _ = msg_tx.send(WorkerMsg {
             revision: 0,
-            msg: Msg::BackupDirPicked {
-                path: picked.clone(),
-            },
+            msg: Msg::BackupDirPicked { pick: pick.clone() },
         });
-        let Some(root) = picked else { return };
+        // 取消 / 选择器不可用：都不该开始复制（状态行由 UI 侧如实区分这两条路）
+        let picker::Outcome::Picked(root) = pick else {
+            return;
+        };
         let result = backup::backup_all(&workshop_dir, Path::new(&root), &backup::stamp_now())
             .map(|s| s.note());
         let _ = msg_tx.send(WorkerMsg {
@@ -2103,48 +2081,16 @@ fn open_external_url(url: &str) -> Result<(), String> {
 /// 选一段待分离音频（系统文件框，后台线程 + 消息回传）。
 fn spawn_file_pick(msg_tx: Sender<WorkerMsg>) {
     std::thread::spawn(move || {
-        let path = pick_audio_blocking();
+        let pick = picker::pick_file(
+            "选择要分离的音频",
+            "音频",
+            &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
+        );
         let _ = msg_tx.send(WorkerMsg {
             revision: 0,
-            msg: Msg::SeparationInputPicked { path },
+            msg: Msg::SeparationInputPicked { pick },
         });
     });
-}
-
-fn pick_audio_blocking() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    let out = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "POSIX path of (choose file with prompt \"选择要分离的音频\")",
-        ])
-        .output()
-        .ok()?;
-
-    #[cfg(target_os = "windows")]
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
-             $d = New-Object System.Windows.Forms.OpenFileDialog; \
-             $d.Filter = '音频|*.wav;*.mp3;*.flac;*.m4a;*.ogg'; \
-             if ($d.ShowDialog() -eq \"OK\") { Write-Output $d.FileName }",
-        ])
-        .output()
-        .ok()?;
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let out = std::process::Command::new("zenity")
-        .args([
-            "--file-selection",
-            "--title=选择要分离的音频",
-            "--file-filter=音频 | *.wav *.mp3 *.flac *.m4a *.ogg",
-        ])
-        .output()
-        .ok()?;
-
-    pick_output_to_path(out)
 }
 
 /// 界面上那个「数字 / 年份规范化」开关被切换时：作废当前工程。
@@ -2678,147 +2624,27 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
 /// 批量导入：系统多选文件框，阻塞式，必须放后台线程（与目录/单文件选择器同款）。
 fn spawn_scripts_pick(msg_tx: Sender<WorkerMsg>) {
     std::thread::spawn(move || {
-        let paths = pick_scripts_blocking();
+        let pick = pick_scripts_blocking();
         let _ = msg_tx.send(WorkerMsg {
             revision: 0,
-            msg: Msg::BatchScriptsPicked { paths },
+            msg: Msg::BatchScriptsPicked { pick },
         });
     });
 }
 
-/// 多选稿件对话框的输出（按平台各一份实现；见 `pick_scripts_blocking`）。
-#[cfg(target_os = "macos")]
-fn scripts_dialog_output() -> Option<std::process::Output> {
-    std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "set fs to choose file with prompt \"选择稿件（可多选）\" with multiple selections allowed",
-            "-e",
-            "set out to \"\"",
-            "-e",
-            "repeat with f in fs",
-            "-e",
-            "set out to out & (POSIX path of f) & linefeed",
-            "-e",
-            "end repeat",
-            "-e",
-            "return out",
-        ])
-        .output()
-        .ok()
-}
-
-#[cfg(target_os = "windows")]
-fn scripts_dialog_output() -> Option<std::process::Output> {
-    std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
-             $d = New-Object System.Windows.Forms.OpenFileDialog; \
-             $d.Multiselect = $true; \
-             $d.Filter = '文本稿件|*.txt;*.md|所有文件|*.*'; \
-             if ($d.ShowDialog() -eq \"OK\") { $d.FileNames | ForEach-Object { Write-Output $_ } }",
-        ])
-        .output()
-        .ok()
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn scripts_dialog_output() -> Option<std::process::Output> {
-    std::process::Command::new("zenity")
-        .args([
-            "--file-selection",
-            "--multiple",
-            "--separator=\n",
-            "--title=选择稿件（可多选）",
-        ])
-        .output()
-        .ok()
-}
-
 /// 多选稿件（一次导入 N 篇是 P1 的入口）。
 ///
-/// 故意**不**在系统对话框里按扩展名过滤：稿件可能是 .txt / .md / 无扩展名，让用户在
-/// 对话框里"看不到自己的文件"比进来之后告诉他"这个文件不是 UTF-8 文本"更差。
+/// macOS / Linux **不过滤扩展名**：稿件可能是 .txt / .md / 无扩展名，让用户在对话框里
+/// "看不到自己的文件"比进来之后告诉他"这个文件不是 UTF-8 文本"更差。
+/// （Windows 沿用既有的「文本稿件|*.txt;*.md」过滤——本批不改对话框实现，
+/// 所以这里按平台给过滤模式，Linux 传空表以保持"不过滤"的现状。）
 /// 过滤与跳过理由都在 `batch::import_scripts`，一处判定。
-fn pick_scripts_blocking() -> Vec<PathBuf> {
-    match scripts_dialog_output() {
-        Some(out) => parse_picked_paths(out.status.success(), &out.stdout),
-        None => Vec::new(),
-    }
-}
-
-/// 多选对话框的输出 → 路径表。
-///
-/// 取消（退出码非 0）必须是**空表**而不是"一个空路径"：后者会让导入把一次取消
-/// 记成"跳过了 1 篇（读不到）"。空路径同样过滤掉。
-fn parse_picked_paths(success: bool, stdout: &[u8]) -> Vec<PathBuf> {
-    if !success {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
-
-fn pick_folder_blocking() -> Option<String> {
-    pick_folder_with_prompt("选择模型目录")
-}
-
-/// 系统目录选择框（可自定义提示语）：模型目录、音色导入都用它。
-fn pick_folder_with_prompt(prompt: &str) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    let out = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            &format!("POSIX path of (choose folder with prompt \"{prompt}\")"),
-        ])
-        .output()
-        .ok()?;
-
+fn pick_scripts_blocking() -> picker::Outcome<Vec<PathBuf>> {
     #[cfg(target_os = "windows")]
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
-                 $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
-                 $d.Description = '{prompt}'; \
-                 if ($d.ShowDialog() -eq \"OK\") {{ Write-Output $d.SelectedPath }}"
-            ),
-        ])
-        .output()
-        .ok()?;
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let out = std::process::Command::new("zenity")
-        .args([
-            "--file-selection",
-            "--directory",
-            &format!("--title={prompt}"),
-        ])
-        .output()
-        .ok()?;
-
-    pick_output_to_path(out)
-}
-
-/// 系统选择框的输出 → 路径（取消时退出码非 0，返回 None，不静默失败）。
-fn pick_output_to_path(out: std::process::Output) -> Option<String> {
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw.trim_end_matches('/').to_string())
-    }
+    let patterns: &[&str] = &["*.txt", "*.md"];
+    #[cfg(not(target_os = "windows"))]
+    let patterns: &[&str] = &[];
+    picker::pick_files("选择稿件（可多选）", "文本稿件", patterns)
 }
 
 /// 「测试连接」：健康检查是阻塞 HTTP（最长 5s），放后台线程，结果回消息通道。
@@ -8055,6 +7881,15 @@ fn should_handle_message(worker_msg: &WorkerMsg, current_revision: u64) -> bool 
         || worker_message_is_current(worker_msg, current_revision)
 }
 
+/// 放掉「一键备份…」的在飞标志。
+///
+/// 它同时是按钮的禁用条件，**取消 / 选择器不可用 / 终态三条路都必须放**：
+/// 忘了放就等于把按钮永久锁死。三处调用共用这一份，别再手写第二遍。
+fn release_backup_running(ui: &MainWindow, state: &Rc<UiState>) {
+    state.backup_running.set(false);
+    ui.set_backup_running(false);
+}
+
 fn message_ignores_revision(msg: &Msg) -> bool {
     matches!(
         msg,
@@ -8289,32 +8124,37 @@ fn tick(
                 ui.set_busy(false);
                 ui.set_status_text(error.into());
             }
-            Msg::ModelDirPicked { path } => match path {
-                Some(p) => {
+            Msg::ModelDirPicked { pick } => match pick {
+                picker::Outcome::Picked(p) => {
                     ui.set_model_dir(p.clone().into());
                     ui.set_status_text(
                         format!("已选中模型目录：{p}（点「应用并重连」生效）").into(),
                     );
                 }
-                None => {
+                picker::Outcome::Cancelled => {
                     ui.set_status_text("取消了选择模型目录".into());
                 }
+                picker::Outcome::Unavailable(trouble) => {
+                    ui.set_status_text(format!("没能选择模型目录：{}", trouble.note()).into());
+                }
             },
-            Msg::BackupDirPicked { path } => match path {
-                Some(p) => ui.set_backup_info(
+            Msg::BackupDirPicked { pick } => match pick {
+                picker::Outcome::Picked(p) => ui.set_backup_info(
                     format!("正在备份到 {p} …（工程大时要一会儿，中途别关窗口）").into(),
                 ),
-                None => {
-                    state.backup_running.set(false);
-                    ui.set_backup_running(false);
+                // 取消 / 选择器不可用：后台线程这两条路都不会再发 `BackupDone`，
+                // 在飞标志必须在这里放掉，否则「一键备份…」被永久锁死。
+                picker::Outcome::Cancelled => {
+                    release_backup_running(ui, state);
                     ui.set_backup_info("已取消备份".into());
+                }
+                picker::Outcome::Unavailable(trouble) => {
+                    release_backup_running(ui, state);
+                    ui.set_backup_info(format!("备份没开始：{}", trouble.note()).into());
                 }
             },
             Msg::BackupDone { result } => {
-                // 终态一定要把在飞标志放掉：它同时是按钮的禁用条件，
-                // 忘了放就等于把「一键备份…」永久锁死
-                state.backup_running.set(false);
-                ui.set_backup_running(false);
+                release_backup_running(ui, state);
                 match result {
                     Ok(note) => ui.set_backup_info(note.into()),
                     Err(error) => ui.set_backup_info(format!("备份失败：{error}").into()),
@@ -8479,12 +8319,15 @@ fn tick(
                 ui.set_bgm_status_text(error.clone().into());
                 ui.set_status_text(error.into());
             }
-            Msg::SeparationInputPicked { path } => match path {
-                Some(p) => {
+            Msg::SeparationInputPicked { pick } => match pick {
+                picker::Outcome::Picked(p) => {
                     set_separation_input(ui, state, p);
                 }
-                None => {
+                picker::Outcome::Cancelled => {
                     ui.set_status_text("取消了选择音频".into());
+                }
+                picker::Outcome::Unavailable(trouble) => {
+                    ui.set_status_text(format!("没能选择音频：{}", trouble.note()).into());
                 }
             },
             Msg::SeparationProgress {
@@ -8734,10 +8577,17 @@ fn tick(
                 };
                 ui.set_status_text(text.into());
             }
-            Msg::DictFilePicked { path } => {
-                let Some(path) = path else {
-                    ui.set_status_text("取消了导入词条".into());
-                    return;
+            Msg::DictFilePicked { pick } => {
+                let path = match pick {
+                    picker::Outcome::Picked(p) => p,
+                    picker::Outcome::Cancelled => {
+                        ui.set_status_text("取消了导入词条".into());
+                        return;
+                    }
+                    picker::Outcome::Unavailable(trouble) => {
+                        ui.set_status_text(format!("没能导入词条：{}", trouble.note()).into());
+                        return;
+                    }
                 };
                 // 文件框是异步的：打开期间可能已经起了**任何**任务（含歌曲/分离这类不设
                 // 全局 running/busy 的），所以这里用与点击时同一个忙判据再查一次。
@@ -8778,10 +8628,17 @@ fn tick(
                     Err(e) => ui.set_status_text(e.into()),
                 }
             }
-            Msg::VoiceImportDirPicked { path } => {
-                let Some(dir) = path else {
-                    ui.set_status_text("取消了导入音色".into());
-                    return;
+            Msg::VoiceImportDirPicked { pick } => {
+                let dir = match pick {
+                    picker::Outcome::Picked(p) => p,
+                    picker::Outcome::Cancelled => {
+                        ui.set_status_text("取消了导入音色".into());
+                        return;
+                    }
+                    picker::Outcome::Unavailable(trouble) => {
+                        ui.set_status_text(format!("没能导入音色：{}", trouble.note()).into());
+                        return;
+                    }
                 };
                 match voices::import_from(&voices_root(), Path::new(&dir), now_ms(), file_stem) {
                     Ok(entry) => {
@@ -8794,9 +8651,30 @@ fn tick(
                     Err(e) => ui.set_status_text(e.into()),
                 }
             }
-            Msg::BatchScriptsPicked { paths } => {
-                // 用户在文件框里按了取消（= 没选到任何路径）：这是 no-op，不能把已经
-                // 导入好的那份列表清掉——"取消"不该有破坏性副作用（复核提的 UX 残留）。
+            Msg::BatchScriptsPicked { pick } => {
+                let paths = match pick {
+                    picker::Outcome::Picked(paths) => paths,
+                    // 用户取消：no-op，不能把已经导入好的那份列表清掉——
+                    // "取消"不该有破坏性副作用（复核提的 UX 残留）。
+                    picker::Outcome::Cancelled => {
+                        let note = if state.batch_rows.borrow().is_empty() {
+                            "没有选稿件".to_string()
+                        } else {
+                            "已取消选择，列表不变".to_string()
+                        };
+                        refresh_batch_summary(ui, state, &note);
+                        ui.set_status_text(note.into());
+                        continue;
+                    }
+                    picker::Outcome::Unavailable(trouble) => {
+                        let note = format!("没能选择稿件：{}", trouble.note());
+                        refresh_batch_summary(ui, state, &note);
+                        ui.set_status_text(note.into());
+                        continue;
+                    }
+                };
+                // 走到这里说明对话框确实给了结果；空表只可能是解析异常（取消已经在
+                // 上面分流），仍然按 no-op 处理，不拿它去清用户的列表。
                 if paths.is_empty() {
                     let note = if state.batch_rows.borrow().is_empty() {
                         "没有选稿件".to_string()
@@ -12475,7 +12353,9 @@ mod tests {
     #[test]
     fn batch_messages_survive_revision_changes() {
         let batch_msgs = vec![
-            Msg::BatchScriptsPicked { paths: Vec::new() },
+            Msg::BatchScriptsPicked {
+                pick: picker::Outcome::Cancelled,
+            },
             Msg::BatchItemStarted {
                 task_id: 1,
                 index: 0,
@@ -12570,7 +12450,7 @@ mod tests {
     fn backup_messages_survive_revision_changes() {
         let msgs = vec![
             Msg::BackupDirPicked {
-                path: Some("/tmp/备份盘".into()),
+                pick: picker::Outcome::Picked("/tmp/备份盘".into()),
             },
             Msg::BackupDone {
                 result: Ok(
@@ -14450,26 +14330,77 @@ mod tests {
         );
     }
 
-    /// 多选文件框的输出解析：取消（退出码非 0）必须是空表，空行要滤掉——
-    /// 否则一次"取消"会被批量导入记成"跳过了 1 篇（读不到）"。
+    /// 生产代码（`main.rs` 去掉测试模块）——扫源码的守卫只看这一部分。
+    ///
+    /// 不切掉测试模块，守卫里的字面量（`"picker::pick_"` 之类）会被自己命中，
+    /// 断言恒真——本仓已经踩过这个坑（`LESSON_系列_测试断言与e2e.md`
+    /// 「扫自己源码的守卫：断言里的『针』会被它自己的源码命中」）。
+    fn production_source() -> &'static str {
+        let src = include_str!("main.rs");
+        let cut = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("测试模块的起点变了：守卫会退化成扫全文件（字面量自命中、断言恒真）");
+        &src[..cut]
+    }
+
+    /// 选择器的三态必须在**每个调用点显式分流**：`Cancelled`（用户关窗）与
+    /// `Unavailable`（命令不存在 / 权限被拒 / 非 0 退出）绝不能合并回一个"没选到"。
+    ///
+    /// 这条读源码钉住"不许再塌成 `Option`"：每个 `picker::pick_*` 调用点都必须同时
+    /// 出现 `Outcome::Cancelled` 与 `Outcome::Unavailable(..)` 两个分支。
+    ///
+    /// 阳性对照（实测过）：把 `spawn_file_pick` 那处写回
+    /// `let Some(path) = ... else { 已取消 }`（即两种"没选到"共用一条路），
+    /// `unavailable` 计数掉到 5、这条立刻红。
     #[test]
-    fn picked_paths_drop_cancellations_and_blank_lines() {
-        let picked = "/a/第一集.txt\n\n/b/第二集.txt\n".as_bytes();
+    fn every_picker_call_site_handles_cancel_and_unavailable_separately() {
+        let src = production_source();
+        let calls = src.matches("picker::pick_").count();
+        let cancelled = src.matches("picker::Outcome::Cancelled =>").count();
+        let unavailable = src.matches("picker::Outcome::Unavailable(").count();
+        // 光有分支还不够：**分支的正文也必须交给用户可执行的说明**。
+        // 阳性对照：把「音频」那处的 `trouble.note()` 换成一句"取消了选择音频"
+        // （分支还在、文案却撒谎）→ 下面这一条立刻红。
+        let notes = src.matches("trouble.note()").count();
         assert_eq!(
-            parse_picked_paths(true, picked),
-            vec![
-                PathBuf::from("/a/第一集.txt"),
-                PathBuf::from("/b/第二集.txt")
-            ]
+            calls, 6,
+            "选择器调用点数量变了（{calls}）——加/删调用点时同步更新这条守卫"
         );
-        assert!(
-            parse_picked_paths(true, b"").is_empty(),
-            "没选到文件就是空表"
+        assert_eq!(
+            cancelled, calls,
+            "有调用点没显式处理「用户取消」（{cancelled} 个分支 vs {calls} 个调用点）"
         );
-        assert!(
-            parse_picked_paths(false, "/a/不该出现.txt\n".as_bytes()).is_empty(),
-            "用户取消时不能把任何路径当成选中"
+        assert_eq!(
+            unavailable, calls,
+            "有调用点没显式处理「选择器不可用」（{unavailable} 个分支 vs {calls} 个调用点）——\
+             那正是本批要修的静默失败"
         );
+        assert_eq!(
+            notes, calls,
+            "有「选择器不可用」分支没把可执行说明（含安装/授权指引）交出去\
+             （{notes} 处 trouble.note() vs {calls} 个调用点）"
+        );
+    }
+
+    /// 系统对话框**只能**由 `picker` 模块拉起：`main.rs` 里不许再出现
+    /// osascript / powershell / zenity——多一处就多一份"取消与起不来混在一起"的机会。
+    #[test]
+    fn dialogs_are_only_launched_from_the_picker_module() {
+        let src = production_source();
+        for program in ["\"osascript\"", "\"zenity\"", "\"powershell\""] {
+            assert!(
+                !src.contains(&format!("Command::new({program})")),
+                "main.rs 里不该再直接拉起系统对话框程序 {program}；\
+                 平台差异与三态判定都在 src/picker.rs 一处"
+            );
+        }
+        // 曾经把"起不来 / 取消 / 非 0 退出"一锅端的两个函数不能再出现
+        for gone in ["fn pick_output", "fn pick_folder_with_prompt"] {
+            assert!(
+                !src.contains(gone),
+                "{gone}… 已被 picker 模块取代，不该复活"
+            );
+        }
     }
 
     /// 真机（默认 ignored）：**批量配音走 worker 的命令通道**——N 篇稿子依次成片，
