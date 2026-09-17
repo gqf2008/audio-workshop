@@ -8,7 +8,7 @@
 //! 跑法：`cargo test -p aw-core --test e2e_service -- --ignored`
 //! 地址与模型可用环境变量覆盖：`AW_SERVER`（默认 http://127.0.0.1:8080）、
 //! `AW_TTS_MODEL`（默认 audio8-tts）。
-//! 策略类断言（重试/失败计数/默认 instruction）在 tests/client_retry.rs 与
+//! 策略类断言（重试/失败计数/请求参数白名单）在 tests/client_retry.rs 与
 //! tests/dub_mock.rs 里用进程内 mock 确定性验证，不依赖真机。
 
 use aw_core::{Client, Project};
@@ -49,7 +49,7 @@ fn eval_roundtrip_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let failed = prj
-        .synthesize(&client, &dir, None, None, |i, s| eprintln!("  [{i}] {s}"))
+        .synthesize(&client, &dir, None, |i, s| eprintln!("  [{i}] {s}"))
         .expect("合成调用本身不应失败");
     assert_eq!(failed, 0, "不该有失败句");
 
@@ -108,7 +108,7 @@ fn dub_pipeline_end_to_end() {
     let dir = std::env::temp_dir().join("aw-core-e2e");
     std::fs::create_dir_all(&dir).unwrap();
     let failed = prj
-        .synthesize(&client, &dir, None, None, |i, s| eprintln!("  [{i}] {s}"))
+        .synthesize(&client, &dir, None, |i, s| eprintln!("  [{i}] {s}"))
         .expect("合成调用本身不应失败");
     assert_eq!(failed, 0, "不该有失败句（失败句数会被返回，不再静默）");
     let done = prj.sentences.iter().filter(|s| s.status == "done").count();

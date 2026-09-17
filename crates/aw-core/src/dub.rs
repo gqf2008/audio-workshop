@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_PUNCTUATION: &str = "。！？；…";
-/// Python 侧 cmd_synth 恒发这条 instruction（不是可选装饰：不发音色/语气线索时读法更飘）
-pub const DEFAULT_INSTRUCTION: &str = "自然、清晰的叙述语气";
 /// 重录时的 seed 步进（Python `cmd_redo`：`s["seed"] += 1000`）
 pub const REDO_SEED_STEP: u64 = 1000;
 
@@ -210,10 +208,9 @@ impl Project {
         client: &Client,
         dir: &Path,
         only: Option<&[usize]>,
-        instruction: Option<&str>,
         on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
-        self.synthesize_stoppable(client, dir, only, instruction, None, on_progress)
+        self.synthesize_stoppable(client, dir, only, None, on_progress)
     }
 
     /// 带协作取消的合成：UI 的「停止合成」置 `stop` 位，句间检查（正在合成的那句
@@ -223,12 +220,10 @@ impl Project {
         client: &Client,
         dir: &Path,
         only: Option<&[usize]>,
-        instruction: Option<&str>,
         stop: Option<&std::sync::atomic::AtomicBool>,
         mut on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
         std::fs::create_dir_all(dir.join("sentences")).ok();
-        let instruction = instruction.unwrap_or(DEFAULT_INSTRUCTION);
         let mut failed = 0usize;
         // 按下标迭代而不是 iter_mut：循环体里要 self.save(dir)（逐句落盘），
         // iter_mut 会把 self.sentences 的可变借用一直占着，与 save 的 &self 冲突。
@@ -262,36 +257,31 @@ impl Project {
                     .map_err(|e| ClientError::Local(e.to_string()))?;
             }
             on_progress(index, &spoken);
-            let outcome = match client.synth(
-                &self.model,
-                &spoken,
-                Some(seed),
-                self.voice_ref.as_deref(),
-                Some(instruction),
-            ) {
-                Ok(wav) => {
-                    let path = dir.join(format!("sentences/{index:03}.wav"));
-                    write_atomic_explained(&path, &wav)
-                        .map_err(|e| ClientError::Local(e.to_string()))?;
-                    let d = wav_duration(&wav)?;
-                    let s = &mut self.sentences[i];
-                    s.duration = Some(d);
-                    s.status = "done".into();
-                    format!("done {d:.2}s")
-                }
-                Err(e) => {
-                    failed += 1;
-                    // `error: oom` 是队列可识别的失败标记；后面的文案仍由
-                    // `ClientError` 的唯一 Display 入口生成，五条链路共用。
-                    let status = if e.is_insufficient_memory() {
-                        format!("error: oom: {e}")
-                    } else {
-                        format!("error: {e}")
-                    };
-                    self.sentences[i].status = status.clone();
-                    status
-                }
-            };
+            let outcome =
+                match client.synth(&self.model, &spoken, Some(seed), self.voice_ref.as_deref()) {
+                    Ok(wav) => {
+                        let path = dir.join(format!("sentences/{index:03}.wav"));
+                        write_atomic_explained(&path, &wav)
+                            .map_err(|e| ClientError::Local(e.to_string()))?;
+                        let d = wav_duration(&wav)?;
+                        let s = &mut self.sentences[i];
+                        s.duration = Some(d);
+                        s.status = "done".into();
+                        format!("done {d:.2}s")
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        // `error: oom` 是队列可识别的失败标记；后面的文案仍由
+                        // `ClientError` 的唯一 Display 入口生成，五条链路共用。
+                        let status = if e.is_insufficient_memory() {
+                            format!("error: oom: {e}")
+                        } else {
+                            format!("error: {e}")
+                        };
+                        self.sentences[i].status = status.clone();
+                        status
+                    }
+                };
             // 逐句落盘（Python `cmd_synth` 同款）：中途被杀/断电，已完成句与状态不丢。
             // 崩溃恢复 = 重跑 synthesize，done 句自动跳过。
             // 顺序必须是「先落盘、再回调」：回调里（UI 刷新/测试断言）读到的状态
@@ -324,7 +314,7 @@ impl Project {
     /// **必须换 seed**：不换的话"重录"回来的是同一条不满意的音频。
     /// 重录后要刷新成品，调用方接着调 [`Project::assemble`]（Python 的 cmd_redo 也顺手重拼）。
     /// 返回值同 [`Project::synthesize`]：失败的句数。
-    // 参数多与 `Project::new` 同理：client/dir/序号/新文本/规范化/instruction/回调
+    // 参数多与 `Project::new` 同理：client/dir/序号/新文本/规范化/回调
     // 都是调用方必须显式给出的决策，包成配置结构体只会让调用点更啰嗦
     #[allow(clippy::too_many_arguments)]
     pub fn redo(
@@ -334,7 +324,6 @@ impl Project {
         index: usize,
         new_text: Option<&str>,
         normalize: impl Fn(&str) -> String,
-        instruction: Option<&str>,
         on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
         if let Some(t) = new_text {
@@ -358,7 +347,7 @@ impl Project {
         // 未保存的文本/seed 修改会被静默丢弃，"重录"回来还是旧文本）。
         self.save(dir)
             .map_err(|e| ClientError::Local(format!("重录前落盘失败: {e}")))?;
-        self.synthesize(client, dir, Some(&[index]), instruction, on_progress)
+        self.synthesize(client, dir, Some(&[index]), on_progress)
     }
 
     /// 拼装成品 + SRT（句子级时间轴）。返回值带**跳过的句数**，不再静默丢句。

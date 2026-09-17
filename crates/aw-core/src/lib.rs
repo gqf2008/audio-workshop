@@ -18,15 +18,15 @@ pub mod text_layer;
 
 pub use audio_client::{
     memory_shortfall, memory_shortfall_note, parse_insufficient_memory, Client, ClientError,
-    InsufficientMemory, MemoryShortfall, DEFAULT_ASR_MODEL,
+    InsufficientMemory, MemoryShortfall, DEFAULT_ASR_MODEL, SYNTH_REQUEST_OPTIONS,
 };
 pub use bgm::{
     assemble_bgm, bgm_artifacts_from_disk, bgm_only_artifacts, generate_segments,
     generate_segments_stoppable, mix_project, BgmArtifacts, BgmOptions, BgmRun,
 };
 pub use dub::{
-    split_sentences, srt_timestamp, Assembled, Project, Sentence, DEFAULT_INSTRUCTION,
-    DEFAULT_PUNCTUATION, REDO_SEED_STEP,
+    split_sentences, srt_timestamp, Assembled, Project, Sentence, DEFAULT_PUNCTUATION,
+    REDO_SEED_STEP,
 };
 pub use eval::{diff_snippet, intelligibility, Intelligibility};
 pub use separate::{
