@@ -1188,19 +1188,20 @@ mod tests {
             done_ids.contains(&id_a) && done_ids.contains(&id_b),
             "两条任务都应完成（实际完成 {done_ids:?}）"
         );
-        // 验收①要的是**串行**：第二条必须在第一条跑完（Done）之后才开始（Queued）。
-        // 只断言"两条都 Done"的话，改成并行 spawn 也照样绿——所以这里钉住先后。
+        // 验收①要的是**串行**：第二条必须等第一条跑完（Done）才**真正开始下载**。
+        // 比的是乙的 Downloading，不是它的 Queued——Queued 是 worker `pop_front` 时才发的，
+        // 天然晚于甲的 Done；拿 Queued 当"开始"的话，每条 spawn 并行也照样绿（复核指出）。
         let a_done = events
             .iter()
             .position(|s| s.id == id_a && s.state == State::Done)
             .expect("甲的 Done 必须在事件流里");
         let b_started = events
             .iter()
-            .position(|s| s.id == id_b && s.state == State::Queued)
-            .expect("乙的 Queued 必须在事件流里");
+            .position(|s| s.id == id_b && s.state == State::Downloading)
+            .expect("乙的 Downloading 必须在事件流里");
         assert!(
             a_done < b_started,
-            "队列必须串行：甲 Done（位置 {a_done}）要在乙 Queued（位置 {b_started}）之前"
+            "队列必须串行：甲 Done（位置 {a_done}）要在乙开始下载 Downloading（位置 {b_started}）之前"
         );
         assert_eq!(std::fs::read(&dest_a).unwrap(), body_a);
         assert_eq!(std::fs::read(&dest_b).unwrap(), body_b);
