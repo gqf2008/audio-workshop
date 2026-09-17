@@ -95,6 +95,9 @@ export component VoicePanel inherits Rectangle {
     in-out property <string> reference-path: "";
     in property <bool> busy: false;
     in property <bool> reference-exists: false;
+    // 当前引擎是否硬要求参考音（index-tts2）：true 时内置默认音色行不可用，
+    // 文案也说清"必须提供参考音频"——不再对任何引擎都写"免参考音，开箱可用"。
+    in property <bool> engine-requires-voice-ref: false;
 
     callback edited();
     callback clear-reference();
@@ -145,9 +148,13 @@ export component VoicePanel inherits Rectangle {
         // ── 来源一：模型内置默认音色 ──
         VoiceOptionRow {
             title: "内置默认音色";
-            detail: root.engine-label + " · 免参考音，开箱可用";
+            // 文案由引擎能力驱动：硬要求参考音的引擎不能说"免参考音，开箱可用"
+            detail: root.engine-requires-voice-ref
+                ? root.engine-label + " · 该引擎必须提供参考音频，不能用内置音色"
+                : root.engine-label + " · 免参考音，开箱可用";
             current: !root.cloning;
-            enabled: !root.busy && root.engine-label != "";
+            enabled: !root.busy && root.engine-label != "" && !root.engine-requires-voice-ref;
+            show-apply: !root.engine-requires-voice-ref;
             use-text: "使用内置音色";
             preview => { root.preview(); }
             apply => { root.clear-reference(); }

@@ -544,6 +544,9 @@ export component DubWorkbench inherits Rectangle {
     in property <string> voice-label: "未选择";
     in property <string> voice-source: "请先选择音色";
     in property <string> voice-hint: "";
+    // 引擎能力（Rust 侧投影）：硬要求参考音 / 只读的 known_issues 说明
+    in property <bool> engine-requires-voice-ref: false;
+    in property <string> engine-note: "";
     in property <bool> voice-ready: false;
 
     // ── 运行状态 ──
@@ -734,6 +737,7 @@ export component DubWorkbench inherits Rectangle {
                         if root.show-voice : VoicePanel {
                             voice-label: root.voice-label;
                             engine-label: root.engine-label;
+                            engine-requires-voice-ref: root.engine-requires-voice-ref;
                             reference-path <=> root.voice-ref-path;
                             // 批量在跑时也把音色区锁住：批量的 voice_ref 在提交那一刻就定格了
                             busy: root.running || root.busy || root.batch-running;
@@ -1021,12 +1025,20 @@ export component DubWorkbench inherits Rectangle {
                             }
                             Text {
                                 horizontal-stretch: 1;
-                                text: "换引擎是换模型（audio8-tts / index-tts2 / 0.1b / stream…）；换音色在上面的「换音色」里";
+                                text: "换引擎是换模型；换音色在上面的「换音色」里";
                                 color: PixelTheme.dim;
                                 font-size: 11px;
                                 vertical-alignment: center;
                                 overflow: elide;
                             }
+                        }
+                        // 引擎能力/已知缺陷：清单里登记什么就只读展示什么（不替用户决策）
+                        Text {
+                            visible: root.engine-note != "";
+                            text: root.engine-note;
+                            color: PixelTheme.dim;
+                            font-size: 11px;
+                            wrap: word-wrap;
                         }
 
                         // 切句

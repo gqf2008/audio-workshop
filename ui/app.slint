@@ -119,6 +119,9 @@ export component MainWindow inherits Window {
     in-out property <string> song-lyrics: "[Verse]\n凌晨的厨房还亮着灯\n[Chorus]\n别让我一个人悬在那句也许";
     in-out property <string> song-style: "Mandarin Chinese R&B slow jam, warm male lead vocal";
     in-out property <int> song-model-index: 0;
+    // 歌曲引擎选项由 Rust 按清单（task=gen）投影；这里的默认值只是**投影前的**安全兜底
+    // （空列表会让 PixelSegmentedControl 的宽度按 0 除）——真来源是 server.json。
+    in property <[string]> song-model-options: ["yue2（歌词成歌）", "ACE-Step（文生音乐）"];
     in property <bool> song-has-result: false;
     // 歌曲任务是否在飞（排队中或运行中）：与全局 busy 分开——歌曲不依赖配音工程，
     // 配音在跑时也该能提交歌曲；全局 busy 在几条任务并行时无法表达"谁在飞"
@@ -175,6 +178,11 @@ export component MainWindow inherits Window {
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
+    // 引擎能力（Rust 侧唯一判据的投影，界面只消费，不重拼条件）：
+    in property <bool> engine-requires-voice-ref: false;  // 该引擎硬要求参考音
+    in property <string> engine-note: "";                 // 硬要求 + known_issues 的只读说明
+    // 「能不能开工」由 Rust 的 voice_readiness 判一次：主按钮 / 内置音色行 / 阻断提示共用
+    in property <bool> dub-voice-ready: false;
 
     in-out property <float> progress: 0.0;
     in-out property <bool> playing: false;
@@ -411,7 +419,9 @@ export component MainWindow inherits Window {
                     voice-label: root.voice-label;
                     voice-source: root.voice-source;
                     voice-hint: root.voice-hint;
-                    voice-ready: root.voice-index >= 0;
+                    voice-ready: root.dub-voice-ready;
+                    engine-requires-voice-ref: root.engine-requires-voice-ref;
+                    engine-note: root.engine-note;
 
                     // 配音页内的高级参数（默认收起，不在抽屉里）
                     speed <=> root.speed;
@@ -554,6 +564,7 @@ export component MainWindow inherits Window {
                     lyrics <=> root.song-lyrics;
                     style <=> root.song-style;
                     model-index <=> root.song-model-index;
+                    model-options: root.song-model-options;
                     busy: root.song-busy;
                     queued: root.song-queued;
                     has-result: root.song-has-result;

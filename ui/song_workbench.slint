@@ -16,6 +16,8 @@ export component SongWorkbench inherits Rectangle {
     in-out property <string> lyrics: "";
     in-out property <string> style: "";
     in-out property <int> model-index: 0;
+    // 选项来自 Rust 按清单投影（不写死 yue2 / ACE-Step）
+    in property <[string]> model-options: [];
     in property <bool> busy: false;
     // 已入队、还没轮到跑：主按钮这时是"取消排队"，不是"生成中…"（排队中取消是硬取消，
     // 立刻出队且不消耗算力；正在跑的歌曲请求发出去就中断不了，不提供假停止）
@@ -119,7 +121,11 @@ export component SongWorkbench inherits Rectangle {
                             }
                             PixelSegmentedControl {
                                 width: 300px;
-                                options: ["yue2（歌词成歌）", "ACE-Step（文生音乐）"];
+                                // 选项来自清单（Rust 投影）；空列表按 0 除会让宽度 NaN，
+                                // 所以留一份与应用内置兜底清单一致的安全默认值。
+                                options: root.model-options.length > 0
+                                    ? root.model-options
+                                    : ["yue2（歌词成歌）", "ACE-Step（文生音乐）"];
                                 index <=> root.model-index;
                                 enabled: !root.busy;
                                 Tooltip {
