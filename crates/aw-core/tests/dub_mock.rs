@@ -333,26 +333,37 @@ fn stoppable_synthesize_keeps_done_and_stops() {
 
 /// 质检分数要能跨会话留存（写进工程），而**重新合成那一句必须把它清掉**——
 /// 否则界面会拿旧分数描述新音频。
+///
+/// 分数与它的**来源模型**（`eval_model`）同生共死：一起落盘、一起清。
+/// 留个孤立的 `eval_model` 会让"这份分是来源未知的旧记录"被判错。
 #[test]
-fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
+fn eval_percent_and_its_source_survive_save_and_are_cleared_by_resynthesis() {
     let wav = support::tiny_wav(&[0i16; 800]);
     let dir = temp_dir("eval-persist");
     let mut prj = project();
-    // 假装上一轮质检给第 0 句打了 91.5 分
+    // 假装上一轮质检给第 0 句打了 91.5 分（用 fun-asr 测的）
     prj.sentences[0].status = "done".into();
     prj.sentences[0].duration = Some(0.1);
     prj.sentences[0].eval_percent = Some(91.5);
+    prj.sentences[0].eval_model = Some("fun-asr".into());
     prj.save(&dir).unwrap();
 
-    // 跨会话：重新读回来分数还在（没有这个字段的旧工程按 None 处理，`#[serde(default)]`）
+    // 跨会话：重新读回来分数与来源都还在（旧工程缺这个字段按 None 处理，`#[serde(default)]`）
     let loaded = Project::load(&dir).unwrap();
     assert_eq!(loaded.sentences[0].eval_percent, Some(91.5));
+    assert_eq!(
+        loaded.sentences[0].eval_model.as_deref(),
+        Some("fun-asr"),
+        "来源模型要跟着分数一起留存"
+    );
     assert_eq!(loaded.sentences[1].eval_percent, None);
+    assert_eq!(loaded.sentences[1].eval_model, None);
 
-    // 重新合成第 1 句 → 它的旧分数作废
+    // 重新合成第 1 句 → 它的旧分数与来源一起作废
     let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
     let mut prj = loaded;
     prj.sentences[1].eval_percent = Some(50.0);
+    prj.sentences[1].eval_model = Some("fun-asr".into());
     let failed = prj
         .synthesize(&client(&mock.base), &dir, Some(&[1]), |_, _| {})
         .unwrap();
@@ -362,9 +373,18 @@ fn eval_percent_survives_save_and_is_cleared_by_resynthesis() {
         "音频换了，旧质检分数必须清掉"
     );
     assert_eq!(
+        prj.sentences[1].eval_model, None,
+        "分数没了，来源模型也不能留（否则会出现孤立的'来源'）"
+    );
+    assert_eq!(
         prj.sentences[0].eval_percent,
         Some(91.5),
         "没重合成的句子分数要保留"
+    );
+    assert_eq!(
+        prj.sentences[0].eval_model.as_deref(),
+        Some("fun-asr"),
+        "没重合成的句子来源也要保留"
     );
 }
 
@@ -378,6 +398,7 @@ fn failed_resynthesis_leaves_no_score_on_disk() {
     prj.sentences[0].status = "done".into();
     prj.sentences[0].duration = Some(0.1);
     prj.sentences[0].eval_percent = Some(88.0);
+    prj.sentences[0].eval_model = Some("fun-asr".into());
     prj.save(&dir).unwrap();
 
     // mock 返回 500：这一句合成失败
@@ -387,11 +408,16 @@ fn failed_resynthesis_leaves_no_score_on_disk() {
         .unwrap();
     assert_eq!(failed, 1);
     assert_eq!(prj.sentences[0].eval_percent, None, "内存里要清");
+    assert_eq!(prj.sentences[0].eval_model, None, "来源也要一起清");
 
     let on_disk = Project::load(&dir).unwrap();
     assert_eq!(
         on_disk.sentences[0].eval_percent, None,
         "磁盘上也要清（旧分已经作废并落盘）"
+    );
+    assert_eq!(
+        on_disk.sentences[0].eval_model, None,
+        "磁盘上的来源也要一起清：先清后写那条不变式同时管两个字段"
     );
     assert!(
         on_disk.sentences[0].status.starts_with("error"),
