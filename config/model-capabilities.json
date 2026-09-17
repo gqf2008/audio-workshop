@@ -1,0 +1,128 @@
+{
+  "models": [
+    {
+      "id": "audio8-tts",
+      "known_issues": [
+        "数字/电话/金额读法不稳定，必须依赖 text.normalization",
+        "audio8-tts-01b 变体在当前上游不可用（可懂度 0~3%、时长乱跳）"
+      ],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": ""
+    },
+    {
+      "id": "index-tts2",
+      "known_issues": [
+        "不接 voice_ref 会直接报错，需在 UI 层强制选音色"
+      ],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": {
+        "voice_ref": true
+      },
+      "role": ""
+    },
+    {
+      "id": "yue2",
+      "known_issues": [
+        "spec 标称仅英文，实测中文咬字可通过（ASR 回查 85%）",
+        "NAR 步数 8→32 耗时 ×6，质量提升有限（波形差 18.7%，电平/频谱基本一致）"
+      ],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": ""
+    },
+    {
+      "id": "ace-step",
+      "known_issues": [
+        "--model 指目录会 fallback 到 safetensors 源并报缺 config.json"
+      ],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": ""
+    },
+    {
+      "id": "stable-audio-small-music",
+      "known_issues": [],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": ""
+    },
+    {
+      "id": "qwen3-asr",
+      "known_issues": [],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": "scoring"
+    },
+    {
+      "id": "audio8-asr",
+      "known_issues": [
+        "对合成语音会退化输出 → 不能用来给 TTS 打分，只用于真实录音"
+      ],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": "fast-asr"
+    },
+    {
+      "id": "fun-asr",
+      "known_issues": [],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": "asr-no-timestamps"
+    },
+    {
+      "id": "sortformer-diar",
+      "known_issues": [],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": "speaker-turns"
+    },
+    {
+      "id": "sheetsage2",
+      "known_issues": [
+        "转出的 ABC 谱接 yue2 的 cot=melody 即翻唱链路"
+      ],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": ""
+    },
+    {
+      "id": "audio8-tts-01b",
+      "known_issues": [
+        "可懂度 0~3%、时长在 0.37~9.89s 乱跳（2026-09-15 实测），当前不可用",
+        "PR #444 修的就是这条 0.1B(Falcon-H1) 链路 —— 合入后复跑 audio-eval 即可验证"
+      ],
+      "mode": "offline",
+      "product_excluded": true,
+      "requires": null,
+      "role": ""
+    },
+    {
+      "id": "audio8-tts-stream",
+      "known_issues": [],
+      "mode": "streaming",
+      "product_excluded": false,
+      "requires": null,
+      "role": "streaming"
+    },
+    {
+      "id": "audio8-tts-01b-stream",
+      "known_issues": [],
+      "mode": "streaming",
+      "product_excluded": true,
+      "requires": null,
+      "role": "streaming"
+    }
+  ],
+  "version": 1
+}
