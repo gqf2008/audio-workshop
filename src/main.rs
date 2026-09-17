@@ -1918,6 +1918,18 @@ fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+/// 取出并摘掉某模型当前在跑的下载任务 id（点击时判"这次是取消还是新下载"）。
+///
+/// 借用刻意分两步：`if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里临时借用会活到
+/// 整个 if-let（含块），块里再 `borrow_mut` 会直接 panic——复核前自己抓到的真坑。
+fn take_active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
+    let id = state.download_ids.borrow().get(key).copied();
+    if id.is_some() {
+        state.download_ids.borrow_mut().remove(key);
+    }
+    id
+}
+
 /// 模型下载接线：一个后台串行队列 + 每个可下载模型一个「下载/取消」按钮。
 ///
 /// 队列线程把每条快照通过既有的 tick 消息泵发回 UI（`Msg::DownloadUpdate`，
@@ -1940,9 +1952,8 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
         let Some(ui) = weak.upgrade() else { return };
         let key = key.to_string();
         // 已经在队列里（排队/下载中/校验中）→ 这个按钮现在是「取消」
-        if let Some(id) = st.download_ids.borrow().get(&key).copied() {
+        if let Some(id) = take_active_download_id(&st, &key) {
             dl.cancel(id);
-            st.download_ids.borrow_mut().remove(&key);
             ui.set_status_text(format!("已取消下载：{key}").into());
             return;
         }
@@ -8217,6 +8228,22 @@ mod tests {
             download_dest_for(&model("yue2", "", "https://example.com/dir/"), dir),
             Path::new("/models/yue2.gguf")
         );
+    }
+
+    /// 点「取消」要把该模型的下载 id 摘掉，且**不能**因为借用冲突 panic：
+    /// `if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里临时借用活到整个 if-let
+    /// （含块），块里再 `borrow_mut` 会直接炸——这条钉住修好的两步借用。
+    #[test]
+    fn take_active_download_id_removes_without_borrow_conflict() {
+        let state = Rc::new(UiState::default());
+        state
+            .download_ids
+            .borrow_mut()
+            .insert("audio8-tts".into(), 7);
+        assert_eq!(take_active_download_id(&state, "audio8-tts"), Some(7));
+        // 第二次：已经摘掉了，不能再次当成"还在跑"（否则连点会重复取消/误排新任务）
+        assert_eq!(take_active_download_id(&state, "audio8-tts"), None);
+        assert!(state.download_ids.borrow().is_empty());
     }
 
     /// `resolve_base` 的字段级覆盖语义：单边覆盖必须生效。
