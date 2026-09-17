@@ -1417,6 +1417,10 @@ mod tests {
                 *g = self.deal;
                 cv.notify_all();
             }
+            // accept 循环现在是**阻塞** accept，上面那把锁唤不醒它——照 MockServer 的做法
+            // 打一条 dummy 连接把 accept 放出来，它才会看到 stop 并退出。
+            // （现在不 join 那条线程、进程退出即结束；但哪天有人改成 join，缺这一行会永久挂住。）
+            let _ = TcpStream::connect(self.addr);
         }
     }
 
@@ -1604,7 +1608,8 @@ mod tests {
             Enqueued::Started(id) => id,
             other => panic!("{other:?}"),
         };
-        // 等终态快照（一条任务会推两个终态；每条都必须满足不变式）
+        // 等终态快照。一条任务**只推一条**终态，而且必须是在收尾（摘 flag / 放 dest 名额）
+        // **之后**才推——所以"看到终态"就等于"该任务已完全收尾"（复核抓过这条被反过来的竞态）。
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut terminal: Option<Snapshot> = None;
         while terminal.is_none() {
