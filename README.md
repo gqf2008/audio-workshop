@@ -15,12 +15,16 @@
 | `src/` + `ui/` | **桌面壳**（Rust + Slint 1.17 + slint-pixel）：配音 + BGM 真实链路 |
 | `crates/aw-core/` | **核心库**：切句 / 文本兜底 / 服务客户端 / 逐句合成 / 拼装 / BGM 生成与混音（与 Python 行为由 90 例 parity 夹具固定） |
 | `config/models.schema.yaml` | **模型参数化配置**：每个模型的旋钮、已知缺陷登记、文本兜底规则 |
+| `config/model-capabilities.json` | 随包**能力清单**（生成物）：`role`/`requires`/`known_issues`/`product_excluded`/`mode`，App 的兜底来源 |
 | `tools/audio_config.py` | 配置层（CLI 形态）：渲染服务配置 / 文本兜底 / 按场景端到端执行 |
+| `tools/gen_model_capabilities.py` | 从 schema 生成上面那份能力清单（`--check` 校验，纯离线） |
 | `tools/audio_dub.py` | 配音链路 CLI（M0）：切句 / 逐句合成 / 拼装 / 单句重录，工程可断点续作 |
 | `tools/audio_eval.py` | 评估台：可懂度（ASR 回测 + 字符级对齐）、耗时、峰值内存、回归对比 |
 | `tools/model_fetch.py` | **基础模型下载器**（M1 免费）：包装上游 model_manager 拉权重 + 打印手动路径片段 |
 
 设计原则：**技术会进步、模型会换 —— 价值在配置层，不在改模型**。模型不稳的地方（数字读法、不可用变体）由配置声明与兜底，不写死在代码里。
+
+模型的能力/硬要求（哪个引擎必须给参考音频、哪个变体不可用）由 `config/models.schema.yaml` 声明，经**两条路**投递到 App：`server.json`（显式、优先级高）与上面那份随包能力清单（兜底）。所以**不需要**先跑 `audio_config.py render --write` 才有提示；详见 `docs/model-capabilities.md`。
 
 引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0），当前为**独立仓库 checkout（v0.7.3）**，submodule 化待落；适配只写在本仓库的薄层。
 

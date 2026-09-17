@@ -15,7 +15,9 @@
 ## 数据从哪来
 
 App 运行时只读 `server.json`（`AW_SERVER_CONFIG` 可覆盖路径），**不读** `config/models.schema.yaml`。
-schema 是产品决策的**唯一作者**，靠 `tools/audio_config.py render` 翻译成 server.json。
+schema 是产品决策的**唯一作者**，经两条路径投递到 App：`tools/audio_config.py render`
+写进 `server.json`（显式、优先级高），以及随包的 `config/model-capabilities.json`
+（兜底；**`render --write` 不再是前提**）—— 见 `docs/model-capabilities.md`。
 
 改前 `to_server()` 只透传 `mode` / `product_excluded`，`role` / `requires` / `known_issues`
 到不了界面 —— 已同步透传（只加字段，不改任何产品决策）。
@@ -47,15 +49,19 @@ App 侧 `ServerModel` 新增（全部 `#[serde(default)]`，**旧清单缺字段
 
 `AW_UI_STATE=engines` 把**实际清单算出来的**结果打到 stderr（不是代码推断）。
 
-**A. 现有 `server.json`（App 现在真读的那份）**——下拉已从 5 项收敛到 2 项：
+**A. 现有 `server.json`（App 现在真读的那份）**——下拉已从 5 项收敛到 2 项。
+本节的数字是**这一批之后**的：`requires` / `known_issues` 靠随包能力清单兜底，
+所以不再需要先 `render --write`（详见 `docs/model-capabilities.md`）：
 
 ```
 清单里 task==tts 共 5 个 → 过滤后剩 2 个
-  [0] audio8-tts  · 要求参考音=false · 默认选中=true  · 开工判据：Ready
-  [1] index-tts2  · 要求参考音=false · 默认选中=false · 开工判据：Ready
-  [不出现在下拉] audio8-tts-01b        · product_excluded=true  · mode=offline
-  [不出现在下拉] audio8-tts-stream     · product_excluded=false · mode=streaming
-  [不出现在下拉] audio8-tts-01b-stream · product_excluded=true  · mode=streaming
+  [0] audio8-tts  · 要求参考音=false · 默认选中=true  · known_issues="数字/电话/金额读法不稳定，…"
+      开工判据：Ready
+  [1] index-tts2  · 要求参考音=true  · 默认选中=false · known_issues="不接 voice_ref 会直接报错，…"
+      开工判据：EngineNeedsReference
+  [不出现在下拉] audio8-tts-01b        · product_excluded=true  · mode=offline  · role=""
+  [不出现在下拉] audio8-tts-stream     · product_excluded=false · mode=streaming · role=streaming
+  [不出现在下拉] audio8-tts-01b-stream · product_excluded=true  · mode=streaming · role=streaming
 音乐制作引擎（清单 task==gen）
   yue2（歌词成歌） → yue2
   ACE-Step（文生音乐） → ace-step
@@ -67,14 +73,19 @@ App 侧 `ServerModel` 新增（全部 `#[serde(default)]`，**旧清单缺字段
 界面**照样列出来**（清单说了算），但选择后会在提交时报
 「引擎 stable-audio-small-music 还没有接入音乐制作链路」—— **显式失败，不是静默换引擎**。
 
-**B. 按 schema 重新渲染后的清单（`AW_SERVER_CONFIG=…` 指过去跑）**——`requires` 生效：
+**B. 按 schema 重新渲染后的清单（在**临时副本**上跑，用户文件不动）**——与 A **逐行一致**：
 
+```sh
+cp ~/.local/opt/audio.cpp/server.json /Volumes/DataExt/tmp/…/server-rendered.json
+AW_SERVER_CONFIG=/Volumes/DataExt/tmp/…/server-rendered.json \
+  python3 tools/audio_config.py render --write      # 只动临时副本
+diff <(兜底清单的 engines dump) <(渲染后清单的 engines dump)
+# → 无差异（两条投递路径结论逐行一致）
 ```
-  [0] audio8-tts  · 要求参考音=false · 默认选中=true  · 开工判据：Ready
-      known_issues="数字/电话/金额读法不稳定，必须依赖 text.normalization；…"
-  [1] index-tts2  · 要求参考音=true  · 默认选中=false · 开工判据：EngineNeedsReference
-      known_issues="不接 voice_ref 会直接报错，需在 UI 层强制选音色"
-```
+
+服务端显式值优先，但那份值本来就来自同一份 schema，所以渲染与不渲染应当得到同一份结论。
+这条对照是"两条投递路径同源、不会各说各话"的证据（**改前** A 与 B 不一致：A 是"没声明"、
+B 才有 `requires`）。
 
 `EngineNeedsReference` 就是界面上的：内置默认音色行置灰、主按钮禁用、
 提示「这个引擎必须提供参考音频（不能只用内置音色）：在下面填一段参考 wav 再开始配音」。
@@ -84,11 +95,12 @@ App 侧 `ServerModel` 新增（全部 `#[serde(default)]`，**旧清单缺字段
 
 ## 已知边界 / 前提
 
-1. **现有 `~/.local/opt/audio.cpp/server.json` 没有 `role` / `requires` / `known_issues`**，
-   所以 `index-tts2` 的能力提示要等清单重新渲染后才会出现在界面上。渲染是覆盖配置文件，
-   属于需要授权的操作，本批**没有**替用户执行；命令是
-   `python3 tools/audio_config.py render --write`。在渲染之前，App 对缺失字段按
-   "没声明"处理（不过滤、不额外要求）—— 不会误禁引擎，只是少一条提示。
+1. ~~现有 `server.json` 没有 `role` / `requires` / `known_issues`，要靠渲染才有提示。~~
+   **已解决（批次 `cc-ai-audio-workshop-capability-fallback`）**：这些字段改由随包
+   `config/model-capabilities.json` 兜底，App **逐字段**回落（服务端显式值优先）。
+   `render --write` 从此是可选动作，不是前提 —— 见 `docs/model-capabilities.md`。
+   本机实测：**没有改过** `server.json`（sha256 `2e317598…` 前后一致），
+   `index-tts2` 已显示"要求参考音=true / `EngineNeedsReference`"。
 2. **不改产品决策**：`product_excluded` / `known_issues` 的内容仍由 `config/models.schema.yaml` 说了算。
 3. **模型管理里的可见性**：被排除的模型若通过下载清单进入「模型」区，仍会出现在下载列表里
    （属 `docs/model-download.md` 那批的表面），但**不能**被选为配音引擎。
