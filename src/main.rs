@@ -1319,7 +1319,9 @@ fn default_engine_index(voices: &[Voice]) -> i32 {
         .unwrap_or(-1)
 }
 
-/// 读取 server.json：音色 = task=="tts" 的模型；地址取 AW_SERVER，否则 host:port。
+/// 读取 server.json：音色 = **可选**的 tts 引擎（判据只有一处，见
+/// `is_selectable_tts_engine`：`product_excluded` 与 streaming-only 不算）；
+/// 地址取 AW_SERVER，否则 host:port。
 /// 文件缺失/解析失败返回空清单 + 原因说明（不 panic：服务没配时界面也可打开）。
 fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
     let cfg_path = config_path();
