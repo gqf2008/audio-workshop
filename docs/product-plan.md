@@ -72,7 +72,7 @@
 | # | 功能 | 级别 | 判据 |
 |---|---|---|---|
 | S1 | 命令行/菜单隐藏入口跑通 yue2 / ace-step | **[M4]** | 可懂度 85% / 71%，达不到产品级；阶段随 CHARTER §9「M4 = 歌曲场景」 |
-| S2 | 转谱接翻唱（sheetsage2 → yue2 cot=melody） | **[M4]** | **桌面「音乐制作」Tab 已接翻唱入口**：模式切换（文生歌 / 翻唱）→ 选源音频（系统文件框三态语义）→ `Cmd::RunCover` 走 `transcribe_abc` → `generate_cover`（固定 yue2，界面锁定引擎下拉并说明约 8 分钟/首）；mock 回归 `cover_runs_sheetsage_then_yue2_melody` 保持绿。**未做**：真机整首翻唱跑通（约 8 分钟/首，尚未留出完整窗口），不按"已交付真机验证"对外说 |
+| S2 | 转谱接翻唱（sheetsage2 → yue2 cot=melody） | **[M4]** | **桌面「音乐制作」Tab 已接翻唱入口**：模式切换（文生歌 / 翻唱）→ 选源音频（系统文件框三态语义）→ `Cmd::RunCover` 走 `transcribe_abc` → `generate_cover`（固定 yue2，界面锁定引擎下拉并说明约 8 分钟/首）；mock 回归 `cover_runs_sheetsage_then_yue2_melody` 保持绿。**真机整首已跑通**（2026-09-17 22:22）：本机 `audiocpp_server`（`backend=metal`，13 models）+ 30.08s / 48kHz / 2ch 源音频（`~/Music/夏日汽水_demo.wav`）+ 4 行新歌词 + `style=清新民谣` → `transcribe_abc`（sheetsage2）→ `generate_cover`（yue2 cot=melody），产物 `/Volumes/DataExt/tmp/aw-cover-e2e/out/cover.wav` = 51.76s / 48kHz / 2ch / 16bit / 9.9MB，RMS=3000.6（非静音），**墙钟 3m36s**。**边界**：跑的是 `aw-core` 的 `examples/song_cover` （与 `Cmd::RunCover` 同一对 `generate_cover` / `transcribe_abc` 调用），**不是 GUI 点击路径** —— GUI 接线由单测 + `AW_UI_STATE=music-cover` 只读冒烟覆盖，翻唱态的像素级布局仍无目视验证，不按"整条 GUI 链路已验收"对外说 |
 | S3 | 歌曲专用界面（作词/结构/多轨） | **不做** | 8 分钟/首，不值得占界面 |
 
 ---

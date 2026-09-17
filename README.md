@@ -76,6 +76,9 @@ cargo run -p aw-core --example bgm_run -- ~/Documents/音频作坊/projects/工�
 # M4 歌曲：文生歌（yue2 / ACE-Step；ACE-Step 本机内存不够）
 #   翻唱（sheetsage2 → yue2 cot=melody）桌面入口在「音乐制作」Tab：切到「翻唱」模式，
 #   选源音频后走 transcribe_abc → generate_cover（固定 yue2）。命令行示例仍可用：
+#   真机整首已跑通（2026-09-17）：本机 audiocpp_server(metal) + 30.08s 源音频 → 产物 51.76s，
+#   RMS=3000.6 非静音，墙钟 3m36s。跑的是 aw-core 的 examples/song_cover（与 Cmd::RunCover
+#   同一对调用），不是 GUI 点击路径 —— GUI 接线靠单测 + 只读冒烟，像素级布局仍未目视。
 # ACE-Step 的门槛是**可用内存** 9.77 GiB（引擎估算 8.77 GiB + 1 GiB 余量）；
 # 本机 16GB 实测（2026-09-17 三次采样，可用值是变量不是硬件常量）：
 #   7.32 GiB（TTS+ASR 常驻）/ 8.24 GiB（全部卸载后）/ 6.60 GiB（复核时）
