@@ -398,7 +398,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                                 PixelButton {
                                     width: 64px;
                                     size: "small";
-                                    text: d.active ? "取消" : (d.state == "已完成" ? "重下" : "下载");
+                                    text: d.active ? "取消" : (d.state == "已完成" ? "重下" : (d.state == "失败" ? "重试" : "下载"));
                                     clicked => { root.download-model(d.key); }
                                 }
                             }

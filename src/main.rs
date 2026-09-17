@@ -1918,16 +1918,56 @@ fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
-/// 取出并摘掉某模型当前在跑的下载任务 id（点击时判"这次是取消还是新下载"）。
+/// 某模型当前在跑的下载任务 id（只读；借用在本函数内就还掉）。
 ///
-/// 借用刻意分两步：`if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里临时借用会活到
-/// 整个 if-let（含块），块里再 `borrow_mut` 会直接 panic——复核前自己抓到的真坑。
-fn take_active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
-    let id = state.download_ids.borrow().get(key).copied();
-    if id.is_some() {
-        state.download_ids.borrow_mut().remove(key);
+/// 「读」与「摘」刻意分开：`if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里
+/// 临时借用会活到整个 if-let（含块），块里再 `borrow_mut` 会直接 panic——自己抓到过的真坑。
+fn active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
+    state.download_ids.borrow().get(key).copied()
+}
+
+/// 一次「下载/取消」点击实际发生了什么（UI 只据它发提示）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClickEffect {
+    /// 首次请求取消：标志已置位，等这一步收尾
+    CancelRequested(u64),
+    /// 之前已经请求过取消、任务还在收尾：这次 no-op
+    AlreadyCancelling(u64),
+    /// 任务其实已经收尾（终态快照还在路上）：如实说，不谎报"已取消"
+    AlreadyFinished(u64),
+    /// 没有在跑的 → 新排一条
+    Enqueued { id: u64, dest: PathBuf },
+    /// 清单里找不到这个模型（点之前清单被改过）
+    UnknownModel,
+}
+
+/// 处理一次「下载/取消」点击：有在跑的就取消，没有才排新任务。
+///
+/// **取消时绝不动 `download_ids`**（复核 B1）。取消是协作式的——旧任务可能还在写
+/// `.part`（读循环最多再落一个 64KiB 块才看到标志）。这里若把 id 摘掉，下一次点击就会
+/// 被当成"没有在跑"而再排一条，两条任务抢同一个 `.part`；只给 `size` 不给 `sha256` 的
+/// 条目只按大小校验，"内容坏但长度恰好对上"会被 rename 成正式文件。id 只由 worker 的
+/// 终态快照摘除（见 tick），所以取消未收尾期间再点只会是 no-op。
+fn apply_download_click(
+    state: &Rc<UiState>,
+    key: &str,
+    cancel: impl FnOnce(u64) -> download::CancelOutcome,
+    enqueue: impl FnOnce() -> Option<(u64, PathBuf)>,
+) -> ClickEffect {
+    if let Some(id) = active_download_id(state, key) {
+        return match cancel(id) {
+            download::CancelOutcome::Requested => ClickEffect::CancelRequested(id),
+            download::CancelOutcome::AlreadyRequested => ClickEffect::AlreadyCancelling(id),
+            download::CancelOutcome::Finished => ClickEffect::AlreadyFinished(id),
+        };
     }
-    id
+    match enqueue() {
+        Some((id, dest)) => {
+            state.download_ids.borrow_mut().insert(key.to_string(), id);
+            ClickEffect::Enqueued { id, dest }
+        }
+        None => ClickEffect::UnknownModel,
+    }
 }
 
 /// 模型下载接线：一个后台串行队列 + 每个可下载模型一个「下载/取消」按钮。
@@ -1946,30 +1986,48 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
     }));
 
     let weak = ui.as_weak();
-    let dl = Rc::clone(&downloader);
     let st = Rc::clone(state);
     ui.on_download_model(move |key| {
         let Some(ui) = weak.upgrade() else { return };
         let key = key.to_string();
-        // 已经在队列里（排队/下载中/校验中）→ 这个按钮现在是「取消」
-        if let Some(id) = take_active_download_id(&st, &key) {
-            dl.cancel(id);
-            ui.set_status_text(format!("已取消下载：{key}").into());
-            return;
-        }
-        let Some(model) = downloadable_models().into_iter().find(|m| m.id == key) else {
-            ui.set_status_text(format!("清单里找不到可下载模型：{key}").into());
-            return;
+        let start_key = key.clone();
+        // 回调是 FnMut：这两份 Rc 每次点击各自 clone 一次再进 FnOnce 闭包，
+        // 不能在闭包外 move 进来（否则第二次点击就用不了）。
+        let dl_cancel = Rc::clone(&downloader);
+        let dl_start = Rc::clone(&downloader);
+        let effect = apply_download_click(
+            &st,
+            &key,
+            move |id| dl_cancel.cancel(id),
+            move || {
+                // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
+                let model = downloadable_models()
+                    .into_iter()
+                    .find(|m| m.id == start_key)?;
+                let id = dl_start.enqueue(download::TaskSpec {
+                    label: model.id.clone(),
+                    url: model.url.clone(),
+                    dest: model.dest.clone(),
+                    expected_sha256: model.sha256.clone(),
+                    expected_size: model.size,
+                });
+                Some((id, model.dest))
+            },
+        );
+        let text = match effect {
+            ClickEffect::Enqueued { dest, .. } => {
+                format!("已加入下载队列：{key} → {}", dest.display())
+            }
+            ClickEffect::CancelRequested(_) => format!(
+                "正在取消下载：{key}（取消是协作式的，等这一步收尾；这期间不会再为它排新下载）"
+            ),
+            ClickEffect::AlreadyCancelling(_) => {
+                format!("正在取消下载：{key}（已在取消中，请稍候）")
+            }
+            ClickEffect::AlreadyFinished(_) => format!("这条下载已经结束了：{key}"),
+            ClickEffect::UnknownModel => format!("清单里找不到可下载模型：{key}"),
         };
-        let id = dl.enqueue(download::TaskSpec {
-            label: model.id.clone(),
-            url: model.url.clone(),
-            dest: model.dest.clone(),
-            expected_sha256: model.sha256.clone(),
-            expected_size: model.size,
-        });
-        st.download_ids.borrow_mut().insert(key.clone(), id);
-        ui.set_status_text(format!("已加入下载队列：{key} → {}", model.dest.display()).into());
+        ui.set_status_text(text.into());
     });
 }
 
@@ -8230,19 +8288,114 @@ mod tests {
         );
     }
 
-    /// 点「取消」要把该模型的下载 id 摘掉，且**不能**因为借用冲突 panic：
-    /// `if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里临时借用活到整个 if-let
-    /// （含块），块里再 `borrow_mut` 会直接炸——这条钉住修好的两步借用。
+    /// B1（复核阻塞项）：点取消之后**不能**立刻允许为同一模型再排一条。
+    ///
+    /// 取消是协作式的：旧任务可能还在写 `.part`（读循环最多再落一个 64KiB 块才看到
+    /// 标志）。旧实现点取消就把 `download_ids` 摘了，于是下一次点击被判成"没有在跑"
+    /// 而再排一条，两条任务抢同一个 `.part`；只给 size 不给 sha256 的条目只按大小校验，
+    /// "内容坏但长度恰好对上"会被 rename 成正式文件。
+    ///
+    /// 这条对旧实现会红：旧实现第二次、第三次点击都会再调 `enqueue`。
     #[test]
-    fn take_active_download_id_removes_without_borrow_conflict() {
+    fn cancel_click_keeps_the_task_registered_so_it_cannot_restart_immediately() {
         let state = Rc::new(UiState::default());
-        state
-            .download_ids
-            .borrow_mut()
-            .insert("audio8-tts".into(), 7);
-        assert_eq!(take_active_download_id(&state, "audio8-tts"), Some(7));
-        // 第二次：已经摘掉了，不能再次当成"还在跑"（否则连点会重复取消/误排新任务）
-        assert_eq!(take_active_download_id(&state, "audio8-tts"), None);
+        let dest = PathBuf::from("/models/m.gguf");
+        let mut enqueues: Vec<u64> = Vec::new();
+
+        // 第一次点击：排一条（id=7）
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| unreachable!("还没在跑，不该走取消"),
+            || {
+                enqueues.push(1);
+                Some((7, dest.clone()))
+            },
+        );
+        assert_eq!(
+            fx,
+            ClickEffect::Enqueued {
+                id: 7,
+                dest: dest.clone()
+            }
+        );
+        assert_eq!(active_download_id(&state, "m"), Some(7));
+
+        // 点取消：请求发出去，但 id 必须**留在** download_ids 里（等 worker 终态快照摘）
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |id| {
+                assert_eq!(id, 7);
+                download::CancelOutcome::Requested
+            },
+            || {
+                enqueues.push(2);
+                Some((8, dest.clone()))
+            },
+        );
+        assert_eq!(fx, ClickEffect::CancelRequested(7));
+        assert_eq!(
+            active_download_id(&state, "m"),
+            Some(7),
+            "取消时不能摘 id：摘了下一次点击就会再排一条，两条抢同一个 .part"
+        );
+
+        // 取消还没收尾就再点：必须是 no-op（仍然是「正在取消」），不能再排
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| download::CancelOutcome::AlreadyRequested,
+            || {
+                enqueues.push(3);
+                Some((9, dest.clone()))
+            },
+        );
+        assert_eq!(fx, ClickEffect::AlreadyCancelling(7));
+        assert_eq!(
+            enqueues,
+            vec![1],
+            "取消未收尾期间不得再排新任务（两条会抢同一个 .part）"
+        );
+
+        // 只有 worker 的终态快照摘掉 id 之后，才允许重下
+        state.download_ids.borrow_mut().remove("m");
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| unreachable!("已经摘了 id，不该走取消"),
+            || {
+                enqueues.push(4);
+                Some((10, dest.clone()))
+            },
+        );
+        assert_eq!(fx, ClickEffect::Enqueued { id: 10, dest });
+        assert_eq!(enqueues, vec![1, 4]);
+    }
+
+    /// `cancel` 返回 Finished（任务其实已经收尾）时要如实说，别谎报"已取消"；
+    /// 重复点取消是 no-op，也不能再排新下载。
+    #[test]
+    fn click_on_already_finished_task_says_finished_and_never_enqueues() {
+        let state = Rc::new(UiState::default());
+        state.download_ids.borrow_mut().insert("m".into(), 7);
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| download::CancelOutcome::Finished,
+            || panic!("已经不在队列里，绝不能排新任务"),
+        );
+        assert_eq!(fx, ClickEffect::AlreadyFinished(7));
+        // 终态快照还没到，id 仍在册；下一次点击还是按"取消"这条路走
+        assert_eq!(active_download_id(&state, "m"), Some(7));
+    }
+
+    /// 清单里找不到模型时如实报 UnknownModel（点之前清单被改过），不静默排空任务。
+    #[test]
+    fn click_with_unknown_model_reports_unknown() {
+        let state = Rc::new(UiState::default());
+        let fx = apply_download_click(&state, "gone", |_| unreachable!("没有在跑"), || None);
+        assert_eq!(fx, ClickEffect::UnknownModel);
         assert!(state.download_ids.borrow().is_empty());
     }
 

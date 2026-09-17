@@ -22,6 +22,17 @@ use sha2::{Digest, Sha256};
 /// 读盘缓冲区：64 KiB 在进度粒度与系统调用次数之间取平衡。
 const CHUNK: usize = 64 * 1024;
 
+/// `Downloader::cancel` 的结果（UI 要据此说对话，不能把"其实已经结束"说成"已取消"）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 这次真的置上了取消标志（第一次请求取消）
+    Requested,
+    /// 之前已经请求过取消，任务还在收尾——这次是 no-op
+    AlreadyRequested,
+    /// 任务已经不在队列里（终态已出），没有什么可取消的
+    Finished,
+}
+
 /// 单任务状态机。`Failed` 带原因，`Done`/`Cancelled` 终态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -457,15 +468,20 @@ impl Downloader {
     }
 
     /// 取消一条任务。正在下载的由原子标志让读循环退出；还没开始的会在轮到它时跳过。
-    /// 返回 false 表示这个 id 已经不在队列里（已完成/已取消/不存在）。
-    pub fn cancel(&self, id: u64) -> bool {
+    ///
+    /// 返回 [`CancelOutcome`]：任务已经收尾时返回 `Finished`，**不要**把它说成"已取消"
+    /// （终态快照可能还在路上，但任务确实已经不在队列里了）。
+    pub fn cancel(&self, id: u64) -> CancelOutcome {
         let flags = self.flags.lock().unwrap();
         match flags.get(&id) {
             Some(flag) => {
-                flag.store(true, Ordering::Relaxed);
-                true
+                if flag.swap(true, Ordering::Relaxed) {
+                    CancelOutcome::AlreadyRequested
+                } else {
+                    CancelOutcome::Requested
+                }
             }
-            None => false,
+            None => CancelOutcome::Finished,
         }
     }
 }
@@ -886,6 +902,37 @@ mod tests {
         assert_eq!(srv.hits().len(), 1);
     }
 
+    /// `cancel` 要如实区分「首次请求取消 / 已在取消中 / 其实已经收尾」，UI 才不会把
+    /// 已经结束的任务说成"已取消"（复核顺手项）。
+    #[test]
+    fn cancel_reports_requested_then_already_requested_then_finished() {
+        let root = temp_dir("cancel-outcome");
+        let body = vec![3u8; 32 * 1024];
+        let srv = MockServer::start(body.clone(), false);
+        let (tx, rx) = channel::<Snapshot>();
+        let dl = Downloader::new(move |s| {
+            let _ = tx.send(s);
+        });
+        let id = dl.enqueue(spec(srv.url("/m/model.bin"), root.join("m.bin"), &body));
+        assert_eq!(dl.cancel(id), CancelOutcome::Requested);
+        assert_eq!(dl.cancel(id), CancelOutcome::AlreadyRequested);
+
+        // 等终态：worker 先摘 flag 再发终态快照，所以看到终态时 cancel 一定报 Finished
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(s) if s.state.is_terminal() => break,
+                Ok(_) => {}
+                Err(_) => assert!(Instant::now() < deadline, "等不到终态快照"),
+            }
+        }
+        assert_eq!(
+            dl.cancel(id),
+            CancelOutcome::Finished,
+            "任务已收尾，不能再报「已取消」"
+        );
+    }
+
     #[test]
     fn creates_missing_target_directory() {
         let root = temp_dir("mkdir");
@@ -947,7 +994,7 @@ mod tests {
         // 排两条：第二条一开始就取消 → 应直接标 Cancelled，且不落地
         let _id_a = dl.enqueue(spec(srv.url("/a.bin"), dest_a.clone(), &body));
         let id_b = dl.enqueue(spec(srv.url("/b.bin"), dest_b.clone(), &body));
-        assert!(dl.cancel(id_b));
+        assert_eq!(dl.cancel(id_b), CancelOutcome::Requested);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut b_cancelled = false;
