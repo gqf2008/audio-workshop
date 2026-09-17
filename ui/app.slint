@@ -163,6 +163,15 @@ export component MainWindow inherits Window {
     // 备份当前能不能点：**Rust 侧 `backup_blocked` 的投影**（与点击回调同一份判据）。
     // 不要在 Slint 里拿 busy/task-running 另拼一套——那样按钮与回调会各说各话。
     in property <bool> backup-blocked: false;
+    // 更新：当前版本 / 清单地址 / 状态行；更新是**只读**检查，不碰本机任何文件
+    in property <string> update-current: "";
+    in-out property <string> update-manifest-url: "";
+    in property <string> update-info: "";
+    in property <bool> update-running: false;
+    // 能不能点「检查更新」：**Rust 侧 `update_blocked` 的投影**（与点击回调同一份判据）。
+    // 能不能点「打开发布页」：Rust 侧 `has_release` 的投影（没有新版时不该能点）。
+    in property <bool> update-blocked: false;
+    in property <bool> update-has-release: false;
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
@@ -293,6 +302,8 @@ export component MainWindow inherits Window {
     callback check-server();
     callback pick-model-dir();
     callback backup-all();
+    callback check-update();
+    callback open-release-page();
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
@@ -719,6 +730,14 @@ export component MainWindow inherits Window {
                     backup-running: root.backup-running;
                     backup-blocked: root.backup-blocked;
                     backup-all => { root.backup-all(); }
+                    update-current: root.update-current;
+                    update-manifest-url <=> root.update-manifest-url;
+                    update-info: root.update-info;
+                    update-running: root.update-running;
+                    update-blocked: root.update-blocked;
+                    update-has-release: root.update-has-release;
+                    check-update => { root.check-update(); }
+                    open-release-page => { root.open-release-page(); }
                 }
             }
         }
