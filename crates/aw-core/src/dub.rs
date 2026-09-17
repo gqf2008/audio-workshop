@@ -137,6 +137,10 @@ pub struct Project {
     /// 旧工程没有这个字段时按"开"处理（与历史行为一致）。
     #[serde(default = "default_auto_normalize")]
     pub auto_normalize: bool,
+    /// 发音词典指纹（空 = 没启用词典）。词典改的是 spoken 文本，所以它变了旧音频不能复用
+    /// ——与 `auto_normalize` 同类。旧工程没有这个字段时按"没启用词典"处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dict_hash: Option<String>,
     pub base_seed: u64,
     pub sentences: Vec<Sentence>,
 }
@@ -192,6 +196,7 @@ impl Project {
             voice_ref_hash: None,
             gap_ms,
             auto_normalize: true,
+            dict_hash: None,
             base_seed,
             sentences,
         }
