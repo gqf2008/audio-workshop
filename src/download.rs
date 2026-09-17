@@ -1160,18 +1160,48 @@ mod tests {
         let id_b = dl.enqueue(spec(srv_b.url("/b.bin"), dest_b.clone(), &body_b));
         assert_ne!(id_a, id_b);
 
-        // 等两条都到终态（Done）
+        // 等两条都到终态（Done），并把**事件顺序**整个留下来。
+        // 注意按"不同的任务 id"数，不能按 Done 事件数：download() 自己发一次 Done、
+        // worker 收尾再发一次，一条任务就有两个 Done——按事件数会提前满足（踩过）。
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut done = std::collections::HashSet::new();
-        while done.len() < 2 && Instant::now() < deadline {
+        let mut events: Vec<Snapshot> = Vec::new();
+        loop {
+            let done_ids: std::collections::HashSet<u64> = events
+                .iter()
+                .filter(|s| s.state == State::Done)
+                .map(|s| s.id)
+                .collect();
+            if done_ids.len() == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "两条任务没能在 10s 内跑完");
             if let Ok(snap) = rx.recv_timeout(Duration::from_millis(200)) {
-                if snap.state == State::Done {
-                    done.insert(snap.id);
-                }
+                events.push(snap);
             }
         }
-        assert_eq!(done.len(), 2, "两条任务都应完成");
-        assert!(done.contains(&id_a) && done.contains(&id_b));
+        let done_ids: std::collections::HashSet<u64> = events
+            .iter()
+            .filter(|s| s.state == State::Done)
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            done_ids.contains(&id_a) && done_ids.contains(&id_b),
+            "两条任务都应完成（实际完成 {done_ids:?}）"
+        );
+        // 验收①要的是**串行**：第二条必须在第一条跑完（Done）之后才开始（Queued）。
+        // 只断言"两条都 Done"的话，改成并行 spawn 也照样绿——所以这里钉住先后。
+        let a_done = events
+            .iter()
+            .position(|s| s.id == id_a && s.state == State::Done)
+            .expect("甲的 Done 必须在事件流里");
+        let b_started = events
+            .iter()
+            .position(|s| s.id == id_b && s.state == State::Queued)
+            .expect("乙的 Queued 必须在事件流里");
+        assert!(
+            a_done < b_started,
+            "队列必须串行：甲 Done（位置 {a_done}）要在乙 Queued（位置 {b_started}）之前"
+        );
         assert_eq!(std::fs::read(&dest_a).unwrap(), body_a);
         assert_eq!(std::fs::read(&dest_b).unwrap(), body_b);
     }
