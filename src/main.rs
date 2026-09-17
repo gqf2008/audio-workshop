@@ -629,6 +629,7 @@ fn persist_active_dictionary(ui: &MainWindow, file: Option<&str>) {
 /// 启用一套词典（或取消启用）：换词典 = 改 spoken 文本 → 与换模型同类，需要重录。
 fn activate_dictionary(
     ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
     state: &Rc<UiState>,
     cmd_tx: &Sender<Cmd>,
     file: Option<String>,
@@ -651,7 +652,7 @@ fn activate_dictionary(
     invalidate_worker_project(cmd_tx, state);
     reset_bgm(ui, state);
     state.assembled.borrow_mut().take();
-    clear_eval_scores(state);
+    clear_eval_scores(ui, rows, state);
     ui.set_has_result(false);
     let what = file
         .as_deref()
@@ -834,12 +835,14 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
 /// 发音词典（P5）：切换 / 导入词条 / 导出词条。
 fn wire_dictionary(
     ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
     cmd_tx: &Sender<Cmd>,
     msg_tx: &Sender<WorkerMsg>,
     state: &Rc<UiState>,
 ) {
     // 切换启用的词典（第 0 项 = 不使用）
     let weak = ui.as_weak();
+    let rows_for_pick = rows.clone();
     let st = state.clone();
     let tx = cmd_tx.clone();
     ui.on_dict_picked(move |i| {
@@ -855,7 +858,7 @@ fn wire_dictionary(
             let (rows, _) = dictionaries::list(&dictionaries_root());
             rows.get((i - 1) as usize).map(|r| r.file.clone())
         };
-        activate_dictionary(&ui, &st, &tx, file);
+        activate_dictionary(&ui, &rows_for_pick, &st, &tx, file);
     });
 
     // 导入词条
@@ -3410,6 +3413,12 @@ struct UiState {
     eval_task: std::cell::Cell<Option<u32>>,
     /// 质检分数（句 index → 可懂度%）。重新合成/改稿后要清掉——分数会失效
     eval_scores: RefCell<HashMap<usize, f64>>,
+    /// 句子列表当前是否按质检分数升序展示。只影响视图，不改工程。
+    qa_sorted: std::cell::Cell<bool>,
+    qa_worst_index: std::cell::Cell<Option<usize>>,
+    /// 连续点「跳到最差句」时给滚动目标加个不可见的亚像素偏移，
+    /// 即使目标行没变也重新触发一次 viewport 更新。
+    qa_scroll_phase: std::cell::Cell<bool>,
     /// 跨 Tab 任务台账（配音 / BGM / 音乐制作 / 人声分离共用一份）。
     tasks: RefCell<tasks::TaskQueue>,
     /// 各类任务当前的 id（进度/收尾消息按 id 回填）
@@ -3528,7 +3537,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_engine_changes(&ui, &cmd_tx, &state);
     wire_templates(&ui, &cmd_tx, &state);
     wire_versions(&ui, &rows, &cmd_tx, &state);
-    wire_dictionary(&ui, &cmd_tx, &msg_tx_ui, &state);
+    wire_dictionary(&ui, &rows, &cmd_tx, &msg_tx_ui, &state);
     load_active_dictionary(&ui, &state);
     wire_voice_panel(&ui, &cmd_tx, &state);
     wire_voice_library(
@@ -3724,10 +3733,10 @@ fn apply_project_to_rows(
     project: &Project,
 ) -> usize {
     let mut done = 0usize;
-    for (i, sentence) in project.sentences.iter().enumerate() {
-        if i >= rows.row_count() {
-            break;
-        }
+    for sentence in &project.sentences {
+        let Some(i) = row_position(rows, sentence.index) else {
+            continue;
+        };
         if sentence.status == "done" {
             done += 1;
             set_status(rows, i, "done");
@@ -3815,6 +3824,7 @@ fn restore_project(
     // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）
     *state.eval_scores.borrow_mut() = scores_from_project(&project);
     apply_eval_labels(rows, &state.eval_scores.borrow());
+    sync_qa_actions(ui, rows, state);
     // BGM 产物是落盘的：重开应用也要看到上次那几轨（否则"昨天混好的分轨今天导不出来"）
     restore_bgm_from_disk(ui, state, &dir);
     refresh_versions(ui, state);
@@ -3870,13 +3880,188 @@ fn wire_theme(ui: &MainWindow) {
     });
 }
 
-/// 稿件变了（改稿/载入示例/清空/重新切句）：句子序号与内容都会变，质检分数一律作废。
+/// 把 UI 行按工程真实 index 找回原顺序。
+fn restore_project_order(mut rows: Vec<Sentence>) -> Vec<Sentence> {
+    rows.sort_by_key(|row| row.index);
+    rows
+}
+
+/// 质检排序：有分数的句子在前，按可懂度升序；没分数的句子排后面。
 ///
-/// 注意**不**放进 `invalidate_worker_project`：工程改名不改句子，分数仍然有效。
-fn clear_eval_scores(state: &Rc<UiState>) {
-    if !state.eval_scores.borrow().is_empty() {
-        state.eval_scores.borrow_mut().clear();
+/// 同分时按工程 index 升序，因此排序是稳定且可复现的；只返回行副本，
+/// 不改 `Project`，也不依赖 `no` 或当前显示位置。
+fn sort_rows_for_eval(mut rows: Vec<Sentence>, scores: &HashMap<usize, f64>) -> Vec<Sentence> {
+    rows.sort_by(|a, b| {
+        let a_project = usize::try_from(a.index).ok();
+        let b_project = usize::try_from(b.index).ok();
+        let ascore = a_project.and_then(|i| scores.get(&i));
+        let bscore = b_project.and_then(|i| scores.get(&i));
+        match (ascore, bscore) {
+            (Some(a_score), Some(b_score)) => a_score
+                .total_cmp(b_score)
+                .then_with(|| a_project.cmp(&b_project)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a_project.cmp(&b_project),
+        }
+    });
+    rows
+}
+
+/// 按工程真实 index 找当前 UI 行位置。排序只改变这个位置，不改变工程句子本身。
+fn row_position_in_slice(rows: &[Sentence], project_index: usize) -> Option<usize> {
+    rows.iter()
+        .position(|row| usize::try_from(row.index).ok() == Some(project_index))
+}
+
+fn row_position(rows: &Rc<VecModel<Sentence>>, project_index: usize) -> Option<usize> {
+    (0..rows.row_count()).find(|&i| {
+        rows.row_data(i)
+            .and_then(|row| usize::try_from(row.index).ok())
+            == Some(project_index)
+    })
+}
+
+fn rows_as_vec(rows: &Rc<VecModel<Sentence>>) -> Vec<Sentence> {
+    (0..rows.row_count())
+        .filter_map(|i| rows.row_data(i))
+        .collect()
+}
+
+fn apply_row_order(rows: &Rc<VecModel<Sentence>>, ordered: Vec<Sentence>) {
+    rows.set_vec(ordered);
+}
+
+/// 排序按钮和跳转按钮共用的可用性判据。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QaActionView {
+    enabled: bool,
+    worst_row: Option<usize>,
+}
+
+fn qa_action_view(
+    rows: &[Sentence],
+    scores: &HashMap<usize, f64>,
+    worst_index: Option<usize>,
+    blocked: bool,
+) -> QaActionView {
+    let worst_row = worst_index.and_then(|index| row_position_in_slice(rows, index));
+    QaActionView {
+        enabled: !blocked && !scores.is_empty() && worst_row.is_some(),
+        worst_row,
     }
+}
+
+fn qa_action_view_for_ui(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    state: &Rc<UiState>,
+) -> QaActionView {
+    qa_action_view(
+        &rows_as_vec(rows),
+        &state.eval_scores.borrow(),
+        state.qa_worst_index.get(),
+        ui.get_running()
+            || ui.get_busy()
+            || ui.get_batch_running()
+            || state.eval_task.get().is_some(),
+    )
+}
+
+fn sync_qa_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
+    let view = qa_action_view_for_ui(ui, rows, state);
+    if rows.row_count() == 0 {
+        return;
+    }
+    // 第 0 行只承载这两个按钮的视图元数据；不写进 Project，也不展示。
+    let Some(mut row) = rows.row_data(0) else {
+        return;
+    };
+    let enabled = view.enabled;
+    let sorted = state.qa_sorted.get();
+    if row.qa_enabled == enabled && row.qa_sorted == sorted {
+        return;
+    }
+    row.qa_enabled = enabled;
+    row.qa_sorted = sorted;
+    rows.set_row_data(0, row);
+}
+
+/// 现有 `select-sentence` 回调里保留的质检视图指令。
+/// 负值不可能与真实 UI 行号冲突；按钮和 Rust 判定共用同一套语义。
+const QA_SORT_COMMAND: i32 = -1;
+const QA_JUMP_WORST_COMMAND: i32 = -2;
+
+fn toggle_qa_sort(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
+    let view = qa_action_view_for_ui(ui, rows, state);
+    if !view.enabled {
+        return;
+    }
+    let selected_project = ui
+        .get_selected()
+        .max(0)
+        .try_into()
+        .ok()
+        .and_then(|i: usize| rows.row_data(i))
+        .and_then(|row| usize::try_from(row.index).ok());
+    let scores = state.eval_scores.borrow().clone();
+    let sorted = !state.qa_sorted.get();
+    state.qa_sorted.set(sorted);
+    let ordered = if sorted {
+        sort_rows_for_eval(rows_as_vec(rows), &scores)
+    } else {
+        restore_project_order(rows_as_vec(rows))
+    };
+    apply_row_order(rows, ordered);
+    if let Some(index) = selected_project {
+        if let Some(i) = row_position(rows, index) {
+            ui.set_selected(i as i32);
+        }
+    }
+    sync_qa_actions(ui, rows, state);
+    ui.set_status_text(
+        if sorted {
+            "已按可懂度升序排列：最差句在前（只改查看顺序）"
+        } else {
+            "已恢复工程原顺序"
+        }
+        .into(),
+    );
+}
+
+fn jump_to_worst(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
+    let view = qa_action_view_for_ui(ui, rows, state);
+    if !view.enabled {
+        return;
+    }
+    let Some(i) = view.worst_row else { return };
+    let Some(row) = rows.row_data(i) else { return };
+    ui.set_selected(i as i32);
+    // 行高固定 48px；选中的展开行在目标位置自身，前面行仍按 48px 计算。
+    // 加一个不可见的亚像素抖动，让“同一句再点一次”也重新触发滚动。
+    let phase = !state.qa_scroll_phase.get();
+    state.qa_scroll_phase.set(phase);
+    let y = i as f32 * 48.0 + if phase { 0.01 } else { 0.0 };
+    if let Some(mut meta) = rows.row_data(0) {
+        meta.qa_scroll_y = y;
+        rows.set_row_data(0, meta);
+    }
+    ui.set_status_text(format!("已跳到最差第 {} 句：可试听或重录", row.no).into());
+}
+
+/// 分数失效的核心状态迁移：清分数、取消排序视角并回到工程原顺序。
+/// 拆出来让单测不用构造窗口也能验证“失效后回原序”。
+fn reset_eval_view(rows: &Rc<VecModel<Sentence>>, state: &UiState) {
+    state.eval_scores.borrow_mut().clear();
+    state.qa_sorted.set(false);
+    state.qa_worst_index.set(None);
+    apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
+}
+
+/// 分数失效的入口：清分数、取消排序视角并回到工程原顺序。
+fn clear_eval_scores(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
+    reset_eval_view(rows, state);
+    sync_qa_actions(ui, rows, state);
 }
 
 fn invalidate_worker_project(cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
@@ -4385,7 +4570,7 @@ fn wire_script(
         let text = ui.get_script_text();
         rebuild(&ui, &rows1, &text);
         invalidate_worker_project(&tx1, &state1);
-        clear_eval_scores(&state1);
+        clear_eval_scores(&ui, &rows1, &state1);
         reset_bgm(&ui, &state1);
         ui.set_status_text(
             format!(
@@ -4410,7 +4595,7 @@ fn wire_script(
         ui.set_script_text(SAMPLE_SCRIPT.into());
         rebuild(&ui, &rows2, SAMPLE_SCRIPT);
         invalidate_worker_project(&tx2, &state2);
-        clear_eval_scores(&state2);
+        clear_eval_scores(&ui, &rows2, &state2);
         reset_bgm(&ui, &state2);
         ui.set_status_text(format!("已载入示例稿：{} 句", rows2.row_count()).into());
     });
@@ -4428,7 +4613,7 @@ fn wire_script(
         ui.set_script_text("".into());
         rebuild(&ui, &rows3, "");
         invalidate_worker_project(&tx3, &state3);
-        clear_eval_scores(&state3);
+        clear_eval_scores(&ui, &rows3, &state3);
         reset_bgm(&ui, &state3);
         ui.set_status_text("稿件已清空，粘一段口播稿试试".into());
     });
@@ -4446,7 +4631,7 @@ fn wire_script(
         let text = ui.get_script_text();
         rebuild(&ui, &rows4, &text);
         invalidate_worker_project(&tx4, &state4);
-        clear_eval_scores(&state4);
+        clear_eval_scores(&ui, &rows4, &state4);
         reset_bgm(&ui, &state4);
         let n = rows4.row_count();
         ui.set_status_text(format!("已重新切句：{n} 句").into());
@@ -4667,7 +4852,12 @@ fn apply_eval_labels(rows: &Rc<VecModel<Sentence>>, scores: &HashMap<usize, f64>
         let Some(mut row) = rows.row_data(i) else {
             continue;
         };
-        let label = scores.get(&i).map(|p| eval_label(*p)).unwrap_or_default();
+        // 行位置可能已经被质检排序改变，分数必须按工程 index 找，不能按 i 找。
+        let label = usize::try_from(row.index)
+            .ok()
+            .and_then(|index| scores.get(&index))
+            .map(|p| eval_label(*p))
+            .unwrap_or_default();
         if row.eval_label.as_str() == label {
             continue;
         }
@@ -5349,7 +5539,7 @@ fn wire_versions(
                 invalidate_worker_project(&tx, &st);
                 reset_bgm(&ui, &st);
                 st.assembled.borrow_mut().take();
-                clear_eval_scores(&st);
+                clear_eval_scores(&ui, &rows, &st);
                 ui.set_has_result(false);
                 refresh_versions(&ui, &st);
                 ui.set_version_diff_text("".into());
@@ -5639,19 +5829,26 @@ fn wire_sentence_actions(
 ) {
     let weak = ui.as_weak();
     let model1 = rows.clone();
+    let state1 = state.clone();
     ui.on_select_sentence(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        if i == QA_SORT_COMMAND {
+            toggle_qa_sort(&ui, &model1, &state1);
+            return;
+        }
+        if i == QA_JUMP_WORST_COMMAND {
+            jump_to_worst(&ui, &model1, &state1);
+            return;
+        }
         if i < 0 {
             return;
         }
-        let Some(ui) = weak.upgrade() else { return };
         ui.set_selected(i);
         if let Some(row) = model1.row_data(i as usize) {
             ui.set_status_text(
                 format!(
                     "已选中第 {} 句 · 起始 {} · 时长 {}",
-                    i + 1,
-                    row.start_label,
-                    row.duration_label
+                    row.no, row.start_label, row.duration_label
                 )
                 .into(),
             );
@@ -5671,6 +5868,7 @@ fn wire_sentence_actions(
             return;
         };
         ui.set_selected(i);
+        // i 是当前可见行位置；play_sentence 内部用 row.index 找工程 wav。
         play_sentence(&ui, &model2, &player2, &state2, i as usize, row.duration);
     });
 
@@ -5683,10 +5881,14 @@ fn wire_sentence_actions(
             return;
         }
         let Some(ui) = weak.upgrade() else { return };
-        let idx = i as usize;
-        if model3.row_data(idx).is_none() {
+        let display_index = i as usize;
+        let Some(row) = model3.row_data(display_index) else {
             return;
-        }
+        };
+        let project_index = match usize::try_from(row.index) {
+            Ok(index) => index,
+            Err(_) => return,
+        };
         // 重录是"刚听完这句就要重录"的短操作：排在 8 分钟歌曲后面等于让用户执行一个
         // 他已经不想要的旧动作，所以**不入队**，而是明确拒绝。判据统一取台账 + busy
         // （重录自己也会置 busy，挡住随后的配音/BGM/导出）。
@@ -5700,19 +5902,23 @@ fn wire_sentence_actions(
             ui.set_status_text("工程已变更：先开始合成，再重录单句".into());
             return;
         }
-        ui.set_selected(i);
+        // 重录会让该句分数失效；先回到工程原序，之后所有消息/试听都用 index 映射。
+        state3.qa_sorted.set(false);
+        apply_row_order(&model3, restore_project_order(rows_as_vec(&model3)));
+        let display_index = row_position(&model3, project_index).unwrap_or(0);
+        ui.set_selected(display_index as i32);
         ui.set_busy(true);
         start_task(
             &ui,
             &state3,
             &state3.redo_task,
             tasks::TaskKind::Dub,
-            format!("重录第 {} 句", idx + 1),
+            format!("重录第 {} 句", row.no),
         );
         if tx3
             .send(Cmd::Redo {
                 revision: state3.project_revision.get(),
-                index: idx,
+                index: project_index,
             })
             .is_err()
         {
@@ -5729,7 +5935,7 @@ fn wire_sentence_actions(
             ui.set_status_text(note.into());
             return;
         }
-        ui.set_status_text(format!("单句重录中：第 {} 句（换 seed 重跑）", i + 1).into());
+        ui.set_status_text(format!("单句重录中：第 {} 句（换 seed 重跑）", row.no).into());
     });
 
     // 时间轴点击 = 从那句话开始听（M1 不做拖动定位，逐句跳转即定位）
@@ -5763,6 +5969,10 @@ fn wire_run(
             ui.set_status_text("稿件为空：先粘稿子或点「载入示例稿」".into());
             return;
         }
+        // 重新合成会让逐句音频/分数进入重算流程；分数排序视角立即回原序。
+        state1.qa_sorted.set(false);
+        apply_row_order(&model4, restore_project_order(rows_as_vec(&model4)));
+        ui.set_selected(-1);
         let model_name = selected_model(&ui);
         if model_name.is_empty() {
             ui.set_status_text("没有可用音色：检查 server.json / audiocpp_server".into());
@@ -6295,7 +6505,9 @@ fn wire_keys(
         let next = if cur < 0 { 0 } else { (cur - 1).max(0) };
         if (next as usize) < model.row_count() {
             ui.set_selected(next);
-            ui.set_status_text(format!("已选中第 {} 句", next + 1).into());
+            if let Some(row) = model.row_data(next as usize) {
+                ui.set_status_text(format!("已选中第 {} 句", row.no).into());
+            }
         }
     });
     let weak = ui.as_weak();
@@ -6310,7 +6522,9 @@ fn wire_keys(
         };
         if next >= 0 && (next as usize) < model.row_count() {
             ui.set_selected(next);
-            ui.set_status_text(format!("已选中第 {} 句", next + 1).into());
+            if let Some(row) = model.row_data(next as usize) {
+                ui.set_status_text(format!("已选中第 {} 句", row.no).into());
+            }
         }
     });
     let weak = ui.as_weak();
@@ -6436,10 +6650,14 @@ fn tick(
                 ui.set_auto_normalize(project.auto_normalize);
                 state.auto_normalize_seen.set(project.auto_normalize);
                 ui.set_gap_ms_text(project.gap_ms.to_string().into());
+                // 载入/续作后先回到工程顺序；分数可以保留，但“按分数看”的视图不跨轮次沿用。
+                state.qa_sorted.set(false);
+                apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
                 // 工程里的质检分数回灌（跨会话留存：重开应用不用重跑 ASR）
                 *state.eval_scores.borrow_mut() = scores_from_project(&project);
                 apply_project_to_rows(ui, rows, &project);
                 apply_eval_labels(rows, &state.eval_scores.borrow());
+                sync_qa_actions(ui, rows, state);
                 state.project_ready.set(true);
                 if reused > 0 {
                     ui.set_status_text(
@@ -6469,15 +6687,23 @@ fn tick(
                 // 所以 UI 在 running（以及随后的 done/error）都清——两边不会说法不一。
                 if sentence_message_invalidates_score(&status) {
                     let had = state.eval_scores.borrow_mut().remove(&index).is_some();
+                    // 这句刚被重做，旧质检结论不再能代表当前音频；排序视角也回原序。
+                    state.qa_worst_index.set(None);
+                    state.qa_sorted.set(false);
+                    apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
+                    if let Some(i) = row_position(rows, index) {
+                        ui.set_selected(i as i32);
+                    }
                     if had {
                         apply_eval_labels(rows, &state.eval_scores.borrow());
                     }
+                    sync_qa_actions(ui, rows, state);
                 }
                 if let Some(d) = duration {
-                    set_row_duration(rows, index, d as f32);
+                    set_row_duration_by_project_index(rows, index, d as f32);
                     recompute_total(rows);
                 }
-                set_status(rows, index, &status);
+                set_status_by_project_index(rows, index, &status);
                 if status == "done" || status == "error" {
                     let done = (0..rows.row_count())
                         .filter(|&i| {
@@ -6526,7 +6752,7 @@ fn tick(
                 ui.set_busy(false);
                 match error {
                     Some(error) => {
-                        set_status(rows, index, "error");
+                        set_status_by_project_index(rows, index, "error");
                         finish_task(
                             ui,
                             state,
@@ -6767,13 +6993,23 @@ fn tick(
                         scores.insert(*idx, *percent);
                     }
                 }
+                // 新的一轮质检结束后先回工程原序；排序要不要开由用户点按钮决定。
+                state.qa_sorted.set(false);
+                state
+                    .qa_worst_index
+                    .set(summary.worst.first().map(|w| w.index));
+                apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
                 apply_eval_labels(rows, &state.eval_scores.borrow());
                 let mut note = eval_summary_note(&summary);
-                // 质检是用户主动发起的"找问题"动作：跑完直接把最差那句选中，
-                // 用户当场就能点旁边的「重录」（列表不滚动，长稿还要自己滚一下）
+                // 质检是用户主动发起的"找问题"动作：跑完先把最差那句选中，
+                // 用户也可以随时用「跳到最差句」重新定位并滚动。
                 if let Some(worst) = summary.worst.first() {
-                    ui.set_selected(worst.index as i32);
+                    if let Some(i) = row_position(rows, worst.index) {
+                        ui.set_selected(i as i32);
+                    }
                     note.push_str(&format!("·已选中第 {} 句", worst.index + 1));
+                } else {
+                    ui.set_selected(-1);
                 }
                 // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
                 let outcome = if summary.scored == 0 {
@@ -6782,6 +7018,7 @@ fn tick(
                     tasks::TaskState::Done
                 };
                 finish_task(ui, state, &state.eval_task, outcome, note.clone());
+                sync_qa_actions(ui, rows, state);
                 ui.set_status_text(note.into());
             }
             Msg::EvalStopped { task_id } => {
@@ -6902,7 +7139,13 @@ fn tick(
                                 applied.skipped[0]
                             )
                         };
-                        activate_dictionary(ui, state, cmd_tx, Some(applied.entry.file.clone()));
+                        activate_dictionary(
+                            ui,
+                            rows,
+                            state,
+                            cmd_tx,
+                            Some(applied.entry.file.clone()),
+                        );
                         ui.set_status_text(
                             format!(
                                 "已导入 {} 条词条到「{}」{}",
@@ -7175,6 +7418,9 @@ fn tick(
     // ── 兜底规则开关（PixelSwitch 没有回调，只能比对上一次的值）──
     sync_auto_normalize_toggle(ui, state);
 
+    // ── 质检按钮：enabled 是排序 / 跳转共用的唯一判据；busy/running 变化要跟上 ──
+    sync_qa_actions(ui, rows, state);
+
     // ── 任务中心的"已排队 / 已运行 N"走字（按秒节流）──
     maybe_refresh_task_times(ui, state);
 }
@@ -7193,22 +7439,25 @@ fn play_sentence(
     rows: &Rc<VecModel<Sentence>>,
     player: &Rc<player::Player>,
     state: &Rc<UiState>,
-    i: usize,
+    display_index: usize,
     duration: f32,
 ) {
-    if rows
-        .row_data(i)
-        .map(|row| row.status.as_str() != "已合成")
-        .unwrap_or(true)
-    {
+    let Some(row) = rows.row_data(display_index) else {
+        return;
+    };
+    if row.status.as_str() != "已合成" {
         ui.set_status_text("这句还没合成：先点「开始合成」".into());
         return;
     }
+    let project_index = match usize::try_from(row.index) {
+        Ok(index) => index,
+        Err(_) => return,
+    };
     let Some(dir) = state.project_dir.borrow().clone() else {
         ui.set_status_text("先跑一次合成".into());
         return;
     };
-    let wav = dir.join(format!("sentences/{i:03}.wav"));
+    let wav = dir.join(format!("sentences/{project_index:03}.wav"));
     if !wav.is_file() {
         ui.set_status_text("这句还没合成：先点「开始合成」".into());
         return;
@@ -7217,17 +7466,13 @@ fn play_sentence(
         Ok(()) => {
             state.playing_total.set(duration.max(0.01));
             ui.set_playing(true);
-            let text = rows
-                .row_data(i)
-                .map(|r| r.text.to_string())
-                .unwrap_or_default();
-            ui.set_status_text(format!("试听第 {} 句：{text}", i + 1).into());
+            ui.set_status_text(format!("试听第 {} 句：{}", row.no, row.text).into());
         }
         Err(e) => ui.set_status_text(e.into()),
     }
 }
 
-/// 全篇试听：有成品播 final.wav，否则按序播全部已合成句。
+/// 全篇试听：有成品播 final.wav，否则按工程顺序播全部已合成句。
 fn play_all(
     ui: &MainWindow,
     rows: &Rc<VecModel<Sentence>>,
@@ -7253,20 +7498,26 @@ fn play_all(
         ui.set_status_text("先跑一次合成".into());
         return;
     };
-    let done: Vec<(usize, f32)> = (0..rows.row_count())
+    // 质检排序只影响屏幕顺序；全篇试听必须回到工程时间顺序。
+    let mut done: Vec<(usize, f32)> = (0..rows.row_count())
         .filter_map(|i| {
             rows.row_data(i)
                 .filter(|r| r.status.as_str() == "已合成")
-                .map(|r| (i, r.duration))
+                .and_then(|r| {
+                    usize::try_from(r.index)
+                        .ok()
+                        .map(|index| (index, r.duration))
+                })
         })
         .collect();
+    done.sort_by_key(|(index, _)| *index);
     if done.is_empty() {
         ui.set_status_text("还没有已合成的句子".into());
         return;
     }
     let paths: Vec<PathBuf> = done
         .iter()
-        .map(|(i, _)| dir.join(format!("sentences/{i:03}.wav")))
+        .map(|(index, _)| dir.join(format!("sentences/{index:03}.wav")))
         .collect();
     match player.play_many(&paths) {
         Ok(()) => {
@@ -7477,6 +7728,7 @@ fn build_rows(lines: &[String]) -> Vec<Sentence> {
     for (i, line) in lines.iter().enumerate() {
         let duration = (line.chars().count() as f32 * SECS_PER_CHAR).max(0.6);
         rows.push(Sentence {
+            index: i as i32,
             no: i as i32 + 1,
             text: line.as_str().into(),
             status: "待合成".into(),
@@ -7485,6 +7737,10 @@ fn build_rows(lines: &[String]) -> Vec<Sentence> {
             duration_label: format!("{duration:.1}s").into(),
             start_label: clock_label(start).into(),
             eval_label: "".into(),
+            // 视图元数据只由第 0 行承载；先给所有行填默认值，排序后由 sync 回写。
+            qa_enabled: false,
+            qa_sorted: false,
+            qa_scroll_y: 0.0,
         });
         start += duration;
     }
@@ -7496,17 +7752,32 @@ fn split_for_preview(text: &str) -> Vec<String> {
     aw_core::split_sentences(text, DEFAULT_PUNCTUATION, MAX_CHARS)
 }
 
-/// 按当前各行时长重排起始时间与总时长（合成拿到真实时长后调用）
+/// 按工程真实 index 重排起始时间与总时长（合成拿到真实时长后调用）。
+///
+/// 质检排序会改变 `VecModel` 的显示顺序，时间轴绝不能跟着显示顺序重算，
+/// 否则只是“看一下低分句”就会把每句的起始时间改错。
 fn recompute_total(rows: &Rc<VecModel<Sentence>>) {
+    let positions: HashMap<usize, usize> = (0..rows.row_count())
+        .filter_map(|i| {
+            rows.row_data(i)
+                .and_then(|row| usize::try_from(row.index).ok())
+                .map(|index| (index, i))
+        })
+        .collect();
+    let mut items = rows_as_vec(rows);
+    items.sort_by_key(|row| row.index);
     let mut start = 0.0_f32;
-    for i in 0..rows.row_count() {
-        let Some(mut row) = rows.row_data(i) else {
-            continue;
-        };
+    for row in &mut items {
         row.start = start;
         row.start_label = clock_label(start).into();
         start += row.duration;
-        rows.set_row_data(i, row);
+    }
+    for row in items {
+        if let Ok(index) = usize::try_from(row.index) {
+            if let Some(&i) = positions.get(&index) {
+                rows.set_row_data(i, row);
+            }
+        }
     }
 }
 
@@ -7556,6 +7827,24 @@ fn set_status(rows: &Rc<VecModel<Sentence>>, i: usize, status: &str) {
     }
     row.status = SharedString::from(label);
     rows.set_row_data(i, row);
+}
+
+/// worker 的句级消息带的是工程 index；排序后必须先找回显示行位置。
+fn set_status_by_project_index(rows: &Rc<VecModel<Sentence>>, project_index: usize, status: &str) {
+    if let Some(i) = row_position(rows, project_index) {
+        set_status(rows, i, status);
+    }
+}
+
+/// 同上：时长属于工程句子，不属于当前展示位置。
+fn set_row_duration_by_project_index(
+    rows: &Rc<VecModel<Sentence>>,
+    project_index: usize,
+    duration: f32,
+) {
+    if let Some(i) = row_position(rows, project_index) {
+        set_row_duration(rows, i, duration);
+    }
 }
 
 fn clock_label(secs: f32) -> String {
@@ -8972,6 +9261,7 @@ mod tests {
     #[test]
     fn fatal_marks_running_rows_failed() {
         let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![Sentence {
+            index: 0,
             eval_label: "".into(),
             no: 1,
             text: "测试句。".into(),
@@ -8980,6 +9270,9 @@ mod tests {
             start: 0.0,
             duration_label: "1.0s".into(),
             start_label: "0:00".into(),
+            qa_enabled: false,
+            qa_sorted: false,
+            qa_scroll_y: 0.0,
         }]));
         mark_running_rows_failed(&rows);
         assert_eq!(rows.row_data(0).unwrap().status, "失败");
@@ -9821,6 +10114,138 @@ mod tests {
         assert_eq!(eval_label(95.0), "可懂度 95.0%", "正好等于阈值不加警告");
         assert_eq!(eval_label(94.9), "⚠ 可懂度 94.9%");
         assert_eq!(eval_label(0.0), "⚠ 可懂度 0.0%");
+    }
+
+    fn test_sentence_row(index: usize) -> Sentence {
+        Sentence {
+            index: index as i32,
+            no: index as i32 + 1,
+            text: format!("第 {} 句", index + 1).into(),
+            status: "已合成".into(),
+            duration: 1.0,
+            start: index as f32,
+            duration_label: "1.0s".into(),
+            start_label: format!("0:0{index}").into(),
+            eval_label: String::new().into(),
+            qa_enabled: false,
+            qa_sorted: false,
+            qa_scroll_y: 0.0,
+        }
+    }
+
+    /// 排序只重排 UI 行，最差在前；恢复时必须回到工程真实 index 顺序。
+    #[test]
+    fn eval_sort_orders_worst_first_and_restores_project_order() {
+        let rows = vec![
+            test_sentence_row(0),
+            test_sentence_row(1),
+            test_sentence_row(2),
+        ];
+        let scores = HashMap::from([(0, 99.0), (1, 80.0), (2, 90.0)]);
+        let sorted = sort_rows_for_eval(rows, &scores);
+        assert_eq!(
+            sorted.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+
+        // 分数失效后走这个函数（clear_eval_scores 的同一实现），回到工程原序。
+        let restored = restore_project_order(sorted);
+        assert_eq!(
+            restored.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// 跳转不能拿显示行号当工程句号：排序后再按 index 找才是同一句。
+    #[test]
+    fn worst_sentence_lookup_uses_project_index_after_sort() {
+        let rows = vec![
+            test_sentence_row(0),
+            test_sentence_row(1),
+            test_sentence_row(2),
+        ];
+        let scores = HashMap::from([(0, 99.0), (1, 80.0), (2, 90.0)]);
+        let sorted = sort_rows_for_eval(rows, &scores);
+        assert_eq!(row_position_in_slice(&sorted, 1), Some(0));
+        assert_eq!(row_position_in_slice(&sorted, 0), Some(2));
+    }
+
+    /// 排序后 worker 消息仍按工程 index 回填；时间轴也仍按工程顺序重算。
+    #[test]
+    fn sorted_rows_still_map_status_and_time_by_project_index() {
+        let mut rows = vec![
+            test_sentence_row(0),
+            test_sentence_row(1),
+            test_sentence_row(2),
+        ];
+        rows[0].duration = 1.0;
+        rows[1].duration = 2.0;
+        rows[2].duration = 3.0;
+        let scores = HashMap::from([(0, 90.0), (1, 80.0), (2, 95.0)]);
+        let model: Rc<VecModel<Sentence>> =
+            Rc::new(VecModel::from(sort_rows_for_eval(rows, &scores)));
+
+        set_status_by_project_index(&model, 0, "running");
+        apply_eval_labels(&model, &scores);
+        recompute_total(&model);
+
+        let by_index = |index: usize| {
+            model
+                .row_data(row_position(&model, index).expect("index should map to a row"))
+                .expect("row should exist")
+        };
+        assert_eq!(by_index(0).status, "合成中");
+        assert_eq!(by_index(2).eval_label, "可懂度 95.0%");
+        assert_eq!(by_index(0).start, 0.0);
+        assert_eq!(by_index(1).start, 1.0);
+        assert_eq!(by_index(2).start, 3.0);
+    }
+
+    /// 真正的失效入口也要回原序，不只是排序函数本身。
+    #[test]
+    fn eval_invalidation_clears_scores_and_restores_project_order() {
+        let rows = vec![
+            test_sentence_row(0),
+            test_sentence_row(1),
+            test_sentence_row(2),
+        ];
+        let scores = HashMap::from([(0, 99.0), (1, 80.0), (2, 90.0)]);
+        let model: Rc<VecModel<Sentence>> =
+            Rc::new(VecModel::from(sort_rows_for_eval(rows, &scores)));
+        let state = UiState {
+            qa_sorted: std::cell::Cell::new(true),
+            qa_worst_index: std::cell::Cell::new(Some(1)),
+            ..UiState::default()
+        };
+        *state.eval_scores.borrow_mut() = scores;
+
+        reset_eval_view(&model, &state);
+
+        assert!(!state.qa_sorted.get());
+        assert_eq!(state.qa_worst_index.get(), None);
+        assert!(state.eval_scores.borrow().is_empty());
+        assert_eq!(
+            rows_as_vec(&model)
+                .iter()
+                .map(|row| row.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// 排序按钮和跳转按钮共用一个可用性判据：没有分数、没有最差句或任务阻塞时
+    /// 两边都必须同时不可用。
+    #[test]
+    fn qa_action_view_has_one_gate_for_sort_and_jump() {
+        let rows = vec![test_sentence_row(0), test_sentence_row(1)];
+        let scores = HashMap::from([(0, 90.0), (1, 80.0)]);
+        let enabled = qa_action_view(&rows, &scores, Some(1), false);
+        assert_eq!(enabled.worst_row, Some(1));
+        assert!(enabled.enabled);
+
+        assert!(!qa_action_view(&rows, &HashMap::new(), Some(1), false).enabled);
+        assert!(!qa_action_view(&rows, &scores, None, false).enabled);
+        assert!(!qa_action_view(&rows, &scores, Some(1), true).enabled);
     }
 
     /// 分数写不进工程时要如实说（分数有效但没落盘），别让用户以为下次打开还在。

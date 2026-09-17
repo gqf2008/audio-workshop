@@ -623,15 +623,31 @@ export component DubWorkbench inherits Rectangle {
                     }
                 }
 
-                // ② 一行状态 + 高级入口 + 主操作（同级 3 个）
+                // ② 一行状态 + 质检视图动作 + 高级入口 + 批量 + 主操作
                 HorizontalLayout {
-                    spacing: 16px;
+                    spacing: 12px;
                     Text { // 首屏
                         text: "共 \{root.sentences.length} 句 · 已合成 \{root.done-count} 句";
                         color: PixelTheme.dim;
                         font-size: 12px;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                    }
+                    PixelButton {
+                        width: 112px;
+                        text: root.sentences[0].qa-sorted ? "恢复原顺序" : "按分数排序";
+                        enabled: root.sentences[0].qa-enabled;
+                        Tooltip { text: @markdown("按可懂度升序排列，最差句排在最前；只改变查看顺序"); }
+                        // -1 是现有 select-sentence 通道里的“切换质检排序”视图指令。
+                        clicked => { root.select-sentence(-1); }
+                    }
+                    PixelButton {
+                        width: 104px;
+                        text: "跳到最差句";
+                        enabled: root.sentences[0].qa-enabled;
+                        Tooltip { text: @markdown("选中并滚动到本次质检最差的句子"); }
+                        // -2 是现有 select-sentence 通道里的“跳到最差句”视图指令。
+                        clicked => { root.select-sentence(-2); }
                     }
                     PixelButton { // 首屏
                         width: 96px;
@@ -1078,6 +1094,7 @@ export component DubWorkbench inherits Rectangle {
 
                 if root.sentences.length > 0 : PixelScrollPanel { // 首屏
                     vertical-stretch: 1;
+                    initial-scroll-y: root.sentences[0].qa-scroll-y;
                     VerticalLayout {
                         width: 100%;
                         spacing: 0px;
