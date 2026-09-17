@@ -15,6 +15,7 @@ mod backup;
 mod batch;
 mod cancel;
 mod dictionaries;
+mod download;
 mod export;
 mod player;
 mod sep_history;
@@ -318,6 +319,9 @@ enum Msg {
         task_id: u32,
         error: String,
     },
+    /// 模型下载：排队/下载/校验/终态都走这一条（带任务 id 自证身份，
+    /// 与工程版本无关——改稿不该把下载进度静默丢掉）
+    DownloadUpdate(download::Snapshot),
     /// 批量导出跑完了（后台线程回报；不是 worker 任务，不进任务台账）
     BatchExportDone {
         /// 导出到哪个目录（消息自带，别在用的时候再读一次界面值——那个值可能已经变了）
@@ -1193,6 +1197,15 @@ struct ServerModel {
     family: String,
     #[serde(default)]
     path: String,
+    /// 上游下载地址（P7）：有它才算"可下载模型"，没有就不显示下载入口。
+    #[serde(default)]
+    url: String,
+    /// 期望 sha256（可选）：给了就下载后必校验，不匹配直接丢弃。
+    #[serde(default)]
+    sha256: String,
+    /// 期望字节数（可选）：没有 sha256 时按它核大小。
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 /// 读取 server.json：音色 = task=="tts" 的模型；地址取 AW_SERVER，否则 host:port。
@@ -1861,6 +1874,292 @@ fn spawn_batch_export(
             revision: 0,
             msg: Msg::BatchExportDone { dir, outcome },
         });
+    });
+}
+
+// ===========================================================================
+// 模型下载器（M4-P7）：可下载模型 → 串行队列 → UI 行
+// ===========================================================================
+
+/// 清单里"可下载模型"：只有带 `url` 的才算。老清单没有 url，列表就是空的——
+/// 不显示假下载入口（与"接入前不显示假按钮"同一条口径）。
+struct DownloadableModel {
+    id: String,
+    url: String,
+    sha256: Option<String>,
+    size: Option<u64>,
+    dest: PathBuf,
+}
+
+/// 从模型清单挑出可下载项，目标目录取全局设置的「模型目录」（`model_dir()`，不写死）。
+fn downloadable_models() -> Vec<DownloadableModel> {
+    let dir = model_dir();
+    let Some(cfg) = read_server_config() else {
+        return Vec::new();
+    };
+    cfg.models
+        .into_iter()
+        .filter(|m| !m.url.trim().is_empty())
+        .map(|m| {
+            let dest = download_dest_for(&m, &dir);
+            let sha = m.sha256.trim();
+            DownloadableModel {
+                id: m.id,
+                url: m.url,
+                sha256: (!sha.is_empty()).then(|| sha.to_string()),
+                size: m.size,
+                dest,
+            }
+        })
+        .collect()
+}
+
+/// 下载目标文件名：优先沿用清单里 `path` 的文件名（服务才能按原路径找到），
+/// 没有就取 url 末段，最后退回 `<id>.gguf`。**目录一律取模型目录**。
+fn download_dest_for(m: &ServerModel, dir: &Path) -> PathBuf {
+    let from_path = Path::new(&m.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let from_url = m
+        .url
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .next_back()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let name = from_path
+        .or(from_url)
+        .unwrap_or_else(|| format!("{}.gguf", m.id));
+    dir.join(name)
+}
+
+/// 人类可读的字节数（进度行用；与备份的 human_bytes 不同档，这里只求短）。
+fn short_bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const KB: f64 = 1024.0;
+    if n as f64 >= MB {
+        format!("{:.1} MB", n as f64 / MB)
+    } else if n as f64 >= KB {
+        format!("{:.0} KB", n as f64 / KB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// 一条下载任务 → 界面行。没有队列快照时按磁盘上有没有正式文件给出"未下载/已就位"。
+fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) -> DownloadRow {
+    let (state_text, detail, progress, active) = match latest {
+        Some(snap) => {
+            let downloading = matches!(
+                snap.state,
+                download::State::Downloading | download::State::Verifying
+            );
+            let detail = if downloading {
+                let mut d = format!(
+                    "已下载 {} / {}",
+                    short_bytes(snap.downloaded),
+                    snap.total
+                        .map(short_bytes)
+                        .unwrap_or_else(|| "?".to_string())
+                );
+                if !snap.note.is_empty() {
+                    d.push_str(" · ");
+                    d.push_str(&snap.note);
+                }
+                d
+            } else if snap.note.is_empty() {
+                // 排队中还没说明：把落盘目标先摆出来
+                snap.dest.display().to_string()
+            } else {
+                // 终态把原因/说明与落盘路径一起给（用户要知道文件去了哪）
+                format!("{} · {}", snap.note, snap.dest.display())
+            };
+            (
+                snap.state.label().to_string(),
+                detail,
+                snap.fraction(),
+                !snap.state.is_terminal(),
+            )
+        }
+        None if m.dest.exists() => (
+            "已就位".to_string(),
+            m.dest.display().to_string(),
+            1.0,
+            false,
+        ),
+        None => (
+            "未下载".to_string(),
+            m.dest.display().to_string(),
+            0.0,
+            false,
+        ),
+    };
+    DownloadRow {
+        key: m.id.clone().into(),
+        label: m.id.clone().into(),
+        state: state_text.into(),
+        detail: detail.into(),
+        progress,
+        active,
+    }
+}
+
+/// 重建"可下载模型"列表：清单元数据 + 队列里每条的最新快照。
+fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
+    let snapshots = state.downloads.borrow();
+    let rows: Vec<DownloadRow> = downloadable_models()
+        .iter()
+        .map(|m| {
+            let latest = snapshots.iter().rev().find(|s| s.label == m.id);
+            download_row_for(m, latest)
+        })
+        .collect();
+    drop(snapshots);
+    ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+/// 某模型当前在跑的下载任务 id（只读；借用在本函数内就还掉）。
+///
+/// 「读」与「摘」刻意分开：`if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里
+/// 临时借用会活到整个 if-let（含块），块里再 `borrow_mut` 会直接 panic——自己抓到过的真坑。
+fn active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
+    state.download_ids.borrow().get(key).copied()
+}
+
+/// 摘掉某模型的下载登记——**只有"登记的确实就是这条任务"才摘**。
+///
+/// 复核第二轮 B1：一条成功的下载会推两个终态快照（`download()` 自己发一个 Done、
+/// worker 收尾再发一个）。第一个终态会把登记摘掉、放行下一次下载；如果这时只按 label
+/// 摘、不看 `id`，紧接着到的**第二个（旧任务的）终态**就会把用户刚登记的新任务摘掉——
+/// UI 以为空闲，「下载」按钮又可点，于是同一个 dest 上叠出第二条任务抢同一个 `.part`。
+fn release_download_id(ids: &mut HashMap<String, u64>, label: &str, id: u64) -> bool {
+    if ids.get(label) == Some(&id) {
+        ids.remove(label);
+        true
+    } else {
+        false
+    }
+}
+
+/// 把一条快照并进列表：同一模型只保留**最新那条任务**的快照。
+///
+/// id 单调递增，"最新"就是 id 最大。旧任务的迟到快照（尤其是它的终态）不能盖掉新任务的
+/// 进度与状态——否则界面会显示旧任务的「已取消 / 已完成」，而新任务其实正在跑，
+/// 按钮文案与 `download_ids` 的登记也会对不上。
+fn merge_download_snapshot(list: &mut Vec<download::Snapshot>, snap: download::Snapshot) {
+    match list.iter_mut().find(|s| s.label == snap.label) {
+        Some(slot) if snap.id >= slot.id => *slot = snap,
+        Some(_) => {}
+        None => list.push(snap),
+    }
+}
+
+/// 一次「下载/取消」点击实际发生了什么（UI 只据它发提示）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClickEffect {
+    /// 首次请求取消：标志已置位，等这一步收尾
+    CancelRequested(u64),
+    /// 之前已经请求过取消、任务还在收尾：这次 no-op
+    AlreadyCancelling(u64),
+    /// 任务其实已经收尾（终态快照还在路上）：如实说，不谎报"已取消"
+    AlreadyFinished(u64),
+    /// 没有在跑的 → 新排一条
+    Enqueued { id: u64, dest: PathBuf },
+    /// 清单里找不到这个模型（点之前清单被改过）
+    UnknownModel,
+}
+
+/// 处理一次「下载/取消」点击：有在跑的就取消，没有才排新任务。
+///
+/// **取消时绝不动 `download_ids`**（复核 B1）。取消是协作式的——旧任务可能还在写
+/// `.part`（读循环最多再落一个 64KiB 块才看到标志）。这里若把 id 摘掉，下一次点击就会
+/// 被当成"没有在跑"而再排一条，两条任务抢同一个 `.part`；只给 `size` 不给 `sha256` 的
+/// 条目只按大小校验，"内容坏但长度恰好对上"会被 rename 成正式文件。id 只由 worker 的
+/// 终态快照摘除（见 tick），所以取消未收尾期间再点只会是 no-op。
+fn apply_download_click(
+    state: &Rc<UiState>,
+    key: &str,
+    cancel: impl FnOnce(u64) -> download::CancelOutcome,
+    enqueue: impl FnOnce() -> Option<(u64, PathBuf)>,
+) -> ClickEffect {
+    if let Some(id) = active_download_id(state, key) {
+        return match cancel(id) {
+            download::CancelOutcome::Requested => ClickEffect::CancelRequested(id),
+            download::CancelOutcome::AlreadyRequested => ClickEffect::AlreadyCancelling(id),
+            download::CancelOutcome::Finished => ClickEffect::AlreadyFinished(id),
+        };
+    }
+    match enqueue() {
+        Some((id, dest)) => {
+            state.download_ids.borrow_mut().insert(key.to_string(), id);
+            ClickEffect::Enqueued { id, dest }
+        }
+        None => ClickEffect::UnknownModel,
+    }
+}
+
+/// 模型下载接线：一个后台串行队列 + 每个可下载模型一个「下载/取消」按钮。
+///
+/// 队列线程把每条快照通过既有的 tick 消息泵发回 UI（`Msg::DownloadUpdate`，
+/// 已在 `message_ignores_revision` 白名单里——与工程版本无关，改稿不该丢进度）。
+fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiState>) {
+    refresh_download_rows(ui, state);
+
+    let tx = msg_tx.clone();
+    let downloader = Rc::new(download::Downloader::new(move |snap| {
+        let _ = tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::DownloadUpdate(snap),
+        });
+    }));
+
+    let weak = ui.as_weak();
+    let st = Rc::clone(state);
+    ui.on_download_model(move |key| {
+        let Some(ui) = weak.upgrade() else { return };
+        let key = key.to_string();
+        let start_key = key.clone();
+        // 回调是 FnMut：这两份 Rc 每次点击各自 clone 一次再进 FnOnce 闭包，
+        // 不能在闭包外 move 进来（否则第二次点击就用不了）。
+        let dl_cancel = Rc::clone(&downloader);
+        let dl_start = Rc::clone(&downloader);
+        let effect = apply_download_click(
+            &st,
+            &key,
+            move |id| dl_cancel.cancel(id),
+            move || {
+                // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
+                let model = downloadable_models()
+                    .into_iter()
+                    .find(|m| m.id == start_key)?;
+                let id = dl_start.enqueue(download::TaskSpec {
+                    label: model.id.clone(),
+                    url: model.url.clone(),
+                    dest: model.dest.clone(),
+                    expected_sha256: model.sha256.clone(),
+                    expected_size: model.size,
+                });
+                Some((id, model.dest))
+            },
+        );
+        let text = match effect {
+            ClickEffect::Enqueued { dest, .. } => {
+                format!("已加入下载队列：{key} → {}", dest.display())
+            }
+            ClickEffect::CancelRequested(_) => format!(
+                "正在取消下载：{key}（取消是协作式的，等这一步收尾；这期间不会再为它排新下载）"
+            ),
+            ClickEffect::AlreadyCancelling(_) => {
+                format!("正在取消下载：{key}（已在取消中，请稍候）")
+            }
+            ClickEffect::AlreadyFinished(_) => format!("这条下载已经结束了：{key}"),
+            ClickEffect::UnknownModel => format!("清单里找不到可下载模型：{key}"),
+        };
+        ui.set_status_text(text.into());
     });
 }
 
@@ -3561,6 +3860,10 @@ struct UiState {
     batch_skipped_notes: RefCell<Vec<String>>,
     /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
     batch_export_running: std::cell::Cell<bool>,
+    /// 模型下载（P7）：队列里每条任务的最新快照（按 id 覆盖，真相在 download 侧）。
+    downloads: RefCell<Vec<download::Snapshot>>,
+    /// 模型 id → 当前在跑的下载任务 id（点「取消」时按它找回任务）
+    download_ids: RefCell<HashMap<String, u64>>,
     /// 一键备份是否在跑（后台线程，**含正在弹目录选择框那段**）。
     /// 防连点起一堆线程、两批同时往同一个目标目录里写。这是真相，
     /// ui 的 `backup-running` 只是它的投影（按钮据此禁用）。
@@ -3677,6 +3980,7 @@ fn main() -> Result<(), slint::PlatformError> {
     );
     refresh_voice_library(&ui);
     wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
+    wire_downloads(&ui, &msg_tx_ui, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &msg_tx_ui, &state);
@@ -3750,6 +4054,47 @@ fn apply_shot_state(ui: &MainWindow) {
         "dark" => {
             ui.set_theme_scheme("dark".into());
             ui.set_status_text("主题已切换：暗色".into());
+        }
+        "downloads" => {
+            // 渲染核对（不是真跑）：把下载队列的四种状态各摆一条，肉眼核对进度/按钮
+            ui.set_drawer_open(true);
+            ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(vec![
+                DownloadRow {
+                    key: "audio8-tts".into(),
+                    label: "audio8-tts".into(),
+                    state: "下载中".into(),
+                    detail: "已下载 412 MB / 2.1 GB · 从 412 MB 字节断点续传".into(),
+                    progress: 0.19,
+                    active: true,
+                },
+                DownloadRow {
+                    key: "indextts2".into(),
+                    label: "indextts2".into(),
+                    state: "排队".into(),
+                    detail: "/Users/me/models/indextts2".into(),
+                    progress: 0.0,
+                    active: true,
+                },
+                DownloadRow {
+                    key: "yue2".into(),
+                    label: "yue2".into(),
+                    state: "已完成".into(),
+                    detail: "下载完成 · /Users/me/models/yue2.gguf".into(),
+                    progress: 1.0,
+                    active: false,
+                },
+                DownloadRow {
+                    key: "ace-step".into(),
+                    label: "ace-step".into(),
+                    state: "失败".into(),
+                    detail: "网络错误：服务器返回 HTTP 404 · /Users/me/models/ace.gguf".into(),
+                    progress: 0.0,
+                    active: false,
+                },
+            ]))));
+            ui.set_status_text(
+                "模型下载：队列 / 断点续传 / 校验（示例数据，用于核对进度与终态）".into(),
+            );
         }
         "voice" => {
             ui.set_dub_voice(true);
@@ -6767,6 +7112,8 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         // 批量导出同理：它来自后台线程，用户点按钮那一刻与工程版本无关；
         // 用 revision 0 发回来，按版本过滤就会「点完没反应」
         | Msg::BatchExportDone { .. }
+        // 模型下载同理：后台队列线程发回，与工程版本无关（下载权重和稿子无关）
+        | Msg::DownloadUpdate(_)
     )
 }
 
@@ -7300,6 +7647,22 @@ fn tick(
                 ui.set_song_status_text(error.clone().into());
                 ui.set_status_text(error.into());
             }
+            Msg::DownloadUpdate(snap) => {
+                // 队列线程推来的快照：同一模型只保留最新那条任务的，重建列表。
+                let label = snap.label.clone();
+                let id = snap.id;
+                let terminal = snap.state.is_terminal();
+                {
+                    let mut list = state.downloads.borrow_mut();
+                    merge_download_snapshot(&mut list, snap);
+                }
+                if terminal {
+                    // 终态才摘登记：中途摘掉会让「取消」按钮又变成「下载」再排一条。
+                    // 而且要**认领自己的 id**——旧任务的迟到终态不能把新任务摘掉（复核 B1）。
+                    release_download_id(&mut state.download_ids.borrow_mut(), &label, id);
+                }
+                refresh_download_rows(ui, state);
+            }
             Msg::BatchExportDone { dir, outcome } => {
                 state.batch_export_running.set(false);
                 let text = match outcome {
@@ -7804,6 +8167,7 @@ fn wire_global_settings(
             *g = next;
         }
         apply_engine_discovery(&ui, Some((&tx, &st)));
+        refresh_download_rows(&ui, &st);
         ui.set_server_status(
             if dir_missing {
                 format!("设置已保存（模型目录还不存在：{dir}）· 正在测试连接…")
@@ -7825,6 +8189,7 @@ fn wire_global_settings(
             return;
         }
         apply_engine_discovery(&ui, Some((&tx, &st)));
+        refresh_download_rows(&ui, &st);
         ui.set_server_status("已重新扫描模型清单".into());
     });
 
@@ -8565,6 +8930,9 @@ mod tests {
             task: "tts".into(),
             family: "f".into(),
             path: path.into(),
+            url: String::new(),
+            sha256: String::new(),
+            size: None,
         };
         let cfg = Some(ServerConfig {
             host: None,
@@ -8582,6 +8950,220 @@ mod tests {
         );
         assert_eq!(models_under_dir(&cfg, Path::new("/elsewhere")), 1);
         assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
+    }
+
+    /// 下载落盘位置：**目录一律取全局设置的模型目录**（不写死、也不跟清单 path 走），
+    /// 文件名优先沿用清单 path（服务才能按原路径找到）。
+    #[test]
+    fn download_dest_uses_model_dir_with_manifest_filename() {
+        // (id, path, url) → 期望落盘路径
+        let model = |id: &str, path: &str, url: &str| ServerModel {
+            id: id.into(),
+            task: "tts".into(),
+            family: "audio8".into(),
+            path: path.into(),
+            url: url.into(),
+            sha256: String::new(),
+            size: None,
+        };
+        let dir = Path::new("/models");
+        assert_eq!(
+            download_dest_for(
+                &model(
+                    "audio8-tts",
+                    "/somewhere/else/audio8-tts.gguf",
+                    "https://huggingface.co/x/audio8-tts.gguf"
+                ),
+                dir
+            ),
+            Path::new("/models/audio8-tts.gguf"),
+            "目录取模型目录，文件名沿用清单 path"
+        );
+        // 清单没给 path：取 url 末段（且剥掉 query）
+        assert_eq!(
+            download_dest_for(
+                &model(
+                    "indextts2",
+                    "",
+                    "https://example.com/w/indextts2.gguf?token=abc"
+                ),
+                dir
+            ),
+            Path::new("/models/indextts2.gguf")
+        );
+        // url 末段是空（以 / 结尾）：退回 <id>.gguf，不能把目录当文件名
+        assert_eq!(
+            download_dest_for(&model("yue2", "", "https://example.com/dir/"), dir),
+            Path::new("/models/yue2.gguf")
+        );
+    }
+
+    /// B1（复核阻塞项）：点取消之后**不能**立刻允许为同一模型再排一条。
+    ///
+    /// 取消是协作式的：旧任务可能还在写 `.part`（读循环最多再落一个 64KiB 块才看到
+    /// 标志）。旧实现点取消就把 `download_ids` 摘了，于是下一次点击被判成"没有在跑"
+    /// 而再排一条，两条任务抢同一个 `.part`；只给 size 不给 sha256 的条目只按大小校验，
+    /// "内容坏但长度恰好对上"会被 rename 成正式文件。
+    ///
+    /// 这条对旧实现会红：旧实现第二次、第三次点击都会再调 `enqueue`。
+    #[test]
+    fn cancel_click_keeps_the_task_registered_so_it_cannot_restart_immediately() {
+        let state = Rc::new(UiState::default());
+        let dest = PathBuf::from("/models/m.gguf");
+        let mut enqueues: Vec<u64> = Vec::new();
+
+        // 第一次点击：排一条（id=7）
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| unreachable!("还没在跑，不该走取消"),
+            || {
+                enqueues.push(1);
+                Some((7, dest.clone()))
+            },
+        );
+        assert_eq!(
+            fx,
+            ClickEffect::Enqueued {
+                id: 7,
+                dest: dest.clone()
+            }
+        );
+        assert_eq!(active_download_id(&state, "m"), Some(7));
+
+        // 点取消：请求发出去，但 id 必须**留在** download_ids 里（等 worker 终态快照摘）
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |id| {
+                assert_eq!(id, 7);
+                download::CancelOutcome::Requested
+            },
+            || {
+                enqueues.push(2);
+                Some((8, dest.clone()))
+            },
+        );
+        assert_eq!(fx, ClickEffect::CancelRequested(7));
+        assert_eq!(
+            active_download_id(&state, "m"),
+            Some(7),
+            "取消时不能摘 id：摘了下一次点击就会再排一条，两条抢同一个 .part"
+        );
+
+        // 取消还没收尾就再点：必须是 no-op（仍然是「正在取消」），不能再排
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| download::CancelOutcome::AlreadyRequested,
+            || {
+                enqueues.push(3);
+                Some((9, dest.clone()))
+            },
+        );
+        assert_eq!(fx, ClickEffect::AlreadyCancelling(7));
+        assert_eq!(
+            enqueues,
+            vec![1],
+            "取消未收尾期间不得再排新任务（两条会抢同一个 .part）"
+        );
+
+        // 只有 worker 的终态快照摘掉 id 之后，才允许重下
+        state.download_ids.borrow_mut().remove("m");
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| unreachable!("已经摘了 id，不该走取消"),
+            || {
+                enqueues.push(4);
+                Some((10, dest.clone()))
+            },
+        );
+        assert_eq!(fx, ClickEffect::Enqueued { id: 10, dest });
+        assert_eq!(enqueues, vec![1, 4]);
+    }
+
+    /// `cancel` 返回 Finished（任务其实已经收尾）时要如实说，别谎报"已取消"；
+    /// 重复点取消是 no-op，也不能再排新下载。
+    #[test]
+    fn click_on_already_finished_task_says_finished_and_never_enqueues() {
+        let state = Rc::new(UiState::default());
+        state.download_ids.borrow_mut().insert("m".into(), 7);
+        let fx = apply_download_click(
+            &state,
+            "m",
+            |_| download::CancelOutcome::Finished,
+            || panic!("已经不在队列里，绝不能排新任务"),
+        );
+        assert_eq!(fx, ClickEffect::AlreadyFinished(7));
+        // 终态快照还没到，id 仍在册；下一次点击还是按"取消"这条路走
+        assert_eq!(active_download_id(&state, "m"), Some(7));
+    }
+
+    /// 复核第二轮 B1：旧任务的**迟到终态快照**不能把用户刚登记的新任务摘掉。
+    ///
+    /// 一条成功下载会推两个终态（`download()` 自己一个 Done、worker 收尾一个）。第一个
+    /// 摘掉登记、放行下一次下载；若只按 label 摘不看 id，第二个（旧任务的）终态就会把
+    /// 新任务的登记摘掉——UI 以为空闲，「下载」又可点，同一个 dest 上叠出第二条任务抢
+    /// 同一个 `.part`。
+    ///
+    /// 这条对"只按 label 摘"的旧实现会红：第一、二条断言都会失败。
+    #[test]
+    fn stale_terminal_snapshot_does_not_release_the_new_task() {
+        let mut ids: HashMap<String, u64> = HashMap::new();
+        ids.insert("m".to_string(), 2); // 用户已经给同一个模型登记了新任务
+                                        // 旧任务（id=1）迟到来的终态：不许摘掉新任务
+        assert!(
+            !release_download_id(&mut ids, "m", 1),
+            "旧任务的终态不该认领新任务的登记"
+        );
+        assert_eq!(
+            ids.get("m"),
+            Some(&2),
+            "旧任务的终态快照不能把新任务的 id 摘掉"
+        );
+        // 确实是这条任务自己的终态才摘
+        assert!(release_download_id(&mut ids, "m", 2));
+        assert!(ids.is_empty());
+    }
+
+    /// 同理，旧任务的迟到快照也不能盖掉**界面行**里新任务的状态：
+    /// 否则按钮显示「下载/重下」，而 `download_ids` 里其实还挂着在跑的新任务。
+    ///
+    /// 这条对"按 label 无条件覆盖"的旧实现会红（旧实现会把 id=1 的 Cancelled 盖上去）。
+    #[test]
+    fn stale_snapshot_does_not_overwrite_the_newer_task_row() {
+        let snap = |id: u64, label: &str, state: download::State| download::Snapshot {
+            id,
+            label: label.to_string(),
+            dest: PathBuf::from("/models/m.gguf"),
+            state,
+            downloaded: 0,
+            total: None,
+            note: String::new(),
+        };
+        let mut list: Vec<download::Snapshot> = Vec::new();
+        merge_download_snapshot(
+            &mut list,
+            snap(2, "m", download::State::Downloading), // 新任务正在跑
+        );
+        // 旧任务（id=1）的迟到终态：直接丢掉，不许盖掉新任务那一行
+        merge_download_snapshot(&mut list, snap(1, "m", download::State::Cancelled));
+        assert_eq!(list.len(), 1, "同一模型只占一行");
+        assert_eq!(list[0].id, 2, "留下的必须是新任务那条");
+        assert_eq!(list[0].state, download::State::Downloading);
+        // 新任务自己的终态照常合并
+        merge_download_snapshot(&mut list, snap(2, "m", download::State::Done));
+        assert_eq!(list[0].state, download::State::Done);
+    }
+
+    /// 清单里找不到模型时如实报 UnknownModel（点之前清单被改过），不静默排空任务。
+    #[test]
+    fn click_with_unknown_model_reports_unknown() {
+        let state = Rc::new(UiState::default());
+        let fx = apply_download_click(&state, "gone", |_| unreachable!("没有在跑"), || None);
+        assert_eq!(fx, ClickEffect::UnknownModel);
+        assert!(state.download_ids.borrow().is_empty());
     }
 
     /// `resolve_base` 的字段级覆盖语义：单边覆盖必须生效。
@@ -10346,6 +10928,15 @@ mod tests {
                 dir: PathBuf::from("/tmp/out"),
                 outcome: export::BatchExportOutcome::NoneSelected,
             },
+            Msg::DownloadUpdate(download::Snapshot {
+                id: 1,
+                label: "audio8-tts".into(),
+                dest: PathBuf::from("/tmp/models/audio8.gguf"),
+                state: download::State::Downloading,
+                downloaded: 10,
+                total: Some(100),
+                note: String::new(),
+            }),
         ];
         let names = [
             "BatchScriptsPicked",
@@ -10354,6 +10945,7 @@ mod tests {
             "BatchItemDone",
             "BatchDone",
             "BatchExportDone",
+            "DownloadUpdate",
         ];
         assert_eq!(names.len(), batch_msgs.len());
         for (i, msg) in batch_msgs.into_iter().enumerate() {

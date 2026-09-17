@@ -23,14 +23,14 @@ import {
     PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
-import { BatchRow, Sentence, SeparationHistoryRow, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
+import { BatchRow, DownloadRow, Sentence, SeparationHistoryRow, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { VoiceDesignTab } from "extra_tabs.slint";
 import { SeparationWorkbench } from "separation_workbench.slint";
 import { SongWorkbench } from "song_workbench.slint";
 
-export { BatchRow, Sentence, SeparationHistoryRow, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
+export { BatchRow, DownloadRow, Sentence, SeparationHistoryRow, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
 
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
@@ -211,6 +211,10 @@ export component MainWindow inherits Window {
     callback library-apply(string);
     callback library-export(string);
     callback library-import();
+
+    // ── 模型下载器（P7）：清单里带 url 的可下载模型 + 串行下载队列 ──
+    in property <[DownloadRow]> download-rows: [];
+    callback download-model(string);
 
     // ── 通知 ──
     in property <string> toast-text: "";
@@ -711,6 +715,8 @@ export component MainWindow inherits Window {
             server-locked: root.server-locked;
                     model-dir <=> root.model-dir;
                     model-dir-info: root.model-dir-info;
+                    download-rows: root.download-rows;
+                    download-model(key) => { root.download-model(key); }
                     apply-server-settings => { root.apply-server-settings(); }
                     rescan-models => { root.rescan-models(); }
                     check-server => { root.check-server(); }

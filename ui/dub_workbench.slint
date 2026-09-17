@@ -25,7 +25,7 @@ import {
     PixelSpinner, PixelTextArea, PixelTextInput, PixelTheme,
 } from "@slint_pixel";
 
-import { Sentence, VersionRow, Voice, VoiceLibRow } from "model.slint";
+import { DownloadRow, Sentence, VersionRow, Voice, VoiceLibRow } from "model.slint";
 import { VoicePanel } from "voice_picker.slint";
 
 // ---------------------------------------------------------------------------
@@ -186,6 +186,9 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <bool> server-locked: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
+    // ── 模型下载器（P7）：可下载模型 + 串行下载队列 ──
+    in property <[DownloadRow]> download-rows: [];
+    callback download-model(string);
     callback apply-server-settings();
     callback rescan-models();
     callback check-server();
@@ -357,6 +360,67 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;
+                }
+
+                // ── 可下载模型 + 串行下载队列（M4-P7）：每条显示状态与进度 ──
+                Text {
+                    text: "可下载模型";
+                    color: PixelTheme.text;
+                    font-size: 12px;
+                }
+                if root.download-rows.length == 0 : Text {
+                    text: "清单里没有带下载地址的模型（在 server.json 给模型补 url / sha256 后这里会出现「下载」入口）。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                if root.download-rows.length > 0 : VerticalLayout {
+                    width: 100%;
+                    spacing: 6px;
+                    for d in root.download-rows : Rectangle {
+                        width: 100%;
+                        border-width: 2px;
+                        border-color: d.state == "失败" ? PixelTheme.danger : root.hairline;
+                        border-radius: 2px;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: d.label;
+                                    color: d.state == "失败" ? PixelTheme.danger : PixelTheme.text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: d.state;
+                                    color: PixelTheme.dim;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                                PixelButton {
+                                    width: 64px;
+                                    size: "small";
+                                    text: d.active ? "取消" : (d.state == "已完成" ? "重下" : (d.state == "失败" ? "重试" : "下载"));
+                                    clicked => { root.download-model(d.key); }
+                                }
+                            }
+                            if d.active || d.progress > 0 : PixelProgressBar {
+                                width: 100%;
+                                progress: d.progress;
+                            }
+                            if d.detail != "" : Text {
+                                text: d.detail;
+                                color: PixelTheme.dim;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                            }
+                        }
+                    }
                 }
             }
 

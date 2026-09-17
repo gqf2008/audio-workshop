@@ -77,3 +77,13 @@ export struct VoiceLibRow {
     created: string,  // 展示用时间
     current: bool,    // 是不是当前工程正在用的那条（按参考音频路径比）
 }
+
+// 模型下载器（P7）列表的一行：可下载模型 + 它的队列状态 / 进度。
+export struct DownloadRow {
+    key: string,          // 模型 id（下载/取消回调回传的键）
+    label: string,        // 展示名（同 id，给未来留别名位）
+    state: string,        // 未下载 / 排队 / 下载中 / 校验中 / 已完成 / 失败 / 已取消 / 已就位
+    detail: string,       // 进度或失败原因（已下载 X / Y）
+    progress: float,      // 0..1（总长未知时为 0）
+    active: bool,         // 排队/下载中/校验中 → 按钮显示「取消」，否则回到「下载 / 重下」
+}
