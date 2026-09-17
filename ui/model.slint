@@ -46,3 +46,11 @@ export struct BatchRow {
     state: string,      // 待跑 / 合成本 / 已完成 / 失败 / 已跳过
     detail: string,     // 进度或失败原因
 }
+
+// 工程版本（P3）列表的一行：留档 / 对比 / 回滚。
+export struct VersionRow {
+    id: string,        // 文件名（回滚/对比时回传）
+    label: string,     // 用户起的标签
+    created: string,   // 展示用时间
+    sentences: int,    // 这份版本有多少句
+}

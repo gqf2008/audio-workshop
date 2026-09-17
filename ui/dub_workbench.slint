@@ -25,7 +25,7 @@ import {
     PixelSpinner, PixelTextArea, PixelTextInput, PixelTheme,
 } from "@slint_pixel";
 
-import { Sentence, Voice } from "model.slint";
+import { Sentence, VersionRow, Voice } from "model.slint";
 import { VoicePanel } from "voice_picker.slint";
 
 // ---------------------------------------------------------------------------
@@ -396,6 +396,12 @@ export component DubWorkbench inherits Rectangle {
     in-out property <bool> auto-normalize: true;
     /// 句间停顿（毫秒，字符串收；留空/非法由 Rust 侧归一成默认 250）
     in-out property <string> gap-ms-text: "250";
+    /// 工程版本（P3）：留档 / 对比 / 回滚
+    in property <[VersionRow]> version-rows: [];
+    in property <string> version-status: "还没有留档";
+    in property <string> version-diff-text: "";
+    in-out property <string> version-label-text: "";
+    in-out property <bool> version-open: false;
     /// 模板（P2）：名字来自 templates.json；选中项与名字输入都在 Rust 侧读写
     in property <[string]> template-names: [];
     in-out property <int> template-index: -1;
@@ -436,6 +442,9 @@ export component DubWorkbench inherits Rectangle {
     callback speed-changed(float);
     /// 停顿改了：只作废"拼装成品"（音频没变，重新导出即可应用）
     callback gap-edited();
+    callback version-save();
+    callback version-diff(string);
+    callback version-rollback(string);
     callback template-apply();
     callback template-save();
     callback template-delete();
@@ -677,6 +686,98 @@ export component DubWorkbench inherits Rectangle {
                                 enabled: !root.running && !root.busy && !root.batch-running
                                     && root.template-index >= 0;
                                 clicked => { root.template-delete(); }
+                            }
+                        }
+
+                        // 工程版本（P3）：留档 / 对比 / 回滚
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "版本";
+                                width: 40px;
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelTextInput {
+                                width: 180px;
+                                enabled: !root.running && !root.busy && !root.batch-running;
+                                text <=> root.version-label-text;
+                                placeholder: "版本标签（留空=时间）";
+                            }
+                            PixelButton {
+                                width: 64px;
+                                text: "留档";
+                                Tooltip { text: @markdown("把当前的稿件与设置存成一份版本（不快照音频：文本相同的句子重跑时自动复用）"); }
+                                enabled: !root.running && !root.busy && !root.batch-running;
+                                clicked => { root.version-save(); }
+                            }
+                            PixelButton {
+                                width: 96px;
+                                text: root.version-open ? "收起版本" : "版本历史";
+                                clicked => { root.version-open = !root.version-open; }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.version-status;
+                                color: PixelTheme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+
+                        if root.version-open : Rectangle {
+                            width: 100%;
+                            background: PixelTheme.bg;
+                            border-width: 2px;
+                            border-color: PixelTheme.hover;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 8px;
+                                if root.version-rows.length == 0 : Text {
+                                    text: "还没有留档。上面的「留档」会把当前稿件与设置存一份。";
+                                    color: PixelTheme.dim;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                                for v in root.version-rows : HorizontalLayout {
+                                    spacing: 10px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: v.label + " · " + v.created + " · " + v.sentences + " 句";
+                                        color: PixelTheme.text;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    PixelButton {
+                                        width: 64px;
+                                        size: "small";
+                                        text: "对比";
+                                        clicked => { root.version-diff(v.id); }
+                                    }
+                                    PixelButton {
+                                        width: 64px;
+                                        size: "small";
+                                        text: "回滚";
+                                        Tooltip { text: @markdown("把这份版本的稿件与设置写回工程；文本相同的句子下次合成时自动复用"); }
+                                        enabled: !root.running && !root.busy && !root.batch-running;
+                                        clicked => { root.version-rollback(v.id); }
+                                    }
+                                }
+                                if root.version-diff-text != "" : PixelScrollPanel {
+                                    height: 140px;
+                                    panel-bg: PixelTheme.bg;
+                                    edge: PixelTheme.hover;
+                                    Text {
+                                        width: 100%;
+                                        text: root.version-diff-text;
+                                        color: PixelTheme.dim;
+                                        font-size: 12px;
+                                        wrap: word-wrap;
+                                    }
+                                }
                             }
                         }
 

@@ -17,6 +17,7 @@ mod export;
 mod player;
 mod tasks;
 mod templates;
+mod versions;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -2597,6 +2598,24 @@ fn voice_ref_matches(
         && saved.voice_ref_hash.as_ref() == voice_ref_hash.as_ref()
 }
 
+/// "旧工程的音频能不能给这份新设置复用"的判据：**模型 / 兜底开关 / 参考音（含内容哈希）
+/// 全一致**。停顿（gap_ms）只影响拼装，不算在内。
+///
+/// worker 的 `load_resumable`（续作/改稿继承）与版本回滚的"按文本继承"**共用这一条**：
+/// 两处各写一遍的话，回滚就可能把 B 模型合成的音频标成"版本显示 A"的已合成
+/// （复核给的反例）。
+fn settings_allow_reuse(
+    saved: &Project,
+    model: &str,
+    voice_ref: &Option<String>,
+    voice_ref_hash: &Option<String>,
+    auto_normalize: bool,
+) -> bool {
+    saved.model == model
+        && saved.auto_normalize == auto_normalize
+        && voice_ref_matches(saved, voice_ref, voice_ref_hash)
+}
+
 fn sentence_texts_match(project: &Project, script: &str) -> bool {
     project
         .sentences
@@ -2701,6 +2720,40 @@ fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<
 
 /// 恢复或新建工程：模型与音色一致且句子文本完全一致 → 原样续作；
 /// 稿件变化时按未变句文本继承 done 音频；模型/音色变化则整工程重录。
+/// 按调用方给的输入造一份新工程。
+///
+/// **唯一入口**：worker 的 `load_resumable`（造新工程）与版本留档（快照当前界面）
+/// 都走它——两处各写一遍的话，"界面留档的工程"与"实际合成的工程"迟早不是同一份。
+fn new_project_from_inputs(
+    script: &str,
+    model: &str,
+    voice_ref: Option<String>,
+    gap_ms: u64,
+    auto_normalize: bool,
+) -> Project {
+    let mut project = Project::new(
+        script,
+        model,
+        gap_ms,
+        BASE_SEED,
+        voice_ref.clone(),
+        DEFAULT_PUNCTUATION,
+        MAX_CHARS,
+        |t| {
+            if auto_normalize {
+                aw_core::normalize(t, &Default::default())
+            } else {
+                // 关掉兜底 = 原文照念（数字/年份交给引擎自己处理）
+                t.to_string()
+            }
+        },
+    );
+    project.auto_normalize = auto_normalize;
+    // 参考音哈希**不在这里算**：`load_resumable` 已经算过一份（算两遍纯属浪费），
+    // 版本留档那边由 `project_from_ui` 自己补。这里只管"按输入造工程"。
+    project
+}
+
 fn load_resumable(
     dir: &Path,
     script: &str,
@@ -2719,9 +2772,7 @@ fn load_resumable(
     if let Some(saved) = saved.as_ref() {
         // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
         // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
-        if saved.model == model
-            && saved.auto_normalize == auto_normalize
-            && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
+        if settings_allow_reuse(saved, model, &voice_ref, &voice_ref_hash, auto_normalize)
             && sentence_texts_match(saved, script)
         {
             let mut project = saved.clone();
@@ -2735,31 +2786,13 @@ fn load_resumable(
         }
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("建工程目录失败: {e}"))?;
-    let mut project = Project::new(
-        script,
-        model,
-        gap_ms,
-        BASE_SEED,
-        voice_ref.clone(),
-        DEFAULT_PUNCTUATION,
-        MAX_CHARS,
-        |t| {
-            if auto_normalize {
-                aw_core::normalize(t, &Default::default())
-            } else {
-                // 关掉兜底 = 原文照念（数字/年份交给引擎自己处理）
-                t.to_string()
-            }
-        },
-    );
+    let mut project =
+        new_project_from_inputs(script, model, voice_ref.clone(), gap_ms, auto_normalize);
+    // 用上面已经算好的哈希（少读一次参考音文件）
     project.voice_ref_hash = voice_ref_hash.clone();
-    project.auto_normalize = auto_normalize;
     let reused = if let Some(saved) = saved.as_ref() {
         // 与快路径同一条判据：开关变了就不能逐句继承（旧音频念的是另一套文本）
-        if saved.model == model
-            && saved.auto_normalize == auto_normalize
-            && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
-        {
+        if settings_allow_reuse(saved, model, &voice_ref, &voice_ref_hash, auto_normalize) {
             reuse_done_sentences(&mut project, saved, dir)?
         } else {
             0
@@ -2935,6 +2968,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_script(&ui, &rows, &cmd_tx, &state);
     wire_engine_changes(&ui, &cmd_tx, &state);
     wire_templates(&ui, &cmd_tx, &state);
+    wire_versions(&ui, &rows, &cmd_tx, &state);
     wire_voice_panel(&ui, &cmd_tx, &state);
     wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
@@ -3212,6 +3246,7 @@ fn restore_project(
     apply_eval_labels(rows, &state.eval_scores.borrow());
     // BGM 产物是落盘的：重开应用也要看到上次那几轨（否则"昨天混好的分轨今天导不出来"）
     restore_bgm_from_disk(ui, state, &dir);
+    refresh_versions(ui, state);
     let _ = cmd_tx.send(Cmd::OpenProject {
         revision: state.project_revision.get(),
         dir,
@@ -3750,9 +3785,12 @@ fn wire_script(
             ui.set_status_text("任务进行中：工程名暂不可改".into());
             return;
         }
+        let stem = file_stem(&ui.get_project_name());
+        *state0.project_dir.borrow_mut() = Some(project_dir(&stem));
         invalidate_worker_project(&tx, &state0);
         reset_bgm(&ui, &state0);
         ui.set_has_result(false);
+        refresh_versions(&ui, &state0);
         ui.set_status_text(format!("工程名：{}", ui.get_project_name()).into());
     });
 
@@ -4481,6 +4519,272 @@ fn wire_task_center(
     });
 }
 
+/// 当前界面上的输入 → 一份工程（版本留档与对比都以"界面看到的"为准）。
+///
+/// 与 worker 造新工程共用 `new_project_from_inputs`，所以留档下来的东西就是"点开始合成
+/// 会用的那一份"，不是另建一个近似对象。
+fn project_from_ui(ui: &MainWindow) -> Project {
+    let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+    let mut project = new_project_from_inputs(
+        &ui.get_script_text(),
+        &current_model_name(ui).unwrap_or_default(),
+        voice_ref.clone(),
+        gap_ms_from_ui(ui),
+        ui.get_auto_normalize(),
+    );
+    // 留档也要忠实：把参考音的内容哈希一起记下来（算不出来就留 None = 下次保守重录）
+    if let Some(path) = voice_ref.as_deref() {
+        project.voice_ref_hash = sha256_file(Path::new(path)).ok();
+    }
+    project
+}
+
+/// 回滚（不碰界面）：读版本 → 用**当前磁盘工程**按文本继承音频与状态 → 落盘。
+///
+/// 关键契约：当前 `project.json` **存在但读不出来**（损坏/权限）时，直接中止并返回
+/// Err——绝不 commit。`Project::load_if_present` 的契约就是"损坏工程不自动重建、不覆盖"，
+/// 回滚如果把 `Err` 当成"没有当前工程"继续写盘，就会把唯一可人工恢复的现场抹掉。
+fn rollback_with_inheritance(dir: &Path, id: &str) -> Result<(Project, usize), String> {
+    let inherited = match Project::load_if_present(dir) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("当前工程读不出来，回滚已中止（不会覆盖现场）：{e}")),
+    };
+    let snapshot = versions::load_for_rollback(dir, id)?;
+    let mut restored = project_from_version(&snapshot);
+    // 与 `load_resumable` 同一条判据：模型 / 兜底开关 / 参考音不一致时**不许复用音频**，
+    // 否则回滚会把"另一个模型/音色合成的声音"标成这份版本的已合成。
+    let reused = match inherited.as_ref() {
+        Some(saved)
+            if settings_allow_reuse(
+                saved,
+                &restored.model,
+                &restored.voice_ref,
+                &restored.voice_ref_hash,
+                restored.auto_normalize,
+            ) =>
+        {
+            reuse_done_sentences(&mut restored, saved, dir)?
+        }
+        _ => 0,
+    };
+    versions::commit_rollback(dir, &restored)?;
+    Ok((restored, reused))
+}
+
+/// 版本快照 → 可继续合成的工程。
+///
+/// 快照里的句子状态是留档那一刻的（全 pending），这里**按稿件与设置重建**，
+/// 句级状态交给调用方用"按文本继承"补——保持"状态由合成决定"这条不变式。
+fn project_from_version(snapshot: &Project) -> Project {
+    let script: String = snapshot.sentences.iter().map(|s| s.text.as_str()).collect();
+    let mut project = new_project_from_inputs(
+        &script,
+        &snapshot.model,
+        snapshot.voice_ref.clone(),
+        snapshot.gap_ms,
+        snapshot.auto_normalize,
+    );
+    project.voice_ref_hash = snapshot.voice_ref_hash.clone();
+    project
+}
+
+/// 时间戳 → 人话（版本列表用；不引日期库，按"多久以前"说）。
+fn relative_time(now_ms: u64, then_ms: u64) -> String {
+    if now_ms < then_ms {
+        return "刚刚".to_string();
+    }
+    let secs = (now_ms - then_ms) / 1000;
+    match secs {
+        0..=59 => "刚刚".to_string(),
+        60..=3599 => format!("{} 分钟前", secs / 60),
+        3600..=86_399 => format!("{} 小时前", secs / 3600),
+        _ => format!("{} 天前", secs / 86_400),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 版本列表 → 界面（含坏文件计数：坏文件不能被当成"没有版本"）。
+fn refresh_versions(ui: &MainWindow, state: &Rc<UiState>) {
+    let Some(dir) = state.project_dir.borrow().clone() else {
+        ui.set_version_rows(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
+        ui.set_version_status("还没有工程：先开始一次合成再留档".into());
+        return;
+    };
+    let (rows, broken) = versions::list(&dir);
+    let now = now_ms();
+    let ui_rows: Vec<VersionRow> = rows
+        .iter()
+        .map(|r| VersionRow {
+            id: r.id.clone().into(),
+            label: r.label.clone().into(),
+            created: relative_time(now, r.created_at).into(),
+            sentences: r.sentences as i32,
+        })
+        .collect();
+    ui.set_version_rows(ModelRc::from(Rc::new(VecModel::from(ui_rows))));
+    let mut status = if rows.is_empty() {
+        "还没有留档".to_string()
+    } else {
+        format!("{} 份留档", rows.len())
+    };
+    if broken > 0 {
+        status.push_str(&format!("（{broken} 个文件读不出来，已跳过）"));
+    }
+    ui.set_version_status(status.into());
+}
+
+/// 差异 → 面板里的多行文本。只列"变了的"：几十句稿子把没变的也铺出来没法读。
+fn format_diff(label: &str, d: &versions::ProjectDiff, lines: &[versions::LineOp]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("与「{label}」对比：{}\n", d.summary()));
+    if !d.settings.is_empty() {
+        out.push_str("\n设置：\n");
+        for c in &d.settings {
+            out.push_str(&format!("  {}：{} → {}\n", c.field, c.before, c.after));
+        }
+    }
+    let changed: Vec<&versions::LineOp> = lines
+        .iter()
+        .filter(|l| !matches!(l, versions::LineOp::Keep(_)))
+        .collect();
+    if changed.is_empty() {
+        out.push_str("\n句子：没有变化\n");
+    } else {
+        out.push_str("\n句子（只列变化）：\n");
+        for l in &changed {
+            match l {
+                versions::LineOp::Add(t) => out.push_str(&format!("  + {t}\n")),
+                versions::LineOp::Remove(t) => out.push_str(&format!("- {t}\n")),
+                versions::LineOp::Keep(_) => {}
+            }
+        }
+        out.push_str(&format!(
+            "\n（其余 {} 句未变）\n",
+            d.lines.len() - changed.len()
+        ));
+    }
+    out
+}
+
+/// 工程版本（P3）：留档 / 对比 / 回滚。
+fn wire_versions(
+    ui: &MainWindow,
+    rows: &Rc<VecModel<Sentence>>,
+    cmd_tx: &Sender<Cmd>,
+    state: &Rc<UiState>,
+) {
+    // 留档
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_version_save(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
+            ui.set_status_text("任务进行中：版本等这轮跑完再留档".into());
+            return;
+        }
+        let Some(dir) = st.project_dir.borrow().clone() else {
+            ui.set_status_text("还没有工程：先开始一次合成再留档".into());
+            return;
+        };
+        let project = project_from_ui(&ui);
+        match versions::save(&dir, &ui.get_version_label_text(), &project, now_ms()) {
+            Ok(_) => {
+                ui.set_version_label_text("".into());
+                refresh_versions(&ui, &st);
+                ui.set_status_text("已留档（不快照音频；文本相同的句子下次合成仍会复用）".into());
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+
+    // 对比（与该版本比"当前界面上的工程"）
+    let weak = ui.as_weak();
+    let st_diff = state.clone();
+    ui.on_version_diff(move |id| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(dir) = st_diff.project_dir.borrow().clone() else {
+            ui.set_status_text("还没有工程".into());
+            return;
+        };
+        let id = id.to_string();
+        match versions::load(&dir, &id) {
+            Ok(v) => {
+                let current = project_from_ui(&ui);
+                let d = versions::diff(&v.project, &current);
+                let text = format_diff(&v.label, &d, &d.lines);
+                ui.set_version_diff_text(text.into());
+                ui.set_version_open(true);
+                ui.set_status_text(format!("版本「{}」{}", v.label, d.summary()).into());
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+
+    // 回滚：写回 project.json（音频不动，交给下次合成按文本继承）
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let tx = cmd_tx.clone();
+    let rows = rows.clone();
+    ui.on_version_rollback(move |id| {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
+            ui.set_status_text("任务进行中：版本等这轮跑完再回滚".into());
+            return;
+        }
+        let Some(dir) = st.project_dir.borrow().clone() else {
+            ui.set_status_text("还没有工程".into());
+            return;
+        };
+        let id = id.to_string();
+        // 两步回滚（复核抓到的关键点）：版本快照里的句子全是 pending，直接写回再跑时
+        // `load_resumable` 走快路径会原样返回它 —— "文本相同的句子复用"就落空；
+        // 而当前工程损坏时必须中止（不能覆盖现场）。两件事都在下面这个函数里定义清楚。
+        match rollback_with_inheritance(&dir, &id) {
+            Ok((project, reused)) => {
+                // 界面回灌：稿件 + 引擎/音色/停顿/兜底，全部走与手工编辑同一条路径
+                let script: String = project.sentences.iter().map(|s| s.text.as_str()).collect();
+                ui.set_script_text(script.clone().into());
+                // 句子行重算（与改稿同一条路径）：这里只有 ui，行模型由 wire_versions 传入
+                rebuild(&ui, &rows, &script);
+                ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+                if !restore_voice_index(&ui, &project.model) {
+                    ui.set_voice_index(-1);
+                }
+                ui.set_gap_ms_text(project.gap_ms.to_string().into());
+                ui.set_auto_normalize(project.auto_normalize);
+                st.auto_normalize_seen.set(project.auto_normalize);
+                refresh_voice_labels(&ui);
+                // 稿件/设置都换了 → 与改稿同一套作废（成品、BGM、质检分数）
+                invalidate_worker_project(&tx, &st);
+                reset_bgm(&ui, &st);
+                st.assembled.borrow_mut().take();
+                clear_eval_scores(&st);
+                ui.set_has_result(false);
+                refresh_versions(&ui, &st);
+                ui.set_version_diff_text("".into());
+                let todo = project
+                    .sentences
+                    .iter()
+                    .filter(|s| s.status != "done")
+                    .count();
+                ui.set_status_text(
+                    format!(
+                        "已回滚到该版本：复用 {reused} 句已合成的音频，还要合成 {todo} 句；点「开始合成」继续"
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+}
+
 /// 模板（P2）：应用 / 存为 / 删除。
 ///
 /// 应用是这里唯一有"后果"的动作：按 `templates::apply_effect` 判定要不要作废工程
@@ -4913,6 +5217,7 @@ fn wire_run(
         state1.project_ready.set(false);
         let stem = file_stem(&ui.get_project_name());
         *state1.project_dir.borrow_mut() = Some(project_dir(&stem));
+        refresh_versions(&ui, &state1);
         if tx
             .send(Cmd::Run {
                 revision: state1.project_revision.get(),
@@ -7187,6 +7492,162 @@ mod tests {
         assert!(over.contains("上限") && over.contains("2000"), "{over}");
         let ok = gap_hint_for("300");
         assert!(ok.contains("300"), "{ok}");
+    }
+
+    /// 复核抓到的关键点：版本快照里的句子全是 pending，**回滚必须先把音频按文本继承过来**
+    /// 再落盘——否则下一次合成走 `load_resumable` 快路径会原样返回这份全 pending 工程，
+    /// "文本相同的句子自动复用"就落空了。
+    #[test]
+    fn rollback_inherits_audio_for_unchanged_sentences() {
+        let dir = temp_dir("rollback-inherit");
+        // 当前工程：两句都已合成（有 wav + done 状态）
+        let mut current = saved_project("第一句。第二句。", None);
+        save_done_project(&dir, &mut current);
+        let inherited = Project::load(&dir).unwrap();
+
+        // 版本快照 = 稿件 + 设置（重建出来全是 pending），这正是留档写下的那份
+        let mut restored =
+            new_project_from_inputs("第一句。第二句。", "audio8-tts", None, GAP_MS, true);
+        assert!(
+            restored.sentences.iter().all(|s| s.status == "pending"),
+            "前提：重建成的新工程没有句级状态"
+        );
+
+        let reused = reuse_done_sentences(&mut restored, &inherited, &dir).unwrap();
+        assert_eq!(reused, 2, "文本相同的两句都该继承到音频");
+        versions::commit_rollback(&dir, &restored).unwrap();
+
+        // 关键断言：下一次「开始合成」不会把这句当成待录
+        let loaded =
+            load_resumable(&dir, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap();
+        assert!(
+            loaded.project.sentences.iter().all(|s| s.status == "done"),
+            "回滚后同文本的句子必须仍是已合成（否则会全部重录）"
+        );
+    }
+
+    /// 复核给的反例：回滚的"按文本继承"也必须过与 `load_resumable` 相同的设置门槛——
+    /// 模型 / 兜底开关 / 参考音不一致时复用音频，会把"另一个模型合成的 wav"标成这份
+    /// 版本的已合成（界面显示 A、听起来是 B）。
+    #[test]
+    fn rollback_does_not_inherit_audio_when_settings_differ() {
+        let dir = temp_dir("rollback-settings");
+        // 当前工程：一套具体设置 + 两句已合成
+        let mut current = saved_project("第一句。第二句。", None);
+        current.model = "index-tts2".into();
+        current.auto_normalize = false;
+        current.voice_ref = Some("/x/别的声线.wav".into());
+        current.voice_ref_hash = Some("hash-x".into());
+        save_done_project(&dir, &mut current);
+        let inherited = Project::load(&dir).unwrap();
+        assert!(settings_allow_reuse(
+            &inherited,
+            &inherited.model,
+            &inherited.voice_ref,
+            &inherited.voice_ref_hash,
+            inherited.auto_normalize,
+        ));
+
+        // 版本与当前工程只在"被 tweak 的那一项"上不同（其余整份克隆，避免测试自己写错）
+        type Tweak = fn(&mut Project);
+        let cases: Vec<(&str, Tweak)> = vec![
+            ("模型不同", |p: &mut Project| {
+                p.model = "audio8-tts".into()
+            }),
+            ("兜底开关不同", |p: &mut Project| {
+                p.auto_normalize = true
+            }),
+            ("参考音不同", |p: &mut Project| {
+                p.voice_ref = Some("/y/另一个声线.wav".into());
+                p.voice_ref_hash = Some("hash-y".into());
+            }),
+            ("同名但内容变了", |p: &mut Project| {
+                p.voice_ref_hash = Some("hash-z".into());
+            }),
+        ];
+        for (name, tweak) in cases {
+            let mut version = inherited.clone();
+            tweak(&mut version);
+            assert!(
+                !settings_allow_reuse(
+                    &inherited,
+                    &version.model,
+                    &version.voice_ref,
+                    &version.voice_ref_hash,
+                    version.auto_normalize,
+                ),
+                "{name}：设置不一致就不该允许复用音频"
+            );
+        }
+    }
+
+    /// **当前工程损坏时回滚必须中止、一个字节都不写**：损坏的 project.json 是唯一可人工
+    /// 恢复的现场，回滚把它当成"没有当前工程"继续写盘就把它抹了（复核抓到的数据安全阻塞）。
+    #[test]
+    fn rollback_refuses_when_current_project_is_corrupt() {
+        let dir = temp_dir("rollback-corrupt");
+        let id = versions::save(
+            &dir,
+            "好版本",
+            &new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true),
+            1,
+        )
+        .unwrap();
+        let corrupt = b"{ this is not json";
+        std::fs::write(dir.join("project.json"), corrupt).unwrap();
+
+        let err = rollback_with_inheritance(&dir, &id).unwrap_err();
+        assert!(err.contains("不会覆盖现场"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("project.json")).unwrap(),
+            corrupt,
+            "损坏的现场必须原样保留"
+        );
+
+        // 对照：工程文件正常时回滚照常完成
+        new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true)
+            .save(&dir)
+            .unwrap();
+        assert!(rollback_with_inheritance(&dir, &id).is_ok());
+    }
+
+    /// 版本列表里的时间用"多久以前"说（不引日期库）：四档 + 未来时间兜底。
+    #[test]
+    fn relative_time_states_the_scale() {
+        // 选一个足够大的 now：下面要减到"2 天前"，小数值会把它减成负溢出
+        let now = 1_000_000_000u64;
+        assert_eq!(relative_time(now, now), "刚刚");
+        assert_eq!(relative_time(now, now - 30_000), "刚刚");
+        assert_eq!(relative_time(now, now - 90_000), "1 分钟前");
+        assert_eq!(relative_time(now, now - 3 * 3_600_000), "3 小时前");
+        assert_eq!(relative_time(now, now - 2 * 86_400_000), "2 天前");
+        assert_eq!(
+            relative_time(now, now + 5_000),
+            "刚刚",
+            "时钟回拨也不出负数"
+        );
+    }
+
+    /// 造工程只有一个入口：worker 造新工程与"版本留档"都用它。
+    /// 这里钉住它真的按输入记下了停顿、兜底开关，并按开关决定 spoken 文本。
+    #[test]
+    fn new_project_from_inputs_records_settings() {
+        let on = new_project_from_inputs("2024年第一句。", "audio8-tts", None, 750, true);
+        assert_eq!(on.gap_ms, 750);
+        assert!(on.auto_normalize);
+        assert_ne!(
+            on.sentences[0].spoken, on.sentences[0].text,
+            "开兜底时 spoken 应被规范化（2024年 → 二零二四年）"
+        );
+
+        let off = new_project_from_inputs("2024年第一句。", "audio8-tts", None, 750, false);
+        assert!(!off.auto_normalize);
+        assert_eq!(
+            off.sentences[0].spoken, off.sentences[0].text,
+            "关兜底就是原文照念"
+        );
+        assert_eq!(off.voice_ref, None);
+        assert_eq!(off.voice_ref_hash, None, "没有参考音就没有哈希");
     }
 
     /// 存模板前必须有个名字：空白名字直接拒绝（否则会存出一条没法选中的无名模板）。
