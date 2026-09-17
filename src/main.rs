@@ -6874,29 +6874,13 @@ fn tick(
                 // 忘了放就等于把「检查更新」永久锁死
                 state.update_running.set(false);
                 ui.set_update_running(false);
-                match result {
-                    Ok(update::UpdateCheck::Newer(release)) => {
-                        ui.set_update_info(release.summary().into());
-                        // 发布页按钮的可用性 = 这个 Option 在不在（tick 里投影给 UI）
-                        *state.update_release.borrow_mut() = Some(release);
-                    }
-                    Ok(update::UpdateCheck::UpToDate) => {
-                        // 清掉上一次那份：不清的话「打开发布页」还亮着，点开是旧版本
-                        *state.update_release.borrow_mut() = None;
-                        ui.set_update_info(
-                            format!(
-                                "已是最新版本 {}（清单里的版本不比它新）",
-                                update::CURRENT_VERSION
-                            )
-                            .into(),
-                        );
-                    }
-                    Err(error) => {
-                        // 失败也要把上一次的发布页收掉：那份已经不代表现在的判断了
-                        *state.update_release.borrow_mut() = None;
-                        ui.set_update_info(format!("检查更新失败：{error}").into());
-                    }
-                }
+                // 「显示什么 + 留不留发布页」由 update::outcome_view 一处决定（有单测钉住
+                // 三种结果；尤其 UpToDate/Err 必须交出 None，否则按钮亮着点开是旧版本）。
+                // 这里只做赋值，不再自己写第二份判断。
+                let (info, release) = update::outcome_view(update::CURRENT_VERSION, result);
+                ui.set_update_info(info.into());
+                // 发布页按钮的可用性 = 这个 Option 在不在（tick 里投影给 UI）
+                *state.update_release.borrow_mut() = release;
             }
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());

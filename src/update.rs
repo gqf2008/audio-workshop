@@ -78,6 +78,29 @@ pub enum UpdateCheck {
     Newer(Release),
 }
 
+/// 「检查结果 → 界面该怎么显示」**唯一一份**决定：返回（状态行那句话，要不要留下发布页）。
+///
+/// 抽成纯函数是为了能被单测钉住：三种结果各自显示什么、哪种结果才留下可点的发布页。
+/// 尤其 `UpToDate`/`Err` **必须交出 `None`**——tick 里就是拿它直接覆盖
+/// `state.update_release` 的；要是"已是最新"还留着上一份发布页，
+/// 按钮就亮着而点开是旧版本（假可点比不显示更糟）。
+pub fn outcome_view(
+    current: &str,
+    result: Result<UpdateCheck, String>,
+) -> (String, Option<Release>) {
+    match result {
+        Ok(UpdateCheck::Newer(release)) => {
+            let info = release.summary();
+            (info, Some(release))
+        }
+        Ok(UpdateCheck::UpToDate) => (
+            format!("已是最新版本 {current}（清单里的版本不比它新）"),
+            None,
+        ),
+        Err(error) => (format!("检查更新失败：{error}"), None),
+    }
+}
+
 /// 解析一份发布清单。接受 GitHub Release API 与自建清单两种形状（见模块注释）。
 pub fn parse_release(json: &str) -> Result<Release, String> {
     let value: serde_json::Value = serde_json::from_str(json)
@@ -805,6 +828,38 @@ mod tests {
             "per-read 超时该在 300ms 量级就返回，实际 {took:?}"
         );
         assert_eq!(mock.hits(), 1);
+    }
+
+    #[test]
+    fn outcome_view_keeps_a_release_page_only_for_a_newer_version() {
+        let (info, keep) = outcome_view(
+            "0.1.0",
+            Ok(UpdateCheck::Newer(Release {
+                version: "0.2.0".into(),
+                notes: "n".into(),
+                url: "https://e.com/r".into(),
+                sha256: Some("ab".into()),
+                size: Some(4096),
+            })),
+        );
+        assert!(
+            info.contains("0.2.0") && info.contains("有新版本"),
+            "{info}"
+        );
+        assert_eq!(keep.map(|r| r.url), Some("https://e.com/r".to_string()));
+
+        // 已是最新：必须把上一次那份收掉，且状态行带上当前版本
+        let (info, keep) = outcome_view("0.1.0", Ok(UpdateCheck::UpToDate));
+        assert!(info.contains("0.1.0") && info.contains("最新"), "{info}");
+        assert!(keep.is_none(), "没有新版时不能留下可点的发布页");
+
+        // 失败：同样收掉发布页，并带上原因
+        let (info, keep) = outcome_view("0.1.0", Err("超时：30 秒内没读到数据".into()));
+        assert!(
+            info.starts_with("检查更新失败：") && info.contains("超时"),
+            "{info}"
+        );
+        assert!(keep.is_none());
     }
 
     #[test]
