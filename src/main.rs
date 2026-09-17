@@ -3415,7 +3415,6 @@ struct UiState {
     eval_scores: RefCell<HashMap<usize, f64>>,
     /// 句子列表当前是否按质检分数升序展示。只影响视图，不改工程。
     qa_sorted: std::cell::Cell<bool>,
-    qa_worst_index: std::cell::Cell<Option<usize>>,
     /// 连续点「跳到最差句」时给滚动目标加个不可见的亚像素偏移，
     /// 即使目标行没变也重新触发一次 viewport 更新。
     qa_scroll_phase: std::cell::Cell<bool>,
@@ -3922,6 +3921,14 @@ fn row_position(rows: &Rc<VecModel<Sentence>>, project_index: usize) -> Option<u
     })
 }
 
+/// 把当前选中行换成工程 index；未选中（负值）保持“无选中”，不要默认吸到第 0 行。
+fn selected_project_index(selected: i32, rows: &[Sentence]) -> Option<usize> {
+    usize::try_from(selected)
+        .ok()
+        .and_then(|i| rows.get(i))
+        .and_then(|row| usize::try_from(row.index).ok())
+}
+
 fn rows_as_vec(rows: &Rc<VecModel<Sentence>>) -> Vec<Sentence> {
     (0..rows.row_count())
         .filter_map(|i| rows.row_data(i))
@@ -3932,22 +3939,38 @@ fn apply_row_order(rows: &Rc<VecModel<Sentence>>, ordered: Vec<Sentence>) {
     rows.set_vec(ordered);
 }
 
+/// 当前最低可懂度句：分数最低优先，同分取工程 index 最小。
+///
+/// 不缓存这个结果。`eval_scores` 是唯一真相源，重启回灌或任一句失效后，
+/// 下一次动作直接按当前分数重新算；这样不会留下“分数还在但最差索引已清空”的死状态。
+fn lowest_scored_index(rows: &[Sentence], scores: &HashMap<usize, f64>) -> Option<usize> {
+    rows.iter()
+        .filter_map(|row| {
+            let index = usize::try_from(row.index).ok()?;
+            scores.get(&index).map(|score| (index, *score))
+        })
+        .min_by(|(a_index, a_score), (b_index, b_score)| {
+            a_score
+                .total_cmp(b_score)
+                .then_with(|| a_index.cmp(b_index))
+        })
+        .map(|(index, _)| index)
+}
+
 /// 排序按钮和跳转按钮共用的可用性判据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QaActionView {
     enabled: bool,
+    worst_index: Option<usize>,
     worst_row: Option<usize>,
 }
 
-fn qa_action_view(
-    rows: &[Sentence],
-    scores: &HashMap<usize, f64>,
-    worst_index: Option<usize>,
-    blocked: bool,
-) -> QaActionView {
+fn qa_action_view(rows: &[Sentence], scores: &HashMap<usize, f64>, blocked: bool) -> QaActionView {
+    let worst_index = lowest_scored_index(rows, scores);
     let worst_row = worst_index.and_then(|index| row_position_in_slice(rows, index));
     QaActionView {
-        enabled: !blocked && !scores.is_empty() && worst_row.is_some(),
+        enabled: !blocked && worst_row.is_some(),
+        worst_index,
         worst_row,
     }
 }
@@ -3960,7 +3983,6 @@ fn qa_action_view_for_ui(
     qa_action_view(
         &rows_as_vec(rows),
         &state.eval_scores.borrow(),
-        state.qa_worst_index.get(),
         ui.get_running()
             || ui.get_busy()
             || ui.get_batch_running()
@@ -3997,13 +4019,7 @@ fn toggle_qa_sort(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiS
     if !view.enabled {
         return;
     }
-    let selected_project = ui
-        .get_selected()
-        .max(0)
-        .try_into()
-        .ok()
-        .and_then(|i: usize| rows.row_data(i))
-        .and_then(|row| usize::try_from(row.index).ok());
+    let selected_project = selected_project_index(ui.get_selected(), &rows_as_vec(rows));
     let scores = state.eval_scores.borrow().clone();
     let sorted = !state.qa_sorted.get();
     state.qa_sorted.set(sorted);
@@ -4042,9 +4058,15 @@ fn jump_to_worst(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiSt
     let phase = !state.qa_scroll_phase.get();
     state.qa_scroll_phase.set(phase);
     let y = i as f32 * 48.0 + if phase { 0.01 } else { 0.0 };
-    if let Some(mut meta) = rows.row_data(0) {
-        meta.qa_scroll_y = y;
-        rows.set_row_data(0, meta);
+    // 行序会随排序变化；把目标广播到每一行，避免第 0 行换人后滚动目标漂移。
+    for row_index in 0..rows.row_count() {
+        if let Some(mut row) = rows.row_data(row_index) {
+            if row.qa_scroll_y == y {
+                continue;
+            }
+            row.qa_scroll_y = y;
+            rows.set_row_data(row_index, row);
+        }
     }
     ui.set_status_text(format!("已跳到最差第 {} 句：可试听或重录", row.no).into());
 }
@@ -4054,7 +4076,6 @@ fn jump_to_worst(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiSt
 fn reset_eval_view(rows: &Rc<VecModel<Sentence>>, state: &UiState) {
     state.eval_scores.borrow_mut().clear();
     state.qa_sorted.set(false);
-    state.qa_worst_index.set(None);
     apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
 }
 
@@ -6688,7 +6709,6 @@ fn tick(
                 if sentence_message_invalidates_score(&status) {
                     let had = state.eval_scores.borrow_mut().remove(&index).is_some();
                     // 这句刚被重做，旧质检结论不再能代表当前音频；排序视角也回原序。
-                    state.qa_worst_index.set(None);
                     state.qa_sorted.set(false);
                     apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
                     if let Some(i) = row_position(rows, index) {
@@ -6995,9 +7015,6 @@ fn tick(
                 }
                 // 新的一轮质检结束后先回工程原序；排序要不要开由用户点按钮决定。
                 state.qa_sorted.set(false);
-                state
-                    .qa_worst_index
-                    .set(summary.worst.first().map(|w| w.index));
                 apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
                 apply_eval_labels(rows, &state.eval_scores.borrow());
                 let mut note = eval_summary_note(&summary);
@@ -10214,7 +10231,6 @@ mod tests {
             Rc::new(VecModel::from(sort_rows_for_eval(rows, &scores)));
         let state = UiState {
             qa_sorted: std::cell::Cell::new(true),
-            qa_worst_index: std::cell::Cell::new(Some(1)),
             ..UiState::default()
         };
         *state.eval_scores.borrow_mut() = scores;
@@ -10222,7 +10238,6 @@ mod tests {
         reset_eval_view(&model, &state);
 
         assert!(!state.qa_sorted.get());
-        assert_eq!(state.qa_worst_index.get(), None);
         assert!(state.eval_scores.borrow().is_empty());
         assert_eq!(
             rows_as_vec(&model)
@@ -10233,19 +10248,56 @@ mod tests {
         );
     }
 
-    /// 排序按钮和跳转按钮共用一个可用性判据：没有分数、没有最差句或任务阻塞时
-    /// 两边都必须同时不可用。
+    /// 排序前若没有选中句子，不能把 -1 误当成第 0 行。
     #[test]
-    fn qa_action_view_has_one_gate_for_sort_and_jump() {
+    fn qa_sort_does_not_remap_missing_selection_to_first_row() {
         let rows = vec![test_sentence_row(0), test_sentence_row(1)];
-        let scores = HashMap::from([(0, 90.0), (1, 80.0)]);
-        let enabled = qa_action_view(&rows, &scores, Some(1), false);
-        assert_eq!(enabled.worst_row, Some(1));
-        assert!(enabled.enabled);
+        assert_eq!(selected_project_index(-1, &rows), None);
+        assert_eq!(selected_project_index(1, &rows), Some(1));
+    }
 
-        assert!(!qa_action_view(&rows, &HashMap::new(), Some(1), false).enabled);
-        assert!(!qa_action_view(&rows, &scores, None, false).enabled);
-        assert!(!qa_action_view(&rows, &scores, Some(1), true).enabled);
+    /// 排序按钮和跳转按钮共用一个可用性判据：只要当前分数有效就可用，
+    /// 不依赖任何易失的“最差句缓存”（重启或单句失效后也走这条）。
+    #[test]
+    fn qa_actions_recover_from_live_scores_without_cached_worst() {
+        let rows = vec![test_sentence_row(0), test_sentence_row(1)];
+        let scores = HashMap::from([(0, 80.0), (1, 90.0)]);
+        // 模拟重启/单句重录：没有旧 summary 缓存，只从存活分数算最差句。
+        let view = qa_action_view(&rows, &scores, false);
+        assert_eq!(view.worst_index, Some(0));
+        assert_eq!(view.worst_row, Some(0));
+        assert!(view.enabled);
+
+        // 修掉最低分句后，剩余分数仍能让用户继续排、继续跳。
+        let mut remaining = scores;
+        remaining.remove(&0);
+        let view = qa_action_view(&rows, &remaining, false);
+        assert_eq!(view.worst_index, Some(1));
+        assert_eq!(view.worst_row, Some(1));
+        assert!(view.enabled);
+
+        assert!(!qa_action_view(&rows, &HashMap::new(), false).enabled);
+        assert!(!qa_action_view(&rows, &remaining, true).enabled);
+    }
+
+    /// 同分时跳到工程 index 最小的那句，排序也必须保持最小 index 在前。
+    #[test]
+    fn qa_ties_pick_the_smallest_project_index() {
+        let rows = vec![
+            test_sentence_row(2),
+            test_sentence_row(1),
+            test_sentence_row(0),
+        ];
+        let scores = HashMap::from([(0, 80.0), (1, 80.0), (2, 90.0)]);
+        let sorted = sort_rows_for_eval(rows, &scores);
+        assert_eq!(
+            sorted.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(lowest_scored_index(&sorted, &scores), Some(0));
+        let view = qa_action_view(&sorted, &scores, false);
+        assert_eq!(view.worst_index, Some(0));
+        assert_eq!(view.worst_row, Some(0));
     }
 
     /// 分数写不进工程时要如实说（分数有效但没落盘），别让用户以为下次打开还在。

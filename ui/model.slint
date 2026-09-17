@@ -18,8 +18,8 @@ export struct Sentence {
     start-label: string,     // 展示用，如 "0:12"
     // 质检分数（""= 没测过/已失效）。并进展开行的状态文案显示，不新增元素
     eval-label: string,
-    // 质检视图动作的元数据。只由第 0 行承载，字段不会被 SentenceRow 展示；
-    // 这样不用改 app.slint 的转发层，也能让按钮文案/判定同源。
+    // 质检视图动作的元数据。qa-enabled/qa-sorted 只由第 0 行承载；
+    // qa-scroll-y 会广播到每一行，排序换行后滚动目标也不会漂移。
     qa-enabled: bool,
     qa-sorted: bool,
     qa-scroll-y: length,
