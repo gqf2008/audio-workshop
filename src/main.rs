@@ -1801,6 +1801,41 @@ fn backup_refusal(
     None
 }
 
+/// 「一键备份…」当前该不该灰掉——**只做投影，不另设判据**。
+///
+/// 三轮复核都在同一条线上：按钮的 enabled 与回调的判据一旦各算各的，就会出现
+/// 「按钮亮着却点不动」（`AW_UI_STATE=batch` 的演示行：`batch_in_flight` 真、
+/// 而 Slint 侧拼的计数不真）或「按钮灰着但判据说不忙」（`AW_UI_STATE=tasks` 的
+/// 演示任务：Slint 计数真、而 `tasks_in_flight` 对演示态短路为假）。
+/// 所以按钮**不再自己拼计数**，一律走这一份——与点击回调同一个 `backup_refusal`。
+fn backup_blocked(
+    ui_busy: bool,
+    ui_running: bool,
+    tasks_in_flight: bool,
+    batch_in_flight: bool,
+    backup_running: bool,
+) -> bool {
+    backup_refusal(
+        ui_busy,
+        ui_running,
+        tasks_in_flight,
+        batch_in_flight,
+        backup_running,
+    )
+    .is_some()
+}
+
+/// 把上面那份判据投影到 UI（每 tick 同步一次；值没变时 Slint 不会重绘）。
+fn refresh_backup_availability(ui: &MainWindow, state: &Rc<UiState>) {
+    ui.set_backup_blocked(backup_blocked(
+        ui.get_busy(),
+        ui.get_running(),
+        tasks_in_flight(state),
+        batch_in_flight(state),
+        state.backup_running.get(),
+    ));
+}
+
 /// 批量导出：扫 projects/ 下有成品的工程，按导出开关复制到导出目录。
 ///
 /// 放后台线程而不是 worker：导出只读磁盘上**已经拼好**的成品（`out/final.wav` 是原子写），
@@ -7263,6 +7298,9 @@ fn tick(
     // 值没变时 Slint 不会重绘。
     ui.set_dub_product_ready(state.assembled.borrow().is_some());
 
+    // ── 一键备份能不能点：与点击回调同一份判据（改动见 backup_blocked 的注释）──
+    refresh_backup_availability(ui, state);
+
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
         ui.set_playing(false);
@@ -9886,20 +9924,54 @@ mod tests {
         assert!(both.contains("备份还在进行"), "{both}");
     }
 
-    /// 守卫与按钮禁用条件必须同源：**歌曲/分离这类只在台账里登记的任务**，
-    /// 也要同时让「一键备份…」变灰（否则按钮亮着、点了被拒，像是坏了）。
-    /// 按钮的 `tasks-busy` 直接由 `task-running/task-pending` 派生（app.slint 的
-    /// `WorkbenchDrawer` 绑定），与这里的 `tasks_in_flight` 取的是同一份台账计数。
+    /// 按钮的禁用态必须**就是**回调用那份判据的投影（复核第三轮的阻塞）。
+    ///
+    /// 只要按钮在 Slint 里另拼一套 busy（`busy || task-running` 之类），演示态就会
+    /// 出现「按钮亮着却点不动」或「按钮灰着但判据说不忙」两种自相矛盾 —— 这条逐项钉住
+    /// `backup_blocked` 与 `backup_refusal` 的等价：refusal 有理由 ⇔ 按钮该灰。
     #[test]
-    fn backup_button_and_guard_share_the_same_inputs() {
+    fn backup_button_state_is_the_projection_of_the_same_refusal() {
+        let cases = [
+            (false, false, false, false, false),
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ];
+        for (busy, running, tasks, batch, backup) in cases {
+            assert_eq!(
+                backup_blocked(busy, running, tasks, batch, backup),
+                backup_refusal(busy, running, tasks, batch, backup).is_some(),
+                "按钮灰不灰必须与回调判据同源：\
+                 busy={busy} running={running} tasks={tasks} batch={batch} backup={backup}"
+            );
+        }
+        // 全空闲必须能点（别为了"同源"把按钮钉死）
+        assert!(!backup_blocked(false, false, false, false, false));
+    }
+
+    /// 按钮的 `enabled` 只能来自 Rust 投影，**不许在 Slint 里另拼计数**。
+    ///
+    /// 这条是源码级守卫：第三轮复核抓到的正是"Slint 侧自己算 `task-running > 0`"
+    /// 与 `tasks_in_flight` 各说各话。谁再把计数拼回 Slint，这条立刻红。
+    #[test]
+    fn backup_button_enabled_does_not_recompute_busyness_in_slint() {
+        let src = include_str!("../ui/dub_workbench.slint");
+        let at = src
+            .find("text: root.backup-running ? \"备份中…\" : \"一键备份…\";")
+            .expect("备份按钮的文案行必须在（改了就同步改这条用例）");
+        let button = &src[at..(at + 400).min(src.len())];
         assert!(
-            backup_refusal(false, false, true, false, false).is_some(),
-            "台账在飞必须拒绝"
+            button.contains("enabled: !root.backup-blocked;"),
+            "按钮的 enabled 必须直接吃 Rust 投影 backup-blocked：{button}"
         );
-        assert!(
-            backup_refusal(false, false, false, false, false).is_none(),
-            "全空闲时不能把按钮也钉死"
-        );
+        for forbidden in ["root.busy", "task-running", "task-pending", "tasks-busy"] {
+            assert!(
+                !button.contains(forbidden),
+                "按钮不该自己拼忙判据（出现 `{forbidden}`）：{button}"
+            );
+        }
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。

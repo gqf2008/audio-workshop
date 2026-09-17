@@ -193,8 +193,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
     // ── 备份：把工程与自建资产复制成一份自包含目录（M4-P8）──
     in property <string> backup-info: "";
     in property <bool> backup-running: false;
-    /// 台账里还有排队/运行中的任务（歌曲、人声分离、质检只登记台账、不设全局 busy）
-    in property <bool> tasks-busy: false;
+    /// 能不能点备份：**Rust 侧 `backup_blocked` 的投影**，与点击回调同一份判据
+    in property <bool> backup-blocked: false;
     callback backup-all();
 
     // 细分隔线：比面板边框轻，只做分组不制造方框
@@ -378,7 +378,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     PixelButton {
                         width: 120px;
                         text: root.backup-running ? "备份中…" : "一键备份…";
-                        enabled: !root.busy && !root.backup-running && !root.tasks-busy;
+                        enabled: !root.backup-blocked;
                         clicked => { root.backup-all(); }
                     }
                     Rectangle { horizontal-stretch: 1; }
