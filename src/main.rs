@@ -1408,7 +1408,15 @@ struct ServerConfig {
     models: Vec<ServerModel>,
 }
 
-#[derive(serde::Deserialize)]
+/// 模型的「产品层能力 / 硬要求」声明（来自 `config/models.schema.yaml`，
+/// 由 `tools/audio_config.py render` 透传进 server.json）。
+#[derive(serde::Deserialize, Default)]
+struct ModelRequires {
+    #[serde(default)]
+    voice_ref: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
 struct ServerModel {
     id: String,
     #[serde(default)]
@@ -1426,9 +1434,87 @@ struct ServerModel {
     /// 期望字节数（可选）：没有 sha256 时按它核大小。
     #[serde(default)]
     size: Option<u64>,
+    /// 产品层已排除（schema 的 `product_excluded`）：仍然注册（便于上游修好后复测），
+    /// 但**不作为可选项在界面暴露**。真机反例：`audio8-tts-01b` 选中后 HTTP 200
+    /// 却产出听不懂的音频（可懂度 0~3%、时长乱跳），全程无报错 —— 最坏的失败形态。
+    #[serde(default)]
+    product_excluded: bool,
+    /// `offline` / `streaming`（schema 的 `mode`）。
+    #[serde(default)]
+    mode: String,
+    /// 能力角色（schema 的 `role`）：`scoring` / `streaming` / `fast-asr` / …
+    #[serde(default)]
+    role: String,
+    /// 后端硬要求（schema 的 `requires`）：如 index-tts2 的 `voice_ref: true`。
+    #[serde(default)]
+    requires: Option<ModelRequires>,
+    /// 已知缺陷（schema 的 `known_issues`）：在选择处**只读**展示，不参与自动决策。
+    #[serde(default)]
+    known_issues: Vec<String>,
 }
 
-/// 读取 server.json：音色 = task=="tts" 的模型；地址取 AW_SERVER，否则 host:port。
+impl ServerModel {
+    /// 只在流式通道上跑（`/v1/audio/speech/live`）：离线批量与评估不适用，不能当离线引擎选。
+    ///
+    /// `mode` 与 `role` 都可能承载这个信息（schema 里两种写法都出现过：audio8-tts-stream
+    /// 是 `mode: streaming`，audio8-tts-01b-stream 同时有 `mode` 与 `role`），两个都认。
+    fn is_streaming_only(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("streaming") || self.role.eq_ignore_ascii_case("streaming")
+    }
+
+    /// 该引擎是否**必须**提供参考音频（index-tts2：不接 voice_ref 直接报错）。
+    fn requires_voice_ref(&self) -> bool {
+        self.requires.as_ref().is_some_and(|r| r.voice_ref)
+    }
+
+    /// 已知缺陷的一句话只读说明（空 = 没登记）。
+    fn known_issues_note(&self) -> String {
+        self.known_issues.join("；")
+    }
+}
+
+/// 配音可选引擎的**唯一判据**：tts 任务 + 没被产品层排除 + 不是流式专用。
+///
+/// 下拉列表、默认引擎、能力判定都必须走它 —— 别再写第二份过滤
+/// （见 `LESSON_同一语义两处实现必然漂移`：同一语义两份实现必然漂移）。
+fn is_selectable_tts_engine(m: &ServerModel) -> bool {
+    m.task == "tts" && !m.product_excluded && !m.is_streaming_only()
+}
+
+/// 清单里的可选 TTS 引擎 → 音色下拉行（配音「高级 → 引擎」消费它）。
+///
+/// 抽成吃 `&[ServerModel]` 的纯函数：测试可以直接喂合成清单，不必读本机 server.json
+/// （进程里改环境变量是多线程 UB，见 `LESSON_多线程测试中set_var修改进程环境是UB`）。
+fn tts_engine_voices(models: &[ServerModel]) -> Vec<Voice> {
+    models
+        .iter()
+        .filter(|m| is_selectable_tts_engine(m))
+        .map(|m| Voice {
+            name: m.id.clone().into(),
+            engine: format!("{} · 本地", m.family).into(),
+            note: short_path(&m.path).into(),
+            license: "仅自用".into(),
+            requires_voice_ref: m.requires_voice_ref(),
+            known_issues: m.known_issues_note().into(),
+        })
+        .collect()
+}
+
+/// 默认引擎：**按能力**挑第一个"不需要参考音频"的可选引擎（开箱可用），
+/// 全都要参考音时退回第一个。**不写死 id** —— 清单里没有 `audio8-tts` 的机器
+/// （例如只有 index-tts2）也能选到可用 TTS，而不是显示"没有可用音色"。
+fn default_engine_index(voices: &[Voice]) -> i32 {
+    voices
+        .iter()
+        .position(|v| !v.requires_voice_ref)
+        .or_else(|| (!voices.is_empty()).then_some(0))
+        .map(|i| i as i32)
+        .unwrap_or(-1)
+}
+
+/// 读取 server.json：音色 = **可选**的 tts 引擎（判据只有一处，见
+/// `is_selectable_tts_engine`：`product_excluded` 与 streaming-only 不算）；
+/// 地址取 AW_SERVER，否则 host:port。
 /// 文件缺失/解析失败返回空清单 + 原因说明（不 panic：服务没配时界面也可打开）。
 fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
     let cfg_path = config_path();
@@ -1450,17 +1536,7 @@ fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
         Ok(c) => c,
         Err(e) => return (Vec::new(), base, format!("server.json 解析失败: {e}")),
     };
-    let voices = cfg
-        .models
-        .iter()
-        .filter(|m| m.task == "tts")
-        .map(|m| Voice {
-            name: m.id.clone().into(),
-            engine: format!("{} · 本地", m.family).into(),
-            note: short_path(&m.path).into(),
-            license: "仅自用".into(),
-        })
-        .collect();
+    let voices = tts_engine_voices(&cfg.models);
     (voices, base, String::new())
 }
 
@@ -2064,31 +2140,22 @@ fn apply_engine_discovery(ui: &MainWindow, invalidate: Option<(&Sender<Cmd>, &Rc
         .flatten()
         .map(|n| n.to_string());
     let (voices, _, note) = discover_engine();
+
+    // 保留用户上次选的引擎（还在列表里就继续用）；否则**按能力**挑默认，不写死 id。
+    // 必须在 voices 被搬进 VecModel 之前算完。
+    let pick = keep
+        .and_then(|name| voices.iter().position(|v| v.name.as_str() == name.as_str()))
+        .map(|i| i as i32)
+        .unwrap_or_else(|| default_engine_index(&voices));
+
     let names: Vec<SharedString> = voices.iter().map(|v| v.name.clone()).collect();
     ui.set_voice_names(ModelRc::from(Rc::new(VecModel::from(names))));
     ui.set_voices(ModelRc::from(Rc::new(VecModel::from(voices))));
 
-    let pick = keep
-        .and_then(|name| {
-            (0..ui.get_voice_names().row_count()).find(|&i| {
-                ui.get_voice_names()
-                    .row_data(i)
-                    .map(|n| n == name.as_str())
-                    .unwrap_or(false)
-            })
-        })
-        .or_else(|| {
-            (0..ui.get_voice_names().row_count()).find(|&i| {
-                ui.get_voice_names()
-                    .row_data(i)
-                    .map(|n| n == "audio8-tts")
-                    .unwrap_or(false)
-            })
-        })
-        .map(|i| i as i32)
-        .unwrap_or(-1);
     let changed = pick != ui.get_voice_index();
     ui.set_voice_index(pick);
+    // 音乐制作的引擎清单也来自同一份 server.json（task=gen），不写死 yue2 / ace-step
+    refresh_song_engine_options(ui);
     refresh_settings_view(ui);
     refresh_voice_labels(ui);
 
@@ -3764,9 +3831,16 @@ fn worker_loop(ctx: WorkerCtx) {
                     }
                 };
                 let model_id = model.clone();
-                let model = match model.as_str() {
-                    "ace-step" => SongModel::AceStep,
-                    _ => SongModel::Yue2,
+                // 未知 gen 引擎**显式失败**，不静默当 yue2 用（见 song_model_for_id）
+                let model = match song_model_for_id(&model_id) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::SongFailed { task_id, error: e },
+                        });
+                        continue;
+                    }
                 };
                 let options = SongOptions {
                     model,
@@ -4833,6 +4907,52 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             ui.set_status_text(
                 format!("模型下载源：{ready} 个有下载入口 · {missing} 个如实标了没有源").into(),
             );
+        }
+        "engines" => {
+            // 真机核对（不截图）：把**实际清单**算出来的引擎列表打到 stderr。
+            // 数字必须来自真实 server.json，不能是代码里推断的。
+            let models = read_server_config().map(|c| c.models).unwrap_or_default();
+            let voices = tts_engine_voices(&models);
+            let dflt = default_engine_index(&voices);
+            eprintln!("=== 配音引擎下拉 · 清单 {}", config_path().display());
+            eprintln!(
+                "清单里 task==tts 共 {} 个 → 过滤后剩 {} 个",
+                models.iter().filter(|m| m.task == "tts").count(),
+                voices.len()
+            );
+            for (i, v) in voices.iter().enumerate() {
+                eprintln!(
+                    "  [{i}] {} · 要求参考音={} · 默认选中={} · known_issues={:?}",
+                    v.name,
+                    v.requires_voice_ref,
+                    i as i32 == dflt,
+                    v.known_issues
+                );
+                // 开工判据按"当前参考音路径 + 参考文本"实算（通常是空 = 用内置音色）
+                let refp = ui.get_voice_ref_path().to_string();
+                let reft = ui.get_voice_ref_text().to_string();
+                let exists = !refp.trim().is_empty() && std::path::Path::new(&refp).is_file();
+                eprintln!(
+                    "      开工判据（参考音「{}」/ 文本「{}」）：{:?}",
+                    refp,
+                    reft,
+                    voice_readiness(Some(v), &refp, exists, &reft)
+                );
+            }
+            for m in models
+                .iter()
+                .filter(|m| m.task == "tts" && !is_selectable_tts_engine(m))
+            {
+                eprintln!(
+                    "  [不出现在下拉] {} · product_excluded={} · mode={:?} · role={:?}",
+                    m.id, m.product_excluded, m.mode, m.role
+                );
+            }
+            let song = song_engine_options(&models);
+            eprintln!("=== 音乐制作引擎（清单 task==gen）");
+            for o in &song {
+                eprintln!("  {} → {}", o.label, o.id);
+            }
         }
         "voice" => {
             ui.set_dub_voice(true);
@@ -7839,6 +7959,93 @@ fn export_song(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_status_text(format!("歌曲已导出到 {}", dst.display()).into());
 }
 
+// ===========================================================================
+// 音乐制作引擎：清单里的 gen 模型 → 可选引擎
+//
+// 改前是两处硬编码：UI 的 `options: ["yue2（歌词成歌）", "ACE-Step（文生音乐）"]`
+// 与提交时的 `if index == 1 { "ace-step" } else { "yue2" }`，worker 再 `_ => Yue2`
+// 兜底 —— 清单里换个 gen 模型时，用户选的根本不是跑的那个，而且全程无报错。
+// 现在选项、下标 → id、id → 实现都从同一份清单派生（见
+// `LESSON_同一语义两处实现必然漂移`：决定走哪个分支的那个判断也该一起抽）。
+// ===========================================================================
+
+/// App 内置支持的音乐制作引擎（清单缺失时的兜底；也是 id ↔ 展示名的唯一表）。
+const BUILTIN_SONG_ENGINES: [(&str, &str); 2] = [
+    ("yue2", "yue2（歌词成歌）"),
+    ("ace-step", "ACE-Step（文生音乐）"),
+];
+
+/// 一个可选的歌曲引擎：稳定 id + 展示名。
+#[derive(Debug, Clone, PartialEq)]
+struct SongEngineOption {
+    id: String,
+    label: String,
+}
+
+/// 内置引擎的展示名；不在内置表里的 id 用 id 本身当展示名（照样可选，但过不了
+/// `song_model_for_id` —— 会显式报"还没接入"，不静默换引擎）。
+fn builtin_song_label(id: &str) -> Option<&'static str> {
+    BUILTIN_SONG_ENGINES
+        .iter()
+        .find(|(bid, _)| *bid == id)
+        .map(|(_, label)| *label)
+}
+
+/// 音乐制作可选引擎的**唯一清单**：清单里 `task == "gen"`、没被产品层排除、
+/// 不是流式专用的模型。界面选项与"下标 → id"都从它派生。
+///
+/// 清单里一个 gen 模型都没有（服务没配 / 读不到 server.json）时退回
+/// `BUILTIN_SONG_ENGINES`：这是显式的兜底清单，不是静默的引擎替换。
+fn song_engine_options(models: &[ServerModel]) -> Vec<SongEngineOption> {
+    let from_manifest: Vec<SongEngineOption> = models
+        .iter()
+        .filter(|m| m.task == "gen" && !m.product_excluded && !m.is_streaming_only())
+        .map(|m| SongEngineOption {
+            label: builtin_song_label(&m.id)
+                .unwrap_or(m.id.as_str())
+                .to_string(),
+            id: m.id.clone(),
+        })
+        .collect();
+    if from_manifest.is_empty() {
+        BUILTIN_SONG_ENGINES
+            .iter()
+            .map(|(id, label)| SongEngineOption {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect()
+    } else {
+        from_manifest
+    }
+}
+
+/// id → 引擎实现。**未知 id 是显式错误**，不再 `_ => Yue2` 静默兜底：
+/// 清单里换个 gen 模型时，宁可报"这个引擎 App 还没接入"，也不要把请求发到错的
+/// 引擎上 —— 用错引擎出的音频，用户从声音里分辨不出来。
+fn song_model_for_id(id: &str) -> Result<SongModel, String> {
+    match id {
+        "yue2" => Ok(SongModel::Yue2),
+        "ace-step" => Ok(SongModel::AceStep),
+        other => Err(format!(
+            "引擎 {other} 还没有接入音乐制作链路（App 支持：yue2 / ace-step）"
+        )),
+    }
+}
+
+/// 把清单里的歌曲引擎投影到界面（选项文案 + 收窄当前下标）。
+fn refresh_song_engine_options(ui: &MainWindow) {
+    let models = read_server_config().map(|c| c.models).unwrap_or_default();
+    let options = song_engine_options(&models);
+    if options.is_empty() {
+        return;
+    }
+    let labels: Vec<SharedString> = options.iter().map(|o| o.label.clone().into()).collect();
+    ui.set_song_model_options(ModelRc::from(Rc::new(VecModel::from(labels))));
+    let keep = ui.get_song_model_index().max(0) as usize;
+    ui.set_song_model_index(keep.min(options.len() - 1) as i32);
+}
+
 fn wire_song(
     ui: &MainWindow,
     cmd_tx: &Sender<Cmd>,
@@ -7881,17 +8088,33 @@ fn wire_song(
             }
             .into(),
         );
-        let model = if ui.get_song_model_index() == 1 {
-            "ace-step"
-        } else {
-            "yue2"
+        let song_engines =
+            song_engine_options(&read_server_config().map(|c| c.models).unwrap_or_default());
+        let model = usize::try_from(ui.get_song_model_index().max(0))
+            .ok()
+            .and_then(|i| song_engines.get(i))
+            .map(|o| o.id.clone());
+        let Some(model) = model else {
+            ui.set_song_busy(false);
+            ui.set_song_queued(false);
+            let note = "没有可用的音乐制作引擎：先在服务清单里配一个 gen 模型";
+            finish_task(
+                &ui,
+                &state1,
+                &state1.song_task,
+                tasks::TaskState::Failed,
+                note,
+            );
+            ui.set_song_status_text(note.into());
+            ui.set_status_text(note.into());
+            return;
         };
         if tx
             .send(Cmd::RunSong {
                 revision: state1.project_revision.get(),
                 task_id,
                 project_name: file_stem(&ui.get_project_name()),
-                model: model.into(),
+                model,
                 lyrics,
                 style,
             })
@@ -9365,13 +9588,105 @@ fn wire_global_settings(
 
 /// 旁白块头：当前音色名 + 来源 + 阻断原因。只反映“能不能开始配音”这一件事，
 /// 不把“稿件为空”等其它原因混进来（那由主按钮与空态承担）。
+/// 当前引擎 / 参考音频能不能开工 —— **唯一判据**。
+///
+/// 配音主按钮的可用性、块头的阻断提示、内置音色行的可点性都从这一个结果派生，
+/// 不在 Slint 里另拼一套条件（见 `LESSON_同一语义两处实现必然漂移` 的补充实例：
+/// 控件禁用态与真实守卫各算各的，换个演示态就自相矛盾）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceReadiness {
+    /// 可以开工。
+    Ready,
+    /// 一个可选 TTS 引擎都没有（服务清单没配 / 读不到）。
+    NoEngine,
+    /// 填了参考音路径，但文件不在。
+    ReferenceMissing,
+    /// 该引擎**必须**提供参考音（index-tts2：不接 voice_ref 直接报错）。
+    EngineNeedsReference,
+    /// 给了参考音，但还差它的文本：服务端要求 `voice_ref` 与 `reference_text`
+    /// **成对**（真机实测只给路径 → HTTP 500）。
+    ReferenceTextMissing,
+}
+
+impl VoiceReadiness {
+    /// 阻断原因（`Ready` 时为空串）。只留当前最重要的一条。
+    fn note(self) -> &'static str {
+        match self {
+            Self::Ready => "",
+            Self::NoEngine => "没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型",
+            Self::ReferenceMissing => "参考音频不存在或不可读：修正路径后再开始配音",
+            Self::EngineNeedsReference => {
+                "这个引擎必须提供参考音频（不能只用内置音色）：在下面填一段参考 wav 再开始配音"
+            }
+            // 与提交处那次拦截**同一个常量**：界面提示与真正拦住用户的话逐字一致，
+            // 不另写一句（见 LESSON_同一语义两处实现必然漂移）。
+            Self::ReferenceTextMissing => aw_core::MISSING_REFERENCE_TEXT,
+        }
+    }
+}
+
+/// 判据入口：引擎行（可选）+ 参考音路径 / 是否可读 → 能不能开工。
+/// 判据入口：引擎行（可选）+ 参考音路径 / 是否可读 / 参考文本 → 能不能开工。
+///
+/// 四条规则合成**一个**结论，覆盖两组批次各自的语义：
+/// ① 引擎硬要求参考音（audio-workshop 的 `requires.voice_ref`）；
+/// ② 参考音与文本必须成对（voice-clone 批次）。
+/// 文本那条**转调** `reference_text_missing`（它又转调 `aw_core::VoiceClone`），
+/// 不在这里另写一份 trim 判断 —— 两份判据迟早漂移。
+fn voice_readiness(
+    engine: Option<&Voice>,
+    ref_path: &str,
+    ref_exists: bool,
+    ref_text: &str,
+) -> VoiceReadiness {
+    let Some(engine) = engine else {
+        return VoiceReadiness::NoEngine;
+    };
+    let path = ref_path.trim();
+    if !path.is_empty() && !ref_exists {
+        return VoiceReadiness::ReferenceMissing;
+    }
+    if engine.requires_voice_ref && path.is_empty() {
+        return VoiceReadiness::EngineNeedsReference;
+    }
+    let as_opt = |v: &str| non_empty(v.to_string());
+    if reference_text_missing(&as_opt(path), &as_opt(ref_text)) {
+        return VoiceReadiness::ReferenceTextMissing;
+    }
+    VoiceReadiness::Ready
+}
+
+/// 引擎行下面那行**只读**说明：硬要求 + 已知缺陷（都没有就是空串）。
+///
+/// `known_issues` 按 `config/models.schema.yaml` 的产品决策只做展示，
+/// 不参与自动决策（不改产品决策，也不替用户做选择）。
+fn engine_note(engine: Option<&Voice>) -> String {
+    let Some(v) = engine else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if v.requires_voice_ref {
+        parts.push("该引擎必须提供参考音频（不接 voice_ref 会直接报错）".to_string());
+    }
+    if !v.known_issues.is_empty() {
+        parts.push(format!("已知问题：{}", v.known_issues));
+    }
+    parts.join(" · ")
+}
+
 fn refresh_voice_labels(ui: &MainWindow) {
     let idx = ui.get_voice_index();
-    let engine = (idx >= 0)
-        .then(|| ui.get_voice_names().row_data(idx as usize))
-        .flatten()
-        .map(|n| n.to_string());
-    ui.set_engine_label(engine.clone().unwrap_or_default().into());
+    // 选中的引擎行（`Voice` 带能力标记：是否硬要求参考音 + known_issues）。
+    // 显示名与能力取同一行，避免"文案看 A、能力看 B"。
+    let engine_row = (idx >= 0)
+        .then(|| ui.get_voices().row_data(idx as usize))
+        .flatten();
+    ui.set_engine_label(
+        engine_row
+            .as_ref()
+            .map(|v| v.name.clone())
+            .unwrap_or_default(),
+    );
 
     let ref_trimmed = ui.get_voice_ref_path().trim().to_string();
     let ref_text_trimmed = ui.get_voice_ref_text().trim().to_string();
@@ -9393,18 +9708,15 @@ fn refresh_voice_labels(ui: &MainWindow) {
     let exists = !ref_trimmed.is_empty() && Path::new(&ref_trimmed).is_file();
     ui.set_reference_exists(exists);
 
-    // 阻断原因只留当前最重要的一条
-    let hint = if engine.is_none() {
-        "没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型"
-    } else if !ref_trimmed.is_empty() && !exists {
-        "参考音频不存在或不可读：修正路径后再开始配音"
-    } else if !ref_trimmed.is_empty() && ref_text_trimmed.is_empty() {
-        // 只在 UI 里说原因；真正的拦截在提交处（用户看的与拦住他的是同一句话）
-        "克隆音色还缺「参考音频的文本」：点「自动转写」或手填这段音频实际念的内容"
-    } else {
-        ""
-    };
-    ui.set_voice_hint(hint.into());
+    // 判据算一次，UI 只消费：主按钮可用性 / 内置音色行 / 阻断提示同一份结论。
+    // 参考文本那条规则由 `voice_readiness` 内部转调 main 的 `reference_text_missing`
+    // 与 `aw_core`，这里不另写一份 trim 判断（见 LESSON_同一语义两处实现必然漂移）。
+    let readiness = voice_readiness(engine_row.as_ref(), &ref_trimmed, exists, &ref_text_trimmed);
+    let requires_ref = engine_row.as_ref().is_some_and(|v| v.requires_voice_ref);
+    ui.set_engine_requires_voice_ref(requires_ref);
+    ui.set_engine_note(engine_note(engine_row.as_ref()).into());
+    ui.set_dub_voice_ready(readiness == VoiceReadiness::Ready);
+    ui.set_voice_hint(readiness.note().into());
 }
 
 fn selected_model(ui: &MainWindow) -> String {
@@ -10346,9 +10658,7 @@ mod tests {
             task: "tts".into(),
             family: "f".into(),
             path: path.into(),
-            url: String::new(),
-            sha256: String::new(),
-            size: None,
+            ..Default::default()
         };
         let cfg = Some(ServerConfig {
             host: None,
@@ -10368,6 +10678,398 @@ mod tests {
         assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
     }
 
+    // ── 模型暴露与能力契约（批次 cc-ai-audio-workshop-model-exposure）─────────
+    // 每条都写了阳性对照：故意改坏哪一处会让它红（改完已复原）。
+
+    /// 造一条清单模型（只填本批关心的字段，其余取默认）。
+    fn sm(id: &str, task: &str) -> ServerModel {
+        ServerModel {
+            id: id.into(),
+            task: task.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 把清单模型转成"下拉行"（要求它是可选的 tts 引擎）。
+    fn voice_of(m: &ServerModel) -> Voice {
+        tts_engine_voices(std::slice::from_ref(m))
+            .into_iter()
+            .next()
+            .expect("用例前提：这条模型应当是可选的 tts 引擎")
+    }
+
+    /// 验收①：配音引擎下拉**不再**出现 `product_excluded` 与 streaming-only 的模型。
+    ///
+    /// 真机反例：`audio8-tts-01b` 选中后 HTTP 200 却产出听不懂的音频（可懂度 0~3%），
+    /// 全程无报错 —— 最坏的失败形态。
+    ///
+    /// 阳性对照：去掉 `is_selectable_tts_engine` 里的 `!m.product_excluded`
+    /// 或 `!m.is_streaming_only()` → 被排除/流式的 id 立刻回到列表，本用例红。
+    #[test]
+    fn tts_engine_list_drops_product_excluded_and_streaming_only() {
+        let models = vec![
+            sm("audio8-tts", "tts"),
+            ServerModel {
+                product_excluded: true,
+                ..sm("audio8-tts-01b", "tts")
+            },
+            ServerModel {
+                mode: "streaming".into(),
+                ..sm("audio8-tts-stream", "tts")
+            },
+            ServerModel {
+                mode: "streaming".into(),
+                role: "streaming".into(),
+                product_excluded: true,
+                ..sm("audio8-tts-01b-stream", "tts")
+            },
+            sm("index-tts2", "tts"),
+            sm("yue2", "gen"), // 不是 tts：本来就不该出现在配音下拉
+            sm("qwen3-asr", "asr"),
+        ];
+        let names: Vec<String> = tts_engine_voices(&models)
+            .iter()
+            .map(|v| v.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["audio8-tts", "index-tts2"],
+            "只留没被排除、且是离线的 tts 模型"
+        );
+        // role 单独承载流式时也要认（schema 里 audio8-tts-01b-stream 两种都写了）
+        let role_only = vec![ServerModel {
+            role: "streaming".into(),
+            ..sm("stream-only", "tts")
+        }];
+        assert!(
+            tts_engine_voices(&role_only).is_empty(),
+            "role=streaming 也算流式专用"
+        );
+    }
+
+    /// 验收②：引擎硬要求参考音（index-tts2）时不能只用内置音色 —— 判据说清原因。
+    ///
+    /// 阳性对照：删掉 `voice_readiness` 里 `engine.requires_voice_ref` 那一段
+    /// → 第一条断言变 `Ready`，本用例红。
+    #[test]
+    fn engine_requiring_reference_cannot_start_on_builtin_voice() {
+        let needs_ref = ServerModel {
+            requires: Some(ModelRequires { voice_ref: true }),
+            ..sm("index-tts2", "tts")
+        };
+        let v = voice_of(&needs_ref);
+        assert!(v.requires_voice_ref, "能力要跟着行走到判据里");
+
+        assert_eq!(
+            voice_readiness(Some(&v), "", false, ""),
+            VoiceReadiness::EngineNeedsReference
+        );
+        assert!(
+            VoiceReadiness::EngineNeedsReference
+                .note()
+                .contains("必须提供参考音频"),
+            "阻断提示要说清是这个引擎的硬要求"
+        );
+        // 填了路径但文件不在 → 报"路径不对"，不冒充"引擎需要参考音"
+        assert_eq!(
+            voice_readiness(Some(&v), "/tmp/ref.wav", false, "念的内容"),
+            VoiceReadiness::ReferenceMissing
+        );
+        // 参考音存在但**没文本**：服务端要求成对，照样要拦（voice-clone 批次的语义）
+        assert_eq!(
+            voice_readiness(Some(&v), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::ReferenceTextMissing
+        );
+        // 提示语必须是提交处真正拦住用户的那一句（同一个常量，不另写一份）
+        assert_eq!(
+            VoiceReadiness::ReferenceTextMissing.note(),
+            aw_core::MISSING_REFERENCE_TEXT,
+            "界面提示与提交拦截必须逐字一致"
+        );
+        // 路径 + 文本都给全 → 才能开工
+        assert_eq!(
+            voice_readiness(Some(&v), "/tmp/ref.wav", true, "念的内容"),
+            VoiceReadiness::Ready
+        );
+
+        // 反例：不吃参考音的引擎，空参考音就该能开工（过滤器不能顺手把正常引擎也禁了）
+        let plain = voice_of(&sm("audio8-tts", "tts"));
+        assert!(!plain.requires_voice_ref);
+        assert_eq!(
+            voice_readiness(Some(&plain), "", false, ""),
+            VoiceReadiness::Ready
+        );
+        // 但"给了参考音却忘了文本"这条与引擎无关：走克隆就得成对，
+        // 否则服务端每句 500（这是 voice-clone 批次的原始症状）
+        assert_eq!(
+            voice_readiness(Some(&plain), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::ReferenceTextMissing,
+            "不要求参考音的引擎，用户主动给了参考音也必须给文本"
+        );
+        // 一个引擎都没有
+        assert_eq!(
+            voice_readiness(None, "", false, ""),
+            VoiceReadiness::NoEngine
+        );
+    }
+
+    /// 验收②（续）：引擎说明里要带上清单登记的 `known_issues`，且硬要求要点名。
+    #[test]
+    fn engine_note_surfaces_requires_and_known_issues() {
+        let m = ServerModel {
+            requires: Some(ModelRequires { voice_ref: true }),
+            known_issues: vec!["不接 voice_ref 会直接报错".into()],
+            ..sm("index-tts2", "tts")
+        };
+        let note = engine_note(Some(&voice_of(&m)));
+        assert!(note.contains("必须提供参考音频"), "{note}");
+        assert!(note.contains("不接 voice_ref 会直接报错"), "{note}");
+        // 干净引擎没有说明行（不能给所有引擎加噪声）
+        assert_eq!(engine_note(Some(&voice_of(&sm("audio8-tts", "tts")))), "");
+        assert_eq!(engine_note(None), "");
+    }
+
+    /// 验收③：默认引擎**按能力**选，不写死 `audio8-tts`。
+    ///
+    /// 阳性对照：把 `default_engine_index` 改回"找名字等于 audio8-tts"
+    /// （或返回常量 -1）→ 第一条断言红。
+    #[test]
+    fn default_engine_follows_capability_not_a_hardcoded_id() {
+        // 清单里没有 audio8-tts（只有 index-tts2）→ 仍要选得到一个可用 TTS
+        let only_index = vec![voice_of(&ServerModel {
+            requires: Some(ModelRequires { voice_ref: true }),
+            ..sm("index-tts2", "tts")
+        })];
+        assert_eq!(
+            default_engine_index(&only_index),
+            0,
+            "清单里没有 audio8-tts 时也要能选到可用 TTS（改前会显示「没有可用音色」）"
+        );
+
+        // 都在时优先"免参考音"的那个：新用户第一次进来就能直接合成
+        let both = vec![
+            voice_of(&ServerModel {
+                requires: Some(ModelRequires { voice_ref: true }),
+                ..sm("index-tts2", "tts")
+            }),
+            voice_of(&sm("audio8-tts", "tts")),
+        ];
+        assert_eq!(
+            default_engine_index(&both),
+            1,
+            "优先开箱可用的引擎（不需要参考音）"
+        );
+
+        // 全都要参考音时退回第一个，而不是 -1
+        let all_need_ref = vec![voice_of(&ServerModel {
+            requires: Some(ModelRequires { voice_ref: true }),
+            ..sm("index-tts2", "tts")
+        })];
+        assert_eq!(default_engine_index(&all_need_ref), 0);
+        assert_eq!(default_engine_index(&[]), -1, "一个引擎都没有才是 -1");
+    }
+
+    /// 验收④：清单里出现未知 gen 引擎时**显式报错**，不静默当 yue2 跑。
+    ///
+    /// 阳性对照：把 `song_model_for_id` 的 `other => Err(..)` 改回
+    /// `_ => Ok(SongModel::Yue2)` → 第三条断言红。
+    #[test]
+    fn unknown_song_engine_is_an_explicit_error_not_a_silent_yue2() {
+        assert_eq!(song_model_for_id("yue2"), Ok(SongModel::Yue2));
+        assert_eq!(song_model_for_id("ace-step"), Ok(SongModel::AceStep));
+        let err = song_model_for_id("experimental-gen").expect_err("未知引擎不能有实现");
+        assert!(
+            err.contains("experimental-gen"),
+            "错误要点名是哪个引擎：{err}"
+        );
+        assert!(err.contains("还没有接入"), "{err}");
+    }
+
+    /// 验收④（续）：歌曲引擎选项来自清单（含展示名），清单为空才退回内置清单。
+    #[test]
+    fn song_engine_options_come_from_the_manifest() {
+        let models = vec![
+            sm("ace-step", "gen"),
+            sm("yue2", "gen"),
+            sm("experimental-gen", "gen"),
+            sm("audio8-tts", "tts"), // 不是 gen
+            ServerModel {
+                product_excluded: true,
+                ..sm("excluded-gen", "gen")
+            },
+            ServerModel {
+                mode: "streaming".into(),
+                ..sm("stream-gen", "gen")
+            },
+        ];
+        let opts = song_engine_options(&models);
+        assert_eq!(
+            opts.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            vec!["ace-step", "yue2", "experimental-gen"],
+            "顺序跟清单走；被排除/流式的 gen 不进列表"
+        );
+        assert_eq!(
+            opts[0].label, "ACE-Step（文生音乐）",
+            "内置引擎用友好展示名"
+        );
+        assert_eq!(
+            opts[2].label, "experimental-gen",
+            "表里没有的用 id 当展示名"
+        );
+
+        // 清单里一个 gen 都没有 → 退回内置清单。**不能返回空列表**：
+        // Slint 的 PixelSegmentedControl 宽度按 options.length 做除数。
+        let fallback = song_engine_options(&[]);
+        assert_eq!(
+            fallback.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            vec!["yue2", "ace-step"]
+        );
+        // 兜底清单本身也要能过 id → 实现（不然 UI 选得到、提交时才发现不支持）
+        for o in &fallback {
+            assert!(
+                song_model_for_id(&o.id).is_ok(),
+                "兜底项 {} 必须真支持",
+                o.id
+            );
+        }
+    }
+
+    /// **清单键名契约**：`server.json` 的键名 → `ServerModel` 的 serde 字段名必须一一对上。
+    ///
+    /// 单独立一条的理由：Python 侧（`tools/audio_config.py::to_server`）与这里的字段名
+    /// 一旦漂移（`requires` 改名、`requires.voice_ref` 换键、`known_issues` 拼错），
+    /// serde 会**静默**取默认值 —— 于是"被排除的模型"照旧出现在下拉里、
+    /// "引擎硬要求参考音"这条规则悄悄消失。那正是本批要修的最坏形态
+    /// （选了不报错、产出听不懂的音频），而**纯函数用例永远发现不了**：
+    /// 它们喂的是 Rust 结构体，不经过 JSON。
+    ///
+    /// 阳性对照：把 `ServerModel` 的 `requires` 改成 `#[serde(rename = "requiresX")]`
+    /// （或把 `ModelRequires::voice_ref` 改名）→ 本用例红。
+    #[test]
+    fn server_json_keys_match_the_serde_field_names() {
+        // 与真实 server.json 形状一致的最小片段（键名逐字取自 schema 的渲染落点）
+        let raw = r#"{
+            "host": "127.0.0.1",
+            "port": 8080,
+            "models": [
+                {
+                    "id": "audio8-tts-01b",
+                    "task": "tts",
+                    "family": "audio8_tts",
+                    "path": "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
+                    "mode": "offline",
+                    "product_excluded": true
+                },
+                {
+                    "id": "index-tts2",
+                    "task": "tts",
+                    "family": "index_tts2",
+                    "path": "/models/IndexTTS2.5-GGUF/i.gguf",
+                    "mode": "offline",
+                    "requires": { "voice_ref": true },
+                    "known_issues": ["不接 voice_ref 会直接报错"]
+                },
+                {
+                    "id": "audio8-tts-01b-stream",
+                    "task": "tts",
+                    "family": "audio8_tts",
+                    "path": "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
+                    "mode": "streaming",
+                    "role": "streaming",
+                    "product_excluded": true
+                },
+                {
+                    "id": "qwen3-asr",
+                    "task": "asr",
+                    "family": "qwen3_asr",
+                    "path": "/models/Qwen3-ASR-0.6B-GGUF/q.gguf",
+                    "mode": "offline",
+                    "role": "scoring"
+                }
+            ]
+        }"#;
+
+        let cfg: ServerConfig = serde_json::from_str(raw).expect("最小清单要能解析");
+        assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cfg.port, Some(8080));
+        assert_eq!(cfg.models.len(), 4);
+
+        assert!(
+            cfg.models[0].product_excluded,
+            "product_excluded 必须解析到（漂移就会静默变成 false=照旧暴露）"
+        );
+        assert!(
+            cfg.models[1].requires_voice_ref(),
+            "requires.voice_ref 必须解析到（漂移就会静默变成 false=不拦）"
+        );
+        assert_eq!(
+            cfg.models[1].known_issues_note(),
+            "不接 voice_ref 会直接报错",
+            "known_issues 必须解析到（漂移就会静默变成空）"
+        );
+        assert!(
+            cfg.models[2].is_streaming_only(),
+            "mode / role = streaming 必须解析到"
+        );
+        assert_eq!(cfg.models[3].role, "scoring", "role 必须解析到");
+
+        // 端到端：判据作用在"从 JSON 来的"清单上，结果要和 Rust 结构体的一致
+        let names: Vec<String> = tts_engine_voices(&cfg.models)
+            .iter()
+            .map(|v| v.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["index-tts2"],
+            "JSON 来的清单走同一条过滤：0.1b 被排除、stream 只走流式"
+        );
+        assert!(
+            tts_engine_voices(&cfg.models)[0].requires_voice_ref,
+            "能力也要穿过 JSON 到达下拉行"
+        );
+    }
+
+    /// 源码级守卫：配音主按钮的可用性必须**消费 Rust 的投影**，不能在 Slint 里
+    /// 重拼条件（改前是 `root.voice-index >= 0`，于是"这个引擎必须给参考音"
+    /// 这条能力在按钮可用性上完全看不见）。
+    ///
+    /// 阳性对照：把 app.slint 那行改回 `voice-ready: root.voice-index >= 0;`
+    /// → 本用例红（见 `LESSON_同一语义两处实现必然漂移` 的补充实例）。
+    #[test]
+    fn dub_voice_ready_is_projected_not_recomputed_in_slint() {
+        let app = include_str!("../ui/app.slint");
+        assert!(
+            app.contains("voice-ready: root.dub-voice-ready;"),
+            "配音主按钮的可用性要消费 Rust 侧投影"
+        );
+        assert!(
+            !app.contains("voice-ready: root.voice-index >= 0;"),
+            "不许在 Slint 里重拼『有引擎就绪』——那会漏掉引擎的能力要求"
+        );
+    }
+
+    /// 源码级守卫：内置默认音色行的文案与可点性都要由**引擎能力**驱动，
+    /// 不能再是"对任何引擎都说免参考音、开箱可用"的常量。
+    ///
+    /// 阳性对照：把 `enabled` 里的 `&& !root.engine-requires-voice-ref` 删掉
+    /// → 本用例红。
+    #[test]
+    fn builtin_voice_row_is_gated_by_engine_capability() {
+        let picker = include_str!("../ui/voice_picker.slint");
+        assert!(
+            picker.contains("in property <bool> engine-requires-voice-ref"),
+            "音色区要接收引擎能力"
+        );
+        assert!(
+            picker.contains("&& !root.engine-requires-voice-ref;"),
+            "硬要求参考音的引擎必须把内置音色行置灰"
+        );
+        assert!(
+            picker.contains("该引擎必须提供参考音频，不能用内置音色"),
+            "文案要说清是引擎的硬要求"
+        );
+    }
+
     /// `..` 与软链都要按**真实路径**算（LESSON：路径包含判定必须按真实路径）：
     /// 词法比较会把 `/models/x/../in/y.gguf` 判成"不在 /models 里"、把"经软链指向模型目录"
     /// 的路径也判成不在——模型盘明明挂了却显示没挂。
@@ -10382,8 +11084,7 @@ mod tests {
             family: "f".into(),
             path,
             url: String::new(),
-            sha256: String::new(),
-            size: None,
+            ..Default::default()
         };
 
         let cfg_with = |id: &str, path: String| {
@@ -14332,9 +15033,7 @@ mod tests {
             task: task.into(),
             family: "f".into(),
             path: path.into(),
-            url: String::new(),
-            sha256: String::new(),
-            size: None,
+            ..Default::default()
         };
         let cfg = ServerConfig {
             host: None,

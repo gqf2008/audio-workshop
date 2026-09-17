@@ -148,6 +148,12 @@ def to_server(cfg):
              "mode": m.get("mode", "offline")}
         if m.get("session_options"): e["session_options"] = m["session_options"]
         if m.get("product_excluded"): e["product_excluded"] = True   # 产品层据此不在 UI 暴露
+        # 产品层的能力/硬要求也必须透传：App 只读 server.json，不透传的话
+        # 「index-tts2 必须给参考音」「qwen3-asr 是打分模型」这类契约到不了界面
+        # （本机实测缺口：server.json 里只有 mode / product_excluded）。
+        if m.get("role"): e["role"] = m["role"]
+        if m.get("requires"): e["requires"] = m["requires"]
+        if m.get("known_issues"): e["known_issues"] = m["known_issues"]
         models.append(e)
     rt = cfg.get("runtime", {})
     return {
