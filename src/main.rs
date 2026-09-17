@@ -3913,15 +3913,10 @@ fn worker_loop(ctx: WorkerCtx) {
                 }
                 // 把"这次没评上、但旧分仍在工程里"的句子也纳入 scores：UI 之后是整体替换，
                 // 少给就会让磁盘有分、界面没分（复核抓到的不一致）。
-                for sen in &project.sentences {
-                    if let Some(percent) = sen.eval_percent {
-                        if sen.status == "done" && !scores.iter().any(|(i, _, _)| *i == sen.index) {
-                            // 带上这份分**原本**的来源：本轮没测到而沿用的旧分，
-                            // 来源是它当年那次质检的模型，不是本轮这个 `model`。
-                            scores.push((sen.index, percent, sen.eval_model.clone()));
-                        }
-                    }
-                }
+                // 来源规则（必须带**当年的**模型，不是本轮这个）在 `carried_over_scores` 里，
+                // 那里有隔离用例。
+                let carried = carried_over_scores(&project, &scores);
+                scores.extend(carried);
                 // 分数落盘：失败不算质检失败（分数本身有效），但要如实报出来
                 let saved = project.save(&dir);
                 let mut warnings: Vec<String> = Vec::new();
@@ -6681,6 +6676,35 @@ fn run_finished_note(
 ///
 /// 每项带 `Option<String>` 的来源模型。**旧工程缺这个字段时是 `None`，要保持 `None`**：
 /// 那是"来源未知"，不是"没测过"（没测过由 `eval_percent == None` 表达，根本不在这里）。
+/// 本轮**没评上、但旧分仍在工程里**的那些句子 → 补进本次结果。
+///
+/// 关键在来源：这些分是**当年那次质检**测的，来源必须用 `sen.eval_model` **原样带回**，
+/// 不能盖成本轮这个 `model`。盖错的形态是"冒充匹配"——部分 ASR 失败 + 用户换过回读模型时，
+/// 界面会对那几句说「现有的分数就是 <本轮模型> 测的」，而这正是 `eval_model` 要消灭的假结论。
+///
+/// 抽成纯函数是为了给它测试隔离：原先这段内联在 worker 的评测循环里，
+/// 把它改成 `Some(model.clone())` 整仓用例**一条都不红**（复核实测的零覆盖）。
+fn carried_over_scores(
+    project: &Project,
+    already_scored: &[(usize, f64, Option<String>)],
+) -> Vec<(usize, f64, Option<String>)> {
+    let mut out = Vec::new();
+    for sen in &project.sentences {
+        let Some(percent) = sen.eval_percent else {
+            continue;
+        };
+        // 与 `eval_ledger_from_project` 同一条口径：只认 done，失败/待合成的旧分不贴
+        if sen.status != "done" {
+            continue;
+        }
+        if already_scored.iter().any(|(i, _, _)| *i == sen.index) {
+            continue;
+        }
+        out.push((sen.index, percent, sen.eval_model.clone()));
+    }
+    out
+}
+
 fn eval_ledger_from_project(project: &Project) -> Vec<(usize, f64, Option<String>)> {
     project
         .sentences
@@ -14833,6 +14857,53 @@ mod tests {
 
     /// 从工程取质检台账：只接受「已合成」的句子（失败句即使文件里留着旧分也不贴），
     /// 并且**带上这份分的来源模型**——`None`（旧记录）要原样保留，不能顺手填成当前模型。
+    /// 沿用旧分时必须带上**它当年的来源**，不能盖成本轮模型。
+    ///
+    /// 复核实测：这段原先内联在 worker 循环里，改成 `Some(model.clone())` 之后整仓
+    /// **一条都不红**（零覆盖）——而失败的形态正是本批要消灭的：部分 ASR 失败 + 换了
+    /// 回读模型时，界面会对那几句说「现有的分数就是 <本轮模型> 测的」，冒充匹配而且是假的。
+    #[test]
+    fn carried_over_scores_keep_their_original_source_model() {
+        let mut prj = Project::new(
+            "第一句。第二句。第三句。",
+            "audio8-tts",
+            GAP_MS,
+            BASE_SEED,
+            None,
+            DEFAULT_PUNCTUATION,
+            MAX_CHARS,
+            |t| t.to_string(),
+        );
+        for s in prj.sentences.iter_mut() {
+            s.status = "done".into();
+        }
+        // 第 0 句：本轮没评上（不在 already_scored 里），旧分是 fun-asr 当年测的
+        prj.sentences[0].eval_percent = Some(70.0);
+        prj.sentences[0].eval_model = Some("fun-asr".into());
+        // 第 1 句：本轮评上了，来源是本轮的 audio8-asr
+        prj.sentences[1].eval_percent = Some(88.0);
+        prj.sentences[1].eval_model = Some("audio8-asr".into());
+        // 第 2 句：没测过 → 不该被沿用
+        prj.sentences[2].eval_percent = None;
+
+        let already = vec![(1usize, 88.0, Some("audio8-asr".to_string()))];
+        let carried = carried_over_scores(&prj, &already);
+
+        assert_eq!(carried.len(), 1, "只有第 0 句该被沿用：{carried:?}");
+        assert_eq!(carried[0].0, 0);
+        assert_eq!(carried[0].1, 70.0);
+        assert_eq!(
+            carried[0].2.as_deref(),
+            Some("fun-asr"),
+            "沿用旧分要带它**当年的来源**"
+        );
+        assert_ne!(
+            carried[0].2.as_deref(),
+            Some("audio8-asr"),
+            "不能把旧分冒充成本轮模型测的"
+        );
+    }
+
     #[test]
     fn eval_ledger_from_project_keeps_only_done_sentences_and_their_source() {
         let mut prj = Project::new(
