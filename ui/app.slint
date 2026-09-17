@@ -23,14 +23,14 @@ import {
     PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
-import { BatchRow, Sentence, TaskRow, Voice } from "model.slint";
+import { BatchRow, Sentence, TaskRow, VersionRow, Voice } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { VoiceDesignTab } from "extra_tabs.slint";
 import { SeparationWorkbench } from "separation_workbench.slint";
 import { SongWorkbench } from "song_workbench.slint";
 
-export { BatchRow, Sentence, TaskRow, Voice } from "model.slint";
+export { BatchRow, Sentence, TaskRow, VersionRow, Voice } from "model.slint";
 
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
@@ -73,6 +73,13 @@ export component MainWindow inherits Window {
     in-out property <bool> auto-normalize: true;
     /// 句间停顿（毫秒）：配音独有，放本页「高级」
     in-out property <string> gap-ms-text: "250";
+    // ── 工程版本（P3）：留档 / 对比 / 回滚 ──
+    in property <[VersionRow]> version-rows: [];
+    in property <string> version-status: "还没有留档";
+    in property <string> version-diff-text: "";
+    in-out property <string> version-label-text: "";
+    in-out property <bool> version-open: false;
+
     /// 模板（P2）：名字来自 templates.json，选中项与名字输入都由 Rust 侧维护
     in property <[string]> template-names: [];
     in-out property <int> template-index: -1;
@@ -212,6 +219,9 @@ export component MainWindow inherits Window {
     callback redo-one(int);
     callback speed-changed(float);
     callback gap-edited();
+    callback version-save();
+    callback version-diff(string);
+    callback version-rollback(string);
     callback template-apply();
     callback template-save();
     callback template-delete();
@@ -368,6 +378,14 @@ export component MainWindow inherits Window {
                     template-apply => { root.template-apply(); }
                     template-save => { root.template-save(); }
                     template-delete => { root.template-delete(); }
+                    version-rows: root.version-rows;
+                    version-status: root.version-status;
+                    version-diff-text: root.version-diff-text;
+                    version-label-text <=> root.version-label-text;
+                    version-open <=> root.version-open;
+                    version-save => { root.version-save(); }
+                    version-diff(id) => { root.version-diff(id); }
+                    version-rollback(id) => { root.version-rollback(id); }
 
                     progress: root.progress;
                     has-result: root.has-result;
