@@ -1,0 +1,1463 @@
+{
+  "models": [
+    {
+      "entry": {
+        "default": false,
+        "display_name": "ACE-Step 1.5 Turbo Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
+            "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "ace_step_turbo_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "audio-cpp/audio.cpp-gguf",
+        "revision": "main",
+        "target_directory": "ACE-Step1.5-GGUF"
+      },
+      "family": "ace_step",
+      "id": "ace-step",
+      "note": "落点精确匹配：ace_step_turbo_q8_0",
+      "packages": [
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 Turbo Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_turbo_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": true,
+          "display_name": "ACE-Step 1.5 Turbo BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_turbo_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 Base Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_base_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 Base BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_base_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 XL Turbo BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf",
+              "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_xl_turbo_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "CaptainArni/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 XL SFT BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf",
+              "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_xl_sft_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "CaptainArni/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 XL Turbo Q8_0 DiT GGUF (BF16 planner)",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf",
+              "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_xl_turbo_q8dit",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "CaptainArni/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "ACE-Step 1.5 XL SFT Q8_0 DiT GGUF (BF16 planner)",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf",
+              "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "ace_step_xl_sft_q8dit",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "CaptainArni/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "ACE-Step1.5-GGUF"
+        }
+      ],
+      "path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
+      "spec": "ace_step.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": null,
+      "family": "audio8_asr",
+      "id": "audio8-asr",
+      "note": "没有落点等于 Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf 的包（该 family 的可下载包：audio8_asr_0_1b_safetensors） —— 暂无下载入口，不猜地址",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Audio8-ASR-0.1B Q8_0 GGUF",
+          "downloadable": false,
+          "files": [
+            {
+              "remote_path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf",
+              "url": null
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "audio8_asr_0_1b_q8_0",
+          "kind": "unsupported",
+          "local_paths": [
+            "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "CC-BY-NC-4.0 checkpoint: convert locally with audiocpp_gguf; no public audio.cpp GGUF distribution is approved.",
+          "repo": "",
+          "revision": "",
+          "target_directory": "Audio8-ASR-0.1B-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Audio8-ASR-0.1B F16 GGUF",
+          "downloadable": false,
+          "files": [
+            {
+              "remote_path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-f16.gguf",
+              "url": null
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "audio8_asr_0_1b_f16",
+          "kind": "unsupported",
+          "local_paths": [
+            "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "CC-BY-NC-4.0 checkpoint: convert locally with audiocpp_gguf; no public audio.cpp GGUF distribution is approved.",
+          "repo": "",
+          "revision": "",
+          "target_directory": "Audio8-ASR-0.1B-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Audio8-ASR-0.1B HF Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "config.json",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/config.json"
+            },
+            {
+              "remote_path": "generation_config.json",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/generation_config.json"
+            },
+            {
+              "remote_path": "preprocessor_config.json",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/preprocessor_config.json"
+            },
+            {
+              "remote_path": "tokenizer.json",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/tokenizer.json"
+            },
+            {
+              "remote_path": "tokenizer_config.json",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/tokenizer_config.json"
+            },
+            {
+              "remote_path": "vocab.json",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/vocab.json"
+            },
+            {
+              "remote_path": "merges.txt",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/merges.txt"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/model.safetensors"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "audio8_asr_0_1b_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Audio8-ASR-0.1B-hf/config.json",
+            "Audio8-ASR-0.1B-hf/generation_config.json",
+            "Audio8-ASR-0.1B-hf/preprocessor_config.json",
+            "Audio8-ASR-0.1B-hf/tokenizer.json",
+            "Audio8-ASR-0.1B-hf/tokenizer_config.json",
+            "Audio8-ASR-0.1B-hf/vocab.json",
+            "Audio8-ASR-0.1B-hf/merges.txt",
+            "Audio8-ASR-0.1B-hf/model.safetensors"
+          ],
+          "precision": "bfloat16",
+          "reason": "CC-BY-NC-4.0 checkpoint: convert locally with audiocpp_gguf; no public audio.cpp GGUF distribution is approved.",
+          "repo": "Audio8/Audio8-ASR-0.1B",
+          "revision": "main",
+          "target_directory": "Audio8-ASR-0.1B-hf"
+        }
+      ],
+      "path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf",
+      "spec": "audio8_asr.json",
+      "status": "no-source"
+    },
+    {
+      "entry": {
+        "default": true,
+        "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+            "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "audio8_tts_preview_0_6b_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "js-byte/Audio8-TTS-Preview-0.6b-GGUF",
+        "revision": "main",
+        "target_directory": "Audio8-TTS-Preview-0.6B-GGUF"
+      },
+      "family": "audio8_tts",
+      "id": "audio8-tts",
+      "note": "落点精确匹配：audio8_tts_preview_0_6b_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "audio8_tts_preview_0_6b_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "js-byte/Audio8-TTS-Preview-0.6b-GGUF",
+          "revision": "main",
+          "target_directory": "Audio8-TTS-Preview-0.6B-GGUF"
+        }
+      ],
+      "path": "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf",
+      "spec": "audio8_tts.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": null,
+      "family": "audio8_tts",
+      "id": "audio8-tts-01b",
+      "note": "没有落点等于 Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf 的包（该 family 的可下载包：audio8_tts_preview_0_6b_q8_0） —— 暂无下载入口，不猜地址",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "audio8_tts_preview_0_6b_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "js-byte/Audio8-TTS-Preview-0.6b-GGUF",
+          "revision": "main",
+          "target_directory": "Audio8-TTS-Preview-0.6B-GGUF"
+        }
+      ],
+      "path": "Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf",
+      "spec": "audio8_tts.json",
+      "status": "no-source"
+    },
+    {
+      "entry": null,
+      "family": "audio8_tts",
+      "id": "audio8-tts-01b-stream",
+      "note": "没有落点等于 Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf 的包（该 family 的可下载包：audio8_tts_preview_0_6b_q8_0） —— 暂无下载入口，不猜地址",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "audio8_tts_preview_0_6b_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "js-byte/Audio8-TTS-Preview-0.6b-GGUF",
+          "revision": "main",
+          "target_directory": "Audio8-TTS-Preview-0.6B-GGUF"
+        }
+      ],
+      "path": "Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf",
+      "spec": "audio8_tts.json",
+      "status": "no-source"
+    },
+    {
+      "entry": {
+        "default": true,
+        "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+            "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "audio8_tts_preview_0_6b_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "js-byte/Audio8-TTS-Preview-0.6b-GGUF",
+        "revision": "main",
+        "target_directory": "Audio8-TTS-Preview-0.6B-GGUF"
+      },
+      "family": "audio8_tts",
+      "id": "audio8-tts-stream",
+      "note": "落点精确匹配：audio8_tts_preview_0_6b_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Audio8 TTS Preview 0.6B Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "audio8_tts_preview_0_6b_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "js-byte/Audio8-TTS-Preview-0.6b-GGUF",
+          "revision": "main",
+          "target_directory": "Audio8-TTS-Preview-0.6B-GGUF"
+        }
+      ],
+      "path": "Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf",
+      "spec": "audio8_tts.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": {
+        "default": true,
+        "display_name": "Fun-ASR-Nano-2512 Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "fun-asr-nano-2512-q8_0.gguf",
+            "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "fun_asr_nano_2512_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Fun-ASR-Nano-2512-GGUF/fun-asr-nano-2512-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "FunAudioLLM/Fun-ASR-Nano-2512-GGUF",
+        "revision": "ce72677f84900f0dc57f498ace253bfb3c9155b6",
+        "target_directory": "Fun-ASR-Nano-2512-GGUF"
+      },
+      "family": "fun_asr_nano",
+      "id": "fun-asr",
+      "note": "落点精确匹配：fun_asr_nano_2512_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Fun-ASR-Nano-2512 Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "fun-asr-nano-2512-q8_0.gguf",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "fun_asr_nano_2512_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Fun-ASR-Nano-2512-GGUF/fun-asr-nano-2512-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "FunAudioLLM/Fun-ASR-Nano-2512-GGUF",
+          "revision": "ce72677f84900f0dc57f498ace253bfb3c9155b6",
+          "target_directory": "Fun-ASR-Nano-2512-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Fun-ASR-Nano-2512 F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "fun-asr-nano-2512-f16.gguf",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "fun_asr_nano_2512_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Fun-ASR-Nano-2512-GGUF/fun-asr-nano-2512-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "FunAudioLLM/Fun-ASR-Nano-2512-GGUF",
+          "revision": "ce72677f84900f0dc57f498ace253bfb3c9155b6",
+          "target_directory": "Fun-ASR-Nano-2512-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Fun-ASR-Nano-2512 HF Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "chat_template.jinja",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/chat_template.jinja"
+            },
+            {
+              "remote_path": "config.json",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/config.json"
+            },
+            {
+              "remote_path": "generation_config.json",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/generation_config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/model.safetensors"
+            },
+            {
+              "remote_path": "processor_config.json",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/processor_config.json"
+            },
+            {
+              "remote_path": "tokenizer.json",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/tokenizer.json"
+            },
+            {
+              "remote_path": "tokenizer_config.json",
+              "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/tokenizer_config.json"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "fun_asr_nano_2512_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Fun-ASR-Nano-2512-hf/chat_template.jinja",
+            "Fun-ASR-Nano-2512-hf/config.json",
+            "Fun-ASR-Nano-2512-hf/generation_config.json",
+            "Fun-ASR-Nano-2512-hf/model.safetensors",
+            "Fun-ASR-Nano-2512-hf/processor_config.json",
+            "Fun-ASR-Nano-2512-hf/tokenizer.json",
+            "Fun-ASR-Nano-2512-hf/tokenizer_config.json"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "FunAudioLLM/Fun-ASR-Nano-2512-hf",
+          "revision": "854d88f94205cd17d2afdb24332130d86fbe654a",
+          "target_directory": "Fun-ASR-Nano-2512-hf"
+        }
+      ],
+      "path": "Fun-ASR-Nano-2512-GGUF/fun-asr-nano-2512-q8_0.gguf",
+      "spec": "fun_asr_nano.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": {
+        "default": false,
+        "display_name": "IndexTTS2.5 Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
+            "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "index_tts2_5_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "audio-cpp/audio.cpp-gguf",
+        "revision": "main",
+        "target_directory": "IndexTTS2.5-GGUF"
+      },
+      "family": "index_tts2",
+      "id": "index-tts2",
+      "note": "落点精确匹配：index_tts2_5_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "IndexTTS2 Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "IndexTTS2-GGUF/index-tts2-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "index_tts2_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS2-GGUF/index-tts2-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "IndexTTS2-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "IndexTTS2 F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "IndexTTS2-GGUF/index-tts2-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "index_tts2_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS2-GGUF/index-tts2-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "IndexTTS2-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "IndexTTS2 Original-Dtype GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "IndexTTS2-GGUF/index-tts2-orig.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-orig.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "index_tts2_orig",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS2-GGUF/index-tts2-orig.gguf"
+          ],
+          "precision": "orig",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "IndexTTS2-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "IndexTTS2 Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "config.yaml",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/config.yaml"
+            },
+            {
+              "remote_path": "bpe.model",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/bpe.model"
+            },
+            {
+              "remote_path": "gpt.safetensors",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/gpt.safetensors"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "index_tts2_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS-2/config.yaml",
+            "IndexTTS-2/bpe.model",
+            "IndexTTS-2/gpt.safetensors"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "mlx-community/index-tts2-mlx",
+          "revision": "main",
+          "target_directory": "IndexTTS-2"
+        },
+        {
+          "default": false,
+          "display_name": "IndexTTS2.5 Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "index_tts2_5_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "IndexTTS2.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "IndexTTS2.5 F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "index_tts2_5_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS2.5-GGUF/index-tts2_5-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "IndexTTS2.5-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "IndexTTS2.5 Original-Dtype GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-orig.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-orig.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "index_tts2_5_orig",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "IndexTTS2.5-GGUF/index-tts2_5-orig.gguf"
+          ],
+          "precision": "orig",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "IndexTTS2.5-GGUF"
+        }
+      ],
+      "path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
+      "spec": "index_tts2.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": {
+        "default": false,
+        "display_name": "Qwen3-ASR 0.6B Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+            "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "qwen3_asr_0_6b_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "audio-cpp/audio.cpp-gguf",
+        "revision": "main",
+        "target_directory": "Qwen3-ASR-0.6B-GGUF"
+      },
+      "family": "qwen3_asr",
+      "id": "qwen3-asr",
+      "note": "落点精确匹配：qwen3_asr_0_6b_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Qwen3-ASR 1.7B Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_asr_1_7b_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-ASR-1.7B-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Qwen3-ASR 1.7B F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_asr_1_7b_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-ASR-1.7B-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Qwen3-ASR 0.6B Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_asr_0_6b_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-ASR-0.6B-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Qwen3-ASR 0.6B F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_asr_0_6b_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-ASR-0.6B-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Qwen3-ASR 1.7B HF Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/config.json"
+            },
+            {
+              "remote_path": "generation_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/generation_config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/model.safetensors"
+            },
+            {
+              "remote_path": "processor_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/processor_config.json"
+            },
+            {
+              "remote_path": "tokenizer_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/tokenizer_config.json"
+            },
+            {
+              "remote_path": "tokenizer.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/tokenizer.json"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "qwen3_asr_1_7b_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-ASR-1.7B-hf/config.json",
+            "Qwen3-ASR-1.7B-hf/generation_config.json",
+            "Qwen3-ASR-1.7B-hf/model.safetensors",
+            "Qwen3-ASR-1.7B-hf/processor_config.json",
+            "Qwen3-ASR-1.7B-hf/tokenizer_config.json",
+            "Qwen3-ASR-1.7B-hf/tokenizer.json"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "Qwen/Qwen3-ASR-1.7B-hf",
+          "revision": "main",
+          "target_directory": "Qwen3-ASR-1.7B-hf"
+        },
+        {
+          "default": false,
+          "display_name": "Qwen3-ASR 0.6B Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/config.json"
+            },
+            {
+              "remote_path": "generation_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/generation_config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/model.safetensors"
+            },
+            {
+              "remote_path": "preprocessor_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/preprocessor_config.json"
+            },
+            {
+              "remote_path": "tokenizer_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/tokenizer_config.json"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "qwen3_asr_0_6b_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-ASR-0.6B/config.json",
+            "Qwen3-ASR-0.6B/generation_config.json",
+            "Qwen3-ASR-0.6B/model.safetensors",
+            "Qwen3-ASR-0.6B/preprocessor_config.json",
+            "Qwen3-ASR-0.6B/tokenizer_config.json"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "Qwen/Qwen3-ASR-0.6B",
+          "revision": "main",
+          "target_directory": "Qwen3-ASR-0.6B"
+        }
+      ],
+      "path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+      "spec": "qwen3_asr.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": null,
+      "family": "sheetsage2",
+      "id": "sheetsage2",
+      "note": "上游 model_specs 里没有 family=sheetsage2 的 spec —— 暂无下载源，不猜地址",
+      "packages": [],
+      "path": "SheetSage2-GGUF/sheetsage2-orig.gguf",
+      "spec": "",
+      "status": "no-source"
+    },
+    {
+      "entry": {
+        "default": true,
+        "display_name": "Sortformer Diar 4spk v1 Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
+            "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "sortformer_diar_4spk_v1_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "audio-cpp/audio.cpp-gguf",
+        "revision": "main",
+        "target_directory": "Sortformer-Diar-4spk-v1-GGUF"
+      },
+      "family": "sortformer_diar",
+      "id": "sortformer-diar",
+      "note": "落点精确匹配：sortformer_diar_4spk_v1_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Sortformer Diar 4spk v1 Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "sortformer_diar_4spk_v1_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Sortformer-Diar-4spk-v1-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Sortformer Diar 4spk v1 F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "sortformer_diar_4spk_v1_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Sortformer-Diar-4spk-v1-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Sortformer Diar 4spk v1 Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "config.json",
+              "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/model.safetensors"
+            },
+            {
+              "remote_path": "processor_config.json",
+              "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/processor_config.json"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "sortformer_diar_4spk_v1_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "diar_sortformer_4spk-v1/config.json",
+            "diar_sortformer_4spk-v1/model.safetensors",
+            "diar_sortformer_4spk-v1/processor_config.json"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "nvidia/diar_sortformer_4spk-v1",
+          "revision": "main",
+          "target_directory": "diar_sortformer_4spk-v1"
+        }
+      ],
+      "path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
+      "spec": "sortformer_diar.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": {
+        "default": false,
+        "display_name": "Stable Audio 3 Small Music Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf",
+            "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "stable_audio_3_small_music_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "audio-cpp/audio.cpp-gguf",
+        "revision": "main",
+        "target_directory": "Stable-Audio-3-Small-Music-GGUF"
+      },
+      "family": "stable_audio",
+      "id": "stable-audio-small-music",
+      "note": "目录匹配（模型 path 指目录），同处多个量化档且 schema 未声明 precision_preference，按 q8_0 优先选中 stable_audio_3_small_music_q8_0",
+      "packages": [
+        {
+          "default": true,
+          "display_name": "Stable Audio 3 Medium Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "stable_audio_3_medium_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Stable-Audio-3-Medium-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Medium F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "stable_audio_3_medium_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Stable-Audio-3-Medium-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Small Music Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "stable_audio_3_small_music_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Stable-Audio-3-Small-Music-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Small Music F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "stable_audio_3_small_music_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Stable-Audio-3-Small-Music-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Small SFX Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "stable_audio_3_small_sfx_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Stable-Audio-3-Small-SFX-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Small SFX F16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "remote_path": "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "stable_audio_3_small_sfx_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Stable-Audio-3-Small-SFX-GGUF"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Medium Safetensors",
+          "downloadable": false,
+          "files": [
+            {
+              "remote_path": "model_config.json",
+              "url": "https://huggingface.co/stabilityai/stable-audio-3-medium/resolve/main/model_config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/stabilityai/stable-audio-3-medium/resolve/main/model.safetensors"
+            }
+          ],
+          "format": "safetensors",
+          "gated": true,
+          "id": "stable_audio_3_medium_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "stable-audio-3-medium/model_config.json",
+            "stable-audio-3-medium/model.safetensors"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "stabilityai/stable-audio-3-medium",
+          "revision": "main",
+          "target_directory": "stable-audio-3-medium"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Small Music Safetensors",
+          "downloadable": false,
+          "files": [
+            {
+              "remote_path": "model_config.json",
+              "url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/resolve/main/model_config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/resolve/main/model.safetensors"
+            }
+          ],
+          "format": "safetensors",
+          "gated": true,
+          "id": "stable_audio_3_small_music_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "stable-audio-3-small-music/model_config.json",
+            "stable-audio-3-small-music/model.safetensors"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "stabilityai/stable-audio-3-small-music",
+          "revision": "main",
+          "target_directory": "stable-audio-3-small-music"
+        },
+        {
+          "default": false,
+          "display_name": "Stable Audio 3 Small SFX Safetensors",
+          "downloadable": false,
+          "files": [
+            {
+              "remote_path": "model_config.json",
+              "url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/resolve/main/model_config.json"
+            },
+            {
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/resolve/main/model.safetensors"
+            }
+          ],
+          "format": "safetensors",
+          "gated": true,
+          "id": "stable_audio_3_small_sfx_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "stable-audio-3-small-sfx/model_config.json",
+            "stable-audio-3-small-sfx/model.safetensors"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "stabilityai/stable-audio-3-small-sfx",
+          "revision": "main",
+          "target_directory": "stable-audio-3-small-sfx"
+        }
+      ],
+      "path": "Stable-Audio-3-Small-Music-GGUF",
+      "spec": "stable_audio.json",
+      "status": "downloadable"
+    },
+    {
+      "entry": null,
+      "family": "yue2",
+      "id": "yue2",
+      "note": "上游 model_specs 里没有 family=yue2 的 spec —— 暂无下载源，不猜地址",
+      "packages": [],
+      "path": "Yue2-3B-GGUF",
+      "spec": "",
+      "status": "no-source"
+    }
+  ],
+  "source": {
+    "generated_by": "tools/gen_model_downloads.py",
+    "note": "由生成脚本产出，勿手改；size/sha256 刻意留空（生成不联网）",
+    "schema": "config/models.schema.yaml",
+    "spec_count": 72,
+    "specs": "model_specs/*.json"
+  },
+  "version": 1
+}

@@ -17,6 +17,10 @@ mod cancel;
 mod dictionaries;
 mod download;
 mod export;
+/// 随包分发的模型下载清单（M4-P7 第二段：下载源）。映射规则与诚实边界都在那里。
+mod model_sources;
+/// 路径比较的唯一入口（`..` / 软链都按真实路径消解）。
+mod paths;
 mod player;
 mod sep_history;
 mod tasks;
@@ -90,6 +94,9 @@ enum Cmd {
         script: String,
         model: String,
         voice_ref: Option<String>,
+        /// 参考音频里实际念的内容。克隆音色**必须**与 `voice_ref` 成对下发，
+        /// 所以它和路径一样是"这次发什么请求"的一部分（见 `aw_core::VoiceClone`）。
+        voice_ref_text: Option<String>,
         project_name: String,
         /// 句间静音（毫秒）：只影响拼装出来的时间轴，不影响逐句音频
         gap_ms: u64,
@@ -114,6 +121,8 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
+        /// 与单篇同一份语义：批量里每篇都用同一个克隆音色
+        voice_ref_text: Option<String>,
         /// 与单篇同一套：句间静音 + 文本兜底开关 + 发音词典（批量产物也受它们影响）
         gap_ms: u64,
         auto_normalize: bool,
@@ -149,6 +158,8 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
+        /// 试听也必须成对：否则克隆音色的试听永远 500，用户按试听选音色会被误导
+        voice_ref_text: Option<String>,
         text: String,
     },
     /// 人声分离（本地 htdemucs）：两轨写到 out_dir。
@@ -173,6 +184,9 @@ enum Cmd {
         revision: u64,
         task_id: u32,
         dir: PathBuf,
+        /// 回读用的 ASR 模型 id。由 UI 侧用 `effective_asr_model()` 算好传进来——
+        /// worker 自己再读一次设置就有两个真相源，报告与实际请求会漂移。
+        model: String,
     },
     /// 歌曲彩蛋生成（独立于配音工程内容，只复用工程目录）。
     RunSong {
@@ -369,6 +383,15 @@ enum Msg {
         label: String,
         error: String,
     },
+    /// 参考音频的**自动转写**结果（后台线程发回，与工程版本无关）。
+    ///
+    /// 只回结果、不直接写界面：转写是"帮用户填"，不是"替用户决定"——
+    /// 调用方要把文本回显出来让人核对（ASR 错一个字，克隆出的音色就跑偏）。
+    ReferenceTranscribed {
+        /// 转写用的 ASR 模型（成功时一并回显，失败原因里也要带）
+        model: String,
+        result: Result<String, String>,
+    },
     /// 歌曲终态：带 task_id 与分离同理——歌曲可以排在别的任务后面，跨改稿时
     /// 用 revision 过滤会把终态丢掉、任务永远停在"运行中"。
     SongDone {
@@ -388,6 +411,8 @@ enum Msg {
         task_id: u32,
         done: usize,
         total: usize,
+        /// 本次实际在用的回读模型：进度文案念它，UI 侧不再自己算一份
+        model: String,
     },
     EvalDone {
         task_id: u32,
@@ -407,6 +432,8 @@ enum Msg {
 /// 质检汇总：平均可懂度 + 最差几句（够用户直接去重录那几句）。
 #[derive(Clone, Debug)]
 struct EvalSummary {
+    /// **本次实际用的**回读模型（与发给服务的 model 同一个值，报告/状态行都念它）
+    model: String,
     /// 平均可懂度百分比（只算转写成功的句子）
     percent: f64,
     scored: usize,
@@ -484,6 +511,13 @@ struct AppSettings {
     /// 缺省 = `src/update.rs::DEFAULT_MANIFEST_URL`（GitHub 最新 Release API）。
     #[serde(default)]
     update_url: Option<String>,
+    /// 质检回读（ASR）用哪个模型：在服务清单 `task == "asr"` 的模型里选。
+    ///
+    /// 缺省 = `aw_core::DEFAULT_ASR_MODEL`（qwen3-asr，M0 定标同款）。
+    /// **唯一入口是 `effective_asr_model()`**：worker 真的拿它去请求、界面回显、
+    /// 质检报告落盘，三处必须是同一份推导（两份实现必然漂移）。
+    #[serde(default)]
+    asr_model: Option<String>,
 }
 
 /// BGM 的默认描述：**与 ui/app.slint 里 `bgm-prompt` 的默认值必须一致**
@@ -592,11 +626,26 @@ fn scan_model_dir_with_limit(dir: &Path, limit: usize) -> (bool, usize) {
 }
 
 /// 模型目录里有多少个清单模型的权重文件（用来判断模型盘挂上没）。
+///
+/// 包含判定走 `crate::paths::resolve_for_compare`（**真实路径**，会消解 `..` 与软链）：
+/// 清单里写 `/models/x/../in/y.gguf`、或模型目录本身是软链时，词法的 `Path::starts_with`
+/// 会漏报/误报——这正是本仓踩过两次的坑（见
+/// `LESSON_路径包含判定必须按真实路径而非字面前缀.md`）。既然已有唯一入口就别再各来一份。
+///
+/// 单条路径解析不了（理论上不会）就当作"不在里面"，不把整次统计打断。
 fn models_under_dir(cfg: &Option<ServerConfig>, dir: &Path) -> usize {
     let Some(cfg) = cfg else { return 0 };
+    let Ok(base) = crate::paths::resolve_for_compare(dir, dir) else {
+        return 0;
+    };
     cfg.models
         .iter()
-        .filter(|m| !m.path.is_empty() && Path::new(&m.path).starts_with(dir))
+        .filter(|m| !m.path.is_empty())
+        .filter(|m| {
+            crate::paths::resolve_for_compare(Path::new(&m.path), &base)
+                .map(|p| p.starts_with(&base))
+                .unwrap_or(false)
+        })
         .count()
 }
 
@@ -829,7 +878,9 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
             ui.set_status_text(format!("已经在用「{}」", entry.name).into());
             return;
         }
-        ui.set_voice_ref_path(path.display().to_string().into());
+        // 走唯一入口：换到另一段音频 ⇒ 上一段名下的转写一起清（否则会拿它的文本
+        // 当条件去克隆新音频，服务端不报错但声音已经不是用户要的那个）
+        set_voice_ref(&ui, path.to_string_lossy().as_ref());
         // 与手工改参考音频同一条路：作废工程与成品，提示需要重新合成
         invalidate_worker_project(&tx, &st);
         reset_bgm(&ui, &st);
@@ -1080,6 +1131,7 @@ fn template_from_inputs(
     name: &str,
     model: &str,
     voice_ref: Option<String>,
+    voice_ref_text: Option<String>,
     speed: f32,
     gap_ms: u64,
     auto_normalize: bool,
@@ -1092,6 +1144,8 @@ fn template_from_inputs(
         name: name.to_string(),
         model: model.to_string(),
         voice_ref,
+        // 模板必须自带参考文本：只存路径的话，应用回来的克隆音色缺文本、跑不起来
+        voice_ref_text,
         speed,
         gap_ms,
         auto_normalize,
@@ -1101,9 +1155,11 @@ fn template_from_inputs(
 /// 当前工程的输入（用来和模板比对，算出"应用后要作废什么"）。
 fn project_inputs_from_ui(ui: &MainWindow) -> templates::ProjectInputs {
     let model = current_model_name(ui).unwrap_or_default();
+    let (voice_ref, voice_ref_text) = voice_input_from_ui(ui);
     templates::ProjectInputs {
         model,
-        voice_ref: non_empty(ui.get_voice_ref_path().to_string()),
+        voice_ref_text,
+        voice_ref,
         gap_ms: gap_ms_from_ui(ui),
         auto_normalize: ui.get_auto_normalize(),
     }
@@ -1135,7 +1191,12 @@ fn refresh_template_names(ui: &MainWindow, keep: Option<&str>) {
 }
 
 fn load_settings() -> AppSettings {
-    let Some(raw) = std::fs::read_to_string(settings_path()).ok() else {
+    load_settings_at(&settings_path())
+}
+
+/// 从指定路径读设置（`load_settings` 的唯一实现；路径可注入才测得了"落盘后能读回"）。
+fn load_settings_at(path: &Path) -> AppSettings {
+    let Some(raw) = std::fs::read_to_string(path).ok() else {
         return AppSettings::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -1148,6 +1209,7 @@ fn load_settings() -> AppSettings {
         dictionary: json_field(&v, "dictionary"),
         bgm: json_field(&v, "bgm").unwrap_or_default(),
         update_url: json_field(&v, "update_url"),
+        asr_model: json_field(&v, "asr_model"),
     }
 }
 
@@ -1158,7 +1220,11 @@ fn json_field<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str) 
 }
 
 fn save_settings(s: &AppSettings) -> std::io::Result<()> {
-    let path = settings_path();
+    save_settings_at(&settings_path(), s)
+}
+
+/// 写到指定路径（`save_settings` 的唯一实现；路径可注入，理由同上）。
+fn save_settings_at(path: &Path, s: &AppSettings) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1357,6 +1423,286 @@ fn read_server_config() -> Option<ServerConfig> {
     std::fs::read_to_string(config_path())
         .ok()
         .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok())
+}
+
+// ===========================================================================
+// 质检回读（ASR）模型：候选来自服务清单，选择落 settings.json
+//
+// 本机 16 GiB 时 `qwen3-asr`（估 3.31 GiB + 1 GiB 余量）装不下，服务直接 503，
+// 而应用把回读模型写死成它 —— 质检整条功能不可用。这里让它可选，并且**动态**列
+// 清单里 `task == "asr"` 的模型（不硬编名字：清单加一个就多一项）。
+// ===========================================================================
+
+/// 清单里所有 `task == "asr"` 的模型 id（保持清单顺序，跳过空 id）。
+fn asr_models_from(cfg: Option<&ServerConfig>) -> Vec<String> {
+    cfg.map(|c| {
+        c.models
+            .iter()
+            .filter(|m| m.task == "asr" && !m.id.trim().is_empty())
+            .map(|m| m.id.clone())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// 本机清单里的 ASR 模型（读不到清单 = 空列表，不算错误）。
+fn asr_models() -> Vec<String> {
+    asr_models_from(read_server_config().as_ref())
+}
+
+/// 当前生效的质检回读模型：设置 > 默认。**这是唯一入口**。
+///
+/// 用户选的 id 若已不在当前清单里也**照用不改**：静默换成别的模型会改变质检口径
+/// （词级/说话人能力都不同），换模型只能由用户点。服务拒绝就如实报错。
+fn effective_asr_model(s: &AppSettings) -> String {
+    s.asr_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(aw_core::DEFAULT_ASR_MODEL)
+        .to_string()
+}
+
+/// 下拉要显示什么 + 每个下标对应哪个 id + 当前选中下标。
+///
+/// 三样一起返回，是因为它们必须来自**同一份推导**：分别算就会漂移成"显示的是 A、
+/// 选出来的却是 B"。当前模型不在清单里时插到第 0 项并标注，保证下拉永远不会
+/// 因为清单变化而静默改掉用户的生效值。
+fn asr_picker_view(models: &[String], current: &str) -> (Vec<String>, Vec<String>, i32) {
+    let mut ids: Vec<String> = models.to_vec();
+    let mut labels: Vec<String> = models.to_vec();
+    if !ids.iter().any(|m| m == current) {
+        ids.insert(0, current.to_string());
+        labels.insert(0, format!("{current}（不在当前清单）"));
+    }
+    let index = ids.iter().position(|m| m == current).unwrap_or(0) as i32;
+    (ids, labels, index)
+}
+
+/// 一个 ASR 候选在磁盘上的权重文件大小（读不到 = None，不猜）。
+fn asr_candidate_weights(cfg: Option<&ServerConfig>) -> Vec<(String, Option<u64>)> {
+    cfg.map(|c| {
+        c.models
+            .iter()
+            .filter(|m| m.task == "asr" && !m.id.trim().is_empty())
+            .map(|m| (m.id.clone(), file_size_of(&m.path)))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// 单个路径的字节数：不存在 / 是目录 / 读不了都返回 None。
+fn file_size_of(path: &str) -> Option<u64> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let md = std::fs::metadata(path).ok()?;
+    md.is_file().then_some(md.len())
+}
+
+/// MiB → 人读（≥1024 MiB 用 GiB）。
+fn humans_mib(mib: u64) -> String {
+    if mib >= 1024 {
+        format!("{:.2} GiB", mib as f64 / 1024.0)
+    } else {
+        format!("{mib} MiB")
+    }
+}
+
+/// 比当前模型更小的 ASR 候选，按磁盘权重升序，最多 3 个。
+///
+/// 当前模型的权重读不到时退化成"清单里其它 ASR 模型"——宁可不排序，也不假装知道谁更小。
+/// 数字标的是**权重文件**大小，不是服务的内存估算，文案里说清楚这一点。
+fn smaller_asr_candidates(current: &str, candidates: &[(String, Option<u64>)]) -> Vec<String> {
+    let cur_size = candidates
+        .iter()
+        .find(|(id, _)| id == current)
+        .and_then(|(_, size)| *size);
+    let mut rest: Vec<&(String, Option<u64>)> =
+        candidates.iter().filter(|(id, _)| id != current).collect();
+    if let Some(cur) = cur_size {
+        rest.retain(|(_, size)| matches!(size, Some(n) if *n < cur));
+    }
+    // 知道的在前（按大小升序），不知道的排后面：不排序 = 不假装知道
+    rest.sort_by_key(|(_, size)| size.map(|n| (0u8, n)).unwrap_or((1, 0)));
+    rest.into_iter()
+        .take(3)
+        .map(|(id, size)| match size {
+            Some(n) => format!("{id}（权重约 {}）", backup::human_bytes(*n)),
+            None => id.clone(),
+        })
+        .collect()
+}
+
+/// 内存不足时的**可执行**提示：哪个模型装不下（含服务给的数字）、当时可用多少、
+/// 本机还有哪些更小的可选。只说"失败"等于把用户扔在原地。
+fn memory_shortfall_hint(
+    model: &str,
+    mem: Option<&aw_core::InsufficientMemory>,
+    candidates: &[(String, Option<u64>)],
+) -> String {
+    let mut out = match mem {
+        Some(m) => {
+            // 服务报的是它眼里的模型名；与请求名不一致时两个都写出来
+            let name = match m.model.as_deref() {
+                Some(n) if n != model => format!("{n}（请求的是 {model}）"),
+                _ => model.to_string(),
+            };
+            let need = match (m.required_mib(), m.estimated_mib, m.headroom_mib) {
+                (Some(req), Some(est), Some(head)) => format!(
+                    "需要约 {}（模型 {} + 余量 {}）",
+                    humans_mib(req),
+                    humans_mib(est),
+                    humans_mib(head)
+                ),
+                _ => "服务没给出可解析的占用估算".to_string(),
+            };
+            let avail = match m.available_mib {
+                Some(a) => format!("，当时可用 {}", humans_mib(a)),
+                None => String::new(),
+            };
+            format!("质检未开始：回读模型 {name} 装不下：{need}{avail}。")
+        }
+        None => format!("质检未开始：回读模型 {model} 装不下（服务因内存不足拒绝加载）。"),
+    };
+    let smaller = smaller_asr_candidates(model, candidates);
+    if smaller.is_empty() {
+        out.push_str(
+            "本机清单里没有更小的 ASR 模型可选：先腾出内存，或给清单加一个更小的 ASR 模型。",
+        );
+    } else {
+        out.push_str(&format!(
+            "本机更小的 ASR 模型可选：{}——在「高级 → 质检回读模型」里改选后重跑。",
+            smaller.join("、")
+        ));
+    }
+    // 换 ASR 会改变质检口径，所以只提示、不代劳
+    out.push_str(
+        "换回读模型会改变质检口径（audio8-asr / fun-asr 没有词级时间戳与说话人分离），需你确认，本应用不会自动换。",
+    );
+    out
+}
+
+/// 单句 ASR 失败之后该怎么办。
+#[derive(Debug, PartialEq, Eq)]
+enum EvalAsrFailure {
+    /// 整轮都不可能成功（内存不足）：带着可执行提示立刻收尾
+    Fatal(String),
+    /// 只是这一句没测到：记数、继续下一句
+    Counted,
+}
+
+/// **唯一判据**：worker 按它决定"收尾"还是"继续"。
+///
+/// 抽出来是为了能直接喂一个真实的 503 body 做用例——真去起服务/等退避才判得出来的话，
+/// 这条行为就没有能红的回归（也不该为了测试去 set_var 改进程环境）。
+fn classify_asr_failure(
+    model: &str,
+    err: &aw_core::ClientError,
+    candidates: &[(String, Option<u64>)],
+) -> EvalAsrFailure {
+    match err.insufficient_memory() {
+        Some(mem) => EvalAsrFailure::Fatal(memory_shortfall_hint(model, Some(&mem), candidates)),
+        None => EvalAsrFailure::Counted,
+    }
+}
+
+/// 回读下拉右边那句说明。只描述"候选从哪来 / 当前选的还在不在 / 换它会变什么"，
+/// 不列举任何写死的模型名（候选是清单给的，写死就又多一份真相）。
+fn asr_model_note(models: &[String], current: &str, in_manifest: bool) -> String {
+    let mut note = if models.is_empty() {
+        "没读到服务清单里 task=asr 的模型：检查 server.json 与 audiocpp_server".to_string()
+    } else {
+        format!("候选来自服务清单（{} 个 ASR 模型）", models.len())
+    };
+    if !in_manifest {
+        note.push_str(&format!("·当前选的 {current} 不在清单里，服务可能加载不了"));
+    }
+    note.push_str("·换模型会改变质检口径（audio8-asr / fun-asr 无词级时间戳与说话人分离）");
+    note
+}
+
+/// 把选中的回读模型落进 settings.json（失败也不阻断，只提示）。
+///
+/// 返回真正写下去的值，便于调用方用它回显——回显若另算一份就会与落盘值漂移。
+fn persist_asr_model(model: &str) -> Result<String, String> {
+    persist_asr_model_at(settings(), &settings_path(), model)
+}
+
+/// `persist_asr_model` 的唯一实现。settings 与路径都可注入：单测不得写用户真实的
+/// settings.json（`LESSON_单测不得写用户真实运行数据须拆出注入缝`）。
+fn persist_asr_model_at(
+    store: &std::sync::Mutex<AppSettings>,
+    path: &Path,
+    model: &str,
+) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("回读模型不能为空".into());
+    }
+    let snapshot = {
+        let mut guard = store.lock().map_err(|_| "设置锁不可用".to_string())?;
+        guard.asr_model = Some(model.to_string());
+        guard.clone()
+    };
+    // 先改内存再落盘是既有约定（失败时至少本次会话生效）；落盘失败要如实回报
+    save_settings_at(path, &snapshot).map_err(|e| e.to_string())?;
+    Ok(model.to_string())
+}
+
+/// 把回读下拉刷成"清单 + 当前生效值"的投影（候选、选中项、说明来自同一份推导）。
+fn refresh_asr_models(ui: &MainWindow) {
+    let models = asr_models();
+    let current = effective_asr_model(&settings_snapshot());
+    let (_, labels, index) = asr_picker_view(&models, &current);
+    let in_manifest = models.contains(&current);
+    let labels: Vec<SharedString> = labels.into_iter().map(SharedString::from).collect();
+    ui.set_asr_model_names(ModelRc::from(Rc::new(VecModel::from(labels))));
+    ui.set_asr_model_index(index);
+    ui.set_asr_model_note(asr_model_note(&models, &current, in_manifest).into());
+}
+
+/// 质检回读模型的下拉：候选来自服务清单，切换落 settings.json。
+///
+/// 归属：回读模型只影响配音页的质检，所以放在本页「高级」里，不进全局抽屉
+/// （`LESSON_全局容器只放全局项单Tab独有的放本页`）。
+fn wire_asr_model(ui: &MainWindow, state: &Rc<UiState>) {
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_asr_model_picked(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        // 质检在跑时不让换：worker 手里那条命令已经带着当时的模型名，
+        // 中途改设置只会造成"界面显示 A、这次实际用 B"。
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
+            ui.set_status_text("任务进行中：等这轮跑完再换回读模型".into());
+            refresh_asr_models(&ui);
+            return;
+        }
+        let current = effective_asr_model(&settings_snapshot());
+        // 与刷新时同一份推导：下拉显示的第 i 项就是这里取出的第 i 项
+        let (ids, _, _) = asr_picker_view(&asr_models(), &current);
+        let picked = ids.get(i.max(0) as usize).cloned();
+        if let Some(id) = picked.filter(|id| *id != current) {
+            match persist_asr_model(&id) {
+                Ok(saved) => {
+                    // 如实说清：盘上那份分数是**上一个模型**测的。本批不给分数打模型标记，
+                    // 所以不能假装它还是当前结论——但也不擅自清分（见 docs 的已知边界）。
+                    let note = if st.eval_scores.borrow().is_empty() {
+                        format!("回读模型已改为 {saved}（下次质检生效）")
+                    } else {
+                        format!(
+                            "回读模型已改为 {saved}：现有分数是上一个模型测的，建议重新质检一次再看结论"
+                        )
+                    };
+                    ui.set_status_text(note.into());
+                }
+                Err(e) => ui.set_status_text(
+                    format!("回读模型没能保存（{e}）：重启后会回到上次的选择").into(),
+                ),
+            }
+        }
+        refresh_asr_models(&ui);
+    });
 }
 
 /// 服务地址解析（纯函数，便于单测三档优先级）。
@@ -2081,60 +2427,57 @@ fn spawn_batch_export(
 // 模型下载器（M4-P7）：可下载模型 → 串行队列 → UI 行
 // ===========================================================================
 
-/// 清单里"可下载模型"：只有带 `url` 的才算。老清单没有 url，列表就是空的——
-/// 不显示假下载入口（与"接入前不显示假按钮"同一条口径）。
+/// 一条真的能点的下载入口（落点 / 校验依据 / 来源 / 落点提醒）。
 struct DownloadableModel {
     id: String,
     url: String,
     sha256: Option<String>,
     size: Option<u64>,
     dest: PathBuf,
+    origin: model_sources::Origin,
+    /// 与 server.json 声明的 path 对不上时的提醒（下完服务可能仍加载不了）。
+    conflict: Option<String>,
 }
 
-/// 从模型清单挑出可下载项，目标目录取全局设置的「模型目录」（`model_dir()`，不写死）。
-fn downloadable_models() -> Vec<DownloadableModel> {
-    let dir = model_dir();
-    let Some(cfg) = read_server_config() else {
-        return Vec::new();
-    };
-    cfg.models
-        .into_iter()
-        .filter(|m| !m.url.trim().is_empty())
-        .map(|m| {
-            let dest = download_dest_for(&m, &dir);
-            let sha = m.sha256.trim();
-            DownloadableModel {
-                id: m.id,
-                url: m.url,
-                sha256: (!sha.is_empty()).then(|| sha.to_string()),
-                size: m.size,
-                dest,
-            }
+/// 下载面板的完整规划：**显示与点击共用这一份**（两处各拼一次判据已经被复核抓过）。
+///
+/// 来源 = `server.json` ∪ 内置清单（`config/model-downloads.json`，由
+/// `tools/gen_model_downloads.py` 从上游 `model_specs` 生成）。服务清单里显式给了
+/// `url` 的以服务为准——服务侧可以覆盖内置清单（内网镜像、自建仓库）。
+fn download_plan() -> Vec<model_sources::Row> {
+    let server: Vec<model_sources::ServerEntry> = read_server_config()
+        .map(|cfg| {
+            cfg.models
+                .into_iter()
+                .map(|m| model_sources::ServerEntry {
+                    id: m.id,
+                    url: m.url,
+                    sha256: m.sha256,
+                    size: m.size,
+                    path: m.path,
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+    model_sources::plan_rows(&server, model_sources::catalog(), &model_dir())
 }
 
-/// 下载目标文件名：优先沿用清单里 `path` 的文件名（服务才能按原路径找到），
-/// 没有就取 url 末段，最后退回 `<id>.gguf`。**目录一律取模型目录**。
-fn download_dest_for(m: &ServerModel, dir: &Path) -> PathBuf {
-    let from_path = Path::new(&m.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .map(str::to_string);
-    let from_url = m
-        .url
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .next_back()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let name = from_path
-        .or(from_url)
-        .unwrap_or_else(|| format!("{}.gguf", m.id));
-    dir.join(name)
+/// 从规划里取一条真的能点的入口（点击时用；没有入口的模型这里返回 None）。
+fn download_entry_for(key: &str) -> Option<DownloadableModel> {
+    download_plan()
+        .into_iter()
+        .find(|r| r.id == key)
+        .and_then(|r| {
+            r.action.map(|a| DownloadableModel {
+                id: r.id,
+                url: a.url,
+                sha256: a.sha256,
+                size: a.size,
+                dest: a.dest,
+                origin: a.origin,
+                conflict: a.conflict,
+            })
+        })
 }
 
 /// 人类可读的字节数（进度行用；与备份的 human_bytes 不同档，这里只求短）。
@@ -2152,7 +2495,7 @@ fn short_bytes(n: u64) -> String {
 
 /// 一条下载任务 → 界面行。没有队列快照时按磁盘上有没有正式文件给出"未下载/已就位"。
 fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) -> DownloadRow {
-    let (state_text, detail, progress, active) = match latest {
+    let (state_text, base, progress, active) = match latest {
         Some(snap) => {
             let downloading = matches!(
                 snap.state,
@@ -2198,6 +2541,13 @@ fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) 
             false,
         ),
     };
+    // 来源 + 落点提醒都要写在行上：否则用户看不出"权重是哪来的"，也看不出
+    // "下完了服务为什么还是加载不了"。
+    let mut detail = format!("{} · {}", m.origin.label(), base);
+    if let Some(conflict) = &m.conflict {
+        detail.push_str(" · ⚠ ");
+        detail.push_str(conflict);
+    }
     DownloadRow {
         key: m.id.clone().into(),
         label: m.id.clone().into(),
@@ -2205,17 +2555,48 @@ fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) 
         detail: detail.into(),
         progress,
         active,
+        actionable: true,
+    }
+}
+
+/// 没有下载源的模型也占一行：如实说为什么，**按钮不可点**。
+/// 诚实边界——不给一个点了必然失败的入口（gated / 上游没有该权重的包 / 没有 spec）。
+fn no_source_row_for(id: &str, reason: &str) -> DownloadRow {
+    DownloadRow {
+        key: id.into(),
+        label: id.into(),
+        state: "没有下载源".into(),
+        detail: reason.into(),
+        progress: 0.0,
+        active: false,
+        actionable: false,
     }
 }
 
 /// 重建"可下载模型"列表：清单元数据 + 队列里每条的最新快照。
 fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
     let snapshots = state.downloads.borrow();
-    let rows: Vec<DownloadRow> = downloadable_models()
-        .iter()
-        .map(|m| {
-            let latest = snapshots.iter().rev().find(|s| s.label == m.id);
-            download_row_for(m, latest)
+    let rows: Vec<DownloadRow> = download_plan()
+        .into_iter()
+        .map(|row| {
+            // 先解构：`action` 会被 move，拆成三个局部变量后两个分支都不带部分移动
+            let model_sources::Row { id, action, reason } = row;
+            match action {
+                Some(action) => {
+                    let model = DownloadableModel {
+                        id,
+                        url: action.url,
+                        sha256: action.sha256,
+                        size: action.size,
+                        dest: action.dest,
+                        origin: action.origin,
+                        conflict: action.conflict,
+                    };
+                    let latest = snapshots.iter().rev().find(|s| s.label == model.id);
+                    download_row_for(&model, latest)
+                }
+                None => no_source_row_for(&id, &reason),
+            }
         })
         .collect();
     drop(snapshots);
@@ -2333,9 +2714,7 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
             move |id| dl_cancel.cancel(id),
             move || {
                 // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
-                let model = downloadable_models()
-                    .into_iter()
-                    .find(|m| m.id == start_key)?;
+                let model = download_entry_for(&start_key)?;
                 let id = dl_start.enqueue(download::TaskSpec {
                     label: model.id.clone(),
                     url: model.url.clone(),
@@ -2638,19 +3017,39 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision,
                 model,
                 voice_ref,
+                voice_ref_text,
                 text,
             } => {
                 let msg = match make_client() {
                     Ok(client) => {
                         // instruction 与配音链路一致（aw_core 合成恒定传 DEFAULT_INSTRUCTION）：
                         // 试听听到的语气必须等于成品，否则用户按试听选音色会被误导。
-                        match client.synth(
-                            &model,
-                            &text,
-                            Some(BASE_SEED),
-                            voice_ref.as_deref(),
-                            Some(aw_core::DEFAULT_INSTRUCTION),
-                        ) {
+                        //
+                        // 克隆同理**必须成对**：只发 voice_ref 的话试听永远 500，
+                        // 用户以为自己选的音色不行，其实是少发了 reference_text。
+                        let outcome = match voice_ref.as_deref() {
+                            Some(path) => match aw_core::VoiceClone::new(
+                                path,
+                                voice_ref_text.as_deref().unwrap_or_default(),
+                            ) {
+                                Ok(clone) => client.synth(
+                                    &model,
+                                    &text,
+                                    Some(BASE_SEED),
+                                    Some(clone),
+                                    Some(aw_core::DEFAULT_INSTRUCTION),
+                                ),
+                                Err(e) => Err(e),
+                            },
+                            None => client.synth(
+                                &model,
+                                &text,
+                                Some(BASE_SEED),
+                                None,
+                                Some(aw_core::DEFAULT_INSTRUCTION),
+                            ),
+                        };
+                        match outcome {
                             Ok(wav) => Msg::VoicePreview {
                                 wav,
                                 label: model.clone(),
@@ -2674,6 +3073,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 script,
                 model,
                 voice_ref,
+                voice_ref_text,
                 project_name,
                 gap_ms,
                 auto_normalize,
@@ -2699,6 +3099,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     &script,
                     &model,
                     voice_ref,
+                    voice_ref_text,
                     gap_ms,
                     auto_normalize,
                     &dict,
@@ -2818,6 +3219,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision,
                 model,
                 voice_ref,
+                voice_ref_text,
                 gap_ms,
                 auto_normalize,
                 dict,
@@ -2871,6 +3273,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         &item.script,
                         &model,
                         voice_ref.clone(),
+                        voice_ref_text.clone(),
                         gap_ms,
                         auto_normalize,
                         &dict,
@@ -3198,6 +3601,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision: _revision,
                 task_id,
                 dir,
+                model,
             } => {
                 if task_take_started(&ctx, task_id) {
                     let _ = ctx.tx.send(WorkerMsg {
@@ -3266,6 +3670,8 @@ fn worker_loop(ctx: WorkerCtx) {
                 let mut asr_failed = 0usize;
                 let mut asr_error: Option<String> = None;
                 let mut stopped = false;
+                // 内存不足这类"整轮都不可能成功"的错误：记下来，跳出循环后带着可执行提示收尾
+                let mut fatal: Option<String> = None;
                 for (n, idx) in done.iter().enumerate() {
                     // 协作式停止：一句转写完再停（ASR 调用本身中断不了）
                     if ctx.eval_stop.load(Ordering::Relaxed) {
@@ -3273,7 +3679,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         break;
                     }
                     let wav = dir.join(format!("sentences/{idx:03}.wav"));
-                    match client.asr(&wav) {
+                    match client.asr_with(&model, &wav) {
                         Ok(hypothesis) => {
                             // clone 一份参考文本：下面还要 mut 借 project.sentences 写分数
                             let reference = project
@@ -3312,14 +3718,29 @@ fn worker_loop(ctx: WorkerCtx) {
                             }
                         }
                         Err(e) => {
-                            // 单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分。
-                            // 这句的旧分数（如果有）**保留**——它描述的是磁盘上那段音频，
-                            // 而这次只是没测到；保留的分数要一起回给 UI，否则 UI 与磁盘不一致。
-                            asr_failed += 1;
-                            // 保留第一条服务端原文（含 OOM 三个动作）；后续同一
-                            // 错误不再重复堆积，摘要只展示一份可执行说明。
-                            if asr_error.is_none() {
-                                asr_error = Some(e.to_string());
+                            // 内存不足不是"这一句没测到"：模型根本加载不了，后面每一句都会
+                            // 同样失败，继续跑只会让用户白等。判据在 `classify_asr_failure`
+                            // （识别口径与用例同一份），这里只执行结论。
+                            match classify_asr_failure(
+                                &model,
+                                &e,
+                                &asr_candidate_weights(read_server_config().as_ref()),
+                            ) {
+                                EvalAsrFailure::Fatal(error) => {
+                                    fatal = Some(error);
+                                    break;
+                                }
+                                // 其余单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分。
+                                // 这句的旧分数（如果有）**保留**——它描述的是磁盘上那段音频，
+                                // 而这次只是没测到；保留的分数要一起回给 UI，否则 UI 与磁盘不一致。
+                                EvalAsrFailure::Counted => {
+                                    asr_failed += 1;
+                                    // 保留第一条服务端原文（含 OOM 三个动作）；后续同一
+                                    // 错误不再重复堆积，摘要只展示一份可执行说明。
+                                    if asr_error.is_none() {
+                                        asr_error = Some(e.to_string());
+                                    }
+                                }
                             }
                         }
                     }
@@ -3329,8 +3750,16 @@ fn worker_loop(ctx: WorkerCtx) {
                             task_id,
                             done: n + 1,
                             total,
+                            model: model.clone(),
                         },
                     });
+                }
+                if let Some(error) = fatal {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::EvalFailed { task_id, error },
+                    });
+                    continue;
                 }
                 if stopped {
                     let _ = ctx.tx.send(WorkerMsg {
@@ -3362,7 +3791,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     .unwrap_or_else(|| "未命名工程".to_string());
                 let report = qa_report_markdown(
                     &project_name,
-                    "qwen3-asr",
+                    &model,
                     &rows,
                     if scored == 0 {
                         0.0
@@ -3407,6 +3836,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     msg: Msg::EvalDone {
                         task_id,
                         summary: EvalSummary {
+                            model: model.clone(),
                             percent,
                             scored,
                             asr_failed,
@@ -3794,13 +4224,18 @@ fn voice_ref_matches(
     saved: &Project,
     voice_ref: &Option<String>,
     voice_ref_hash: &Option<String>,
+    voice_ref_text: &Option<String>,
 ) -> bool {
     saved.voice_ref.as_ref() == voice_ref.as_ref()
         && saved.voice_ref_hash.as_ref() == voice_ref_hash.as_ref()
+        // 参考文本也是音色的一部分：同一段音频换个转写文本 = 另一个声音。
+        // 少了这一条，"让用户确认/修正 ASR 转写"就成了空转——改完文本点开始合成，
+        // 句子全是 done 直接被复用，用户听到的还是旧转写合成的声音。
+        && saved.voice_ref_text.as_ref() == voice_ref_text.as_ref()
 }
 
-/// "旧工程的音频能不能给这份新设置复用"的判据：**模型 / 兜底开关 / 参考音（含内容哈希）
-/// 全一致**。停顿（gap_ms）只影响拼装，不算在内。
+/// "旧工程的音频能不能给这份新设置复用"的判据：**模型 / 兜底开关 / 参考音
+/// （路径 + 内容哈希 + 参考文本）全一致**。停顿（gap_ms）只影响拼装，不算在内。
 ///
 /// worker 的 `load_resumable`（续作/改稿继承）与版本回滚的"按文本继承"**共用这一条**：
 /// 两处各写一遍的话，回滚就可能把 B 模型合成的音频标成"版本显示 A"的已合成
@@ -3810,6 +4245,7 @@ fn settings_allow_reuse(
     model: &str,
     voice_ref: &Option<String>,
     voice_ref_hash: &Option<String>,
+    voice_ref_text: &Option<String>,
     auto_normalize: bool,
     dict_fingerprint: &str,
 ) -> bool {
@@ -3818,7 +4254,7 @@ fn settings_allow_reuse(
         // 词典与兜底开关同类：它改的是 spoken 文本，换词典就不能复用旧音频。
         // 旧工程/没启用时 `dict_hash` 是 None —— 按"空词典"处理，与当前空词典等价。
         && effective_dict_hash(saved) == dict_fingerprint
-        && voice_ref_matches(saved, voice_ref, voice_ref_hash)
+        && voice_ref_matches(saved, voice_ref, voice_ref_hash, voice_ref_text)
 }
 
 /// 工程记录的词典指纹：None（旧工程 / 从没启用过）等价于"空词典"。
@@ -3941,6 +4377,7 @@ fn new_project_from_inputs(
     script: &str,
     model: &str,
     voice_ref: Option<String>,
+    voice_ref_text: Option<String>,
     gap_ms: u64,
     auto_normalize: bool,
     dict: &std::collections::BTreeMap<String, String>,
@@ -3965,20 +4402,94 @@ fn new_project_from_inputs(
     );
     project.auto_normalize = auto_normalize;
     project.dict_hash = Some(dictionaries::fingerprint(dict));
+    // 参考文本与参考音**同进同出**：没有参考音就不该留下孤立的文本（否则"已切回内置音色"
+    // 之后旧文本还在，下次选回同一段音频会静默沿用上一次的转写）。
+    project.voice_ref_text = match project.voice_ref {
+        Some(_) => voice_ref_text,
+        None => None,
+    };
     // 参考音哈希**不在这里算**：`load_resumable` 已经算过一份（算两遍纯属浪费），
     // 版本留档那边由 `project_from_ui` 自己补。这里只管"按输入造工程"。
     project
 }
 
+/// 参考文本只属于**当前这一段**参考音；路径一换，它就作废。
+///
+/// 返回 true = 文本仍然有效（还是同一段音频），不用清。
+///
+/// 为什么"必须清"不是洁癖（复核真机复现的静默缺陷）：文本非空 ⇒
+/// `reference_text_missing`（本文件下方）拦不住；而 `settings_allow_reuse` 见
+/// `voice_ref` 变了会**重录** ⇒ 于是**拿 A 音频的转写去条件 B 音频**。
+/// 服务端不报错（正确文本 273241B / 完全无关文本 289628B —— 产物已经变了），
+/// 用户只会觉得"换了音频但音色怪怪的"。
+fn keeps_reference_text(old_path: &str, new_path: &str) -> bool {
+    let old = old_path.trim();
+    !old.is_empty() && old == new_path.trim()
+}
+
+/// 清掉参考文本与它的状态行。**唯一入口**：清除参考音、换参考音、手改路径都走它。
+fn clear_reference_text(ui: &MainWindow) {
+    ui.set_voice_ref_text("".into());
+    ui.set_voice_ref_text_status("".into());
+}
+
+/// 换参考音频：写路径，并**在路径真的变了的时候**把名下的文本一起清掉。
+///
+/// 这是全文件**唯一一处**写 `voice-ref-path` 的地方 —— 源码级守卫
+/// `reference_path_writes_go_through_this_helper` 钉住了这点，谁再绕过它就红。
+fn set_voice_ref(ui: &MainWindow, path: &str) {
+    if !keeps_reference_text(&ui.get_voice_ref_path(), path) {
+        clear_reference_text(ui);
+    }
+    ui.set_voice_ref_path(path.into());
+}
+
+/// 界面上的音色输入：**唯一入口**。
+///
+/// 返回 `(参考音频路径, 参考音频的文本)`，并在这里统一执行"没有参考音就不带孤立文本"
+/// 这条口径——单篇 / 批量 / 试听 / 模板比对都走它，免得某条路径漏掉一半。
+/// （孤立文本会让"切回内置音色再选回同一段音频"静默沿用上一份转写。）
+fn voice_input_from_ui(ui: &MainWindow) -> (Option<String>, Option<String>) {
+    let path = non_empty(ui.get_voice_ref_path().to_string());
+    let text = path
+        .as_ref()
+        .and_then(|_| non_empty(ui.get_voice_ref_text().to_string()));
+    (path, text)
+}
+
+/// "克隆音色还差参考文本吗"——提交前的拦截判据。
+///
+/// 真正的规则在 `aw_core::VoiceClone::new`（服务端要求路径与文本成对）；这里只是**提前问一次**，
+/// 不另写一份 trim 判断（两份迟早漂移）。返回 true = 该拦住。
+fn reference_text_missing(voice_ref: &Option<String>, voice_ref_text: &Option<String>) -> bool {
+    match voice_ref.as_deref() {
+        Some(path) => {
+            aw_core::VoiceClone::new(path, voice_ref_text.as_deref().unwrap_or_default()).is_err()
+        }
+        None => false,
+    }
+}
+
+// 8 个参数确实多，但每个都是调用方必须显式给出的决策（路径/稿子/引擎/音色两项/停顿/
+// 兜底/词典）。打包成配置结构体只是把同一串东西换个地方写，调用点反而更啰嗦——
+// 与 `Project::new` 的处理一致。
+#[allow(clippy::too_many_arguments)]
 fn load_resumable(
     dir: &Path,
     script: &str,
     model: &str,
     voice_ref: Option<String>,
+    voice_ref_text: Option<String>,
     gap_ms: u64,
     auto_normalize: bool,
     dict: &std::collections::BTreeMap<String, String>,
 ) -> Result<LoadedProject, String> {
+    // 没有参考音就不要带着孤立的参考文本走（与 new_project_from_inputs 同一口径）
+    let voice_ref_text = if voice_ref.is_some() {
+        voice_ref_text
+    } else {
+        None
+    };
     let dict_hash = dictionaries::fingerprint(dict);
     let voice_ref_hash = match voice_ref.as_deref() {
         Some(path) => Some(sha256_file(Path::new(path))?),
@@ -3995,6 +4506,7 @@ fn load_resumable(
             model,
             &voice_ref,
             &voice_ref_hash,
+            &voice_ref_text,
             auto_normalize,
             &dict_hash,
         ) && sentence_texts_match(saved, script)
@@ -4014,6 +4526,7 @@ fn load_resumable(
         script,
         model,
         voice_ref.clone(),
+        voice_ref_text.clone(),
         gap_ms,
         auto_normalize,
         dict,
@@ -4027,6 +4540,7 @@ fn load_resumable(
             model,
             &voice_ref,
             &voice_ref_hash,
+            &voice_ref_text,
             auto_normalize,
             &dict_hash,
         ) {
@@ -4240,7 +4754,10 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_versions(&ui, &rows, &cmd_tx, &state);
     wire_dictionary(&ui, &rows, &cmd_tx, &msg_tx_ui, &state);
     load_active_dictionary(&ui, &state);
-    wire_voice_panel(&ui, &cmd_tx, &state);
+    wire_asr_model(&ui, &state);
+    refresh_asr_models(&ui);
+    // voice-clone 批给这个函数加了 msg_tx_ui（「自动转写」要后台跑 ASR 再回消息）
+    wire_voice_panel(&ui, &cmd_tx, &msg_tx_ui, &state);
     wire_voice_library(
         &ui,
         &VoiceLibraryCtx {
@@ -4336,44 +4853,98 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             ui.set_status_text("主题已切换：暗色".into());
         }
         "downloads" => {
-            // 渲染核对（不是真跑）：把下载队列的四种状态各摆一条，肉眼核对进度/按钮
+            // 渲染核对（不是真跑）：把下载队列的四种状态 + 没有下载源 + 落点警告各摆一条
             ui.set_drawer_open(true);
             ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(vec![
                 DownloadRow {
                     key: "audio8-tts".into(),
                     label: "audio8-tts".into(),
                     state: "下载中".into(),
-                    detail: "已下载 412 MB / 2.1 GB · 从 412 MB 字节断点续传".into(),
+                    detail: "来源：内置下载清单 · 已下载 412 MB / 2.1 GB · 从 412 MB 字节断点续传".into(),
                     progress: 0.19,
                     active: true,
+                    actionable: true,
                 },
                 DownloadRow {
                     key: "indextts2".into(),
                     label: "indextts2".into(),
                     state: "排队".into(),
-                    detail: "/Users/me/models/indextts2".into(),
+                    detail: "来源：server.json（服务清单） · /Users/me/models/indextts2".into(),
                     progress: 0.0,
                     active: true,
+                    actionable: true,
                 },
                 DownloadRow {
                     key: "yue2".into(),
                     label: "yue2".into(),
                     state: "已完成".into(),
-                    detail: "下载完成 · /Users/me/models/yue2.gguf".into(),
+                    detail: "来源：内置下载清单 · 下载完成 · /Users/me/models/yue2.gguf".into(),
                     progress: 1.0,
                     active: false,
+                    actionable: true,
                 },
                 DownloadRow {
                     key: "ace-step".into(),
                     label: "ace-step".into(),
                     state: "失败".into(),
-                    detail: "网络错误：服务器返回 HTTP 404 · /Users/me/models/ace.gguf".into(),
+                    detail: "来源：内置下载清单 · 网络错误：服务器返回 HTTP 404 · /Users/me/models/ace.gguf".into(),
                     progress: 0.0,
                     active: false,
+                    actionable: true,
+                },
+                DownloadRow {
+                    key: "qwen3-asr".into(),
+                    label: "qwen3-asr".into(),
+                    state: "未下载".into(),
+                    detail: "来源：内置下载清单 · /Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf · ⚠ 落点与 server.json 对不上：清单 path 是 /Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf，本次会下到 /Users/me/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf —— 下完服务仍可能加载不到".into(),
+                    progress: 0.0,
+                    active: false,
+                    actionable: true,
+                },
+                DownloadRow {
+                    key: "yue-2-no-source".into(),
+                    label: "yue2".into(),
+                    state: "没有下载源".into(),
+                    detail: "上游 model_specs 里没有 family=yue2 的 spec —— 暂无下载源，不猜地址".into(),
+                    progress: 0.0,
+                    active: false,
+                    actionable: false,
                 },
             ]))));
             ui.set_status_text(
-                "模型下载：队列 / 断点续传 / 校验（示例数据，用于核对进度与终态）".into(),
+                "模型下载：队列 / 断点续传 / 校验 / 没有下载源 / 落点提醒（示例数据）".into(),
+            );
+        }
+        "model-sources" => {
+            // 真机态：不灌示例数据，直接按「server.json ∪ 内置清单」渲一遍，
+            // 并报出"几个真的有下载入口、几个如实标了没有源"。
+            ui.set_drawer_open(true);
+            let plan = download_plan();
+            let ready = plan.iter().filter(|r| r.action.is_some()).count();
+            let missing = plan.len() - ready;
+            // 无头核对用（这个态就是给"跑一次看真实数字"用的）：把每行的结论打到 stderr，
+            // 屏幕上也能看，但屏幕锁着时只有 stderr 拿得到。
+            eprintln!("AW_UI_STATE=model-sources：{ready} 个有下载入口 / {missing} 个没有下载源");
+            for r in &plan {
+                match &r.action {
+                    Some(a) => {
+                        let warn = match &a.conflict {
+                            Some(c) => format!(" ⚠ {c}"),
+                            None => String::new(),
+                        };
+                        eprintln!(
+                            "  {} → {}（{}）{warn}",
+                            r.id,
+                            a.dest.display(),
+                            a.origin.label()
+                        )
+                    }
+                    None => eprintln!("  {} → 没有下载源：{}", r.id, r.reason),
+                }
+            }
+            refresh_download_rows(ui, ui_state);
+            ui.set_status_text(
+                format!("模型下载源：{ready} 个有下载入口 · {missing} 个如实标了没有源").into(),
             );
         }
         "engines" => {
@@ -4396,13 +4967,15 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     i as i32 == dflt,
                     v.known_issues
                 );
-                // 开工判据按"当前参考音路径"实算（通常是空 = 用内置音色）
+                // 开工判据按"当前参考音路径 + 参考文本"实算（通常是空 = 用内置音色）
                 let refp = ui.get_voice_ref_path().to_string();
+                let reft = ui.get_voice_ref_text().to_string();
                 let exists = !refp.trim().is_empty() && std::path::Path::new(&refp).is_file();
                 eprintln!(
-                    "      开工判据（参考音「{}」）：{:?}",
+                    "      开工判据（参考音「{}」/ 文本「{}」）：{:?}",
                     refp,
-                    voice_readiness(Some(v), &refp, exists)
+                    reft,
+                    voice_readiness(Some(v), &refp, exists, &reft)
                 );
             }
             for m in models
@@ -4639,7 +5212,11 @@ fn restore_project(
         // 不保留默认 index，否则“开始合成”会把缺失模型静默换成另一音色。
         ui.set_voice_index(-1);
     }
-    ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+    // 参考文本与参考音一起回灌：只回灌路径的话，重开应用后克隆音色会因为"没文本"
+    // 被前置拦截挡住，用户得凭空重填一次（其实工程里存着）。顺序不能反——
+    // `set_voice_ref` 会因为"换了段音频"先把文本清掉。
+    set_voice_ref(ui, &project.voice_ref.clone().unwrap_or_default());
+    ui.set_voice_ref_text(project.voice_ref_text.clone().unwrap_or_default().into());
     refresh_voice_labels(ui);
     // 工程里记着的两个输入回灌界面：兜底开关（决定怎么念）与句间停顿（决定拼装）
     ui.set_auto_normalize(project.auto_normalize);
@@ -5860,6 +6437,9 @@ fn eval_summary_note(summary: &EvalSummary) -> String {
     if let Some(path) = &summary.report_path {
         note.push_str(&format!("·报告 {}", file_label(path)));
     }
+    // 回读模型念出来：报告的"回读模型"与状态行这一点必须是同一个值，否则用户
+    // 换过模型之后两边说法会不一致（而且报告是要存档的，事后更没法核对）。
+    note.push_str(&format!("·回读 {}", summary.model));
     note
 }
 
@@ -6024,7 +6604,12 @@ fn wire_batch(
             return;
         };
         let model = v.name.to_string();
-        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
+        // 与单篇同一条前置拦截：批量里 10 篇 × N 句全红是最坏的失败形态
+        if reference_text_missing(&voice_ref, &voice_ref_text) {
+            ui.set_batch_summary(aw_core::MISSING_REFERENCE_TEXT.into());
+            return;
+        }
 
         // 每条先登记成一条配音任务（排队中），worker 轮到它时用 TaskStarted 抬成运行中
         let mut items = Vec::new();
@@ -6062,6 +6647,7 @@ fn wire_batch(
                 revision: st.project_revision.get(),
                 model,
                 voice_ref,
+                voice_ref_text,
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
                 dict: st.active_dict.borrow().clone(),
@@ -6197,11 +6783,12 @@ fn wire_task_center(
 /// 与 worker 造新工程共用 `new_project_from_inputs`，所以留档下来的东西就是"点开始合成
 /// 会用的那一份"，不是另建一个近似对象。
 fn project_from_ui(ui: &MainWindow, dict: &std::collections::BTreeMap<String, String>) -> Project {
-    let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+    let (voice_ref, voice_ref_text) = voice_input_from_ui(ui);
     let mut project = new_project_from_inputs(
         &ui.get_script_text(),
         &current_model_name(ui).unwrap_or_default(),
         voice_ref.clone(),
+        voice_ref_text,
         gap_ms_from_ui(ui),
         ui.get_auto_normalize(),
         dict,
@@ -6238,6 +6825,7 @@ fn rollback_with_inheritance(
                 &restored.model,
                 &restored.voice_ref,
                 &restored.voice_ref_hash,
+                &restored.voice_ref_text,
                 restored.auto_normalize,
                 &effective_dict_hash(&restored),
             ) =>
@@ -6265,6 +6853,7 @@ fn project_from_version(
         &script,
         &snapshot.model,
         snapshot.voice_ref.clone(),
+        snapshot.voice_ref_text.clone(),
         snapshot.gap_ms,
         snapshot.auto_normalize,
         dict,
@@ -6438,7 +7027,8 @@ fn wire_versions(
                 ui.set_script_text(script.clone().into());
                 // 句子行重算（与改稿同一条路径）：这里只有 ui，行模型由 wire_versions 传入
                 rebuild(&ui, &rows, &script);
-                ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+                set_voice_ref(&ui, &project.voice_ref.clone().unwrap_or_default());
+                ui.set_voice_ref_text(project.voice_ref_text.clone().unwrap_or_default().into());
                 if !restore_voice_index(&ui, &project.model) {
                     ui.set_voice_index(-1);
                 }
@@ -6502,7 +7092,8 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
         let effect = templates::apply_effect(&project_inputs_from_ui(&ui), &t);
 
         // 先套用输入（模型索引按名字找回，找不到就把索引清 -1，别静默换成别的引擎）
-        ui.set_voice_ref_path(t.voice_ref.clone().unwrap_or_default().into());
+        set_voice_ref(&ui, &t.voice_ref.clone().unwrap_or_default());
+        ui.set_voice_ref_text(t.voice_ref_text.clone().unwrap_or_default().into());
         if !restore_voice_index(&ui, &t.model) {
             ui.set_voice_index(-1);
         }
@@ -6558,6 +7149,7 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
             &ui.get_template_name_text(),
             &model,
             non_empty(ui.get_voice_ref_path().to_string()),
+            non_empty(ui.get_voice_ref_text().to_string()),
             ui.get_speed(),
             gap_ms_from_ui(&ui),
             ui.get_auto_normalize(),
@@ -6652,6 +7244,10 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
             ui.set_status_text("任务进行中：参考音暂不可改".into());
             return;
         }
+        // 路径字段是 in-out 绑定，回调触发时 Slint 已经把它改成新值了 ——
+        // 拿不到旧值做比较，所以**任何编辑都让文本作废**：
+        // 文本属于原来那段音频，留着就会静默拿它去条件新音频（见 `keeps_reference_text`）。
+        clear_reference_text(&ui);
         invalidate_worker_project(&tx2, &state2);
         reset_bgm(&ui, &state2);
         ui.set_has_result(false);
@@ -6666,7 +7262,12 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
 /// 音色只有两种来源——模型内置默认音色 / 参考音频克隆出来的音色；
 /// 模型（audio8-tts / index-tts2 / 0.1b / stream…）是**引擎参数**，走 `model-changed`。
 /// 单一事实来源：`voice-ref-path` 为空 = 内置默认音色，非空 = 克隆音色（不设第二个 mode 状态）。
-fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+fn wire_voice_panel(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
+    state: &Rc<UiState>,
+) {
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
     let st = state.clone();
@@ -6689,7 +7290,7 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
             return;
         };
         let model = v.name.to_string();
-        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
         let what = if voice_ref.is_some() {
             "克隆音色"
         } else {
@@ -6704,6 +7305,7 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
                 revision: st.project_revision.get(),
                 model,
                 voice_ref,
+                voice_ref_text,
                 text: VOICE_PREVIEW_TEXT.to_string(),
             })
             .is_err()
@@ -6722,12 +7324,73 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
         if ui.get_running() || ui.get_busy() || ui.get_voice_ref_path().is_empty() {
             return;
         }
-        ui.set_voice_ref_path("".into());
+        // 清空路径 ⇒ helper 判定"不是同一段音频" ⇒ 文本与状态行一起清
+        set_voice_ref(&ui, "");
         invalidate_worker_project(&tx, &st);
         reset_bgm(&ui, &st);
         ui.set_has_result(false);
         refresh_voice_labels(&ui);
         ui.set_status_text("已切回内置默认音色：请重新开始合成".into());
+    });
+
+    // ── 参考音频的文本：与参考音一样是音色的一部分（服务端拿它做条件）──
+    //    手改 ⇒ 与"换参考音"同一条作废路径；清掉状态行是因为用户已经自己拍板了。
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_voice_ref_text_changed(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_voice_ref_text_status("".into());
+        refresh_voice_labels(&ui);
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：参考音频的文本暂不可改".into());
+            return;
+        }
+        invalidate_worker_project(&tx, &st);
+        reset_bgm(&ui, &st);
+        ui.set_has_result(false);
+        ui.set_status_text("参考音频的文本已改：请重新开始合成".into());
+    });
+
+    // ── 自动转写：**只帮用户填，不替用户决定**。结果回填到输入框 + 状态行要求核对。──
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    let st = state.clone();
+    ui.on_transcribe_reference(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_voice_ref_text_busy() {
+            return;
+        }
+        // 转写期间不能有合成在跑：文本一变就要作废旧工程，跑到一半改输入会让
+        // "界面上是什么"和"这次合成用的是哪份文本"对不上。
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&st) {
+            ui.set_voice_ref_text_status(
+                "有任务正在进行：自动转写要等它结束（转写会作废旧工程音频）".into(),
+            );
+            return;
+        }
+        let Some(path) = non_empty(ui.get_voice_ref_path().to_string()) else {
+            ui.set_voice_ref_text_status("先填参考音频路径，再点「自动转写」".into());
+            return;
+        };
+        if !Path::new(&path).is_file() {
+            ui.set_voice_ref_text_status("参考音频不存在或不可读：先修正路径".into());
+            return;
+        }
+        let model = aw_core::DEFAULT_ASR_MODEL.to_string();
+        ui.set_voice_ref_text_busy(true);
+        ui.set_voice_ref_text_status(format!("正在用 {model} 转写参考音频…").into());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let result = match make_client() {
+                Ok(client) => client.asr(Path::new(&path)).map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            let _ = msg.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::ReferenceTranscribed { model, result },
+            });
+        });
     });
 }
 
@@ -6907,7 +7570,7 @@ fn wire_run(
                 set_status(&model4, i, "待合成");
             }
         }
-        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
         if let Some(path) = voice_ref.as_deref() {
             if !Path::new(path).is_file() {
                 ui.set_status_text(
@@ -6915,6 +7578,13 @@ fn wire_run(
                 );
                 return;
             }
+        }
+        // 克隆音色缺参考文本：**发起前**拦住。发出去的话每一句都会撞同一个 500
+        // （服务端原文用户看不懂，而且 N 句 = N 条一模一样的失败）。
+        // 文案与 `Project::synthesize` 的前置拦截**同一份常量**，不另写一句话。
+        if reference_text_missing(&voice_ref, &voice_ref_text) {
+            ui.set_status_text(aw_core::MISSING_REFERENCE_TEXT.into());
+            return;
         }
         reset_bgm(&ui, &state1);
         stop1.store(false, Ordering::Relaxed);
@@ -6942,6 +7612,7 @@ fn wire_run(
                 script: ui.get_script_text().to_string(),
                 model: model_name.clone(),
                 voice_ref,
+                voice_ref_text,
                 project_name: stem,
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
@@ -7632,6 +8303,8 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BackupDirPicked { .. }
         | Msg::BackupDone { .. }
         | Msg::VoiceImportDirPicked { .. }
+        // 参考音转写：来自后台线程，与稿件版本无关（转的是参考音，不是稿子）
+        | Msg::ReferenceTranscribed { .. }
         | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
         | Msg::SeparationProgress { .. }
@@ -7924,6 +8597,40 @@ fn tick(
                     }
                 }
             }
+            Msg::ReferenceTranscribed { model, result } => {
+                ui.set_voice_ref_text_busy(false);
+                match result {
+                    Ok(text) => {
+                        // **填进输入框**而不是替用户拍板：用户能在同一处直接改错字。
+                        // 状态行一直留着提醒，直到他改文本或开始合成（见 on_start_run）。
+                        ui.set_voice_ref_text(text.clone().into());
+                        ui.set_voice_ref_text_status(
+                            format!(
+                                "已用 {model} 转写并填入（{} 字）：**请核对**，转写错字会让克隆音色跑偏。",
+                                text.trim().chars().count()
+                            )
+                            .into(),
+                        );
+                        // 文本变了 ⇒ 旧成品/旧工程不可复用（与手改参考文本同一条路）。
+                        // 三件事与 `on_voice_ref_text_changed` **逐条对齐**：少了 BGM 与
+                        // has_result，"试听全篇/导出"会亮着、点了才说"工程已变更"（复核指出）。
+                        // 必须在这里作废 worker 那份内存工程：否则下一次「重新合成某句」
+                        // 会拿旧文本去合成，用户改了文本却听不出变化。
+                        invalidate_worker_project(cmd_tx, state);
+                        reset_bgm(ui, state);
+                        ui.set_has_result(false);
+                        refresh_voice_labels(ui);
+                        ui.set_status_text("参考音频已转写：核对文本后开始合成".into());
+                    }
+                    Err(e) => {
+                        ui.set_voice_ref_text_status(
+                            format!("自动转写失败（{model}）：{e} —— 可以手填这段音频实际念的内容")
+                                .into(),
+                        );
+                        ui.set_status_text("自动转写失败：手动填写参考音频的文本即可继续".into());
+                    }
+                }
+            }
             Msg::VoicePreviewFailed { label, error } => {
                 ui.set_busy(false);
                 ui.set_status_text(format!("试听失败（{label}）：{error}").into());
@@ -8096,9 +8803,10 @@ fn tick(
                 task_id,
                 done,
                 total,
+                model,
             } => {
                 if state.eval_task.get() == Some(task_id) {
-                    let note = format!("质检中：第 {done}/{total} 句");
+                    let note = format!("质检中：第 {done}/{total} 句 · 回读 {model}");
                     ui.set_status_text(note.clone().into());
                     progress_task(
                         ui,
@@ -8733,6 +9441,8 @@ fn wire_global_settings(
             dictionary: prev.dictionary,
             // 「更新」的清单地址也不在这里改（有自己的落盘点 save_update_url），原样带上
             update_url: prev.update_url,
+            // 质检回读模型也不在这里改（自己的落盘点 persist_asr_model），原样带上
+            asr_model: prev.asr_model,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -8880,6 +9590,9 @@ enum VoiceReadiness {
     ReferenceMissing,
     /// 该引擎**必须**提供参考音（index-tts2：不接 voice_ref 直接报错）。
     EngineNeedsReference,
+    /// 给了参考音，但还差它的文本：服务端要求 `voice_ref` 与 `reference_text`
+    /// **成对**（真机实测只给路径 → HTTP 500）。
+    ReferenceTextMissing,
 }
 
 impl VoiceReadiness {
@@ -8892,12 +9605,27 @@ impl VoiceReadiness {
             Self::EngineNeedsReference => {
                 "这个引擎必须提供参考音频（不能只用内置音色）：在下面填一段参考 wav 再开始配音"
             }
+            // 与提交处那次拦截**同一个常量**：界面提示与真正拦住用户的话逐字一致，
+            // 不另写一句（见 LESSON_同一语义两处实现必然漂移）。
+            Self::ReferenceTextMissing => aw_core::MISSING_REFERENCE_TEXT,
         }
     }
 }
 
 /// 判据入口：引擎行（可选）+ 参考音路径 / 是否可读 → 能不能开工。
-fn voice_readiness(engine: Option<&Voice>, ref_path: &str, ref_exists: bool) -> VoiceReadiness {
+/// 判据入口：引擎行（可选）+ 参考音路径 / 是否可读 / 参考文本 → 能不能开工。
+///
+/// 四条规则合成**一个**结论，覆盖两组批次各自的语义：
+/// ① 引擎硬要求参考音（audio-workshop 的 `requires.voice_ref`）；
+/// ② 参考音与文本必须成对（voice-clone 批次）。
+/// 文本那条**转调** `reference_text_missing`（它又转调 `aw_core::VoiceClone`），
+/// 不在这里另写一份 trim 判断 —— 两份判据迟早漂移。
+fn voice_readiness(
+    engine: Option<&Voice>,
+    ref_path: &str,
+    ref_exists: bool,
+    ref_text: &str,
+) -> VoiceReadiness {
     let Some(engine) = engine else {
         return VoiceReadiness::NoEngine;
     };
@@ -8907,6 +9635,10 @@ fn voice_readiness(engine: Option<&Voice>, ref_path: &str, ref_exists: bool) -> 
     }
     if engine.requires_voice_ref && path.is_empty() {
         return VoiceReadiness::EngineNeedsReference;
+    }
+    let as_opt = |v: &str| non_empty(v.to_string());
+    if reference_text_missing(&as_opt(path), &as_opt(ref_text)) {
+        return VoiceReadiness::ReferenceTextMissing;
     }
     VoiceReadiness::Ready
 }
@@ -8944,6 +9676,7 @@ fn refresh_voice_labels(ui: &MainWindow) {
     );
 
     let ref_trimmed = ui.get_voice_ref_path().trim().to_string();
+    let ref_text_trimmed = ui.get_voice_ref_text().trim().to_string();
 
     // 音色名：内置默认音色 / 克隆音色 · <参考音频文件名>（音色 ≠ 模型）
     if ref_trimmed.is_empty() {
@@ -8962,8 +9695,10 @@ fn refresh_voice_labels(ui: &MainWindow) {
     let exists = !ref_trimmed.is_empty() && Path::new(&ref_trimmed).is_file();
     ui.set_reference_exists(exists);
 
-    // 判据算一次，UI 只消费：主按钮可用性 / 内置音色行 / 阻断提示同一份结论
-    let readiness = voice_readiness(engine_row.as_ref(), &ref_trimmed, exists);
+    // 判据算一次，UI 只消费：主按钮可用性 / 内置音色行 / 阻断提示同一份结论。
+    // 参考文本那条规则由 `voice_readiness` 内部转调 main 的 `reference_text_missing`
+    // 与 `aw_core`，这里不另写一份 trim 判断（见 LESSON_同一语义两处实现必然漂移）。
+    let readiness = voice_readiness(engine_row.as_ref(), &ref_trimmed, exists, &ref_text_trimmed);
     let requires_ref = engine_row.as_ref().is_some_and(|v| v.requires_voice_ref);
     ui.set_engine_requires_voice_ref(requires_ref);
     ui.set_engine_note(engine_note(engine_row.as_ref()).into());
@@ -9391,6 +10126,9 @@ fn wire_quality_check(
         let stem = file_stem(&ui.get_project_name());
         let dir = project_dir(&stem);
         stop_flag.store(false, Ordering::Relaxed);
+        // 这里就把生效模型定下来发给 worker：UI 回显、报告落盘、真实请求三处同一个值，
+        // 不给"两处各算一份"留机会（运行中改设置也不会让它们漂移）。
+        let model = effective_asr_model(&settings_snapshot());
         let id = enqueue_task(
             &ui,
             &st,
@@ -9399,8 +10137,10 @@ fn wire_quality_check(
             "质检 · ASR 回读",
         );
         let note: String = match queue_note(&st, id) {
-            Some(q) => format!("{q} · 轮到它时自动开始质检"),
-            None => "质检中：正在逐句 ASR 回读（首次会加载 ASR 模型，约 8s）…".to_string(),
+            Some(q) => format!("{q} · 轮到它时自动开始质检（回读 {model}）"),
+            None => {
+                format!("质检中：用 {model} 逐句 ASR 回读（首次会加载该模型，约 8s）…")
+            }
         };
         ui.set_status_text(note.into());
         if tx
@@ -9408,6 +10148,7 @@ fn wire_quality_check(
                 revision: st.project_revision.get(),
                 task_id: id,
                 dir,
+                model,
             })
             .is_err()
         {
@@ -9813,7 +10554,7 @@ mod tests {
         assert!(v.requires_voice_ref, "能力要跟着行走到判据里");
 
         assert_eq!(
-            voice_readiness(Some(&v), "", false),
+            voice_readiness(Some(&v), "", false, ""),
             VoiceReadiness::EngineNeedsReference
         );
         assert!(
@@ -9822,25 +10563,47 @@ mod tests {
                 .contains("必须提供参考音频"),
             "阻断提示要说清是这个引擎的硬要求"
         );
-        // 给了一段真实存在的参考音 → 可以开工
-        assert_eq!(
-            voice_readiness(Some(&v), "/tmp/ref.wav", true),
-            VoiceReadiness::Ready
-        );
         // 填了路径但文件不在 → 报"路径不对"，不冒充"引擎需要参考音"
         assert_eq!(
-            voice_readiness(Some(&v), "/tmp/ref.wav", false),
+            voice_readiness(Some(&v), "/tmp/ref.wav", false, "念的内容"),
             VoiceReadiness::ReferenceMissing
         );
+        // 参考音存在但**没文本**：服务端要求成对，照样要拦（voice-clone 批次的语义）
+        assert_eq!(
+            voice_readiness(Some(&v), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::ReferenceTextMissing
+        );
+        // 提示语必须是提交处真正拦住用户的那一句（同一个常量，不另写一份）
+        assert_eq!(
+            VoiceReadiness::ReferenceTextMissing.note(),
+            aw_core::MISSING_REFERENCE_TEXT,
+            "界面提示与提交拦截必须逐字一致"
+        );
+        // 路径 + 文本都给全 → 才能开工
+        assert_eq!(
+            voice_readiness(Some(&v), "/tmp/ref.wav", true, "念的内容"),
+            VoiceReadiness::Ready
+        );
+
         // 反例：不吃参考音的引擎，空参考音就该能开工（过滤器不能顺手把正常引擎也禁了）
         let plain = voice_of(&sm("audio8-tts", "tts"));
         assert!(!plain.requires_voice_ref);
         assert_eq!(
-            voice_readiness(Some(&plain), "", false),
+            voice_readiness(Some(&plain), "", false, ""),
             VoiceReadiness::Ready
         );
+        // 但"给了参考音却忘了文本"这条与引擎无关：走克隆就得成对，
+        // 否则服务端每句 500（这是 voice-clone 批次的原始症状）
+        assert_eq!(
+            voice_readiness(Some(&plain), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::ReferenceTextMissing,
+            "不要求参考音的引擎，用户主动给了参考音也必须给文本"
+        );
         // 一个引擎都没有
-        assert_eq!(voice_readiness(None, "", false), VoiceReadiness::NoEngine);
+        assert_eq!(
+            voice_readiness(None, "", false, ""),
+            VoiceReadiness::NoEngine
+        );
     }
 
     /// 验收②（续）：引擎说明里要带上清单登记的 `known_issues`，且硬要求要点名。
@@ -10005,50 +10768,92 @@ mod tests {
         );
     }
 
-    /// 下载落盘位置：**目录一律取全局设置的模型目录**（不写死、也不跟清单 path 走），
-    /// 文件名优先沿用清单 path（服务才能按原路径找到）。
+    /// `..` 与软链都要按**真实路径**算（LESSON：路径包含判定必须按真实路径）：
+    /// 词法比较会把 `/models/x/../in/y.gguf` 判成"不在 /models 里"、把"经软链指向模型目录"
+    /// 的路径也判成不在——模型盘明明挂了却显示没挂。
     #[test]
-    fn download_dest_uses_model_dir_with_manifest_filename() {
-        // (id, path, url) → 期望落盘路径
-        let model = |id: &str, path: &str, url: &str| ServerModel {
+    fn models_under_dir_resolves_dotdot_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("aw-mud-{}", std::process::id()));
+        let models = root.join("models");
+        std::fs::create_dir_all(models.join("in")).unwrap();
+        let model = |id: &str, path: String| ServerModel {
             id: id.into(),
             task: "tts".into(),
-            family: "audio8".into(),
-            path: path.into(),
-            url: url.into(),
+            family: "f".into(),
+            path,
+            url: String::new(),
             ..Default::default()
         };
-        let dir = Path::new("/models");
+
+        let cfg_with = |id: &str, path: String| {
+            Some(ServerConfig {
+                host: None,
+                port: None,
+                models: vec![model(id, path)],
+            })
+        };
+
+        // ① `..` **逃出去**：字面上以 `<root>/models` 开头，真实路径在 `<root>/outside` 里
+        //    —— 词法比较会误报成"模型盘上有这个模型"。
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let escape = models
+            .join("x")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("y.gguf")
+            .display()
+            .to_string();
         assert_eq!(
-            download_dest_for(
-                &model(
-                    "audio8-tts",
-                    "/somewhere/else/audio8-tts.gguf",
-                    "https://huggingface.co/x/audio8-tts.gguf"
-                ),
-                dir
-            ),
-            Path::new("/models/audio8-tts.gguf"),
-            "目录取模型目录，文件名沿用清单 path"
+            models_under_dir(&cfg_with("escape", escape), &models),
+            0,
+            "`..` 逃出模型目录的不能算在里面（词法前缀会误报）"
         );
-        // 清单没给 path：取 url 末段（且剥掉 query）
+
+        // ② `..` 只是绕一下、真实路径仍在模型目录里 → 要算
+        let dotdot = models
+            .join("x")
+            .join("..")
+            .join("in")
+            .join("y.gguf")
+            .display()
+            .to_string();
         assert_eq!(
-            download_dest_for(
-                &model(
-                    "indextts2",
-                    "",
-                    "https://example.com/w/indextts2.gguf?token=abc"
-                ),
-                dir
-            ),
-            Path::new("/models/indextts2.gguf")
+            models_under_dir(&cfg_with("dotdot", dotdot), &models),
+            1,
+            "`..` 要按真实路径消解"
         );
-        // url 末段是空（以 / 结尾）：退回 <id>.gguf，不能把目录当文件名
-        assert_eq!(
-            download_dest_for(&model("yue2", "", "https://example.com/dir/"), dir),
-            Path::new("/models/yue2.gguf")
-        );
+
+        // 软链：`link` 指向 models，挂在 link 下面的权重也算在 models 里
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&models, &link).unwrap();
+            // ③ 经软链指向模型目录 → 真实在模型目录里，字面上不在
+            let viasymlink = link.join("in").join("z.gguf").display().to_string();
+            assert_eq!(
+                models_under_dir(&cfg_with("viasymlink", viasymlink), &models),
+                1,
+                "经软链指向模型目录的路径也要算在里面"
+            );
+
+            // ④ 反过来：字面上在模型目录里，但中间那段是个指向外面的软链 → 不算
+            let out_link = models.join("捷径");
+            std::os::unix::fs::symlink(root.join("outside"), &out_link).unwrap();
+            let sneaky = out_link.join("w.gguf").display().to_string();
+            assert_eq!(
+                models_under_dir(&cfg_with("sneaky", sneaky), &models),
+                0,
+                "模型目录里被软链引到外面的路径不能算（词法前缀会误报）"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
+
+    // 下载落盘位置现在由 `model_sources::plan_rows` 统一算（内置清单的上游布局优先，
+    // 服务清单没给布局时按 path/url 兜底）：那些分支的用例在 `src/model_sources.rs`，
+    // 这里不重复一份——两份实现正是这条链路上被抓过的错。
 
     /// B1（复核阻塞项）：点取消之后**不能**立刻允许为同一模型再排一条。
     ///
@@ -10235,12 +11040,8 @@ mod tests {
 
         // 只覆盖端口 → host 回落清单
         let over_port = AppSettings {
-            host: None,
             port: Some(9999),
-            model_dir: None,
-            dictionary: None,
-            bgm: Default::default(),
-            update_url: None,
+            ..Default::default()
         };
         assert_eq!(
             resolve_base(&over_port, &cfg, None).0,
@@ -10250,11 +11051,7 @@ mod tests {
         // 只覆盖 host → 端口回落清单
         let over_host = AppSettings {
             host: Some("10.0.0.1".into()),
-            port: None,
-            model_dir: None,
-            dictionary: None,
-            bgm: Default::default(),
-            update_url: None,
+            ..Default::default()
         };
         assert_eq!(
             resolve_base(&over_host, &cfg, None).0,
@@ -10364,6 +11161,150 @@ mod tests {
             MAX_CHARS,
             |t| aw_core::normalize(t, &Default::default()),
         )
+    }
+
+    // ── 音色克隆：参考文本是音色的一部分（招牌功能 D11）────────────────────
+    //
+    // 背景（真机）：audio8-tts 收到 voice_ref 却收不到 reference_text 会 HTTP 500，
+    // 修复前每一句都那样。这里钉住三条"改回去就红"的判据。
+
+    /// 拦截判据只在"克隆态 + 缺文本"时为真；内置音色不受影响。
+    #[test]
+    fn reference_text_missing_only_fires_for_clone_without_text() {
+        let path = Some("/x/我的声线.wav".to_string());
+        assert!(
+            reference_text_missing(&path, &None),
+            "克隆态没填文本 → 必须拦住（否则 N 句各撞一次 500）"
+        );
+        assert!(
+            reference_text_missing(&path, &Some("   ".to_string())),
+            "纯空白不算填了"
+        );
+        assert!(
+            !reference_text_missing(&path, &Some("实际念的内容".to_string())),
+            "填了就该放行"
+        );
+        assert!(
+            !reference_text_missing(&None, &None),
+            "内置音色不需要参考文本"
+        );
+    }
+
+    /// 参考文本变了 → 旧音频**不能**复用。
+    ///
+    /// 这是"让用户核对/修正 ASR 转写"能不能真的生效的关键：少了这一条，
+    /// 用户改完文本点开始合成，句子全是 done 被直接复用，听到的还是旧转写的声音。
+    #[test]
+    fn reuse_is_refused_when_only_the_reference_text_changed() {
+        let mut saved = saved_project("第一句。", Some("/x/我的声线.wav"));
+        saved.voice_ref_hash = Some("hash-a".into());
+        saved.voice_ref_text = Some("旧转写。".into());
+
+        let same = (Some("/x/我的声线.wav".to_string()), Some("hash-a".into()));
+        assert!(
+            settings_allow_reuse(
+                &saved,
+                "audio8-tts",
+                &same.0,
+                &same.1,
+                &Some("旧转写。".into()),
+                true,
+                &effective_dict_hash(&saved),
+            ),
+            "三样都一致才允许复用"
+        );
+        assert!(
+            !settings_allow_reuse(
+                &saved,
+                "audio8-tts",
+                &same.0,
+                &same.1,
+                &Some("改过的转写。".into()),
+                true,
+                &effective_dict_hash(&saved),
+            ),
+            "只改参考文本也必须判成换音色"
+        );
+    }
+
+    /// 没有参考音就不能留孤立的参考文本（否则切回内置音色再选回同一段音频，
+    /// 会静默沿用上一份转写）。
+    #[test]
+    fn orphan_reference_text_is_dropped() {
+        let p = new_project_from_inputs(
+            "第一句。",
+            "audio8-tts",
+            None,
+            Some("这段文本没有对应的参考音".into()),
+            GAP_MS,
+            true,
+            &empty_dict(),
+        );
+        assert_eq!(p.voice_ref_text, None, "无参考音时不该留下文本");
+
+        let with_ref = new_project_from_inputs(
+            "第一句。",
+            "audio8-tts",
+            Some("/x/我的声线.wav".into()),
+            Some("实际念的内容".into()),
+            GAP_MS,
+            true,
+            &empty_dict(),
+        );
+        assert_eq!(with_ref.voice_ref_text.as_deref(), Some("实际念的内容"));
+    }
+
+    /// 参考文本只在"还是同一段音频"时保留。
+    #[test]
+    fn reference_text_only_survives_when_the_path_is_unchanged() {
+        assert!(
+            keeps_reference_text("/x/a.wav", "/x/a.wav"),
+            "同一段音频要保留（否则用户点一下输入框就丢转写）"
+        );
+        assert!(
+            keeps_reference_text("  /x/a.wav ", "/x/a.wav"),
+            "只差首尾空白算同一段"
+        );
+        assert!(
+            !keeps_reference_text("/x/a.wav", "/x/b.wav"),
+            "换到别的音频必须清（否则拿 A 的转写去条件 B）"
+        );
+        assert!(!keeps_reference_text("/x/a.wav", ""), "清空必须清");
+        assert!(
+            !keeps_reference_text("", "/x/a.wav"),
+            "从空变成有：本来也没有文本可留"
+        );
+    }
+
+    /// 换参考音频的每条路径都必须把参考文本一起清 —— 否则**静默**拿上一段的转写当条件。
+    ///
+    /// 这条是**源码级守卫**（第四轮复核真机抓到的）：音色库「应用」与手改路径只换
+    /// `voice-ref-path`、不清 `voice-ref-text` ⇒ 文本非空时 `reference_text_missing`
+    /// 拦不住，而 `settings_allow_reuse` 见 `voice_ref` 变了又去重录 ⇒ 拿 A 音频的转写
+    /// 去条件 B 音频。服务端**不报错**、产物已经变了（复核真机：正确文本 273241B /
+    /// 完全无关文本 289628B，sha 也不同）。
+    ///
+    /// 加锁方式：把"写 `voice-ref-path`"收敛成唯一一处 `set_voice_ref`（它内部按
+    /// `keeps_reference_text` 决定要不要清文本）。谁再直接写这个属性，这条立刻红。
+    #[test]
+    fn reference_path_writes_go_through_the_helper_that_clears_the_text() {
+        let src = include_str!("main.rs");
+        // 拼接构造 needle：否则这条用例自己的源码就会被算成一次命中
+        let needle = concat!("ui.set_voice_ref_", "path(");
+        let writes = src.matches(needle).count();
+        assert_eq!(
+            writes, 1,
+            "写 voice-ref-path 只允许在 set_voice_ref 里一处（现在 {writes} 处）：\
+             多出来的地方必须改走 set_voice_ref，否则换音频会留着上一段的参考文本"
+        );
+
+        // 反向也要钉住：helper 本身必须真的清（不能只留个名字）
+        let at = src.find("fn set_voice_ref(").expect("set_voice_ref 必须在");
+        let body = &src[at..(at + 400).min(src.len())];
+        assert!(
+            body.contains("clear_reference_text(") && body.contains("keeps_reference_text("),
+            "set_voice_ref 必须按 keeps_reference_text 判断、并真的清文本：{body}"
+        );
     }
 
     fn save_done_project(dir: &Path, project: &mut Project) {
@@ -10481,6 +11422,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10499,6 +11441,7 @@ mod tests {
             &dir,
             "第一句。第二句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10530,6 +11473,7 @@ mod tests {
             &inherited.model,
             &inherited.voice_ref,
             &inherited.voice_ref_hash,
+            &inherited.voice_ref_text,
             inherited.auto_normalize,
             &effective_dict_hash(&inherited),
         ));
@@ -10563,6 +11507,7 @@ mod tests {
                     &version.model,
                     &version.voice_ref,
                     &version.voice_ref_hash,
+                    &version.voice_ref_text,
                     version.auto_normalize,
                     &effective_dict_hash(&version),
                 ),
@@ -10579,7 +11524,15 @@ mod tests {
         let id = versions::save(
             &dir,
             "好版本",
-            &new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true, &empty_dict()),
+            &new_project_from_inputs(
+                "第一句。",
+                "audio8-tts",
+                None,
+                None,
+                GAP_MS,
+                true,
+                &empty_dict(),
+            ),
             1,
         )
         .unwrap();
@@ -10595,9 +11548,17 @@ mod tests {
         );
 
         // 对照：工程文件正常时回滚照常完成
-        new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true, &empty_dict())
-            .save(&dir)
-            .unwrap();
+        new_project_from_inputs(
+            "第一句。",
+            "audio8-tts",
+            None,
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .save(&dir)
+        .unwrap();
         assert!(rollback_with_inheritance(&dir, &id, &empty_dict()).is_ok());
     }
 
@@ -10626,6 +11587,7 @@ mod tests {
             "2024年第一句。",
             "audio8-tts",
             None,
+            None,
             750,
             true,
             &empty_dict(),
@@ -10640,6 +11602,7 @@ mod tests {
         let off = new_project_from_inputs(
             "2024年第一句。",
             "audio8-tts",
+            None,
             None,
             750,
             false,
@@ -10661,6 +11624,7 @@ mod tests {
             "  口播标准  ",
             "audio8-tts",
             Some("/v.wav".into()),
+            None,
             1.1,
             300,
             false,
@@ -10674,7 +11638,8 @@ mod tests {
         assert!(!t.auto_normalize);
 
         for blank in ["", "   ", "\t"] {
-            let err = template_from_inputs(blank, "audio8-tts", None, 1.0, 250, true).unwrap_err();
+            let err =
+                template_from_inputs(blank, "audio8-tts", None, None, 1.0, 250, true).unwrap_err();
             assert!(err.contains("名字"), "{err}");
         }
     }
@@ -10776,7 +11741,8 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let with_dict = new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, true, &dict);
+        let with_dict =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, None, 250, true, &dict);
         assert_eq!(with_dict.sentences[0].spoken, "崇庆的桥。");
         assert_eq!(
             with_dict.dict_hash,
@@ -10785,12 +11751,20 @@ mod tests {
         );
 
         // 关掉数字兜底，词典仍然生效
-        let no_rule = new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, false, &dict);
+        let no_rule =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, None, 250, false, &dict);
         assert_eq!(no_rule.sentences[0].spoken, "崇庆的桥。");
 
         // 空词典 = 原文
-        let empty =
-            new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, true, &empty_dict());
+        let empty = new_project_from_inputs(
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            None,
+            250,
+            true,
+            &empty_dict(),
+        );
         assert!(
             empty.sentences[0].spoken.contains("重庆") || empty.sentences[0].spoken.contains("重")
         );
@@ -10811,8 +11785,15 @@ mod tests {
 
         let dir = temp_dir("dict-change");
         // 当前工程：用词典 A 合成好的句子
-        let mut old =
-            new_project_from_inputs("重庆的桥。", "audio8-tts", None, GAP_MS, true, &dict_a);
+        let mut old = new_project_from_inputs(
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            None,
+            GAP_MS,
+            true,
+            &dict_a,
+        );
         save_done_project(&dir, &mut old);
 
         // 用词典 B 续作：不能复用（旧音频念的是另一套）
@@ -10820,6 +11801,7 @@ mod tests {
             &dir,
             "重庆的桥。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10841,13 +11823,21 @@ mod tests {
         );
 
         // 同一套词典：照旧续作（句子仍是 done）
-        let mut old2 =
-            new_project_from_inputs("重庆的桥。", "audio8-tts", None, GAP_MS, true, &dict_a);
+        let mut old2 = new_project_from_inputs(
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            None,
+            GAP_MS,
+            true,
+            &dict_a,
+        );
         save_done_project(&dir, &mut old2);
         let same = load_resumable(
             &dir,
             "重庆的桥。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10888,6 +11878,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS + 250,
             true,
             &empty_dict(),
@@ -10920,6 +11911,7 @@ mod tests {
             "2024年第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10945,6 +11937,7 @@ mod tests {
             "2024年第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             false,
             &empty_dict(),
@@ -10968,6 +11961,7 @@ mod tests {
             &dir,
             "第一句。改过的第二句。第三句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -11001,6 +11995,7 @@ mod tests {
             "丙句。甲句。丁句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -11031,6 +12026,7 @@ mod tests {
             &dir,
             "重复句。重复句。不同句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -11068,6 +12064,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(new_voice.display().to_string()),
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -11093,6 +12090,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(missing_path),
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -11206,6 +12204,7 @@ mod tests {
             "第一句。第二句。",
             "index-tts2",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -11235,6 +12234,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(voice_path),
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -11780,6 +12780,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -11800,6 +12801,7 @@ mod tests {
             &fresh,
             "第一句。第二句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -11946,6 +12948,7 @@ mod tests {
                 revision: 1,
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                voice_ref_text: None,
                 gap_ms: GAP_MS,
                 auto_normalize: true,
                 dict: empty_dict(),
@@ -12028,6 +13031,7 @@ mod tests {
                 revision: 1,
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                voice_ref_text: None,
                 gap_ms: GAP_MS,
                 auto_normalize: true,
                 dict: empty_dict(),
@@ -12437,6 +13441,7 @@ mod tests {
     #[test]
     fn eval_summary_note_handles_all_failed_and_all_clean() {
         let all_failed = EvalSummary {
+            model: "qwen3-asr".into(),
             percent: 0.0,
             scored: 0,
             asr_failed: 5,
@@ -12453,6 +13458,7 @@ mod tests {
         assert!(!note.contains("全部一致"), "全失败不是全部一致：{note}");
 
         let clean = EvalSummary {
+            model: "qwen3-asr".into(),
             percent: 100.0,
             scored: 3,
             asr_failed: 0,
@@ -12467,6 +13473,7 @@ mod tests {
         assert!(note.contains("全部一致"), "{note}");
 
         let with_worst = EvalSummary {
+            model: "audio8-asr".into(),
             percent: 96.4,
             scored: 57,
             asr_failed: 2,
@@ -12487,8 +13494,19 @@ mod tests {
             note.contains("第 12 句") && note.contains("92.3%") && note.contains("应为"),
             "最差句要给序号、分数与差异片段：{note}"
         );
+        // 状态行念的必须是**这次实际用的**模型：非默认名要出现，且不能出现默认名
+        assert!(note.contains("回读 audio8-asr"), "要念出实际模型：{note}");
+        assert!(
+            !note.contains("qwen3-asr"),
+            "状态行不能写死默认模型名：{note}"
+        );
+        assert!(
+            eval_summary_note(&clean).contains("回读 qwen3-asr"),
+            "默认模型也要念出来"
+        );
 
         let oom = EvalSummary {
+            model: "qwen3-asr".into(),
             percent: 0.0,
             scored: 0,
             asr_failed: 1,
@@ -12765,6 +13783,7 @@ mod tests {
     #[test]
     fn eval_summary_note_reports_persist_warning() {
         let summary = EvalSummary {
+            model: "audio8-asr".into(),
             percent: 96.4,
             scored: 57,
             asr_failed: 0,
@@ -12853,9 +13872,14 @@ mod tests {
                 snippet: "…【应为 例，读到 力】…".into(),
             },
         ];
-        let md = qa_report_markdown("示例工程", "qwen3-asr", &rows, 96.4, 2, 0);
+        // 故意用**非默认**名：写死 qwen3-asr 的实现会在这里红
+        let md = qa_report_markdown("示例工程", "fun-asr", &rows, 96.4, 2, 0);
         assert!(md.contains("# 质检报告 · 示例工程"), "{md}");
-        assert!(md.contains("qwen3-asr"), "要写明回读模型：{md}");
+        assert!(
+            md.contains("回读模型：fun-asr"),
+            "要写明实际用的回读模型：{md}"
+        );
+        assert!(!md.contains("qwen3-asr"), "报告不能写死默认模型名：{md}");
         assert!(md.contains("平均可懂度：96.4%"), "{md}");
         assert!(
             md.contains("| 1 | 100.0% | 第一句测试。"),
@@ -12873,7 +13897,8 @@ mod tests {
     /// 一句都没评上分时，报告不能写"平均 0%"（与摘要同一口径）。
     #[test]
     fn qa_report_markdown_says_when_nothing_scored() {
-        let md = qa_report_markdown("示例工程", "qwen3-asr", &[], 0.0, 0, 5);
+        let md = qa_report_markdown("示例工程", "audio8-asr", &[], 0.0, 0, 5);
+        assert!(md.contains("回读模型：audio8-asr"), "{md}");
         assert!(md.contains("未能评分"), "{md}");
         assert!(!md.contains("平均可懂度：0.0%"), "{md}");
         assert!(md.contains("转写失败 5"), "{md}");
@@ -12889,7 +13914,7 @@ mod tests {
     /// 合成准备故意直接用 aw-core（与 app 同一条链路）：走 `Cmd::Run` 会落到用户的
     /// `~/Documents/音频作坊/projects/<工程名>` 下，测试不该往用户真实数据目录里写东西。
     #[test]
-    #[ignore = "需要本机 audiocpp_server + audio8-tts + qwen3-asr"]
+    #[ignore = "需要本机 audiocpp_server + audio8-tts + audio8-asr"]
     fn worker_eval_writes_report_end_to_end() {
         let dir = std::env::temp_dir().join(format!("aw-worker-eval-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -12930,10 +13955,12 @@ mod tests {
             })
         });
         cmd_tx
+            // 故意用一个**非默认**的回读模型：报告与状态行必须念这个，而不是写死的 qwen3-asr
             .send(Cmd::RunEval {
                 revision: 0,
                 task_id: 7,
                 dir: dir.clone(),
+                model: "audio8-asr".into(),
             })
             .unwrap();
 
@@ -12958,6 +13985,11 @@ mod tests {
         let md = std::fs::read_to_string(&path).expect("报告应已落盘");
         assert!(md.contains("# 质检报告"), "{md}");
         assert!(md.contains("第一句测试。"), "报告里要有逐句参考文本：{md}");
+        assert!(
+            md.contains("回读模型：audio8-asr"),
+            "报告要写实际用的模型：{md}"
+        );
+        assert!(!md.contains("qwen3-asr"), "报告不能写死默认模型名：{md}");
         eprintln!("报告：{}\n{md}", path.display());
 
         // 工程里的分数也落了盘（跨会话留存那条）
@@ -12968,11 +14000,72 @@ mod tests {
         );
     }
 
+    /// 16kHz / 单声道 / 16bit / 0.1s 静音：手搓一个最小合法 wav
+    /// （主 crate 没有 hound 依赖，这里只为了给真机探针一个能读的输入）。
+    fn tiny_silent_wav() -> Vec<u8> {
+        let frames: u32 = 1600;
+        let data_len = frames * 2;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&16_000u32.to_le_bytes());
+        out.extend_from_slice(&32_000u32.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        out
+    }
+
+    /// 真机（默认 ignored）：把**活的** 503 喂给真实的失败判据，看提示能不能照着做。
+    ///
+    /// 内存宽裕时 `qwen3-asr` 也装得上 —— 那本次就没触发，如实打印并返回，
+    /// 不假装验证过（`RULE_可达性.md` 第 3 条：条件不满足走 detect-and-return）。
+    #[test]
+    #[ignore = "需要本机 audiocpp_server；内存紧时才会真实触发 insufficient_memory"]
+    fn live_memory_shortfall_becomes_an_actionable_hint() {
+        let base = std::env::var("AW_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+        let client = Client::new(&base);
+        assert!(client.healthy(), "服务不可用：{base}");
+        let wav = std::env::temp_dir().join(format!("aw-oom-probe-{}.wav", std::process::id()));
+        std::fs::write(&wav, tiny_silent_wav()).unwrap();
+
+        let candidates = asr_candidate_weights(read_server_config().as_ref());
+        match client.asr_with("qwen3-asr", &wav) {
+            Ok(text) => eprintln!("本次没触发：qwen3-asr 装得下（回读={text:?}），跳过降档验证"),
+            Err(e) => match classify_asr_failure("qwen3-asr", &e, &candidates) {
+                EvalAsrFailure::Fatal(msg) => {
+                    eprintln!("原始 503：{e}");
+                    eprintln!("组装出的提示：{msg}");
+                    assert!(msg.contains("qwen3-asr"), "{msg}");
+                    assert!(
+                        msg.contains("GiB") || msg.contains("MiB"),
+                        "要带需要/可用数字：{msg}"
+                    );
+                    assert!(
+                        msg.contains("audio8-asr") || msg.contains("fun-asr"),
+                        "要点名更小的候选：{msg}"
+                    );
+                    assert!(msg.contains("不会自动换"), "要写明不自动换：{msg}");
+                }
+                EvalAsrFailure::Counted => {
+                    eprintln!("本次没触发内存不足（判成单句失败），服务回的是：{e}")
+                }
+            },
+        }
+    }
+
     /// 一句都没评上分时**也要**把"落盘告警/报告路径"带出来——旧写法在 scored==0 分支提前 return，
     /// 把报告路径和"报告没写进去"的告警一起吞了（复核指出）。
     #[test]
     fn eval_summary_note_keeps_warnings_when_nothing_scored() {
         let summary = EvalSummary {
+            model: "audio8-asr".into(),
             percent: 0.0,
             scored: 0,
             asr_failed: 5,
@@ -13027,6 +14120,7 @@ mod tests {
                 script: "第一句测试。第二句测试。".into(),
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                voice_ref_text: None,
                 project_name: "worker-dub-e2e".into(),
                 gap_ms: GAP_MS,
                 auto_normalize: true,
@@ -13626,6 +14720,320 @@ mod tests {
         assert_ne!(s.bgm.prompt, DEFAULT_BGM_PROMPT);
     }
 
+    /// 质检回读的候选**来自服务清单**，不是硬编的三个名字：清单加一个 task=asr
+    /// 的模型，下拉里就要多一个（本用例故意放第 4 个，钉住"不是写死的三个"）。
+    #[test]
+    fn asr_models_come_from_the_manifest_not_a_hardcoded_list() {
+        let m = |id: &str, task: &str, path: &str| ServerModel {
+            id: id.into(),
+            task: task.into(),
+            family: "f".into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        let cfg = ServerConfig {
+            host: None,
+            port: None,
+            models: vec![
+                m("audio8-tts", "tts", "/models/tts/x.gguf"),
+                m("qwen3-asr", "asr", "/models/asr/q.gguf"),
+                m("audio8-asr", "asr", "/models/asr/a.gguf"),
+                m("sortformer-diar", "diar", "/models/diar/s.gguf"),
+                m("fun-asr", "asr", "/models/asr/f.gguf"),
+                m("whisper-tiny", "asr", "/models/asr/w.gguf"),
+            ],
+        };
+        assert_eq!(
+            asr_models_from(Some(&cfg)),
+            vec!["qwen3-asr", "audio8-asr", "fun-asr", "whisper-tiny"],
+            "只收 task==asr，且保持清单顺序"
+        );
+        assert!(asr_models_from(None).is_empty(), "没有清单 = 没有候选");
+    }
+
+    /// 生效模型 = 设置 > 默认；空串/空白不算选择（回退默认而不是拿空串去请求）。
+    #[test]
+    fn effective_asr_model_defaults_then_honours_the_choice() {
+        let none = AppSettings::default();
+        assert_eq!(effective_asr_model(&none), "qwen3-asr");
+        let blank = AppSettings {
+            asr_model: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_asr_model(&blank), "qwen3-asr", "空白不算选择");
+        let picked = AppSettings {
+            asr_model: Some("  audio8-asr  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_asr_model(&picked), "audio8-asr", "去掉两侧空白");
+        // 清单里没有也照用：换模型会改质检口径，不能静默替换
+        let gone = AppSettings {
+            asr_model: Some("removed-asr".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_asr_model(&gone), "removed-asr");
+    }
+
+    /// 下拉的显示名、下标、id 必须来自同一份推导：当前模型不在清单里时也要留在
+    /// 第 0 项（否则清单一变，用户没动过下拉，生效模型却被静默换掉）。
+    #[test]
+    fn asr_picker_view_keeps_the_current_model_visible() {
+        let models: Vec<String> = ["qwen3-asr", "audio8-asr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let (ids, labels, index) = asr_picker_view(&models, "audio8-asr");
+        assert_eq!(index, 1);
+        assert_eq!(labels[index as usize], "audio8-asr");
+        assert_eq!(
+            ids[index as usize], "audio8-asr",
+            "下标取回的 id 必须就是显示的那个"
+        );
+
+        let (ids, labels, index) = asr_picker_view(&models, "gone-asr");
+        assert_eq!(index, 0);
+        assert_eq!(ids[0], "gone-asr", "不在清单里也照用它");
+        assert!(labels[0].contains("不在当前清单"), "{}", labels[0]);
+        assert_eq!(labels.len(), 3);
+
+        // 选第 2 项（清单第 2 个）拿到的就是它自己的 id——显示与取值同源
+        let (ids, labels, _) = asr_picker_view(&models, "qwen3-asr");
+        assert_eq!(
+            (ids[1].as_str(), labels[1].as_str()),
+            ("audio8-asr", "audio8-asr")
+        );
+    }
+
+    /// 报告与 ASR 请求都必须用**本次实际用的模型**，不能退回写死的字面量。
+    ///
+    /// 用源码级守卫而不是只测纯函数：`qa_report_markdown` 的入参谁都能传对，
+    /// 真正会漂移的是**调用点**（"回显与真实行为不同源"这类问题被复核抓到过多次）；
+    /// 而真机 e2e 是 `#[ignore]` 的，跑不到就等于没保护。
+    #[test]
+    fn report_and_request_read_the_run_model_not_a_literal() {
+        let src = include_str!("main.rs");
+        // 这个"针"必须拼出来：直接写完整字面量的话，它会命中**本用例自己的源码**，
+        // 断言恒真、改坏也不红（第一次写就踩了这个坑，阳性对照抓出来的）。
+        let request = format!("client.asr_with({}, &wav)", "&model");
+        assert!(
+            src.contains(&request),
+            "ASR 请求必须用这次选中的模型，不能退回 client.asr()"
+        );
+        assert!(
+            src.contains(
+                "qa_report_markdown(\n                    &project_name,\n                    &model,"
+            ),
+            "报告必须用本次实际用的模型"
+        );
+        // 报告调用点里不能再出现写死的默认模型名（正是这条被复核驳回的形态）
+        assert!(
+            !src.contains("\"qwen3-asr\",\n                    &rows"),
+            "报告路径不得写死模型名"
+        );
+    }
+
+    /// 下拉旁的说明：候选数来自清单、当前值不在清单要明说、换模型口径会变要明说。
+    #[test]
+    fn asr_model_note_is_honest_about_where_candidates_come_from() {
+        let models: Vec<String> = ["qwen3-asr", "audio8-asr", "fun-asr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let note = asr_model_note(&models, "qwen3-asr", true);
+        assert!(note.contains("3 个 ASR 模型"), "候选数要来自清单：{note}");
+        assert!(note.contains("说话人分离"), "要如实说明能力差异：{note}");
+        assert!(!note.contains("不在清单里"), "在清单里就不该这么写：{note}");
+
+        let note = asr_model_note(&models, "gone-asr", false);
+        assert!(
+            note.contains("gone-asr") && note.contains("不在清单里"),
+            "当前值不在清单时要说清（照用不换，但服务可能加载不了）：{note}"
+        );
+
+        let note = asr_model_note(&[], "qwen3-asr", false);
+        assert!(note.contains("没读到服务清单"), "清单读不到要说清：{note}");
+    }
+
+    /// 内存不足 → 整轮立刻收尾（带可执行提示）；其它 ASR 失败 → 只记这一句。
+    ///
+    /// 直接喂真机 503 body，不起服务、不进退避等待：worker 执行的是这条判据的结论。
+    #[test]
+    fn memory_shortfall_is_fatal_while_other_asr_errors_are_counted() {
+        let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+        let candidates = vec![
+            ("qwen3-asr".to_string(), Some(3_400_000_000u64)),
+            ("audio8-asr".to_string(), Some(459_000_000)),
+        ];
+        let err = aw_core::ClientError::Server(503, body.to_string());
+        match classify_asr_failure("qwen3-asr", &err, &candidates) {
+            EvalAsrFailure::Fatal(msg) => {
+                assert!(msg.contains("qwen3-asr"), "{msg}");
+                assert!(
+                    msg.contains("3.84 GiB") && msg.contains("4.31 GiB"),
+                    "{msg}"
+                );
+                assert!(msg.contains("audio8-asr"), "{msg}");
+            }
+            other => panic!("内存不足必须整轮收尾，实得 {other:?}"),
+        }
+
+        // 模型忙碌也是 503 —— 那是"这一句没测到"，不能当成装不下
+        let busy = r#"{"error":{"message":"model 'qwen3-asr' is busy","type":"model_busy"}}"#;
+        assert_eq!(
+            classify_asr_failure(
+                "qwen3-asr",
+                &aw_core::ClientError::Server(503, busy.to_string()),
+                &candidates
+            ),
+            EvalAsrFailure::Counted
+        );
+        // 传输层失败（服务没起来）同样只记一句：换模型也救不了
+        assert_eq!(
+            classify_asr_failure(
+                "qwen3-asr",
+                &aw_core::ClientError::Http("连接被拒绝".into()),
+                &candidates
+            ),
+            EvalAsrFailure::Counted
+        );
+    }
+
+    /// 内存不足的提示必须**可执行**：模型名 + 需要/可用数字 + 更小的候选 + 不自动换。
+    #[test]
+    fn memory_shortfall_hint_names_the_model_numbers_and_smaller_candidates() {
+        // 真机 503 body 解析出来的数字
+        let mem = aw_core::InsufficientMemory {
+            message: "cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)".into(),
+            model: Some("qwen3-asr".into()),
+            estimated_mib: Some(3389),
+            headroom_mib: Some(1024),
+            available_mib: Some(3932),
+        };
+        let candidates = vec![
+            ("qwen3-asr".to_string(), Some(3_400_000_000u64)),
+            ("audio8-asr".to_string(), Some(459_000_000)),
+            ("fun-asr".to_string(), Some(1_200_000_000)),
+        ];
+        let hint = memory_shortfall_hint("qwen3-asr", Some(&mem), &candidates);
+        assert!(hint.contains("qwen3-asr"), "要说清是哪个模型：{hint}");
+        assert!(
+            hint.contains("4.31 GiB"),
+            "要说需要多少（估算+余量）：{hint}"
+        );
+        assert!(
+            hint.contains("3.31 GiB") && hint.contains("1.00 GiB"),
+            "拆开也要给：{hint}"
+        );
+        assert!(hint.contains("3.84 GiB"), "要说当时可用多少：{hint}");
+        assert!(
+            hint.contains("audio8-asr") && hint.contains("fun-asr"),
+            "要列出更小的候选：{hint}"
+        );
+        assert!(
+            !hint.contains("qwen3-asr（权重"),
+            "当前模型不该出现在降档候选里：{hint}"
+        );
+        assert!(hint.contains("不会自动换"), "必须写明不自动换：{hint}");
+        assert!(hint.contains("质检回读模型"), "要指出去哪儿改：{hint}");
+        // 没有更小的可选时不能留空话
+        let hint = memory_shortfall_hint("qwen3-asr", Some(&mem), &candidates[..1]);
+        assert!(hint.contains("没有更小的 ASR 模型可选"), "{hint}");
+        // 数字解析不出来也要给出动作，而不是只报错
+        let no_numbers = aw_core::InsufficientMemory {
+            message: "cannot load model 'qwen3-asr'（这条没有可解析的数字）".into(),
+            model: Some("qwen3-asr".into()),
+            estimated_mib: None,
+            headroom_mib: None,
+            available_mib: None,
+        };
+        let hint = memory_shortfall_hint("qwen3-asr", Some(&no_numbers), &candidates);
+        assert!(hint.contains("没给出可解析"), "{hint}");
+        assert!(hint.contains("audio8-asr"), "数字缺失也要给候选：{hint}");
+    }
+
+    /// 候选按磁盘权重升序、剔除当前模型；权重读不到的排在后面（不假装知道谁更小）。
+    #[test]
+    fn smaller_asr_candidates_orders_by_weight_and_drops_the_current() {
+        let c = |id: &str, size: Option<u64>| (id.to_string(), size);
+        let candidates = vec![
+            c("qwen3-asr", Some(3_400_000_000)),
+            c("fun-asr", Some(1_200_000_000)),
+            c("mystery-asr", None),
+            c("audio8-asr", Some(459_000_000)),
+            c("bigger-asr", Some(9_000_000_000)),
+        ];
+        let got = smaller_asr_candidates("qwen3-asr", &candidates);
+        assert_eq!(got.len(), 2, "更大/权重未知/当前的都要剔掉：{got:?}");
+        assert!(got[0].starts_with("audio8-asr"), "小的排前面：{got:?}");
+        assert!(got[1].starts_with("fun-asr"), "{got:?}");
+        assert!(
+            got[0].contains("437.7MB") && got[1].contains("1144.4MB"),
+            "要给出权重数字（bytes→MB，1024 进制）：{got:?}"
+        );
+        assert!(
+            !got.iter().any(|g| g.contains("9000")),
+            "比当前更大的不当降档候选：{got:?}"
+        );
+
+        // 当前模型的权重读不到 → 不筛大小（不假装知道谁更小），但不能把"权重未知"的
+        // 候选排到"知道更小"的前面去
+        let unknown_current = smaller_asr_candidates("mystery-asr", &candidates);
+        assert_eq!(
+            unknown_current.len(),
+            3,
+            "不知道当前多大就不按大小筛（只受最多 3 条的上限约束）：{unknown_current:?}"
+        );
+        assert!(
+            unknown_current.last().unwrap().starts_with("qwen3-asr"),
+            "有数字的在前（即便比当前大也不装懂）：{unknown_current:?}"
+        );
+    }
+
+    /// 选择要真的落盘、重启读回；拒绝写入时不得改动盘上已有的值。
+    #[test]
+    fn asr_model_choice_survives_a_settings_roundtrip() {
+        let dir = temp_dir("asr-model-settings");
+        let path = dir.join("settings.json");
+        let store = std::sync::Mutex::new(AppSettings::default());
+        assert_eq!(
+            effective_asr_model(&store.lock().unwrap()),
+            "qwen3-asr",
+            "没选过 = 默认"
+        );
+
+        assert_eq!(
+            persist_asr_model_at(&store, &path, " audio8-asr ").unwrap(),
+            "audio8-asr"
+        );
+        let back = load_settings_at(&path);
+        assert_eq!(back.asr_model.as_deref(), Some("audio8-asr"), "重启读回");
+        assert_eq!(effective_asr_model(&back), "audio8-asr");
+
+        assert_eq!(
+            persist_asr_model_at(&store, &path, "fun-asr").unwrap(),
+            "fun-asr"
+        );
+        assert_eq!(
+            load_settings_at(&path).asr_model.as_deref(),
+            Some("fun-asr")
+        );
+
+        assert!(persist_asr_model_at(&store, &path, "   ").is_err());
+        assert_eq!(
+            load_settings_at(&path).asr_model.as_deref(),
+            Some("fun-asr"),
+            "拒绝写入时盘上的值不能被改掉"
+        );
+
+        // 老版本文件（没有这一段）读得回来，且回落默认
+        let legacy_path = dir.join("legacy.json");
+        std::fs::write(&legacy_path, "{\"host\":\"127.0.0.1\",\"port\":8080}").unwrap();
+        let legacy = load_settings_at(&legacy_path);
+        assert_eq!(legacy.asr_model, None);
+        assert_eq!(effective_asr_model(&legacy), "qwen3-asr");
+    }
+
     /// "这套 BGM 结果还算不算当前"：`has_result && !stale`。
     /// 改描述后只置 stale（结果还在、能试听），光看 has_result 会把旧结果当当前导出；
     /// 从磁盘恢复的那套一律 stale（重开后判不出上次用的描述）。
@@ -13727,6 +15135,7 @@ mod tests {
                     revision: 1,
                     model: "audio8-tts".into(),
                     voice_ref: None,
+                    voice_ref_text: None,
                     gap_ms: GAP_MS,
                     auto_normalize: true,
                     dict: empty_dict(),

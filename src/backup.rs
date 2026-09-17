@@ -159,41 +159,11 @@ fn dest_inside_source(workshop_dir: &Path, dest_root: &Path) -> Result<bool, Str
 
 /// 把路径解析成"真实的绝对路径"，**允许路径本身还不存在**。
 ///
-/// `fs::canonicalize` 要求整条路径都存在，而备份目标通常是个还没建出来的目录。
-/// 做法：向上找到最近的、真实存在的祖先做 `canonicalize`（这一步会解开软链），
-/// 再把剩下的段按词法拼回去。剩下的段都还不存在，其中的 `..` 只能在自己的尾段里
-/// 回退、或退到已解析的祖先上——与内核 `create_dir_all` 的实际行为一致。
+/// 真正的实现在 `crate::paths::resolve_for_compare`（全仓库唯一的路径包含判定入口）；
+/// 这里只是把"相对路径按当前目录解析"这条备份侧的口径补上。
 fn resolve_for_compare(p: &Path) -> Result<PathBuf, String> {
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("取当前目录失败（{e}）"))?
-            .join(p)
-    };
-    let mut base = abs;
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(&base) {
-            let mut out = real;
-            for seg in tail.iter().rev() {
-                let seg = seg.as_os_str();
-                if seg == std::ffi::OsStr::new("..") {
-                    out.pop();
-                } else if seg != std::ffi::OsStr::new(".") {
-                    out.push(seg);
-                }
-            }
-            return Ok(out);
-        }
-        match (base.parent(), base.file_name()) {
-            (Some(parent), Some(name)) if parent != base => {
-                tail.push(name.to_os_string());
-                base = parent.to_path_buf();
-            }
-            _ => return Err(format!("路径解析不了：{}", p.display())),
-        }
-    }
+    let cwd = std::env::current_dir().map_err(|e| format!("取当前目录失败（{e}）"))?;
+    crate::paths::resolve_for_compare(p, &cwd)
 }
 
 /// 递归复制一个条目（文件或目录）。**任何单个文件的失败都只记一条跳过**，不拖垮整份备份。

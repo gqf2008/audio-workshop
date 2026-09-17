@@ -44,6 +44,47 @@ fn insufficient_memory_is_not_retried() {
     assert!(note.contains("3.84 GiB"), "服务端原文不能被吞: {note}");
 }
 
+/// **HTTP 级**的不变式：传输层必须把 503 的 body **原样**交给上层，
+/// 展示层才做截断。构造一条合法但很长的 insufficient_memory body，
+/// 把 `"type":"insufficient_memory"` 与那几个数字推到第 200 个字符**之后**：
+/// 只要 post_once 提前截断，JSON 就会残缺 → `insufficient_memory()` 解析不出来 → 本条红。
+///
+/// 这同时钉住两件事：OOM 不重试（hit_count == 1）与 body 不被提前截断。
+#[test]
+fn long_insufficient_memory_body_is_not_truncated_on_the_http_path() {
+    let head = "cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB \
+                headroom exceeds available host memory (3.84 GiB)";
+    // 填充要足够长：让 type 落在 200 字符之后（否则这条用例证明不了截断问题）
+    let body = format!(
+        r#"{{"error":{{"message":"{head}{}","type":"insufficient_memory"}}}}"#,
+        "；后面还跟着一长段与判定无关的补充说明".repeat(12)
+    );
+    assert!(
+        body.find(r#""type""#).unwrap() > 200,
+        "构造失败：type 必须落在 200 字符之后，否则测不到截断"
+    );
+
+    let mock = support::Mock::start(vec![(503, body)]);
+    let c = client(&mock.base, 6);
+    let err = c
+        .asr_with("qwen3-asr", std::path::Path::new("/tmp/a.wav"))
+        .unwrap_err();
+
+    assert_eq!(mock.hit_count(), 1, "OOM 必须只发一次，不能自动重试");
+    let mem = err
+        .insufficient_memory()
+        .expect("长 body 也必须被结构化识别（说明传输层没提前截断）");
+    assert_eq!(mem.model.as_deref(), Some("qwen3-asr"));
+    assert_eq!(mem.estimated_mib, Some(3389), "估算值要完整");
+    assert_eq!(mem.required_mib(), Some(4413), "估算 + 余量");
+    assert_eq!(mem.available_mib, Some(3932), "可用内存要完整");
+    assert!(
+        mem.message.contains(head),
+        "服务端原文要透出：{}",
+        mem.message
+    );
+}
+
 #[test]
 fn gives_up_after_six_attempts_like_python() {
     let mock = support::Mock::start(vec![(503, r#"{"error":"一直忙"}"#.into())]);

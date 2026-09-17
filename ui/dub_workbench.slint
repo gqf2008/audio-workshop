@@ -395,7 +395,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     font-size: 12px;
                 }
                 if root.download-rows.length == 0 : Text {
-                    text: "清单里没有带下载地址的模型（在 server.json 给模型补 url / sha256 后这里会出现「下载」入口）。";
+                    text: "没有可列的模型：server.json 里没有模型、内置下载清单里也没有。";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;
@@ -427,7 +427,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
                                     font-size: 11px;
                                     vertical-alignment: center;
                                 }
-                                PixelButton {
+                                // 没有下载源的模型不给按钮（点了必然失败），只显示状态与原因
+                                if d.actionable : PixelButton {
                                     width: 64px;
                                     size: "small";
                                     text: d.active ? "取消" : (d.state == "已完成" ? "重下" : (d.state == "失败" ? "重试" : "下载"));
@@ -561,6 +562,10 @@ export component DubWorkbench inherits Rectangle {
     // ── 音色区（页内展开，与「高级」同款；换音色 ≠ 换模型）──
     in property <string> engine-label: "";
     in-out property <string> voice-ref-path: "";
+    /// 参考音频的文本：服务端要求与参考音频成对（缺它每句都 500）；改它 = 换音色
+    in-out property <string> voice-ref-text: "";
+    in property <string> voice-ref-text-status: "";
+    in property <bool> voice-ref-text-busy: false;
     in property <[string]> voice-names: [];
     in-out property <int> voice-index: 0;
     callback engine-changed();
@@ -597,6 +602,11 @@ export component DubWorkbench inherits Rectangle {
     in property <[string]> template-names: [];
     in-out property <int> template-index: -1;
     in-out property <string> template-name-text: "";
+    /// 质检回读（ASR）模型：候选**来自服务清单**里 task=="asr" 的模型，
+    /// 由 Rust 侧算好后灌进来（这里不硬编任何模型名）。
+    in property <[string]> asr-model-names: [];
+    in-out property <int> asr-model-index: 0;
+    in property <string> asr-model-note: "";
     in property <float> progress: 0.0;
     in property <bool> has-result: false;
     in property <string> export-dir: "";
@@ -617,6 +627,8 @@ export component DubWorkbench inherits Rectangle {
     callback new-voice();
     callback clear-reference();
     callback voice-ref-changed();
+    callback voice-ref-text-changed();
+    callback transcribe-reference();
     callback script-edited();
     callback use-sample();
     callback clear-script();
@@ -635,6 +647,8 @@ export component DubWorkbench inherits Rectangle {
     /// 停顿改了：只作废"拼装成品"（音频没变，重新导出即可应用）
     callback gap-edited();
     callback dict-picked(int);
+    /// 换质检回读模型（换它会改变质检口径，所以只由用户点，不自动换）
+    callback asr-model-picked(int);
     callback dict-import();
     callback dict-export();
     callback version-save();
@@ -739,6 +753,11 @@ export component DubWorkbench inherits Rectangle {
                             engine-label: root.engine-label;
                             engine-requires-voice-ref: root.engine-requires-voice-ref;
                             reference-path <=> root.voice-ref-path;
+                            reference-text <=> root.voice-ref-text;
+                            reference-text-status: root.voice-ref-text-status;
+                            transcribing: root.voice-ref-text-busy;
+                            reference-text-edited => { root.voice-ref-text-changed(); }
+                            transcribe-reference => { root.transcribe-reference(); }
                             // 批量在跑时也把音色区锁住：批量的 voice_ref 在提交那一刻就定格了
                             busy: root.running || root.busy || root.batch-running;
                             reference-exists: root.reference-exists;
@@ -1205,6 +1224,36 @@ export component DubWorkbench inherits Rectangle {
                                 text: "试听全篇";
                                 enabled: root.has-result && !root.busy && !root.playing;
                                 clicked => { root.preview-all(); }
+                            }
+                        }
+
+                        // 质检回读（ASR）模型：候选来自服务清单 task=="asr" 的模型。
+                        // 放在「质检」按钮同一片区域：换模型就是换质检口径，不该藏进全局设置
+                        // （配音独有的参数留在本页，见 docs/ui 的归属规则）。
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "回读";
+                                width: 40px;
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelComboBox {
+                                width: 220px;
+                                model: root.asr-model-names;
+                                index <=> root.asr-model-index;
+                                placeholder: "qwen3-asr";
+                                enabled: !root.running && !root.busy && !root.batch-running;
+                                selected(i) => { root.asr-model-picked(i); }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.asr-model-note;
+                                color: PixelTheme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
                         }
 
