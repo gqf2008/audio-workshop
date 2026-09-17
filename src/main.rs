@@ -1774,22 +1774,28 @@ fn export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> 
     None
 }
 
-/// 能不能起一次新备份。三条拒绝理由与 `export_refusal` 同一族（都是"别抄到写了一半的文件"）：
-///   · 已经在备份：连点会起一堆线程，两批同时往同一个目标目录里写；
-///   · 有合成/拼装在跑：备份抄的是**磁盘上的文件**，混音/拼装写到一半就会抄到半套；
-///   · 批量队列在跑：同上（批量每篇也在写 `projects/` 底下的东西）。
+/// 能不能起一次新备份。理由与 `export_refusal` 同一族（都是"别抄到写了一半的文件"），
+/// 但**判据必须比它宽**：备份抄的是整棵 `projects/`，而写 `projects/` 的不止"拼装"——
+/// 歌曲写 `song/`、人声分离写 `stems/`、质检写报告、批量每篇都在写。这些任务**不设
+/// 全局 `busy`**（各自页面 busy + 一条台账），所以只查 `busy` 会漏（复核第二轮抓到的阻塞）。
+/// 这里把四类来源都收进来：
+///   · `backup_running`：连点会起一堆线程，两批同时往同一个目标目录里写；
+///   · `tasks_in_flight`：台账里还有排队/运行中的任务（配音/BGM/歌曲/分离/质检/批量都在里面）；
+///   · `ui_busy` / `ui_running`：正在拼装，或单篇配音在跑（单篇设的是 `running` 不是 `busy`）。
 fn backup_refusal(
     ui_busy: bool,
+    ui_running: bool,
+    tasks_in_flight: bool,
     batch_in_flight: bool,
     backup_running: bool,
 ) -> Option<&'static str> {
     if backup_running {
         return Some("备份还在进行：等它写完（工程大时要一会儿）");
     }
-    if batch_in_flight {
-        return Some("批量任务正在跑：等它跑完再备份（否则会抄到写了一半的产物）");
+    if tasks_in_flight || batch_in_flight {
+        return Some("还有任务在跑（配音/BGM/歌曲/人声分离/质检/批量）：等它跑完再备份（否则会抄到写了一半的产物）");
     }
-    if ui_busy {
+    if ui_busy || ui_running {
         return Some("合成/拼装正在进行：等它结束再备份（否则会抄到写了一半的产物）");
     }
     None
@@ -7482,9 +7488,15 @@ fn wire_global_settings(
     let msg = msg_tx.clone();
     ui.on_backup_all(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if let Some(refusal) =
-            backup_refusal(ui.get_busy(), batch_in_flight(&st), st.backup_running.get())
-        {
+        // 按钮的 enabled 与这里必须用**同一份判据**：只让按钮变灰、回调不拦，
+        // 快捷键/程序化触发照样能起备份；只拦回调、按钮不灰，用户会以为点了没反应。
+        if let Some(refusal) = backup_refusal(
+            ui.get_busy(),
+            ui.get_running(),
+            tasks_in_flight(&st),
+            batch_in_flight(&st),
+            st.backup_running.get(),
+        ) {
             ui.set_backup_info(refusal.into());
             return;
         }
@@ -9845,23 +9857,49 @@ mod tests {
     /// 备份的起跑守卫：连点、以及和别的写盘动作撞车，都要被挡住（复核的阻塞项 2）。
     #[test]
     fn backup_refusal_blocks_double_click_and_concurrent_writers() {
+        // 参数顺序：(ui_busy, ui_running, tasks_in_flight, batch_in_flight, backup_running)
         assert!(
-            backup_refusal(false, false, false).is_none(),
+            backup_refusal(false, false, false, false, false).is_none(),
             "空闲时该放行"
         );
-        let again = backup_refusal(false, false, true).expect("已经在备份时必须拒绝");
+        let again = backup_refusal(false, false, false, false, true).expect("已经在备份时必须拒绝");
         assert!(again.contains("备份还在进行"), "{again}");
+        // 单篇配音：设的是 ui.running（不是 busy）——只查 busy 的老版本会漏
         assert!(
-            backup_refusal(true, false, false).is_some(),
-            "合成/拼装在跑时不能备份（会抄到写了一半的产物）"
+            backup_refusal(false, true, false, false, false).is_some(),
+            "单篇配音在跑（ui.running）时不能备份"
         );
         assert!(
-            backup_refusal(false, true, false).is_some(),
+            backup_refusal(true, false, false, false, false).is_some(),
+            "合成/拼装在跑时不能备份（会抄到写了一半的产物）"
+        );
+        // 歌曲 / 人声分离 / 质检：**只登记台账、不设全局 busy**，这是复核第二轮抓到的漏网
+        let from_tasks = backup_refusal(false, false, true, false, false)
+            .expect("台账里有任务在飞时必须拒绝（歌曲/分离写 projects/，正是备份要抄的）");
+        assert!(from_tasks.contains("还有任务在跑"), "{from_tasks}");
+        assert!(
+            backup_refusal(false, false, false, true, false).is_some(),
             "批量在跑时不能备份（同上）"
         );
         // 已经在备份时，别的理由不该抢答——否则用户看到的是"合成中"而不是"备份中"
-        let both = backup_refusal(true, true, true).unwrap();
+        let both = backup_refusal(true, true, true, true, true).unwrap();
         assert!(both.contains("备份还在进行"), "{both}");
+    }
+
+    /// 守卫与按钮禁用条件必须同源：**歌曲/分离这类只在台账里登记的任务**，
+    /// 也要同时让「一键备份…」变灰（否则按钮亮着、点了被拒，像是坏了）。
+    /// 按钮的 `tasks-busy` 直接由 `task-running/task-pending` 派生（app.slint 的
+    /// `WorkbenchDrawer` 绑定），与这里的 `tasks_in_flight` 取的是同一份台账计数。
+    #[test]
+    fn backup_button_and_guard_share_the_same_inputs() {
+        assert!(
+            backup_refusal(false, false, true, false, false).is_some(),
+            "台账在飞必须拒绝"
+        );
+        assert!(
+            backup_refusal(false, false, false, false, false).is_none(),
+            "全空闲时不能把按钮也钉死"
+        );
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。

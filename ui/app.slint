@@ -706,6 +706,9 @@ export component MainWindow inherits Window {
                     pick-model-dir => { root.pick-model-dir(); }
                     backup-info: root.backup-info;
                     backup-running: root.backup-running;
+                    // 与 backup_refusal 的 tasks_in_flight 同源：歌曲/人声分离/质检只登记
+                    // 台账、不设全局 busy，光看 busy 会让按钮亮着却点不动
+                    tasks-busy: root.task-running > 0 || root.task-pending > 0;
                     backup-all => { root.backup-all(); }
                 }
             }
