@@ -2598,6 +2598,24 @@ fn voice_ref_matches(
         && saved.voice_ref_hash.as_ref() == voice_ref_hash.as_ref()
 }
 
+/// "旧工程的音频能不能给这份新设置复用"的判据：**模型 / 兜底开关 / 参考音（含内容哈希）
+/// 全一致**。停顿（gap_ms）只影响拼装，不算在内。
+///
+/// worker 的 `load_resumable`（续作/改稿继承）与版本回滚的"按文本继承"**共用这一条**：
+/// 两处各写一遍的话，回滚就可能把 B 模型合成的音频标成"版本显示 A"的已合成
+/// （复核给的反例）。
+fn settings_allow_reuse(
+    saved: &Project,
+    model: &str,
+    voice_ref: &Option<String>,
+    voice_ref_hash: &Option<String>,
+    auto_normalize: bool,
+) -> bool {
+    saved.model == model
+        && saved.auto_normalize == auto_normalize
+        && voice_ref_matches(saved, voice_ref, voice_ref_hash)
+}
+
 fn sentence_texts_match(project: &Project, script: &str) -> bool {
     project
         .sentences
@@ -2754,9 +2772,7 @@ fn load_resumable(
     if let Some(saved) = saved.as_ref() {
         // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
         // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
-        if saved.model == model
-            && saved.auto_normalize == auto_normalize
-            && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
+        if settings_allow_reuse(saved, model, &voice_ref, &voice_ref_hash, auto_normalize)
             && sentence_texts_match(saved, script)
         {
             let mut project = saved.clone();
@@ -2776,10 +2792,7 @@ fn load_resumable(
     project.voice_ref_hash = voice_ref_hash.clone();
     let reused = if let Some(saved) = saved.as_ref() {
         // 与快路径同一条判据：开关变了就不能逐句继承（旧音频念的是另一套文本）
-        if saved.model == model
-            && saved.auto_normalize == auto_normalize
-            && voice_ref_matches(saved, &voice_ref, &voice_ref_hash)
-        {
+        if settings_allow_reuse(saved, model, &voice_ref, &voice_ref_hash, auto_normalize) {
             reuse_done_sentences(&mut project, saved, dir)?
         } else {
             0
@@ -4538,9 +4551,21 @@ fn rollback_with_inheritance(dir: &Path, id: &str) -> Result<(Project, usize), S
     };
     let snapshot = versions::load_for_rollback(dir, id)?;
     let mut restored = project_from_version(&snapshot);
+    // 与 `load_resumable` 同一条判据：模型 / 兜底开关 / 参考音不一致时**不许复用音频**，
+    // 否则回滚会把"另一个模型/音色合成的声音"标成这份版本的已合成。
     let reused = match inherited.as_ref() {
-        Some(saved) => reuse_done_sentences(&mut restored, saved, dir)?,
-        None => 0,
+        Some(saved)
+            if settings_allow_reuse(
+                saved,
+                &restored.model,
+                &restored.voice_ref,
+                &restored.voice_ref_hash,
+                restored.auto_normalize,
+            ) =>
+        {
+            reuse_done_sentences(&mut restored, saved, dir)?
+        }
+        _ => 0,
     };
     versions::commit_rollback(dir, &restored)?;
     Ok((restored, reused))
@@ -7499,6 +7524,60 @@ mod tests {
             loaded.project.sentences.iter().all(|s| s.status == "done"),
             "回滚后同文本的句子必须仍是已合成（否则会全部重录）"
         );
+    }
+
+    /// 复核给的反例：回滚的"按文本继承"也必须过与 `load_resumable` 相同的设置门槛——
+    /// 模型 / 兜底开关 / 参考音不一致时复用音频，会把"另一个模型合成的 wav"标成这份
+    /// 版本的已合成（界面显示 A、听起来是 B）。
+    #[test]
+    fn rollback_does_not_inherit_audio_when_settings_differ() {
+        let dir = temp_dir("rollback-settings");
+        // 当前工程：一套具体设置 + 两句已合成
+        let mut current = saved_project("第一句。第二句。", None);
+        current.model = "index-tts2".into();
+        current.auto_normalize = false;
+        current.voice_ref = Some("/x/别的声线.wav".into());
+        current.voice_ref_hash = Some("hash-x".into());
+        save_done_project(&dir, &mut current);
+        let inherited = Project::load(&dir).unwrap();
+        assert!(settings_allow_reuse(
+            &inherited,
+            &inherited.model,
+            &inherited.voice_ref,
+            &inherited.voice_ref_hash,
+            inherited.auto_normalize,
+        ));
+
+        // 版本与当前工程只在"被 tweak 的那一项"上不同（其余整份克隆，避免测试自己写错）
+        let cases: Vec<(&str, fn(&mut Project))> = vec![
+            ("模型不同", |p: &mut Project| {
+                p.model = "audio8-tts".into()
+            }),
+            ("兜底开关不同", |p: &mut Project| {
+                p.auto_normalize = true
+            }),
+            ("参考音不同", |p: &mut Project| {
+                p.voice_ref = Some("/y/另一个声线.wav".into());
+                p.voice_ref_hash = Some("hash-y".into());
+            }),
+            ("同名但内容变了", |p: &mut Project| {
+                p.voice_ref_hash = Some("hash-z".into());
+            }),
+        ];
+        for (name, tweak) in cases {
+            let mut version = inherited.clone();
+            tweak(&mut version);
+            assert!(
+                !settings_allow_reuse(
+                    &inherited,
+                    &version.model,
+                    &version.voice_ref,
+                    &version.voice_ref_hash,
+                    version.auto_normalize,
+                ),
+                "{name}：设置不一致就不该允许复用音频"
+            );
+        }
     }
 
     /// **当前工程损坏时回滚必须中止、一个字节都不写**：损坏的 project.json 是唯一可人工
