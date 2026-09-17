@@ -99,7 +99,7 @@ fn oom_sentence_is_marked_and_retry_only_reruns_failed_sentence() {
         "后台队列要有可识别的 error: oom 标记：{}",
         prj.sentences[0].status
     );
-    assert!(prj.sentences[0].status.contains("卸载空闲模型"));
+    assert!(prj.sentences[0].status.contains("释放模型内存"));
     assert!(prj.sentences[0].status.contains("3.84 GiB"));
     let on_disk = aw_core::Project::load(&dir).expect("OOM 句必须逐句落盘");
     assert!(

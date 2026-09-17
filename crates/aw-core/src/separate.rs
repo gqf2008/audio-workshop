@@ -477,7 +477,7 @@ mod tests {
         );
         assert!(note.contains("cannot load model x"), "{note}");
         assert!(
-            note.contains("卸载空闲模型") && note.contains("q4_0"),
+            note.contains("释放模型内存") && note.contains("q4_0"),
             "{note}"
         );
     }

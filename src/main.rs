@@ -4285,6 +4285,18 @@ fn apply_project_to_rows(
     rows: &Rc<VecModel<Sentence>>,
     project: &Project,
 ) -> usize {
+    let done = apply_project_sentence_statuses(rows, project);
+    recompute_total(rows);
+    ui.set_done_count(done as i32);
+    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
+    ui.set_has_result(done > 0);
+    done
+}
+
+/// `apply_project_to_rows` 的状态回灌主体（不碰 MainWindow，便于无头回归）。
+/// 关键是 error 分支传**完整** `sentence.status`：磁盘上的 `error: oom: ...`
+/// 不能在这里被压成裸 "error"，否则重开后释放模型内存按钮会消失。
+fn apply_project_sentence_statuses(rows: &Rc<VecModel<Sentence>>, project: &Project) -> usize {
     let mut done = 0usize;
     for sentence in &project.sentences {
         let Some(i) = row_position(rows, sentence.index) else {
@@ -4297,15 +4309,13 @@ fn apply_project_to_rows(
                 set_row_duration(rows, i, d as f32);
             }
         } else if sentence.status.starts_with("error") {
-            set_status(rows, i, "error");
+            // 完整状态串要带下去：`error: oom: ...` 里的详情就是「释放模型内存」
+            // 按钮的可见性来源，压成裸 "error" 会让重开工程后按钮消失。
+            set_status(rows, i, &sentence.status);
         } else {
             set_status(rows, i, "pending");
         }
     }
-    recompute_total(rows);
-    ui.set_done_count(done as i32);
-    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
-    ui.set_has_result(done > 0);
     done
 }
 
@@ -10436,6 +10446,53 @@ mod tests {
         );
     }
 
+    /// 工程恢复走的就是 apply_project_to_rows（restore_project 与 Msg::ProjectLoaded
+    /// 都调它）；完整 error status 必须带下去，重开后按钮不能消失。
+    #[test]
+    fn applying_project_status_keeps_oom_detail_for_restore() {
+        let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![test_sentence_row(0)]));
+        let mut project = Project::new(
+            "测试句。",
+            "audio8-tts",
+            GAP_MS,
+            BASE_SEED,
+            None,
+            DEFAULT_PUNCTUATION,
+            MAX_CHARS,
+            |t| t.to_string(),
+        );
+        project.sentences[0].status =
+            "error: oom: 内存不足（OOM）：释放模型内存（会卸载服务上所有已加载模型）".into();
+
+        apply_project_sentence_statuses(&rows, &project);
+        let row = rows.row_data(0).unwrap();
+        assert!(row.oom, "恢复后 OOM 按钮不能消失：{row:?}");
+        assert!(row.error_detail.contains("释放模型内存"), "{row:?}");
+        assert!(row.error_detail.contains("所有已加载模型"), "{row:?}");
+    }
+
+    #[test]
+    fn unload_button_requires_confirmation_and_warns_global_effect() {
+        let source = include_str!("../ui/dub_workbench.slint");
+        assert!(
+            source.contains("PixelPopconfirm"),
+            "释放模型内存必须二次确认"
+        );
+        assert!(
+            source.contains("这会卸载服务上所有模型的常驻内存"),
+            "确认文案要说清全局误伤边界"
+        );
+        assert!(source.contains("确认释放"), "确认按钮文案要明确");
+        assert!(
+            source.contains("confirm => { root.unload-models(); }"),
+            "只有确认回调才能发卸载请求"
+        );
+        assert!(
+            !source.contains("clicked => { root.unload-models(); }"),
+            "触发按钮本身不能直接发卸载请求"
+        );
+    }
+
     #[test]
     fn oom_error_detail_survives_status_mapping_and_finish_note() {
         let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![Sentence {
@@ -10464,7 +10521,7 @@ mod tests {
         assert!(row.error_detail.contains("qwen3-asr"), "{row:?}");
         assert!(row.error_detail.contains("3.31 GiB"), "{row:?}");
         assert!(row.error_detail.contains("3.84 GiB"), "{row:?}");
-        assert!(row.error_detail.contains("卸载空闲模型"), "{row:?}");
+        assert!(row.error_detail.contains("释放模型内存"), "{row:?}");
 
         let note = run_finished_note(1, false, 0, 2, 3, Some(&status));
         assert!(note.contains("2/3 句"), "{note}");
@@ -10474,7 +10531,7 @@ mod tests {
             "{note}"
         );
         assert!(
-            note.contains("卸载空闲模型") && note.contains("q4_0"),
+            note.contains("释放模型内存") && note.contains("q4_0"),
             "{note}"
         );
         assert!(
@@ -11466,7 +11523,7 @@ mod tests {
         let note = eval_summary_note(&oom);
         assert!(note.contains("转写服务说明"), "{note}");
         assert!(
-            note.contains("卸载空闲模型") && note.contains("q4_0"),
+            note.contains("释放模型内存") && note.contains("q4_0"),
             "{note}"
         );
         assert!(

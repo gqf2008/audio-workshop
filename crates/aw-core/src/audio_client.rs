@@ -80,7 +80,7 @@ pub fn memory_shortfall(body: &str) -> Option<MemoryShortfall> {
 pub fn memory_shortfall_note(body: &str) -> Option<String> {
     memory_shortfall(body).map(|shortfall| {
         format!(
-            "内存不足（OOM）：{}。释放内存后继续：① 卸载空闲模型；② 把模型降到 q4_0 量化档；③ 关掉其它占内存的应用。",
+            "内存不足（OOM）：{}。释放内存后继续：① 释放模型内存（会卸载服务上所有已加载模型，先确认没有其它任务在用）；② 把模型降到 q4_0 量化档；③ 关掉其它占内存的应用。",
             shortfall.message
         )
     })
@@ -197,14 +197,23 @@ impl Client {
         let path = "/v1/tasks/unload_all_models";
         let value = self.post_once(path, &json!({}))?;
         let Some(list) = value.get("unloaded") else {
-            return Ok(format!("服务返回成功：{}", truncate(&value.to_string())));
+            return Err(ClientError::Decode(format!(
+                "unload 响应缺少 unloaded 数组: {}",
+                truncate(&value.to_string())
+            )));
         };
         let Some(items) = list.as_array() else {
-            return Ok(format!(
-                "服务返回成功，但 unloaded 不是数组：{}",
+            return Err(ClientError::Decode(format!(
+                "unload 响应的 unloaded 不是数组: {}",
                 truncate(&value.to_string())
-            ));
+            )));
         };
+        if let Some(bad) = items.iter().position(|item| !item.is_string()) {
+            return Err(ClientError::Decode(format!(
+                "unload 响应 unloaded[{bad}] 不是字符串: {}",
+                truncate(&value.to_string())
+            )));
+        }
         let names: Vec<String> = items
             .iter()
             .filter_map(Value::as_str)
@@ -366,7 +375,10 @@ mod tests {
         assert!(note.contains("qwen3-asr"), "{note}");
         assert!(note.contains("3.31 GiB"), "{note}");
         assert!(note.contains("3.84 GiB"), "{note}");
-        assert!(note.contains("卸载空闲模型"), "{note}");
+        assert!(
+            note.contains("释放模型内存") && note.contains("所有已加载模型"),
+            "{note}"
+        );
         assert!(note.contains("q4_0"), "{note}");
         assert!(note.contains("关掉其它占内存的应用"), "{note}");
     }
@@ -381,7 +393,7 @@ mod tests {
         assert!(!busy.is_insufficient_memory());
         let busy_note = busy.to_string();
         assert!(busy_note.contains("model is busy"), "{busy_note}");
-        assert!(!busy_note.contains("卸载空闲模型"), "{busy_note}");
+        assert!(!busy_note.contains("释放模型内存"), "{busy_note}");
 
         // 非 JSON body：保留原文，不按关键词猜。
         let plain = ClientError::Server(503, "service unavailable".into());

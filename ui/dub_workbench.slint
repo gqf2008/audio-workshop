@@ -21,7 +21,7 @@
 
 import {
     PixelBadge, PixelButton, PixelComboBox, PixelSlider, PixelSwitch,
-    PixelProgressBar, PixelScrollPanel, PixelSegmentedControl,
+    PixelProgressBar, PixelPopconfirm, PixelScrollPanel, PixelSegmentedControl,
     PixelSpinner, PixelTextArea, PixelTextInput, PixelTheme,
 } from "@slint_pixel";
 
@@ -151,14 +151,16 @@ component SentenceRow inherits Rectangle {
                 Tooltip { text: @markdown("只重跑这一句"); }
                 clicked => { root.redo(); }
             }
-            PixelButton {
+            PixelPopconfirm {
                 visible: root.item.oom;
-                width: 104px;
-                size: "small";
-                text: "释放模型内存";
+                width: 112px;
+                popup-height: 160px;
+                button-text: "释放模型内存";
+                text: "这会卸载服务上所有模型的常驻内存，可能影响其它正在使用该服务的任务。确定继续？";
+                confirm-text: "确认释放";
+                cancel-text: "取消";
                 enabled: !root.busy;
-                Tooltip { text: @markdown("手动调用本地服务卸载已加载模型；只在你点击时执行，可能影响其它正在使用服务的任务"); }
-                clicked => { root.unload-models(); }
+                confirm => { root.unload-models(); }
             }
         }
     }

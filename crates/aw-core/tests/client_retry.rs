@@ -39,7 +39,7 @@ fn insufficient_memory_is_not_retried() {
         .unwrap_err();
     assert_eq!(mock.hit_count(), 1, "OOM 必须只发一次，不能自动重试");
     let note = err.to_string();
-    assert!(note.contains("卸载空闲模型"), "提示要有可执行动作: {note}");
+    assert!(note.contains("释放模型内存"), "提示要有可执行动作: {note}");
     assert!(note.contains("q4_0"), "提示要有可执行动作: {note}");
     assert!(note.contains("3.84 GiB"), "服务端原文不能被吞: {note}");
 }
@@ -71,13 +71,40 @@ fn unload_all_models_reports_names_and_service_errors_truthfully() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).unwrap();
-        let request = String::from_utf8_lossy(&buf[..n]);
+        // 读完整请求（headers + Content-Length body），不能在客户端还在写 body
+        // 时就响应并关闭；高负载下单次 read 只会拿到半个 headers。
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head_end = request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .expect("请求必须包含 headers 结束标记");
+        let head = String::from_utf8_lossy(&request[..head_end]);
         assert!(
-            request.starts_with("POST /v1/tasks/unload_all_models HTTP/1.1"),
-            "unload endpoint 写错: {request}"
+            head.starts_with("POST /v1/tasks/unload_all_models HTTP/1.1"),
+            "unload endpoint 写错: {head}"
         );
+        let content_length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let already = request.len().saturating_sub(head_end);
+        if content_length > already {
+            let mut rest = vec![0u8; content_length - already];
+            stream.read_exact(&mut rest).unwrap();
+        }
         let body = r#"{"unloaded":["yue2","qwen3-asr"]}"#;
         write!(
             stream,
@@ -99,6 +126,18 @@ fn unload_all_models_reports_names_and_service_errors_truthfully() {
         .unload_all_models()
         .expect_err("500 必须报错，不能假装卸载成功");
     assert!(err.to_string().contains("unload failed"), "{err}");
+
+    // 200 但协议体不合法也不能当成功；三种畸形体都要显式失败。
+    for body in [r#"{}"#, r#"{"unloaded":"x"}"#, r#"{"unloaded":[1]}"#] {
+        let malformed = support::Mock::start(vec![(200, body.into())]);
+        let err = client(&malformed.base, 1)
+            .unload_all_models()
+            .expect_err("畸形 unload 响应必须报 Decode，不能假装成功");
+        assert!(
+            err.to_string().contains("unload") || err.to_string().contains("响应解析失败"),
+            "{err}"
+        );
+    }
 }
 
 /// 评审原话：500 且 body 恰好含 "503" 会被旧实现的 `contains("503")` 误判成可重试
