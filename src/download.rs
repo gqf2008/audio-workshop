@@ -224,6 +224,11 @@ pub fn download_with(
     let mut allow_retry = offset > 0;
 
     let (mut reader, mut writer, mut downloaded, total, resumed) = loop {
+        // 循环顶也查一次取消：416（断点不合法）会让这里再补发一次 GET，
+        // 没有这一句的话"取消后不再有网络请求"在 416 这条路上不成立。
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DownloadError::Cancelled);
+        }
         let resp = send_get(&agent, &spec.url, offset)?;
         let status = resp.status();
         match status {
@@ -253,10 +258,14 @@ pub fn download_with(
                 break (resp.into_reader(), file, 0u64, total, false);
             }
             other => {
-                return Err(DownloadError::Http(format!(
-                    "服务器返回 HTTP {other}（{}）",
-                    spec.url
-                )));
+                // 错误也要读 body，否则 403/404 的原因（限流 / 需要授权 / 源没了）看不见
+                let text = resp.into_string().unwrap_or_default();
+                let reason: String = text.trim().chars().take(200).collect();
+                return Err(DownloadError::Http(if reason.is_empty() {
+                    format!("服务器返回 HTTP {other}（{}）", spec.url)
+                } else {
+                    format!("服务器返回 HTTP {other}：{reason}（{}）", spec.url)
+                }));
             }
         }
     };
@@ -374,10 +383,14 @@ fn send_get(agent: &ureq::Agent, url: &str, offset: u64) -> Result<ureq::Respons
     if offset > 0 {
         req = req.set("Range", &format!("bytes={offset}-"));
     }
-    req.call().map_err(|e| match e {
-        ureq::Error::Status(code, _) => DownloadError::Http(format!("服务器返回 HTTP {code}")),
-        other => DownloadError::Http(other.to_string()),
-    })
+    match req.call() {
+        Ok(resp) => Ok(resp),
+        // 4xx/5xx 在 ureq 里是 Err(Status(code, resp))：这里**把响应本体交回给上层**，
+        // 由上层按状态码分支——416（断点不合法）要能走补救，其它错误要能读 body 说清原因。
+        // 只在这里把响应当 Err 吞掉的话，416 补救分支是死代码，永远走不到。
+        Err(ureq::Error::Status(_, resp)) => Ok(resp),
+        Err(other) => Err(DownloadError::Http(other.to_string())),
+    }
 }
 
 /// 响应声明的**总**字节数：优先解析 `Content-Range: bytes a-b/total`
@@ -642,9 +655,11 @@ mod tests {
         range: Option<String>,
     }
 
-    /// 服务端行为：`stall` 让服务端发完头就不写 body（钉读超时）。
+    /// 服务端行为：`arm_before_reply` 在回响应**之前**置位（把"取消已经发生"钉成确定事件）；
+    /// `stall` 让服务端发完头就不写 body（钉读超时）。
     struct ServeBehavior {
         honor_range: bool,
+        arm_before_reply: Option<Arc<AtomicBool>>,
         stall_body: Option<Duration>,
     }
 
@@ -661,6 +676,7 @@ mod tests {
                 body,
                 ServeBehavior {
                     honor_range,
+                    arm_before_reply: None,
                     stall_body: None,
                 },
             )
@@ -672,7 +688,20 @@ mod tests {
                 vec![0u8; len],
                 ServeBehavior {
                     honor_range: false,
+                    arm_before_reply: None,
                     stall_body: Some(stall),
+                },
+            )
+        }
+
+        /// 每次服务请求前先把 `flag` 置 true（B3：钉「取消之后不再发请求」）。
+        fn start_arming(body: Vec<u8>, honor_range: bool, flag: Arc<AtomicBool>) -> MockServer {
+            Self::start_with(
+                body,
+                ServeBehavior {
+                    honor_range,
+                    arm_before_reply: Some(flag),
+                    stall_body: None,
                 },
             )
         }
@@ -752,6 +781,11 @@ mod tests {
             path,
             range: range.clone(),
         });
+        // 先置位再回响应：客户端一定是在"标志已置位"之后才读到这个响应，
+        // 于是"416 之后还会不会再发请求"变成确定性的（不赌时序）。
+        if let Some(flag) = &behavior.arm_before_reply {
+            flag.store(true, Ordering::Relaxed);
+        }
         // 卡住模式：只发头，body 一直不写，`stall` 之后才关连接
         if let Some(stall) = behavior.stall_body {
             let head = format!(
@@ -1010,6 +1044,57 @@ mod tests {
             CancelOutcome::Finished,
             "任务已收尾，不能再报「已取消」"
         );
+    }
+
+    /// 416 补救本身也必须真的能走通：`.part` 比文件还大（换源/文件变小）时，丢弃
+    /// `.part` 从 0 重下。
+    ///
+    /// 这条同时钉住一个真 bug：416 以前是**死代码**——ureq 把 4xx 当 `Err(Error::Status)`
+    /// 返回，`send_get` 又把它直接翻成 `DownloadError::Http`，补救分支永远走不到，用户
+    /// 只会看到"服务器返回 HTTP 416"。修好 `send_get`（把响应交回上层）后这条才会绿。
+    #[test]
+    fn stale_oversized_part_recovers_by_restarting_from_zero() {
+        let root = temp_dir("416-recover");
+        let body = vec![4u8; 16 * 1024];
+        let srv = MockServer::start(body.clone(), true);
+        let dest = root.join("model.bin");
+        std::fs::write(part_path(&dest), vec![0u8; 32 * 1024]).unwrap();
+        let s = spec(srv.url("/m/model.bin"), dest.clone(), &body);
+
+        let (r, _seen) = run(&s, &AtomicBool::new(false));
+        let out = r.expect("416 之后应丢弃坏断点、从 0 重下成功");
+        assert!(out.restarted_from_zero, "应如实标出不是续传");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let hits = srv.hits();
+        assert_eq!(hits.len(), 2, "第一次带 Range 被 416 拒，第二次不带 Range");
+        assert_eq!(hits[0].range.as_deref(), Some("bytes=32768-"));
+        assert!(hits[1].range.is_none());
+    }
+
+    /// B3（复核阻塞项）：416（断点不合法）之后会再补发一次 GET——这条路也必须看取消标志，
+    /// 否则「取消后不再有网络请求」在 416 上不成立。
+    ///
+    /// mock 在回第一个响应**之前**就把取消标志置上，把时序钉成确定性的：
+    /// 旧实现会在 416 之后补发第二次请求（hits=2），修好后 hits=1。
+    #[test]
+    fn cancel_before_416_retry_prevents_the_second_request() {
+        let root = temp_dir("416-cancel");
+        let body = vec![5u8; 8 * 1024];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let srv = MockServer::start_arming(body.clone(), true, Arc::clone(&cancel));
+        let dest = root.join("model.bin");
+        // .part 比文件还大 → Range 不合法 → 服务器回 416
+        std::fs::write(part_path(&dest), vec![0u8; 16 * 1024]).unwrap();
+        let s = spec(srv.url("/m/model.bin"), dest.clone(), &body);
+
+        let r = download_with(&s, &cancel, Timeouts::default(), |_| {});
+        assert!(matches!(r, Err(DownloadError::Cancelled)), "实际 {r:?}");
+        assert_eq!(
+            srv.hits().len(),
+            1,
+            "416 之后不该再发第二次请求（取消标志已置位）"
+        );
+        assert!(!dest.exists());
     }
 
     /// B2（复核阻塞项）：服务端发完响应头就卡住不写 body 时，读超时必须生效——否则
