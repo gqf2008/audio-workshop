@@ -168,6 +168,12 @@ impl std::fmt::Display for DownloadError {
 impl std::error::Error for DownloadError {}
 
 /// 下载结果：给调用方解释"这次到底续了没"。
+///
+/// **`download()` 不推终态快照**：终态只有一处产出——`worker_loop` 在
+/// `finish_job`（摘 flag / 放开 dest 名额 / 减 in_flight）**之后**推的那一条。
+/// 这是 `Downloader` 契约"看到终态 ⇒ 已完全收尾"的实现方式。早期版本在
+/// `download()` 内部也推一条 Done，而那条必然早于收尾，于是留出窗口期
+/// （cancel 报 AlreadyRequested、同 dest 重排被判 Duplicate）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
     /// 最终文件字节数
@@ -274,7 +280,7 @@ pub fn download_with(
         }
     };
 
-    let mut note = if resumed {
+    let note = if resumed {
         format!("从 {downloaded} 字节断点续传")
     } else if restarted_from_zero {
         "服务器不支持续传，已从 0 重新下载".to_string()
@@ -355,24 +361,8 @@ pub fn download_with(
     std::fs::rename(&part, &spec.dest)
         .map_err(|e| DownloadError::Io(format!("重命名到 {} 失败：{e}", spec.dest.display())))?;
 
-    note = if resumed {
-        format!("断点续传完成（续了 {} 字节）", offset)
-    } else if restarted_from_zero {
-        "服务器不支持续传，已从 0 重下完成".to_string()
-    } else {
-        "下载完成".to_string()
-    };
-    let done = Snapshot {
-        id: 0,
-        label: spec.label.clone(),
-        dest: spec.dest.clone(),
-        state: State::Done,
-        downloaded: got,
-        total: Some(got),
-        note,
-    };
-    on_progress(&done);
-
+    // 终态文案不在这里拼：终态快照由 `worker_loop` 在收尾后推，
+    // 文案也在 `run_one` 里按 `Outcome` 三个字段现算（一处措辞）。
     Ok(Outcome {
         bytes: got,
         resumed,
@@ -607,6 +597,19 @@ impl Downloader {
         Enqueued::Started(id)
     }
 
+    /// 这条任务是否还在登记里（只读；**不给生产代码用**，只给"终态前必须已收尾"那条
+    /// 回归用——`cancel()` 有副作用（会置标志），拿它当探针会把下一次查询也污染掉）。
+    #[cfg(test)]
+    fn is_registered(&self, id: u64) -> bool {
+        self.flags.lock().unwrap().contains_key(&id)
+    }
+
+    /// 这个目标路径是否还有活动任务登记（只读；同上，测试专用）。
+    #[cfg(test)]
+    fn has_active_dest(&self, dest: &Path) -> bool {
+        self.state.0.lock().unwrap().active_dests.contains_key(dest)
+    }
+
     /// 取消一条任务。正在下载的由原子标志让读循环退出；还没开始的会在轮到它时跳过。
     ///
     /// 返回 [`CancelOutcome`]：任务已经收尾时返回 `Finished`，**不要**把它说成"已取消"
@@ -679,18 +682,29 @@ fn worker_loop(
         let Some(job) = take_job(&state, true) else {
             return;
         };
-        run_one(&job, &notify);
+        let terminal = run_one(&job, &notify);
+        // **先收尾、再推终态**：契约是"看到终态 ⇒ 已完全收尾"。顺序反了会留出
+        // 一个窗口期（cancel 报 AlreadyRequested、同 dest 重排被判 Duplicate），
+        // 下面的 `terminal_snapshot_means_the_task_is_fully_finished` 钉住这条。
         finish_job(&state, &flags, &job.spec.dest, job.id);
+        notify(terminal);
     }
 }
 
 /// 执行一条任务（含取消检查与终态快照）。
-fn run_one(job: &Job, notify: &Arc<dyn Fn(Snapshot) + Send + Sync>) {
+/// 跑一条任务：过程中推进度快照，**返回终态快照**（不自己推）。
+///
+/// 终态由 `worker_loop` 在 `finish_job` **之后**推——这是 `Downloader` 的一条契约：
+/// **看到终态快照 ⇒ 该任务已完全收尾**（flag 已摘、dest 名额已放开、in_flight 已减）。
+/// 反过来写（先 notify 再收尾）会留一个窗口期：`cancel(id)` 在窗口内报
+/// `AlreadyRequested` 而不是 `Finished`，同一窗口里重排同一 dest 还会被当成
+/// `Duplicate` 并指向已完成的旧任务 id——复核实测在负载下约 0.7%~2.4% 命中。
+fn run_one(job: &Job, notify: &Arc<dyn Fn(Snapshot) + Send + Sync>) -> Snapshot {
     let id = job.id;
     let spec = &job.spec;
+    // 还没开始就被取消（取消排队中的任务走这条）：终态由调用方在收尾后推
     if job.cancel.load(Ordering::Relaxed) {
-        notify(snapshot_of(spec, id, State::Cancelled, 0, None, "已取消"));
-        return;
+        return snapshot_of(spec, id, State::Cancelled, 0, None, "已取消");
     }
     notify(snapshot_of(
         spec,
@@ -715,28 +729,17 @@ fn run_one(job: &Job, notify: &Arc<dyn Fn(Snapshot) + Send + Sync>) {
             } else {
                 "下载完成".to_string()
             };
-            notify(snapshot_of(
-                spec,
-                id,
-                State::Done,
-                out.bytes,
-                Some(out.bytes),
-                &note,
-            ));
+            snapshot_of(spec, id, State::Done, out.bytes, Some(out.bytes), &note)
         }
-        Err(DownloadError::Cancelled) => {
-            notify(snapshot_of(spec, id, State::Cancelled, 0, None, "已取消"));
-        }
-        Err(e) => {
-            notify(snapshot_of(
-                spec,
-                id,
-                State::Failed(e.to_string()),
-                0,
-                None,
-                &e.to_string(),
-            ));
-        }
+        Err(DownloadError::Cancelled) => snapshot_of(spec, id, State::Cancelled, 0, None, "已取消"),
+        Err(e) => snapshot_of(
+            spec,
+            id,
+            State::Failed(e.to_string()),
+            0,
+            None,
+            &e.to_string(),
+        ),
     }
 }
 
@@ -1004,10 +1007,16 @@ mod tests {
         assert!(!out.resumed && !out.restarted_from_zero);
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert!(!part_path(&dest).exists(), ".part 提交后不应残留");
-        // 进度快照应覆盖 下载中→校验中→完成
+        // `download()` 只推进度快照，**不推终态**（终态由 worker 在收尾后推一条）——
+        // 所以这里最后一条应是 Verifying。终态那条与"看到终态 ⇒ 已完全收尾"
+        // 的不变式由 `terminal_snapshot_means_the_task_is_fully_finished` 覆盖。
         assert!(seen.iter().any(|s| s.state == State::Downloading));
         assert!(seen.iter().any(|s| s.state == State::Verifying));
-        assert_eq!(seen.last().unwrap().state, State::Done);
+        assert!(
+            seen.iter().all(|s| !s.state.is_terminal()),
+            "download() 不该推终态：{:?}",
+            seen.iter().map(|s| s.state.clone()).collect::<Vec<_>>()
+        );
         assert_eq!(srv.hits().len(), 1);
         assert_eq!(srv.hits()[0].path, "/m/model.bin");
         assert!(srv.hits()[0].range.is_none(), "没有断点时不该发 Range");
@@ -1291,9 +1300,14 @@ mod tests {
     }
 
     impl BarrierServer {
+        /// `wait` 是**客户端读超时之外**的兜底：正常情况下 `deal` 个请求一到齐就立刻放行，
+        /// 完全不依赖这个时长。它只在"串行实现"下才生效（永远等不到第 `deal` 个），
+        /// 以及极端负载下连接迟迟没被 accept 时给客户端留足时间。
         fn start(deal: usize, wait: Duration) -> BarrierServer {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
+            // 阻塞 accept：非阻塞 + sleep 轮询在高负载下会拖慢"第二个请求被 accept"，
+            // 让屏障误判成"没等齐"（我压测时 720 次里踩到 2 次，都以 5.03s 超时告终）。
+            listener.set_nonblocking(false).unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(Mutex::new(Vec::new()));
             let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -1365,13 +1379,11 @@ mod tests {
                                 let _ = stream.shutdown(Shutdown::Both);
                             }));
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(_) => {
                             if stop_srv.load(Ordering::Relaxed) {
                                 break;
                             }
-                            std::thread::sleep(Duration::from_millis(2));
                         }
-                        Err(_) => break,
                     }
                 }
                 for h in handles {
@@ -1537,6 +1549,101 @@ mod tests {
         assert_eq!(last.state, State::Done, "{last:?}");
         assert_eq!(srv.hits(), vec!["/same.bin".to_string()], "只允许一次请求");
         assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    /// **看到终态快照 ⇒ 该任务已完全收尾**（flag 摘掉、dest 名额放开、in_flight 减掉）。
+    ///
+    /// 这条钉两件事，都是复核驳回时点名的：
+    ///   ① 顺序不变式：`finish_job` 必须在终态 `notify` **之前**。反过来写会留一个
+    ///      窗口期，`cancel(id)` 报 `AlreadyRequested` 而不是 `Finished`
+    ///      —— `cancel_reports_requested_then_already_requested_then_finished` 因此在
+    ///      负载下 ~0.7%~2.4% flaky（复核实测 6/250 与 2/300，我本地 1/120）。
+    ///   ② `finish_job` 的**释放**那一半：整段 `active_dests.remove` 删掉后以前全仓
+    ///      337 条仍全绿（没有测试隔离），这条补上。
+    ///
+    /// **断言必须写在 `notify` 回调里面**：只有那里继承了 `finish_job` 的
+    /// happens-before（worker 先收尾再 notify）。在另一个线程里等快照到达**再**查，
+    /// 窗口已经过去、恒绿——我第一版就是这么写的，被自己骗过。
+    ///
+    /// 探针也必须是**只读**的：第一版我在回调里调 `dl.cancel(id)` 来验证，
+    /// 结果 `cancel` 自己把标志置上了，断言当然读到 `Requested`（假红）。
+    /// 这里改查 `is_registered` / `has_active_dest` 两个纯读探针。
+    #[test]
+    fn terminal_snapshot_means_the_task_is_fully_finished() {
+        let root = temp_dir("terminal-cleanup");
+        let body = vec![5u8; 16 * 1024];
+        let srv = MockServer::start(body.clone(), false);
+        let dest = root.join("m.bin");
+        let (tx, rx) = channel::<Snapshot>();
+        let dl_holder: Arc<Mutex<Option<Arc<Downloader>>>> = Arc::new(Mutex::new(None));
+        let dl_slot = Arc::clone(&dl_holder);
+        // 在 notify 里（worker 线程，finish_job 之后）抓到的只读探针结果
+        let probes: Arc<Mutex<Vec<(u64, bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let probes_slot = Arc::clone(&probes);
+        let dl = Downloader::new(
+            move |snap| {
+                if snap.state.is_terminal() {
+                    if let Some(dl) = dl_slot.lock().unwrap().as_ref() {
+                        probes_slot.lock().unwrap().push((
+                            snap.id,
+                            !dl.is_registered(snap.id),
+                            !dl.has_active_dest(&snap.dest),
+                        ));
+                    }
+                    let _ = tx.send(snap);
+                }
+            },
+            Some(1),
+        );
+        let dl = Arc::new(dl);
+        *dl_holder.lock().unwrap() = Some(Arc::clone(&dl));
+
+        let id = match dl.enqueue(spec(srv.url("/m.bin"), dest.clone(), &body), |u| {
+            u.to_string()
+        }) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
+        // 等终态快照（一条任务会推两个终态；每条都必须满足不变式）
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut terminal: Option<Snapshot> = None;
+        while terminal.is_none() {
+            assert!(Instant::now() < deadline, "等不到终态快照");
+            if let Ok(snap) = rx.recv_timeout(Duration::from_millis(50)) {
+                if snap.id == id && snap.state.is_terminal() {
+                    terminal = Some(snap);
+                }
+            }
+        }
+
+        let probes = probes.lock().unwrap().clone();
+        assert!(
+            !probes.is_empty(),
+            "notify 回调里应至少抓到一次终态（否则断言没生效）"
+        );
+        for (snap_id, flag_gone, dest_freed) in &probes {
+            assert!(
+                *flag_gone,
+                "终态快照（id={snap_id}）发出时 flag 还在——说明收尾被放在了 notify 之后\
+                 （复核实测的 flaky 根因：cancel 会报 AlreadyRequested）"
+            );
+            assert!(
+                *dest_freed,
+                "终态快照（id={snap_id}）发出时 dest 名额还没放开——说明 active_dests \
+                 的释放在 notify 之后（同一窗口里重排同 dest 会被误判 Duplicate）"
+            );
+        }
+
+        // 公开 API 上再确认一次：终态已到，现在重排同一 dest 必须能排上
+        let id2 = match dl.enqueue(spec(srv.url("/m.bin"), dest.clone(), &body), |u| {
+            u.to_string()
+        }) {
+            Enqueued::Started(id2) => id2,
+            Enqueued::Duplicate { existing } => {
+                panic!("终态后同一 dest 必须能重排，却被当成 Duplicate（指向已完成的 #{existing}）")
+            }
+        };
+        assert_ne!(id2, id);
     }
 
     /// 去重按**完整目标路径**，不是按文件名。

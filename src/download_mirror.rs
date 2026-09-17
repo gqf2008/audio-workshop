@@ -71,6 +71,39 @@ fn official_suffix(url: &str) -> Option<&str> {
     None
 }
 
+/// 校验用户填的镜像前缀：必须带 `http://` 或 `https://`。
+///
+/// 不带 scheme（例如只填 `hf-mirror.com`）会被当成相对路径、拼出
+/// `hf-mirror.com/org/repo/...` —— 失败是响的（网络错误），但用户拿不到
+/// "我该补个 https://" 这条线索。所以在**保存时**就拦下并说清怎么改。
+///
+/// 返回 `Ok(None)` = 留空（用官方）；`Ok(Some(normalized))` = 可用的前缀；
+/// `Err(说明)` = 不是能用的前缀。
+pub fn validate_prefix(prefix: &str) -> Result<Option<String>, String> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // scheme 判定用**原文**：`normalize_prefix` 会削掉尾部斜杠，而 `https://` 的
+    // 尾斜杠正是"没有主机名"的判据（削完变成 `https:` 会报出误导性的"要补 scheme"）。
+    let lower = trimmed.to_ascii_lowercase();
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = lower.strip_prefix(scheme) {
+            let host = rest.trim_end_matches('/');
+            if host.is_empty() || host.starts_with('/') {
+                return Err(format!(
+                    "镜像地址 {trimmed} 缺少主机名——写成 https://你的镜像域名（例如 https://hf-mirror.com）"
+                ));
+            }
+            // 归一后再返回（削掉尾部斜杠/空白）
+            return Ok(normalize_prefix(trimmed));
+        }
+    }
+    Err(format!(
+        "镜像地址要以 http:// 或 https:// 开头（你填的是 {trimmed}）——只填域名会被当成相对路径"
+    ))
+}
+
 /// 界面上「当前生效的源」那一行。
 ///
 /// 与 [`rewrite_url`] 同源：有镜像就报镜像，没有就报官方——**不猜、不美化**。
@@ -191,6 +224,32 @@ mod tests {
         let note = source_note("https://hf-mirror.com/");
         assert!(note.contains("https://hf-mirror.com"), "note={note}");
         assert!(!note.contains("hf-mirror.com/（"), "尾斜杠应已归一：{note}");
+    }
+
+    /// 不带 scheme 的镜像前缀在**保存时**就要被拦下并给可执行的说明。
+    #[test]
+    fn prefix_without_a_scheme_is_rejected_with_an_actionable_message() {
+        for bad in ["hf-mirror.com", "//hf-mirror.com", "ftp://hf-mirror.com"] {
+            let err = validate_prefix(bad).expect_err(&format!("{bad} 应被拒绝"));
+            assert!(
+                err.contains("http://") && err.contains("https://"),
+                "要说清该补什么 scheme：{err}"
+            );
+            assert!(err.contains(bad), "要把用户填的值回显出来：{err}");
+        }
+        // 缺主机名也要拦
+        let err = validate_prefix("https://").expect_err("空主机名应被拒绝");
+        assert!(err.contains("主机名"), "{err}");
+        // 合法值原样通过（并归一尾斜杠）
+        assert_eq!(
+            validate_prefix("https://hf-mirror.com///")
+                .unwrap()
+                .as_deref(),
+            Some("https://hf-mirror.com")
+        );
+        // 留空 = 用官方（不是错误）
+        assert_eq!(validate_prefix("").unwrap(), None);
+        assert_eq!(validate_prefix("   ").unwrap(), None);
     }
 
     /// 官方前缀后面直接结束（没有路径）也不该 panic。
