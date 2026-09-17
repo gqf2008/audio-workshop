@@ -348,7 +348,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
                 PixelTextInput {
                     text <=> root.model-dir;
-                    placeholder: "模型目录，默认 <应用工作目录>/models";
+                    placeholder: "模型目录，默认跟着服务清单里的模型根";
                     enabled: !root.busy;
                 }
                 HorizontalLayout {
@@ -362,7 +362,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     PixelButton {
                         width: 72px;
                         text: "用默认";
-                        Tooltip { text: @markdown("清空即用默认目录 <应用工作目录>/models"); }
+                        Tooltip { text: @markdown("清空即用默认目录：服务清单里模型 path 的公共父目录（推不出来才回落 <应用工作目录>/models）"); }
                         enabled: !root.busy;
                         clicked => { root.model-dir = ""; }
                     }
@@ -382,7 +382,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: "默认是应用工作目录下的 models/。目录只描述模型文件放在哪，用于核对模型盘挂上没；引擎仍按服务清单里的 id 加载。";
+                    text: "默认跟着服务清单里那些模型 path 的公共父目录（本机就是服务实际加载模型的那一层）；清单读不出来或跨卷时才回落到应用工作目录下的 models/。目录只描述模型文件放在哪，用于核对模型盘挂上没；引擎仍按服务清单里的 id 加载。";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;
