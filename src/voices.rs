@@ -68,6 +68,25 @@ pub fn library_dir(root: &Path) -> PathBuf {
 /// 允许的参考音频扩展名（与单篇音色选择一致）；其它一律拒绝并给可执行文案。
 const AUDIO_EXTS: [&str; 5] = ["wav", "mp3", "flac", "m4a", "ogg"];
 
+/// 名字的 64 位 FNV-1a：给库内文件名加一段稳定后缀。
+///
+/// 为什么不能只用 `sanitize(name)`：`a/b` 与 `a_b` 归一后是同一个文件名，后一条会把前一条的
+/// 音频覆盖掉（复核指出）。后缀取自**名字本身**（小写化），所以同一个名字总是同一个文件
+/// （覆盖语义不变），不同名字的文件名不会撞。
+fn name_suffix(lower_name: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in lower_name.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 库内文件名：`<slug>-<hash8>.<ext>`（hash 取名字哈希的前 8 位，够用且短）。
+fn library_file_name(slug: &str, lower_name: &str, ext: &str) -> String {
+    format!("{slug}-{}.{ext}", &name_suffix(lower_name)[..8])
+}
+
 fn ext_of(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|e| e.to_str())
@@ -120,9 +139,18 @@ pub fn usable_audio_path(root: &Path, entry: &VoiceEntry) -> Result<PathBuf, Str
         ));
     }
     let path = audio_path(root, entry);
-    if !path.is_file() {
-        return Err(format!(
+    // 用 symlink_metadata 而不是 is_file：库里的 `x.wav` 若是指向库外文件的软链，
+    // is_file() 会跟着它读出去（复核指出）。我们要的是"库里真有一份音频"。
+    let meta = std::fs::symlink_metadata(&path).map_err(|_| {
+        format!(
             "音色「{}」的音频不在库里（{}）——重新存一次，或从备份导入",
+            entry.name,
+            path.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!(
+            "音色「{}」的音频不是普通文件（{}）——符号链接/目录都不接受，重新存一次",
             entry.name,
             path.display()
         ));
@@ -172,8 +200,10 @@ pub fn add_from_file(
         }
     }
 
+    // **先读索引**：索引坏了就别动任何音色文件（否则会留下"索引没有、文件被换"的残局）
+    let mut index = load(root)?;
     let slug = sanitize(name);
-    let file = format!("{slug}.{ext}");
+    let file = library_file_name(&slug, &name.to_lowercase(), &ext);
     let dir = library_dir(root);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("建音色库目录失败：{}（{e}）", dir.display()))?;
@@ -188,18 +218,17 @@ pub fn add_from_file(
         note: note.trim().to_string(),
         created_at: now_ms,
     };
-    let mut index = load(root)?;
-    // 覆盖旧条目时，把旧音频清掉（同一条目换扩展名会留下孤儿文件）
-    if let Some(old) = index.get(name) {
-        let old_path = audio_path(root, old);
-        if old_path != dst && old_path.is_file() {
-            // 清不掉也无所谓：那个文件已经没有任何条目引用（哑文件，不影响使用），
-            // 但绝不因为"清理失败"就把新音色回滚掉
-            let _ = std::fs::remove_file(&old_path);
-        }
-    }
+    // 覆盖旧条目时记住旧文件；**索引落盘成功之后**再清（顺序反了会留下"索引指向已删文件"）
+    let stale_old = index
+        .get(name)
+        .map(|old| audio_path(root, old))
+        .filter(|p| *p != dst);
     index.upsert(entry.clone());
     save_index(root, &index)?;
+    if let Some(old_path) = stale_old {
+        // 清不掉也无所谓：那个文件已经没有条目引用（哑文件），不能因此把新音色回滚
+        let _ = std::fs::remove_file(&old_path);
+    }
     Ok(entry)
 }
 
@@ -215,7 +244,12 @@ pub fn export_to(
         return Err(format!("音色库里没有「{name}」"));
     };
     let src = usable_audio_path(root, entry)?;
-    let dir = dest_root.join(sanitize(&entry.name));
+    // 目录名同样带名字哈希后缀：`a/b` 与 `a_b` 归一后不能落到同一个导出目录
+    let dir = dest_root.join(format!(
+        "{}-{}",
+        sanitize(&entry.name),
+        &name_suffix(&entry.name.to_lowercase())[..8]
+    ));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("建导出目录失败：{}（{e}）", dir.display()))?;
     let meta = serde_json::to_vec_pretty(entry).map_err(|e| format!("导出序列化失败：{e}"))?;
@@ -247,8 +281,13 @@ pub fn import_from(
         ));
     }
     let src = src_dir.join(&entry.file);
-    if !src.is_file() {
-        return Err(format!("导入失败：音频文件不在包里（{}）", src.display()));
+    let meta = std::fs::symlink_metadata(&src)
+        .map_err(|_| format!("导入失败：音频文件不在包里（{}）", src.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!(
+            "导入失败：包里的音频不是普通文件（{}）——符号链接/目录都不接受",
+            src.display()
+        ));
     }
     let bytes = std::fs::read(&src).map_err(|e| format!("导入失败：读音频（{e}）"))?;
     if bytes.is_empty() {
@@ -314,7 +353,11 @@ mod tests {
 
         let entry = add_from_file(&root, "口播男声", &src, "试音用", 42, sanitize).unwrap();
         assert_eq!(entry.name, "口播男声");
-        assert_eq!(entry.file, "口播男声.wav");
+        assert!(
+            entry.file.starts_with("口播男声-") && entry.file.ends_with(".wav"),
+            "库内文件名 = slug + 名字哈希后缀：{}",
+            entry.file
+        );
         let in_lib = audio_path(&root, &entry);
         assert!(in_lib.is_file());
         let lib_bytes = std::fs::read(&in_lib).unwrap();
@@ -411,7 +454,12 @@ mod tests {
         let out = root.join("导出到这里");
         let dir = export_to(&root, "跨机音色", &out, sanitize).unwrap();
         assert!(dir.join(EXPORT_META).is_file());
-        assert!(dir.join("跨机音色.wav").is_file());
+        let exported = load(&root).unwrap().get("跨机音色").unwrap().clone();
+        assert!(
+            dir.join(&exported.file).is_file(),
+            "导出的音频名应与库里一致：{}",
+            exported.file
+        );
 
         let entry = import_from(&other, &dir, 9, sanitize).unwrap();
         assert_eq!(entry.name, "跨机音色");
@@ -465,6 +513,64 @@ mod tests {
         .unwrap();
         let err = import_from(&root, &pkg, 1, sanitize).unwrap_err();
         assert!(err.contains("不合法"), "{err}");
+    }
+
+    /// 两个不同的名字归一后是**同一个 slug**（`a/b` vs `a_b`）：文件名必须仍然不同，
+    /// 否则后一条会把前一条的音频覆盖掉（复核指出）。
+    #[test]
+    fn names_that_sanitize_the_same_still_get_distinct_files() {
+        let root = temp_dir("slug-collision");
+        let a = root.join("a.wav");
+        let b = root.join("b.wav");
+        write_wav(&a, 100);
+        write_wav(&b, 200);
+
+        let e1 = add_from_file(&root, "a/b", &a, "", 1, sanitize).unwrap();
+        let e2 = add_from_file(&root, "a_b", &b, "", 2, sanitize).unwrap();
+        assert_ne!(
+            e1.file, e2.file,
+            "两个名字不能共用一个文件：{e1:?} / {e2:?}"
+        );
+
+        let index = load(&root).unwrap();
+        assert_eq!(index.voices.len(), 2, "两条都要在库里");
+        assert_eq!(
+            std::fs::read(audio_path(&root, &e1)).unwrap(),
+            std::fs::read(&a).unwrap(),
+            "第一条的音频不能被第二条覆盖"
+        );
+        assert_eq!(
+            std::fs::read(audio_path(&root, &e2)).unwrap(),
+            std::fs::read(&b).unwrap()
+        );
+    }
+
+    /// 库里的音频是**指向库外文件的符号链接**：不接受（否则"自包含"是假的）。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_audio_in_library_is_refused() {
+        let root = temp_dir("symlink-lib");
+        let outside = root.join("外面的.wav");
+        write_wav(&outside, 9);
+        let mut index = VoiceIndex::default();
+        let file = "伪装.wav".to_string();
+        std::fs::create_dir_all(library_dir(&root)).unwrap();
+        std::os::unix::fs::symlink(&outside, library_dir(&root).join(&file)).unwrap();
+        index.voices.push(VoiceEntry {
+            name: "伪装".into(),
+            file,
+            note: String::new(),
+            created_at: 1,
+        });
+        save_index(&root, &index).unwrap();
+
+        let entry = load(&root).unwrap().voices[0].clone();
+        let err = usable_audio_path(&root, &entry).unwrap_err();
+        assert!(err.contains("不是普通文件"), "{err}");
+        assert!(
+            export_to(&root, "伪装", &root.join("out"), sanitize).is_err(),
+            "导出也要拒绝符号链接"
+        );
     }
 
     /// 手改 `index.json` 把 `file` 写成库外路径：导出/应用都必须拒绝，不能顺着它读库外文件。

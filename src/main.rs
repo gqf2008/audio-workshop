@@ -648,7 +648,7 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
     let tx = ctx.cmd_tx.clone();
     ui.on_library_apply(move |name| {
         let Some(ui) = weak.upgrade() else { return };
-        if project_editing_blocked(&ui, &st) {
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
             ui.set_status_text("任务进行中：音色等这轮跑完再换".into());
             return;
         }
@@ -1547,16 +1547,23 @@ fn pick_folder_with_prompt(prompt: &str) -> Option<String> {
         .args([
             "-NoProfile",
             "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
-             $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
-             if ($d.ShowDialog() -eq \"OK\") { Write-Output $d.SelectedPath }",
+            &format!(
+                "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+                 $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+                 $d.Description = '{prompt}'; \
+                 if ($d.ShowDialog() -eq \"OK\") {{ Write-Output $d.SelectedPath }}"
+            ),
         ])
         .output()
         .ok()?;
 
     #[cfg(all(unix, not(target_os = "macos")))]
     let out = std::process::Command::new("zenity")
-        .args(["--file-selection", "--directory", "--title=选择模型目录"])
+        .args([
+            "--file-selection",
+            "--directory",
+            &format!("--title={prompt}"),
+        ])
         .output()
         .ok()?;
 

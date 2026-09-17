@@ -553,7 +553,8 @@ export component DubWorkbench inherits Rectangle {
                             voice-label: root.voice-label;
                             engine-label: root.engine-label;
                             reference-path <=> root.voice-ref-path;
-                            busy: root.running || root.busy;
+                            // 批量在跑时也把音色区锁住：批量的 voice_ref 在提交那一刻就定格了
+                            busy: root.running || root.busy || root.batch-running;
                             reference-exists: root.reference-exists;
                             edited => { root.voice-ref-changed(); }
                             clear-reference => { root.clear-reference(); }
