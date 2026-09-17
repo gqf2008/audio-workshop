@@ -575,10 +575,13 @@ fn dictionaries_root() -> PathBuf {
 /// 词典列表 → 界面（名字 + 词条数；坏文件计数）。
 fn refresh_dictionaries(ui: &MainWindow, state: &Rc<UiState>) {
     let (rows, broken) = dictionaries::list(&dictionaries_root());
-    let names: Vec<SharedString> = rows
-        .iter()
-        .map(|r| SharedString::from(format!("{}（{} 条）", r.name, r.count)))
-        .collect();
+    // 下拉的**第 0 项**固定是"不使用词典"（与 `dict_index` 的映射一致）：
+    // 只放库里的名字会让 index 0 显示成第一套词典、而 Rust 按"不使用"处理。
+    let mut names: Vec<SharedString> = vec![SharedString::from("不使用词典")];
+    names.extend(
+        rows.iter()
+            .map(|r| SharedString::from(format!("{}（{} 条）", r.name, r.count))),
+    );
     ui.set_dict_names(ModelRc::from(Rc::new(VecModel::from(names))));
     // 下拉第 0 项固定是「不使用词典」，所以库里的排 1..n
     let active = state.active_dict_file.borrow().clone();
@@ -8178,6 +8181,9 @@ mod tests {
             }),
             ("同名但内容变了", |p: &mut Project| {
                 p.voice_ref_hash = Some("hash-z".into());
+            }),
+            ("换了词典", |p: &mut Project| {
+                p.dict_hash = Some("别的词典指纹".into());
             }),
         ];
         for (name, tweak) in cases {
