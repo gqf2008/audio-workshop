@@ -27,6 +27,23 @@ fn retries_on_503_until_success() {
     assert_eq!(mock.hit_count(), 3, "503 后应重试直到成功");
 }
 
+/// 结构化内存不足是“明确拒绝”，不是“服务忙”：不能在后台白等 5 次退避，
+/// 要把控制权立刻交回配音队列，让用户释放内存后点继续。
+#[test]
+fn insufficient_memory_is_not_retried() {
+    let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+    let mock = support::Mock::start(vec![(503, body.into())]);
+    let c = client(&mock.base, 6);
+    let err = c
+        .synth("audio8-tts", "你好", Some(1), None, None)
+        .unwrap_err();
+    assert_eq!(mock.hit_count(), 1, "OOM 必须只发一次，不能自动重试");
+    let note = err.to_string();
+    assert!(note.contains("释放模型内存"), "提示要有可执行动作: {note}");
+    assert!(note.contains("q4_0"), "提示要有可执行动作: {note}");
+    assert!(note.contains("3.84 GiB"), "服务端原文不能被吞: {note}");
+}
+
 #[test]
 fn gives_up_after_six_attempts_like_python() {
     let mock = support::Mock::start(vec![(503, r#"{"error":"一直忙"}"#.into())]);
@@ -42,6 +59,85 @@ fn gives_up_after_six_attempts_like_python() {
     );
     // 错误体必须透出，否则看不见 503 的原因
     assert!(err.to_string().contains("一直忙"), "错误体应透出: {err}");
+}
+
+#[test]
+fn unload_all_models_reports_names_and_service_errors_truthfully() {
+    use std::io::{Read as _, Write as _};
+
+    // 成功路径用裸 TCP mock 钉住**真实 endpoint**；support::Mock 只看 body，
+    // 不能在测试里证明服务端路径没写错。
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // 读完整请求（headers + Content-Length body），不能在客户端还在写 body
+        // 时就响应并关闭；高负载下单次 read 只会拿到半个 headers。
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head_end = request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .expect("请求必须包含 headers 结束标记");
+        let head = String::from_utf8_lossy(&request[..head_end]);
+        assert!(
+            head.starts_with("POST /v1/tasks/unload_all_models HTTP/1.1"),
+            "unload endpoint 写错: {head}"
+        );
+        let content_length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let already = request.len().saturating_sub(head_end);
+        if content_length > already {
+            let mut rest = vec![0u8; content_length - already];
+            stream.read_exact(&mut rest).unwrap();
+        }
+        let body = r#"{"unloaded":["yue2","qwen3-asr"]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let note = client(&base, 1).unload_all_models().expect("200 应成功");
+    assert!(
+        note.contains("yue2") && note.contains("qwen3-asr"),
+        "{note}"
+    );
+    server.join().unwrap();
+
+    let failed = support::Mock::start(vec![(500, r#"{"error":"unload failed"}"#.into())]);
+    let err = client(&failed.base, 1)
+        .unload_all_models()
+        .expect_err("500 必须报错，不能假装卸载成功");
+    assert!(err.to_string().contains("unload failed"), "{err}");
+
+    // 200 但协议体不合法也不能当成功；三种畸形体都要显式失败。
+    for body in [r#"{}"#, r#"{"unloaded":"x"}"#, r#"{"unloaded":[1]}"#] {
+        let malformed = support::Mock::start(vec![(200, body.into())]);
+        let err = client(&malformed.base, 1)
+            .unload_all_models()
+            .expect_err("畸形 unload 响应必须报 Decode，不能假装成功");
+        assert!(
+            err.to_string().contains("unload") || err.to_string().contains("响应解析失败"),
+            "{err}"
+        );
+    }
 }
 
 /// 评审原话：500 且 body 恰好含 "503" 会被旧实现的 `contains("503")` 误判成可重试

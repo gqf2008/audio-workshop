@@ -97,9 +97,14 @@ enum Cmd {
         auto_normalize: bool,
         /// 当前启用的发音词典（空 map = 没启用）：与兜底开关同类，改了要重录
         dict: std::collections::BTreeMap<String, String>,
+        /// true = 这次只重跑工程里 `error:` 的句子（用户释放内存后点「继续合成」）。
+        /// false = 正常续作：done 跳过，pending/error 继续。
+        retry_failed: bool,
     },
     /// 单句重录（换 seed 重合成该句）
     Redo { revision: u64, index: usize },
+    /// 用户点「释放模型内存」：调用服务端 /v1/tasks/unload_all_models。
+    UnloadModels,
     /// 批量配音（M4-P1）：按顺序把 N 篇稿子跑成 N 个工程。
     ///
     /// 与单篇共用同一条链路（load_resumable → synthesize → assemble）与同一份
@@ -202,11 +207,18 @@ enum Msg {
         status: String,
         duration: Option<f64>,
     },
-    /// 一轮合成结束：失败句数、是否被停止
+    /// 一轮合成结束：失败句数、是否被停止；`error` 是第一条失败句的完整状态文案，
+    /// 用来让状态栏/任务中心看到 OOM 的可执行下一步，而不是只剩一个失败计数。
     RunDone {
         failed: usize,
         stopped: bool,
         reused: usize,
+        error: Option<String>,
+    },
+    /// 手动释放模型内存的终态（成功/失败都带回服务原文）。
+    ModelsUnloaded {
+        ok: bool,
+        note: String,
     },
     /// 批量：某一条开始跑了（UI 把这一行切成"合成本"，并显示第 i/N 条）
     BatchItemStarted {
@@ -400,6 +412,8 @@ struct EvalSummary {
     scored: usize,
     /// ASR 转写失败的句数（服务端错误等）——不混进平均分，但要报出来
     asr_failed: usize,
+    /// 第一条 ASR 失败的服务端原文（OOM 等），用于质检摘要里的可执行下一步。
+    asr_error: Option<String>,
     /// 最差 N 句（按可懂度升序；只含有差异的句子）
     worst: Vec<EvalIssue>,
     /// 全部评上的分数（句 index → 可懂度%），给句子行展示用
@@ -2597,6 +2611,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 gap_ms,
                 auto_normalize,
                 dict,
+                retry_failed,
             } => {
                 if task_take_started(&ctx, task_id) {
                     // 排队期间被停掉：不载入、不合成，按"用户停止"收尾
@@ -2606,6 +2621,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             failed: 0,
                             stopped: true,
                             reused: 0,
+                            error: None,
                         },
                     });
                     continue;
@@ -2649,15 +2665,48 @@ fn worker_loop(ctx: WorkerCtx) {
                         continue;
                     }
                 };
+                // 用户释放内存后点「继续合成」：只喂上次失败的工程下标，done 句
+                // 绝不重新请求。正常首次/续跑则 `None`，由 aw-core 跳过 done。
+                let only_failed = if retry_failed {
+                    Some(project.failed_sentence_indices())
+                } else {
+                    None
+                };
+                if matches!(only_failed.as_ref(), Some(v) if v.is_empty()) {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::RunDone {
+                            failed: 0,
+                            stopped: false,
+                            reused,
+                            error: None,
+                        },
+                    });
+                    current = Some((revision, dir, project));
+                    continue;
+                }
                 let tx = ctx.tx.clone();
                 let started = RefCell::new(std::collections::HashSet::new());
+                let mut first_error: Option<String> = None;
                 let run = project.synthesize_stoppable(
                     &client,
                     &dir,
-                    None,
+                    only_failed.as_deref(),
                     None,
                     Some(&ctx.stop),
                     |idx, note| {
+                        // 优先把 OOM 留作整轮摘要；若第一条只是普通失败、
+                        // 后面才有 OOM，也不能让可执行的内存提示被前面的错误盖掉。
+                        let is_oom = note.starts_with("error: oom");
+                        match first_error.as_deref() {
+                            None if note.starts_with("error") => {
+                                first_error = Some(note.to_string());
+                            }
+                            Some(existing) if is_oom && !existing.starts_with("error: oom") => {
+                                first_error = Some(note.to_string());
+                            }
+                            _ => {}
+                        }
                         report_progress(&tx, revision, &mut started.borrow_mut(), idx, note);
                     },
                 );
@@ -2671,6 +2720,7 @@ fn worker_loop(ctx: WorkerCtx) {
                                 failed,
                                 stopped,
                                 reused,
+                                error: first_error,
                             },
                         });
                     }
@@ -2683,6 +2733,19 @@ fn worker_loop(ctx: WorkerCtx) {
                         });
                     }
                 }
+            }
+            Cmd::UnloadModels => {
+                let (ok, note) = match make_client() {
+                    Ok(client) => match client.unload_all_models() {
+                        Ok(note) => (true, note),
+                        Err(e) => (false, e.to_string()),
+                    },
+                    Err(e) => (false, e),
+                };
+                let _ = ctx.tx.send(WorkerMsg {
+                    revision: 0,
+                    msg: Msg::ModelsUnloaded { ok, note },
+                });
             }
             Cmd::RunBatch {
                 revision,
@@ -3134,6 +3197,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 let mut sum = 0.0f64;
                 let mut scored = 0usize;
                 let mut asr_failed = 0usize;
+                let mut asr_error: Option<String> = None;
                 let mut stopped = false;
                 for (n, idx) in done.iter().enumerate() {
                     // 协作式停止：一句转写完再停（ASR 调用本身中断不了）
@@ -3185,7 +3249,11 @@ fn worker_loop(ctx: WorkerCtx) {
                             // 这句的旧分数（如果有）**保留**——它描述的是磁盘上那段音频，
                             // 而这次只是没测到；保留的分数要一起回给 UI，否则 UI 与磁盘不一致。
                             asr_failed += 1;
-                            let _ = e;
+                            // 保留第一条服务端原文（含 OOM 三个动作）；后续同一
+                            // 错误不再重复堆积，摘要只展示一份可执行说明。
+                            if asr_error.is_none() {
+                                asr_error = Some(e.to_string());
+                            }
                         }
                     }
                     let _ = ctx.tx.send(WorkerMsg {
@@ -3275,6 +3343,7 @@ fn worker_loop(ctx: WorkerCtx) {
                             percent,
                             scored,
                             asr_failed,
+                            asr_error,
                             worst: issues,
                             scores,
                             persist_warning,
@@ -3576,17 +3645,19 @@ fn report_progress(
     if !started.insert(idx) {
         let (status, duration) = if let Some(rest) = note.strip_prefix("done ") {
             let d = rest.trim_end_matches('s').parse::<f64>().ok();
-            ("done", d)
+            ("done".to_string(), d)
         } else if note.starts_with("error") {
-            ("error", None)
+            // 终态 note 就是 aw-core 落盘的完整句状态（含 `error: oom` 与
+            // ClientError 的唯一可执行文案）；原样带给 UI，不在这里二次拼提示。
+            (note.to_string(), None)
         } else {
-            ("running", None)
+            ("running".to_string(), None)
         };
         let _ = tx.send(WorkerMsg {
             revision,
             msg: Msg::Sentence {
                 index: idx,
-                status: status.into(),
+                status,
                 duration,
             },
         });
@@ -4127,7 +4198,8 @@ fn main() -> Result<(), slint::PlatformError> {
     seed_shot_bgm_artifacts(&ui, &state);
 
     // 产截图 / 演示用初始态（仅 debug；release 无此旁路）
-    apply_shot_state(&ui, &state);
+    // mem-shortfall 的 "oom" 态要 rows，auto-update 的 "update" 态要 state —— 两个都传
+    apply_shot_state(&ui, &rows, &state);
 
     // ── 主循环 ──
     let timer = Timer::default();
@@ -4162,7 +4234,7 @@ fn ready_note(base: Option<&str>) -> String {
 /// 产截图 / 演示用初始态（`AW_UI_STATE=selected|drawer|dark`；仅 debug 构建存在，
 /// release 整个函数被编译掉，验证：`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0）
 #[cfg(debug_assertions)]
-fn apply_shot_state(ui: &MainWindow, ui_state: &Rc<UiState>) {
+fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &Rc<UiState>) {
     let Ok(state) = std::env::var("AW_UI_STATE") else {
         return;
     };
@@ -4170,6 +4242,14 @@ fn apply_shot_state(ui: &MainWindow, ui_state: &Rc<UiState>) {
         "selected" => {
             ui.set_selected(1);
             ui.set_status_text("已选中第 2 句 · 试听 / 重录就在行下方".into());
+        }
+        "oom" => {
+            let body = r#"{"error":{"message":"cannot load model \u0027qwen3-asr\u0027: estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+            if let Some(detail) = aw_core::memory_shortfall_note(body) {
+                set_status(rows, 0, &format!("error: oom: {detail}"));
+                ui.set_selected(0);
+                ui.set_status_text("内存不足：展开的句子行应显示「释放模型内存」按钮".into());
+            }
         }
         "drawer" => {
             ui.set_drawer_open(true);
@@ -4342,13 +4422,25 @@ fn apply_shot_state(ui: &MainWindow, ui_state: &Rc<UiState>) {
 }
 
 #[cfg(not(debug_assertions))]
-fn apply_shot_state(_ui: &MainWindow, _state: &Rc<UiState>) {}
+fn apply_shot_state(_ui: &MainWindow, _rows: &Rc<VecModel<Sentence>>, _state: &Rc<UiState>) {}
 
 fn apply_project_to_rows(
     ui: &MainWindow,
     rows: &Rc<VecModel<Sentence>>,
     project: &Project,
 ) -> usize {
+    let done = apply_project_sentence_statuses(rows, project);
+    recompute_total(rows);
+    ui.set_done_count(done as i32);
+    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
+    ui.set_has_result(done > 0);
+    done
+}
+
+/// `apply_project_to_rows` 的状态回灌主体（不碰 MainWindow，便于无头回归）。
+/// 关键是 error 分支传**完整** `sentence.status`：磁盘上的 `error: oom: ...`
+/// 不能在这里被压成裸 "error"，否则重开后释放模型内存按钮会消失。
+fn apply_project_sentence_statuses(rows: &Rc<VecModel<Sentence>>, project: &Project) -> usize {
     let mut done = 0usize;
     for sentence in &project.sentences {
         let Some(i) = row_position(rows, sentence.index) else {
@@ -4361,15 +4453,13 @@ fn apply_project_to_rows(
                 set_row_duration(rows, i, d as f32);
             }
         } else if sentence.status.starts_with("error") {
-            set_status(rows, i, "error");
+            // 完整状态串要带下去：`error: oom: ...` 里的详情就是「释放模型内存」
+            // 按钮的可见性来源，压成裸 "error" 会让重开工程后按钮消失。
+            set_status(rows, i, &sentence.status);
         } else {
             set_status(rows, i, "pending");
         }
     }
-    recompute_total(rows);
-    ui.set_done_count(done as i32);
-    ui.set_progress(done as f32 / rows.row_count().max(1) as f32);
-    ui.set_has_result(done > 0);
     done
 }
 
@@ -5476,7 +5566,49 @@ fn stop_separation(ui: &MainWindow, state: &Rc<UiState>, sep_stop: &Arc<AtomicBo
 /// "新音频 + 旧分数"）。所以 running / done / error 都要清，只有 pending 例外。
 /// 抽成函数是为了让这条语义有单测钉住（复核抓过"两边说法不一"）。
 fn sentence_message_invalidates_score(status: &str) -> bool {
-    matches!(status, "running" | "done" | "error")
+    matches!(status, "running" | "done") || status.starts_with("error")
+}
+
+/// `error: oom: 内存不足…` → `oom: 内存不足…`（只去掉协议前缀，保留可执行文案）。
+fn sentence_error_detail(status: &str) -> &str {
+    status
+        .strip_prefix("error")
+        .unwrap_or(status)
+        .trim_start_matches(':')
+        .trim()
+}
+
+/// 一轮配音结束后给用户看的唯一状态文案。
+///
+/// 失败时把第一条错误原文（可能是 OOM 的模型/内存/三个动作）带出来，并明确
+/// 下一次「继续合成」只重跑失败句——不能只显示一个失败计数让用户自己猜。
+fn run_finished_note(
+    failed: usize,
+    stopped: bool,
+    reused: usize,
+    done: i32,
+    total: i32,
+    error: Option<&str>,
+) -> String {
+    let reused_note = if reused > 0 {
+        format!("（复用 {reused} 句）")
+    } else {
+        String::new()
+    };
+    if stopped {
+        format!("已停止：完成 {done}/{total} 句{reused_note}，可随时继续")
+    } else if failed > 0 {
+        let detail = error
+            .map(sentence_error_detail)
+            .filter(|d| !d.is_empty())
+            .map(|d| format!("：{d}"))
+            .unwrap_or_default();
+        format!(
+            "本轮完成 {done}/{total} 句{reused_note}（{failed} 句失败{detail}；点「继续合成」只重跑失败句）"
+        )
+    } else {
+        format!("合成完成 {done}/{total} 句{reused_note}：可试听、可导出 WAV / SRT")
+    }
 }
 
 /// 从工程里取质检分数：**只接受状态是「已合成」的句子**。
@@ -5599,6 +5731,9 @@ fn eval_summary_note(summary: &EvalSummary) -> String {
         }
         n
     };
+    if let Some(err) = &summary.asr_error {
+        note.push_str(&format!("·转写服务说明：{err}"));
+    }
     // ……再追加"东西有没有落盘"。**两种分支都要走到这里**：一句都没评上分时报告照样写了，
     // 写失败/分数没落盘也得让用户看见（复核指出旧写法在 scored==0 时提前 return，把这些吞了）。
     if let Some(warn) = &summary.persist_warning {
@@ -6636,7 +6771,18 @@ fn wire_run(
             ui.set_status_text("没有可用音色：检查 server.json / audiocpp_server".into());
             return;
         }
-        // 续作语义：已合成句保持原样（worker 跳过 done 句），其余重跑
+        // 续作语义：已合成句保持原样（worker 跳过 done 句），其余重跑。
+        // 若界面上已经有失败句，这一次明确走「只重跑失败句」，不把 pending
+        // 或 done 混进去。
+        let failed_count = (0..n)
+            .filter(|&i| {
+                model4
+                    .row_data(i)
+                    .map(|r| r.status.starts_with("失败"))
+                    .unwrap_or(false)
+            })
+            .count();
+        let retry_failed = failed_count > 0;
         let resume = ui.get_done_count() > 0;
         if !resume {
             for i in 0..n {
@@ -6682,6 +6828,7 @@ fn wire_run(
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
                 dict: state1.active_dict.borrow().clone(),
+                retry_failed,
             })
             .is_err()
         {
@@ -6699,7 +6846,11 @@ fn wire_run(
             return;
         }
         ui.set_status_text(
-            if resume {
+            if retry_failed {
+                format!(
+                    "继续合成 · {model_name} · 只重跑 {failed_count} 句失败句（不重跑已完成的句子）"
+                )
+            } else if resume {
                 format!(
                     "继续合成 · {model_name} · 已完成的 {} 句自动跳过",
                     ui.get_done_count()
@@ -6716,6 +6867,25 @@ fn wire_run(
     ui.on_stop_run(move || {
         let Some(ui) = weak.upgrade() else { return };
         stop_dub_run(&ui, &stop2);
+    });
+
+    // 手动释放模型内存：只在用户点 OOM 句子上的按钮时调用。任何任务在飞时
+    // 都拒绝，避免把别的任务正在用的模型卸掉；结果由 worker 回包如实展示。
+    let weak = ui.as_weak();
+    let tx_unload = cmd_tx.clone();
+    let st_unload = state.clone();
+    ui.on_unload_models(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&st_unload) {
+            ui.set_status_text("有任务正在进行：等任务结束后再释放模型内存".into());
+            return;
+        }
+        ui.set_busy(true);
+        ui.set_status_text("正在请求服务端卸载已加载模型…".into());
+        if tx_unload.send(Cmd::UnloadModels).is_err() {
+            ui.set_busy(false);
+            ui.set_status_text("工作线程不可用：释放模型内存未发出，请重启应用".into());
+        }
     });
 
     let weak = ui.as_weak();
@@ -7234,6 +7404,7 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         Msg::TaskStarted { .. }
         | Msg::TaskStage { .. }
         | Msg::ServerHealth { .. }
+        | Msg::ModelsUnloaded { .. }
         | Msg::ModelDirPicked { .. }
         // 备份：目录选择结果来自对话框，终态来自长 IO，两者都与工程版本无关；
         // 不在名单里就会出现"备份好了但状态行还停在正在备份"（期间改一次稿就永远停住）
@@ -7285,7 +7456,7 @@ fn tick(
     cmd_tx: &Sender<Cmd>,
 ) {
     // ── 工作线程消息 ──
-    let mut run_finished: Option<(usize, bool, usize)> = None;
+    let mut run_finished: Option<(usize, bool, usize, Option<String>)> = None;
     loop {
         let worker_msg = msg_rx.borrow_mut().try_recv();
         let Ok(worker_msg) = worker_msg else { break };
@@ -7365,8 +7536,10 @@ fn tick(
                     }
                     sync_qa_actions(ui, rows, state);
                 }
+                // 走 review-leftovers 抽出的可测入口（按工程 index 回填）；
+                // error 判定用 starts_with：OOM 句的状态是 `error: oom: ...`，不是裸 "error"
                 apply_sentence_msg(rows, index, &status, duration);
-                if status == "done" || status == "error" {
+                if status == "done" || status.starts_with("error") {
                     let done = (0..rows.row_count())
                         .filter(|&i| {
                             rows.row_data(i)
@@ -7390,13 +7563,21 @@ fn tick(
                 failed,
                 stopped,
                 reused,
+                error,
             } => {
                 ui.set_busy(false);
-                // 任务台账：停下来 = 已停止；有失败句 = 失败；否则完成
+                // 任务台账：停下来 = 已停止；有失败句 = 失败；否则完成。
+                // 失败时把第一条完整错误带给任务中心，OOM 的三个动作不能只活在
+                // 句子行里；状态栏随后还会明确告诉用户「继续合成」只重跑失败句。
                 let (task_state, detail) = if stopped {
                     (tasks::TaskState::Stopped, "用户停止".to_string())
                 } else if failed > 0 {
-                    (tasks::TaskState::Failed, format!("{failed} 句失败"))
+                    let detail = error
+                        .as_deref()
+                        .map(sentence_error_detail)
+                        .map(|d| format!("{failed} 句失败：{d}"))
+                        .unwrap_or_else(|| format!("{failed} 句失败"));
+                    (tasks::TaskState::Failed, detail)
                 } else {
                     (
                         tasks::TaskState::Done,
@@ -7408,7 +7589,16 @@ fn tick(
                     )
                 };
                 finish_task(ui, state, &state.dub_task, task_state, detail);
-                run_finished = Some((failed, stopped, reused));
+                run_finished = Some((failed, stopped, reused, error));
+            }
+            Msg::ModelsUnloaded { ok, note } => {
+                ui.set_busy(false);
+                let text = if ok {
+                    format!("释放模型内存：{note}")
+                } else {
+                    format!("释放模型内存失败：{note}")
+                };
+                ui.set_status_text(text.into());
             }
             Msg::RedoDone { index, error } => {
                 ui.set_busy(false);
@@ -8114,27 +8304,13 @@ fn tick(
             }
         }
     }
-    if let Some((failed, stopped, reused)) = run_finished {
+    if let Some((failed, stopped, reused, error)) = run_finished {
         ui.set_running(false);
         let n = rows.row_count() as i32;
         let done = ui.get_done_count();
         ui.set_progress(done as f32 / n.max(1) as f32);
-        let reused_note = if reused > 0 {
-            format!("（复用 {reused} 句）")
-        } else {
-            String::new()
-        };
         ui.set_status_text(
-            if stopped {
-                format!("已停止：完成 {done}/{n} 句{reused_note}，可随时继续")
-            } else if failed > 0 {
-                format!(
-                    "本轮完成 {done}/{n} 句{reused_note}（{failed} 句失败：重跑自动重试失败句）"
-                )
-            } else {
-                format!("合成完成 {done}/{n} 句{reused_note}：可试听、可导出 WAV / SRT")
-            }
-            .into(),
+            run_finished_note(failed, stopped, reused, done, n, error.as_deref()).into(),
         );
         if done > 0 {
             ui.set_has_result(true);
@@ -8552,6 +8728,8 @@ fn build_rows(lines: &[String]) -> Vec<Sentence> {
             duration_label: format!("{duration:.1}s").into(),
             start_label: clock_label(start).into(),
             eval_label: "".into(),
+            error_detail: "".into(),
+            oom: false,
             // 视图元数据只由第 0 行承载；先给所有行填默认值，排序后由 sync 回写。
             qa_enabled: false,
             qa_sorted: false,
@@ -8625,22 +8803,32 @@ fn rebuild(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, text: &str) {
     ui.set_playing(false);
 }
 
-/// 状态标签映射：内部状态（aw-core）→ 界面文案
+/// 状态标签映射：内部状态（aw-core）→ 界面文案。
+///
+/// `error: oom: …` 不在这里丢掉后半段：句子行要能直接看见 oom 与三个动作，
+/// 不能只显示一个没有下一步信息的「失败」。详情仍然来自 aw-core 的同一份状态，
+/// UI 不重新判断哪些错误算内存不足。
 fn set_status(rows: &Rc<VecModel<Sentence>>, i: usize, status: &str) {
-    let label = match status {
-        "done" => "已合成",
-        "pending" => "待合成",
-        "running" => "合成中",
-        "error" => "失败",
-        other => other,
+    let (label, error_detail) = if status == "done" {
+        ("已合成", "")
+    } else if status == "pending" {
+        ("待合成", "")
+    } else if status == "running" {
+        ("合成中", "")
+    } else if status.starts_with("error") {
+        ("失败", sentence_error_detail(status))
+    } else {
+        (status, "")
     };
     let Some(mut row) = rows.row_data(i) else {
         return;
     };
-    if row.status.as_str() == label {
+    if row.status.as_str() == label && row.error_detail.as_str() == error_detail {
         return;
     }
     row.status = SharedString::from(label);
+    row.error_detail = SharedString::from(error_detail);
+    row.oom = error_detail.starts_with("oom") || error_detail.contains("内存不足");
     rows.set_row_data(i, row);
 }
 
@@ -10544,6 +10732,8 @@ mod tests {
         let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![Sentence {
             index: 0,
             eval_label: "".into(),
+            error_detail: "".into(),
+            oom: false,
             no: 1,
             text: "测试句。".into(),
             status: "合成中".into(),
@@ -10556,7 +10746,131 @@ mod tests {
             qa_scroll_y: 0.0,
         }]));
         mark_running_rows_failed(&rows);
-        assert_eq!(rows.row_data(0).unwrap().status, "失败");
+        let row = rows.row_data(0).unwrap();
+        assert_eq!(row.status, "失败");
+        assert!(
+            row.error_detail.is_empty(),
+            "fatal 没有具体错误时不能伪造详情"
+        );
+    }
+
+    /// 工程恢复走的就是 apply_project_to_rows（restore_project 与 Msg::ProjectLoaded
+    /// 都调它）；完整 error status 必须带下去，重开后按钮不能消失。
+    #[test]
+    fn applying_project_status_keeps_oom_detail_for_restore() {
+        let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![test_sentence_row(0)]));
+        let mut project = Project::new(
+            "测试句。",
+            "audio8-tts",
+            GAP_MS,
+            BASE_SEED,
+            None,
+            DEFAULT_PUNCTUATION,
+            MAX_CHARS,
+            |t| t.to_string(),
+        );
+        project.sentences[0].status =
+            "error: oom: 内存不足（OOM）：释放模型内存（会卸载服务上所有已加载模型）".into();
+
+        apply_project_sentence_statuses(&rows, &project);
+        let row = rows.row_data(0).unwrap();
+        assert!(row.oom, "恢复后 OOM 按钮不能消失：{row:?}");
+        assert!(row.error_detail.contains("释放模型内存"), "{row:?}");
+        assert!(row.error_detail.contains("所有已加载模型"), "{row:?}");
+    }
+
+    /// 源码级接线守卫：单测 helper 不足以证明生产 wrapper 真的走它。
+    /// 若 apply_project_to_rows 改成不调用 helper，或自己把错误压成裸 error，
+    /// 这条会红（对应第三轮复核的“只测 helper 不等于有隔离”）。
+    #[test]
+    fn apply_project_to_rows_routes_through_status_helper() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn apply_project_to_rows(")
+            .expect("生产恢复 wrapper 必须存在");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("apply_project_to_rows 必须有函数级结束")
+            + 2;
+        let wrapper = &rest[..end];
+        assert!(
+            wrapper.contains("apply_project_sentence_statuses(rows, project)"),
+            "wrapper 必须走共享状态回灌，否则恢复详情会再次丢失"
+        );
+        assert!(
+            !wrapper.contains("set_status(rows, i, \"error\")"),
+            "wrapper 不得绕过 helper 把完整 error status 压成裸 error"
+        );
+    }
+
+    #[test]
+    fn unload_button_requires_confirmation_and_warns_global_effect() {
+        let source = include_str!("../ui/dub_workbench.slint");
+        assert!(
+            source.contains("PixelPopconfirm"),
+            "释放模型内存必须二次确认"
+        );
+        assert!(
+            source.contains("这会卸载服务上所有模型的常驻内存"),
+            "确认文案要说清全局误伤边界"
+        );
+        assert!(source.contains("确认释放"), "确认按钮文案要明确");
+        assert!(
+            source.contains("confirm => { root.unload-models(); }"),
+            "只有确认回调才能发卸载请求"
+        );
+        assert!(
+            !source.contains("clicked => { root.unload-models(); }"),
+            "触发按钮本身不能直接发卸载请求"
+        );
+    }
+
+    #[test]
+    fn oom_error_detail_survives_status_mapping_and_finish_note() {
+        let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::from(vec![Sentence {
+            index: 0,
+            eval_label: "".into(),
+            error_detail: "".into(),
+            oom: false,
+            no: 1,
+            text: "测试句。".into(),
+            status: "待合成".into(),
+            duration: 1.0,
+            start: 0.0,
+            duration_label: "1.0s".into(),
+            start_label: "0:00".into(),
+            qa_enabled: false,
+            qa_sorted: false,
+            qa_scroll_y: 0.0,
+        }]));
+        let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+        let detail = aw_core::memory_shortfall_note(body).expect("测试 body 必须是结构化 OOM");
+        let status = format!("error: oom: {detail}");
+        set_status_by_project_index(&rows, 0, &status);
+        let row = rows.row_data(0).unwrap();
+        assert_eq!(row.status, "失败");
+        assert!(row.oom, "OOM 行必须显示释放模型内存按钮：{row:?}");
+        assert!(row.error_detail.contains("qwen3-asr"), "{row:?}");
+        assert!(row.error_detail.contains("3.31 GiB"), "{row:?}");
+        assert!(row.error_detail.contains("3.84 GiB"), "{row:?}");
+        assert!(row.error_detail.contains("释放模型内存"), "{row:?}");
+
+        let note = run_finished_note(1, false, 0, 2, 3, Some(&status));
+        assert!(note.contains("2/3 句"), "{note}");
+        assert!(note.contains("1 句失败"), "{note}");
+        assert!(
+            note.contains("qwen3-asr") && note.contains("3.84 GiB"),
+            "{note}"
+        );
+        assert!(
+            note.contains("释放模型内存") && note.contains("q4_0"),
+            "{note}"
+        );
+        assert!(
+            note.contains("继续合成") && note.contains("只重跑失败句"),
+            "{note}"
+        );
     }
 
     #[test]
@@ -10593,6 +10907,22 @@ mod tests {
                 assert_eq!(duration, Some(1.25));
             }
             _ => panic!("第二条应为 done"),
+        }
+
+        // 失败终态必须原样带走 `error: oom` 的可执行详情，不能再被压成裸 "error"。
+        report_progress(
+            &tx,
+            7,
+            &mut started,
+            2,
+            "error: oom: 内存不足：释放内存后继续",
+        );
+        let third = rx.recv().unwrap();
+        match third.msg {
+            Msg::Sentence { status, .. } => {
+                assert_eq!(status, "error: oom: 内存不足：释放内存后继续");
+            }
+            _ => panic!("第三条应为 error"),
         }
     }
 
@@ -11549,6 +11879,7 @@ mod tests {
             percent: 0.0,
             scored: 0,
             asr_failed: 5,
+            asr_error: None,
             worst: Vec::new(),
             scores: Vec::new(),
             persist_warning: None,
@@ -11564,6 +11895,7 @@ mod tests {
             percent: 100.0,
             scored: 3,
             asr_failed: 0,
+            asr_error: None,
             worst: Vec::new(),
             scores: vec![(0, 100.0), (1, 100.0), (2, 100.0)],
             persist_warning: None,
@@ -11577,6 +11909,7 @@ mod tests {
             percent: 96.4,
             scored: 57,
             asr_failed: 2,
+            asr_error: None,
             scores: vec![(0, 100.0), (11, 92.3)],
             persist_warning: Some("分数未写入工程：磁盘空间不足（需要 0.1 MB）".into()),
             report_path: Some(std::path::PathBuf::from("/tmp/示例工程/qa-report.md")),
@@ -11592,6 +11925,29 @@ mod tests {
         assert!(
             note.contains("第 12 句") && note.contains("92.3%") && note.contains("应为"),
             "最差句要给序号、分数与差异片段：{note}"
+        );
+
+        let oom = EvalSummary {
+            percent: 0.0,
+            scored: 0,
+            asr_failed: 1,
+            asr_error: aw_core::memory_shortfall_note(
+                r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#,
+            ),
+            worst: Vec::new(),
+            scores: Vec::new(),
+            persist_warning: None,
+            report_path: None,
+        };
+        let note = eval_summary_note(&oom);
+        assert!(note.contains("转写服务说明"), "{note}");
+        assert!(
+            note.contains("释放模型内存") && note.contains("q4_0"),
+            "{note}"
+        );
+        assert!(
+            note.contains("3.31 GiB") && note.contains("3.84 GiB"),
+            "{note}"
         );
     }
 
@@ -11615,6 +11971,8 @@ mod tests {
             duration_label: "1.0s".into(),
             start_label: format!("0:0{index}").into(),
             eval_label: String::new().into(),
+            error_detail: String::new().into(),
+            oom: false,
             qa_enabled: false,
             qa_sorted: false,
             qa_scroll_y: 0.0,
@@ -11849,6 +12207,7 @@ mod tests {
             percent: 96.4,
             scored: 57,
             asr_failed: 0,
+            asr_error: None,
             worst: vec![EvalIssue {
                 index: 11,
                 percent: 92.3,
@@ -11907,6 +12266,7 @@ mod tests {
         );
         assert!(sentence_message_invalidates_score("done"));
         assert!(sentence_message_invalidates_score("error"));
+        assert!(sentence_message_invalidates_score("error: oom: 内存不足"));
         assert!(
             !sentence_message_invalidates_score("pending"),
             "没开始做就不动"
@@ -12055,6 +12415,7 @@ mod tests {
             percent: 0.0,
             scored: 0,
             asr_failed: 5,
+            asr_error: None,
             worst: Vec::new(),
             scores: Vec::new(),
             persist_warning: Some("质检报告未写入：磁盘空间不足".into()),
@@ -12109,6 +12470,7 @@ mod tests {
                 gap_ms: GAP_MS,
                 auto_normalize: true,
                 dict: empty_dict(),
+                retry_failed: false,
             })
             .unwrap();
 
@@ -12127,13 +12489,14 @@ mod tests {
                     failed,
                     stopped,
                     reused,
-                } => break (failed, stopped, reused),
+                    error,
+                } => break (failed, stopped, reused, error),
                 Msg::Fatal(e) => panic!("合成中止：{e}"),
                 _ => {}
             }
         };
         assert_eq!(loaded_reused, Some(0), "全新工程不该复用旧句");
-        assert_eq!(run_done, (0, false, 0), "实得 {run_done:?}");
+        assert_eq!(run_done, (0, false, 0, None), "实得 {run_done:?}");
         assert_eq!(
             done_durations.len(),
             2,

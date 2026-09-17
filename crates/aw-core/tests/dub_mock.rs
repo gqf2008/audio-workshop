@@ -73,6 +73,60 @@ fn sends_default_instruction_and_counts_failures() {
     assert!(out.duration > 0.0);
 }
 
+/// OOM 句在队列里保留 `error: oom`，不重试同一请求；重跑只喂 failed_sentence_indices，
+/// done 句不再被碰。这是“释放内存后继续”路径的核心回归。
+#[test]
+fn oom_sentence_is_marked_and_retry_only_reruns_failed_sentence() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let oom = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+    let mock = support::Mock::start(vec![
+        (503, oom.into()),
+        (200, support::audio_response(&wav)),
+        (200, support::audio_response(&wav)),
+        (200, support::audio_response(&wav)),
+    ]);
+    let dir = temp_dir("oom-retry");
+    let mut prj = project();
+    let c = client(&mock.base);
+
+    let failed = prj
+        .synthesize(&c, &dir, None, None, |_, _| {})
+        .expect("首轮合成");
+    assert_eq!(failed, 1, "只有内存不足的那一句失败，不能报成整轮全失败");
+    assert_eq!(mock.hit_count(), 3, "OOM 不自动重试；其余两句各发一次");
+    assert!(
+        prj.sentences[0].status.starts_with("error: oom:"),
+        "后台队列要有可识别的 error: oom 标记：{}",
+        prj.sentences[0].status
+    );
+    assert!(prj.sentences[0].status.contains("释放模型内存"));
+    assert!(prj.sentences[0].status.contains("3.84 GiB"));
+    let on_disk = aw_core::Project::load(&dir).expect("OOM 句必须逐句落盘");
+    assert!(
+        on_disk.sentences[0].status.starts_with("error: oom:"),
+        "磁盘上的队列标记也要可识别：{}",
+        on_disk.sentences[0].status
+    );
+    assert!(on_disk.failed_sentence_indices().contains(&0));
+    assert_eq!(prj.sentences[1].status, "done");
+    assert_eq!(prj.sentences[2].status, "done");
+
+    let retry = prj.failed_sentence_indices();
+    assert_eq!(retry, vec![0], "继续时只选失败句");
+    let failed = prj
+        .synthesize(&c, &dir, Some(&retry), None, |_, _| {})
+        .expect("只重跑失败句");
+    assert_eq!(failed, 0);
+    assert_eq!(
+        mock.hit_count(),
+        4,
+        "只应再发失败那一句的请求，done 句不能重跑"
+    );
+    assert_eq!(prj.sentences[0].status, "done");
+    assert_eq!(prj.sentences[1].status, "done");
+    assert_eq!(prj.sentences[2].status, "done");
+}
+
 /// 全部句子都失败：synthesize 返回全部失败数、assemble 明确报错（不是产出空成品）
 #[test]
 fn all_sentences_failing_is_reported_not_silent() {

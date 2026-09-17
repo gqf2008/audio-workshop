@@ -24,6 +24,12 @@ use stem_splitter_core::{
 /// 默认模型名（与上游 registry 里的条目一致）。
 pub const DEFAULT_MODEL: &str = "htdemucs_ort_v1";
 
+/// 人声分离也经过这一个入口：若上游错误体是结构化 OOM，复用 audiocpp 的
+/// 唯一识别/文案；普通上游错误保持“分离失败：原文”。
+fn separation_error_note(raw: &str) -> String {
+    crate::audio_client::memory_shortfall_note(raw).unwrap_or_else(|| format!("分离失败：{raw}"))
+}
+
 /// 分离请求。
 #[derive(Clone, Debug)]
 pub struct SeparationRequest {
@@ -365,7 +371,7 @@ pub fn separate_tracks(
     let input = req.input.display().to_string();
 
     let handle = std::thread::spawn(move || {
-        Separator::separate(&input, opts).map_err(|e| format!("分离失败：{e}"))
+        Separator::separate(&input, opts).map_err(|e| separation_error_note(&e.to_string()))
     });
 
     // 边等边转进度（recv_timeout 轮询，直到子线程结束）
@@ -560,6 +566,18 @@ mod tests {
         assert!(err.contains("复用"), "{err}");
         assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
         assert!(err.contains("aw-core"), "{err}");
+    }
+
+    #[test]
+    fn structured_oom_from_upstream_uses_the_shared_actionable_note() {
+        let note = separation_error_note(
+            r#"{"error":{"message":"cannot load model x: need 1 GiB, have 0.2 GiB","type":"insufficient_memory"}}"#,
+        );
+        assert!(note.contains("cannot load model x"), "{note}");
+        assert!(
+            note.contains("释放模型内存") && note.contains("q4_0"),
+            "{note}"
+        );
     }
 
     #[test]

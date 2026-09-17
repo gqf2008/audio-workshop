@@ -35,13 +35,72 @@ impl ClientError {
             _ => None,
         }
     }
+
+    /// 这是不是服务端结构化返回的内存不足（而不是别的 503）。
+    ///
+    /// 唯一识别入口：只认 JSON 里 `error.type == "insufficient_memory"`，
+    /// 不从人类可读 message 里猜数字或关键词。
+    pub fn is_insufficient_memory(&self) -> bool {
+        matches!(self, ClientError::Server(_, body) if memory_shortfall(body).is_some())
+    }
+}
+
+/// 服务端结构化内存不足错误的最小投影。
+///
+/// `message` 是服务端原文，保留模型名、估算内存、余量和当前可用内存，
+/// 不在这里重新解析数字（那会让服务端改文案时应用跟着漂移）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryShortfall {
+    pub message: String,
+}
+
+/// 只认结构化字段 `error.type == "insufficient_memory"`。
+///
+/// 非 JSON、空 body、别的 `error.type` 都返回 `None`；调用方不得把任意 503
+/// 都说成内存不足。抽出纯函数是为了让识别与文案只有一处，供所有 Tab 共用。
+pub fn memory_shortfall(body: &str) -> Option<MemoryShortfall> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    if error.get("type").and_then(Value::as_str) != Some("insufficient_memory") {
+        return None;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("服务端没有提供内存不足的详细说明")
+        .to_string();
+    Some(MemoryShortfall { message })
+}
+
+/// 内存不足的唯一用户文案入口。
+///
+/// 三个动作是产品计划 §2 步骤 4 失败① 的可执行下一步；配音 / BGM / 歌曲 /
+/// 人声分离 / 质检所有走到 `ClientError` 的路径都通过 `Display` 使用它，
+/// 不再在每个 Tab 各写一套提示。
+pub fn memory_shortfall_note(body: &str) -> Option<String> {
+    memory_shortfall(body).map(|shortfall| {
+        format!(
+            "内存不足（OOM）：{}。释放内存后继续：① 释放模型内存（会卸载服务上所有已加载模型，先确认没有其它任务在用）；② 把模型降到 q4_0 量化档；③ 关掉其它占内存的应用。",
+            shortfall.message
+        )
+    })
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Http(e) => write!(f, "请求失败: {e}"),
-            ClientError::Server(code, body) => write!(f, "服务端拒绝: HTTP {code} {body}"),
+            ClientError::Server(code, body) => {
+                if *code == 503 {
+                    if let Some(note) = memory_shortfall_note(body) {
+                        return write!(f, "{note}");
+                    }
+                    if body.trim().is_empty() {
+                        return write!(f, "服务端拒绝: HTTP 503（响应没有正文，无法判断原因）");
+                    }
+                }
+                write!(f, "服务端拒绝: HTTP {code} {}", truncate(body))
+            }
             ClientError::Decode(e) => write!(f, "响应解析失败: {e}"),
             // 本地失败已经带全上下文（路径 / 需要多少空间），不再加前缀把话说两遍
             ClientError::Local(e) => write!(f, "{e}"),
@@ -130,6 +189,47 @@ impl Client {
         self.post_with_retry("/v1/tasks/run", &body)
     }
 
+    /// 手动卸载服务当前加载的全部模型（`/v1/tasks/unload_all_models`）。
+    ///
+    /// 只在用户显式点击「释放模型内存」时调用；这里不做自动调用，也不猜测服务
+    /// 返回。返回的 `unloaded` 名称会如实展示，空数组也会说清楚“没有可卸载的”。
+    pub fn unload_all_models(&self) -> Result<String, ClientError> {
+        let path = "/v1/tasks/unload_all_models";
+        let value = self.post_once(path, &json!({}))?;
+        let Some(list) = value.get("unloaded") else {
+            return Err(ClientError::Decode(format!(
+                "unload 响应缺少 unloaded 数组: {}",
+                truncate(&value.to_string())
+            )));
+        };
+        let Some(items) = list.as_array() else {
+            return Err(ClientError::Decode(format!(
+                "unload 响应的 unloaded 不是数组: {}",
+                truncate(&value.to_string())
+            )));
+        };
+        if let Some(bad) = items.iter().position(|item| !item.is_string()) {
+            return Err(ClientError::Decode(format!(
+                "unload 响应 unloaded[{bad}] 不是字符串: {}",
+                truncate(&value.to_string())
+            )));
+        }
+        let names: Vec<String> = items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if names.is_empty() {
+            Ok("服务已成功响应：当前没有可卸载的已加载模型".into())
+        } else {
+            Ok(format!(
+                "已请求卸载 {} 个模型：{}",
+                names.len(),
+                names.join("、")
+            ))
+        }
+    }
+
     /// 是否可用（/health）
     pub fn healthy(&self) -> bool {
         ureq::get(&format!("{}/health", self.base))
@@ -163,7 +263,11 @@ impl Client {
                 Err(e) => {
                     // 按状态码判定，不看消息内容：500 且 body 里恰好含 "503"
                     // （比如错误信息里提到端口/编号）不该被当成可重试
-                    let retryable = e.status() == Some(503) && attempt + 1 < tries;
+                    // 内存不足不是“服务忙”：服务端已经明确拒绝，重试同一请求只会让用户
+                    // 白等退避周期；交给配音队列标 error: oom，释放内存后再由用户继续。
+                    let retryable = e.status() == Some(503)
+                        && !e.is_insufficient_memory()
+                        && attempt + 1 < tries;
                     last = Some(e);
                     if !retryable {
                         break;
@@ -187,8 +291,10 @@ impl Client {
                 .map_err(|e| ClientError::Decode(e.to_string())),
             Err(ureq::Error::Status(code, r)) => {
                 // 关键：HTTP 错误也要读 body，否则 503 的原因（内存不足/忙碌）看不见
+                // 保留完整 body：内存不足的 message 可能超过展示上限，结构化识别和
+                // 原文透出都不该先被截断；Display 对流式错误做展示级截断。
                 let text = r.into_string().unwrap_or_default();
-                Err(ClientError::Server(code, truncate(&text)))
+                Err(ClientError::Server(code, text))
             }
             Err(e) => Err(ClientError::Http(e.to_string())),
         }
@@ -252,5 +358,64 @@ mod tests {
         assert_ne!(e500.status(), Some(503));
         assert!(ClientError::Http("连接被拒绝".into()).status().is_none());
         assert!(ClientError::Decode("坏 json".into()).status().is_none());
+    }
+
+    const OOM_BODY: &str = r#"{
+        "error": {
+            "message": "cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)",
+            "type": "insufficient_memory"
+        }
+    }"#;
+
+    #[test]
+    fn structured_oom_is_actionable_and_keeps_server_message() {
+        let err = ClientError::Server(503, OOM_BODY.into());
+        assert!(err.is_insufficient_memory());
+        let note = err.to_string();
+        assert!(note.contains("qwen3-asr"), "{note}");
+        assert!(note.contains("3.31 GiB"), "{note}");
+        assert!(note.contains("3.84 GiB"), "{note}");
+        assert!(
+            note.contains("释放模型内存") && note.contains("所有已加载模型"),
+            "{note}"
+        );
+        assert!(note.contains("q4_0"), "{note}");
+        assert!(note.contains("关掉其它占内存的应用"), "{note}");
+    }
+
+    #[test]
+    fn only_the_structured_error_type_is_treated_as_oom() {
+        // 别的错误类型不能沾 OOM 文案。
+        let busy = ClientError::Server(
+            503,
+            r#"{"error":{"message":"model is busy","type":"model_busy"}}"#.into(),
+        );
+        assert!(!busy.is_insufficient_memory());
+        let busy_note = busy.to_string();
+        assert!(busy_note.contains("model is busy"), "{busy_note}");
+        assert!(!busy_note.contains("释放模型内存"), "{busy_note}");
+
+        // 非 JSON body：保留原文，不按关键词猜。
+        let plain = ClientError::Server(503, "service unavailable".into());
+        assert!(!plain.is_insufficient_memory());
+        assert!(plain.to_string().contains("service unavailable"));
+        assert!(!plain.to_string().contains("内存不足"));
+
+        // 空 body：明确说没有正文，不能伪装成内存不足。
+        let empty = ClientError::Server(503, "".into());
+        assert!(!empty.is_insufficient_memory());
+        assert!(empty.to_string().contains("响应没有正文"));
+    }
+
+    #[test]
+    fn oom_message_is_not_truncated_before_the_note_is_built() {
+        let tail = "tail-after-two-hundred-chars";
+        let message = format!("{}{tail}", "x".repeat(220));
+        let body = format!(
+            r#"{{"error":{{"message":"{}","type":"insufficient_memory"}}}}"#,
+            message
+        );
+        let note = memory_shortfall_note(&body).expect("结构化 OOM 必须识别");
+        assert!(note.contains(tail), "完整 message 不能被展示层吞掉: {note}");
     }
 }
