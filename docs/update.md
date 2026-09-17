@@ -71,6 +71,33 @@
 （见 `LESSON_自动更新大文件下载须per-read超时且应用替换禁止cp_R嵌套.md`）。
 这两条常量是 `src/update.rs` 的 `CONNECT_TIMEOUT` / `READ_TIMEOUT`，改它们要按 `RULE_阈值变更.md` 独立提交。
 
+## 已知前提：默认清单地址要求仓库**可匿名读取**
+
+默认地址走的是 **未认证**请求（不给 token）。2026-09-17 实测：
+
+```console
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'User-Agent: audio-workshop/0.1.0' \
+    https://api.github.com/repos/gqf2008/audio-workshop/releases/latest
+404
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.github.com/repos/rust-lang/rust
+200                     # 本机到 GitHub API 是通的（不是网络问题）
+$ git -c credential.helper= ls-remote github
+fatal: could not read Username for 'https://github.com'   # 去掉本机凭据就取不到
+```
+
+即：**`gqf2008/audio-workshop` 目前不是匿名可读的**（带本机 keychain 凭据的 git 能 `ls-remote`，
+不带凭据的 API 一律 404）。所以现在点「检查更新」会如实得到
+「服务器返回 HTTP 404——地址不对，或这个仓库还没有 Release」，而不是某个假结果。
+
+要让它真正可用，三选一（都不在本批范围）：
+
+1. 把仓库/Release 变成匿名可读；
+2. 把清单发布到一个匿名可读的位置（CDN / 对象存储 / 静态站点），在设置里覆盖「清单地址」；
+3. 以后单独一批做带凭据的清单访问（token 放哪、怎么存，是独立的安全设计）。
+
+**不选 3 的理由**：把一个 token 塞进"检查更新"这条默认路径会引入凭据分发/存储问题，
+而 v1 的目标只是"知道有新版本"；先用可匿名读取的清单把这条链路跑通更划算。
+
 ## 安全边界：发布页只认 http(s)
 
 清单是**外部输入**。「打开发布页」交给系统打开器时，地址先过 `update::is_http_url`
