@@ -422,7 +422,9 @@ fn describe_error(url: &str, err: ureq::Error) -> String {
             let detail = snippet(&body);
             let hint = match code {
                 404 => {
-                    "——地址不对，或这个仓库还没有 Release；确认「清单地址」指向某个已发布的 Release"
+                    // GitHub 对**私有**仓库也回 404（不是 403）——只写"地址不对或没有 Release"会
+                    // 把"仓库不可匿名读"误导成"你填错了"。本项目的仓库就是私有的，这条不是假设。
+                    "——地址不对、仓库不是匿名可读（GitHub 对私有仓库也回 404）、或还没有 Release；                     确认「清单地址」指向一个匿名可读的已发布 Release"
                 }
                 403 | 429 => "——多半被限流：稍后再试，或在「清单地址」里换成内网/镜像清单",
                 _ => "——服务器拒绝了这次请求",
