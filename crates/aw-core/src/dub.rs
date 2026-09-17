@@ -118,6 +118,19 @@ pub struct Sentence {
     /// · 只改工程名、续跑时跳过已完成的句子 → 保留（音频没变）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_percent: Option<f64>,
+    /// 这份 `eval_percent` 是**哪个回读模型**测出来的。
+    ///
+    /// 与 `eval_percent` 同生共死（一起写、一起清）。两个字段的**组合**有三种含义，
+    /// 界面必须分开说，不能混：
+    /// · `eval_percent == None`           → 没测过（本字段此时无意义）；
+    /// · `Some(_)` + `eval_model == None` → 测过，但**来源未知**
+    ///   （本字段引入之前写的旧工程）；
+    /// · `Some(_)` + `Some(m)`            → 这份分是 `m` 测的。
+    ///
+    /// 为什么值得占一个字段：换回读模型会改变质检口径（词级/说话人能力都不同），
+    /// 没有它就只能笼统说"可能是上一个模型测的"，说不清是哪一次结论。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +204,7 @@ impl Project {
                 start: None,
                 status: "pending".into(),
                 eval_percent: None,
+                eval_model: None,
             })
             .collect();
         Self {
@@ -268,7 +282,10 @@ impl Project {
             // 若反过来（先写 wav 再清分），进程在换 wav 与逐句 save 之间退出就会留下那个组合，
             // 重启后旧分会被贴到新音频上（复核指出）。代价是失败后这句没有分数——丢一个分数
             // 比显示一个错的分数好，重跑一次质检即可补回来。
+            // 分数与它的来源模型必须**一起**作废：留下孤立的 `eval_model`
+            // 会让"来源未知"与"来源是 X"两种判断都失去依据（复核口径）。
             if self.sentences[i].eval_percent.take().is_some() {
+                self.sentences[i].eval_model = None;
                 self.save(dir)
                     .map_err(|e| ClientError::Local(e.to_string()))?;
             }

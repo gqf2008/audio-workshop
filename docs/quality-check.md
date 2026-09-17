@@ -44,6 +44,28 @@ CHARTER §5 把「评估台 `audio-eval`（可懂度/耗时/内存 + 回归对�
   （不是写死的名字；清单加一个就多一项）。默认 `qwen3-asr`（M0 定标同款），选择落
   `settings.json`，重启读回。放在本页而不是全局设置：它只影响配音页的质检
   （归属判定见 `LESSON_全局容器只放全局项单Tab独有的放本页`）。
+- **每份分都标着「是谁测的」**：句子除了 `eval_percent` 还有 `eval_model`
+  （`project.json` 里能看到），写的是**那一次实际用的回读模型**。它与 `qa-report.md` 里的
+  「回读模型」是**同一个入参**（只在 `record_eval_score` 一处写入，
+  `qa_report_and_the_project_tag_read_the_same_run_model` 钉住）——所以报告与工程标记
+  不可能各说一套。
+  换过回读模型后，状态行 **指名道姓** 说出差异，而不是笼统一句"可能是上一个模型测的"：
+
+  ```
+  现有 12 句的分数是 fun-asr 测的，当前回读模型是 audio8-asr——换模型会改变质检口径，
+  建议重新质检一次再看结论
+  ```
+
+  三种情形分开说，这是本批的核心：
+  - **来源 = 当前模型** → 「现有 N 句的分数就是 X 测的」（不误报）；
+  - **来源 ≠ 当前模型** → 上面那句（两个模型名都点出来）；
+  - **旧工程**（本字段引入之前写的，`eval_percent` 有值但没有 `eval_model`）→
+    「现有 N 句的分数是【来源未知】的旧记录……无法判断它们是不是 X 测的」——
+    既不冒充"匹配"，也不冒充"没测过"（后者是 `eval_percent == None`，压根不进这份统计）。
+
+  一部分重测过、一部分因 ASR 失败沿用旧分时会**两边都报**（"X 测的 M 句；另 N 句来源未知"）。
+  分数与来源**同生共死**：重做某句、换词典、换模型导致作废时一起清，落盘也一起落
+  （`crates/aw-core/src/dub.rs` 的 `Project::synthesize` 先清后写那条不变式同时管两个字段）。
 - 进行中：状态栏「质检中：第 i/N 句」，任务中心一条 `质检` 任务（有进度、可停止）。
 - 完成：状态栏 + 任务中心 detail
 
@@ -160,9 +182,13 @@ fun-asr（权重约 1144.4MB）——在「高级 → 质检回读模型」里�
   不会替你按下「重录」（ASR 也可能听错，自动重录等于替用户下结论）。要批量重录需要再动一次列表交互。
 - **排序视角不持久化**：排序是当前会话的查看状态，不写工程；重开或重新质检后从工程原序开始。
 - **只支持已合成（status=done）的句子**；工程损坏会走 `Project::load_if_present` 的明确报错。
-- **分数没有"是哪个模型测的"标记**：换回读模型后，工程里那份分数**不会**被自动作废
-  （只在状态行提醒"现有分数是上一个模型测的，建议重新质检一次"）。要给分数打模型标记、
-  按模型失效是另一批的事；在此之前不要把两套口径的分数当成同一个结论。
+- **换模型不自动作废旧分、也不自动重测**：分数现在**标着来源模型**（`eval_model`），
+  界面会指名道姓地说出"这些分是 X 测的、当前是 Y"，但**作不作废由用户决定** ——
+  有人就是想拿不同回读模型的结论互相对照，替他清掉等于丢数据。
+  旧工程（没有该字段）按**来源未知**显示，不会被当成"就是当前模型测的"。
+- **`eval_model` 是"这份分是谁测的"，不是"这份分准不准"**：同一句话换回读模型会得出
+  不同数字（词级/说话人能力都不同），所以**不同来源的分数不可直接比较**——
+  界面给出提示，但不做换算、也不自动挑一个"更可信"的。
 - **不做自动降档**：内存不足时只给"哪个装不下 / 需要多少 / 可用多少 / 换哪个"，
   绝不自动换模型——ASR 一换，质检口径就变了（词级/说话人能力都不同）。
 - **回读模型只在配音页的「高级」里**，不进全局设置抽屉（它只影响本页质检）。
@@ -177,8 +203,12 @@ cargo test -p aw-core --test asr_mock                                # ASR 请�
 cargo test -p aw-core --test e2e_service -- --ignored                # 真机（需服务在跑）
 cargo test -p audio-workshop --bin audio-workshop -- asr_ memory_shortfall smaller_asr
                                                                     # 选模型 / 报告念实际模型 / 内存不足降档提示
+cargo test -p audio-workshop --bin audio-workshop -- qa_source_note eval_model_key eval_ledger
+                                                                    # 分数来源：换模型的说明 / 旧工程=未知 / 键名契约
 cargo test -p audio-workshop --bin audio-workshop -- --ignored worker_eval_writes_report
-                                                                    # 真机：换到 audio8-asr 跑通一次质检，报告写 audio8-asr
-                                                                    # 真机：合成 → worker 质检 → qa-report.md
+                                                                    # 真机：合成 → worker 质检 → qa-report.md，
+                                                                    # 且 project.json 的 eval_model 与报告里的模型同源
+                                                                    # （真机跑过：模型 audio8-asr，2 句 100%）
+AW_UI_STATE=qa-tag cargo run -p audio-workshop                        # 只读演示态：打三条来源口径（不碰用户配置）
 python3 tools/gen_eval_parity_cases.py --check                       # 夹具是否过期
 ```
