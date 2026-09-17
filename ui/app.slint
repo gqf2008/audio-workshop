@@ -235,6 +235,10 @@ export component MainWindow inherits Window {
     callback library-import();
 
     // ── 模型下载器（P7）：清单里带 url 的可下载模型 + 串行下载队列 ──
+    in-out property <string> download-mirror: "";
+    in-out property <string> download-concurrency: "";
+    in property <string> download-source-note: "";
+    in property <string> download-concurrency-note: "";
     in property <[DownloadRow]> download-rows: [];
     callback download-model(string);
 
@@ -766,6 +770,10 @@ export component MainWindow inherits Window {
             server-locked: root.server-locked;
                     model-dir <=> root.model-dir;
                     model-dir-info: root.model-dir-info;
+                    download-mirror <=> root.download-mirror;
+                    download-concurrency <=> root.download-concurrency;
+                    download-source-note: root.download-source-note;
+                    download-concurrency-note: root.download-concurrency-note;
                     download-rows: root.download-rows;
                     download-model(key) => { root.download-model(key); }
                     apply-server-settings => { root.apply-server-settings(); }

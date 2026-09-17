@@ -1,4 +1,4 @@
-//! 增强模型下载器核心（M4-P7 第一段）：串行队列 + 断点续传 + 校验后提交。
+//! 增强模型下载器核心（M4-P7）：N 并发队列 + 断点续传 + 校验后提交。
 //!
 //! 设计要点（与仓库既有的落盘约定一致，见 docs/robustness.md）：
 //!   · 先写 `<目标>.part`，**校验通过才 rename 成正式文件**——正式路径要么没有，
@@ -7,15 +7,19 @@
 //!     就是服务器不认 Range，如实从 0 重下并在状态里标出来，绝不假装续传。
 //!   · 没有期望 sha256 时按声明大小（清单里的 size，或响应 Content-Length）核大小。
 //!
-//! 队列本身跑在一个后台线程里：`enqueue` 只是把任务塞进去，`cancel` 通过原子标志
-//! 让正在下载的读循环尽快退出——取消不会阻塞、也不需要等网络超时。
+//! 队列跑在 `effective_concurrency()` 个后台 worker 上（默认 2，可配 1..=4）；
+//! `enqueue` 只按目标路径去重 + 登记，`cancel` 通过原子标志让正在下载的读循环尽快
+//! 退出——取消不会阻塞、也不需要等网络超时。
+//!
+//! **同一目标路径只允许一个 writer**：`.part` + `rename` 的提交点语义在
+//! 两个 writer 下会坏（两次 append 交错、长度还可能刚好等于声明大小），
+//! 所以在入队时按 dest 去重（见 `Enqueued::Duplicate`）。
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -456,8 +460,36 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ===========================================================================
-// 队列：串行执行、可取消
+// 队列：N 并发、目标去重、可取消
 // ===========================================================================
+
+/// 并发上限（用户可配 1..=4）。装模型是网络密集 + 磁盘密集各占一半，2 条并排
+/// 能把"一次装多个"的等待折半，又不会把带宽切成四份导致每条都更慢。
+pub const MAX_CONCURRENCY: u32 = 4;
+
+/// 默认并发。
+pub const DEFAULT_CONCURRENCY: u32 = 2;
+
+/// 把配置里的并发数夹到有效区间：缺省 / 0 / 越界都回落 2。
+///
+/// 这是**唯一**的并发数归一化入口：`Downloader` 的线程数与界面回显都从它算，
+/// 免得界面写"2 并发"、队列其实起了 4 个。
+pub fn effective_concurrency(configured: Option<u32>) -> u32 {
+    configured
+        .unwrap_or(DEFAULT_CONCURRENCY)
+        .clamp(1, MAX_CONCURRENCY)
+}
+
+/// `enqueue` 的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Enqueued {
+    /// 真的排上了：`id` 是它的任务 id
+    Started(u64),
+    /// 已有一个活动任务在写同一个目标路径——第二个 writer 会把 `.part`
+    /// 搅坏（两个 append 交错、长度还可能刚好对上声明大小），所以**拒绝**，
+    /// 返回已经在跑的那个 id 让调用方说清"它已经在队列里了"。
+    Duplicate { existing: u64 },
+}
 
 /// 一条排队中的任务（id + 规格 + 它自己的取消标志）。
 struct Job {
@@ -466,51 +498,113 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
-/// 下载队列句柄。`enqueue` 把任务追加到队列尾部并唤醒后台线程；
-/// 后台线程**串行**执行（一次只下一个），完成/失败都推快照给 UI。
+/// 队列共享状态。锁只保护下面这几个容器，**不覆盖下载过程**——下载在各自的
+/// worker 线程里跑，否则"并行"会退化成串行。
+struct QueueState {
+    /// 待执行（FIFO）
+    queued: VecDeque<Job>,
+    /// 目标路径 → 已有活动任务 id。入队去重与 worker 收尾都维护它。
+    active_dests: HashMap<PathBuf, u64>,
+    /// 排队中 + 在跑中的任务数（判并发上限）
+    in_flight: u32,
+    /// 还活着的 worker 线程数（Drop 时递减，减到 0 让阻塞等待的线程退出）
+    alive: u32,
+}
+
+/// 下载队列句柄。
+///
+/// `enqueue` 把任务交给队列（按目标路径去重 + 受并发上限约束）；
+/// `concurrency` 个后台线程各自取一条执行，一条失败/取消不影响其它。
 pub struct Downloader {
-    shared: Arc<Mutex<VecDeque<Job>>>,
+    state: Arc<(Mutex<QueueState>, Condvar)>,
     flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
     next_id: Arc<AtomicU64>,
-    wake: Sender<()>,
+    notify: Arc<dyn Fn(Snapshot) + Send + Sync>,
+    workers: u32,
 }
 
 impl Downloader {
-    /// 起一个后台队列线程；`notify` 在每次状态/进度变化时被调用（在后台线程里）。
-    pub fn new<F>(notify: F) -> Downloader
+    /// 起 `concurrency`（夹到 1..=4）个后台 worker；`notify` 在每次状态/进度变化时
+    /// 被调用（在 worker 线程里）。
+    pub fn new<F>(notify: F, concurrency: Option<u32>) -> Downloader
     where
         F: Fn(Snapshot) + Send + Sync + 'static,
     {
-        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let workers = effective_concurrency(concurrency);
+        let state = Arc::new((
+            Mutex::new(QueueState {
+                queued: VecDeque::new(),
+                active_dests: HashMap::new(),
+                in_flight: 0,
+                alive: workers,
+            }),
+            Condvar::new(),
+        ));
         let flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
-        let (wake, wake_rx) = channel::<()>();
-        let notify = Arc::new(notify);
-        {
-            let shared = Arc::clone(&shared);
+        let notify: Arc<dyn Fn(Snapshot) + Send + Sync> = Arc::new(notify);
+        for _ in 0..workers {
+            let state = Arc::clone(&state);
             let flags = Arc::clone(&flags);
             let notify = Arc::clone(&notify);
-            std::thread::spawn(move || worker_loop(shared, flags, notify, wake_rx));
+            std::thread::spawn(move || worker_loop(state, flags, notify));
         }
         Downloader {
-            shared,
+            state,
             flags,
             next_id,
-            wake,
+            notify,
+            workers,
         }
     }
 
-    /// 入队一条任务，返回它的 id。会立刻推一条 Queued 快照。
-    pub fn enqueue(&self, spec: TaskSpec) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.flags.lock().unwrap().insert(id, Arc::clone(&cancel));
-        self.shared
-            .lock()
-            .unwrap()
-            .push_back(Job { id, spec, cancel });
-        let _ = self.wake.send(());
-        id
+    /// 入队一条任务。同一目标路径若已有活动任务（排队中或在跑），**拒绝**第二个
+    /// writer 并返回它的 id。
+    ///
+    /// `mirror` 把清单里的原始 URL 改写成当前生效的源——**在入队时**应用，
+    /// 所以"入队后改设置"不会让已经在排的旧任务偷偷换源（用户看到什么就下什么）。
+    pub fn enqueue<G>(&self, spec: TaskSpec, mirror: G) -> Enqueued
+    where
+        G: FnOnce(&str) -> String,
+    {
+        let dest = spec.dest.clone();
+        let (lock, cvar) = &*self.state;
+        let (id, spec, cancel) = {
+            let mut g = lock.lock().unwrap();
+            while g.in_flight >= self.workers {
+                g = cvar.wait(g).unwrap();
+            }
+            if let Some(existing) = g.active_dests.get(&dest).copied() {
+                return Enqueued::Duplicate { existing };
+            }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let spec = TaskSpec {
+                url: mirror(&spec.url),
+                ..spec
+            };
+            g.active_dests.insert(dest, id);
+            g.in_flight += 1;
+            g.queued.push_back(Job {
+                id,
+                spec: spec.clone(),
+                cancel: Arc::clone(&cancel),
+            });
+            (id, spec, cancel)
+        };
+        self.flags.lock().unwrap().insert(id, cancel);
+        cvar.notify_one();
+        // 快照在锁外推：notify 是调用方的闭包，锁内调用可能反向加锁
+        (self.notify)(Snapshot {
+            id,
+            label: spec.label.clone(),
+            dest: spec.dest.clone(),
+            state: State::Queued,
+            downloaded: 0,
+            total: spec.expected_size,
+            note: String::new(),
+        });
+        Enqueued::Started(id)
     }
 
     /// 取消一条任务。正在下载的由原子标志让读循环退出；还没开始的会在轮到它时跳过。
@@ -532,87 +626,116 @@ impl Downloader {
     }
 }
 
-fn worker_loop<F>(
-    shared: Arc<Mutex<VecDeque<Job>>>,
-    flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
-    notify: Arc<F>,
-    wake_rx: Receiver<()>,
-) where
-    F: Fn(Snapshot) + Send + Sync,
-{
+impl Drop for Downloader {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.state;
+        let mut g = lock.lock().unwrap();
+        g.alive = g.alive.saturating_sub(1);
+        cvar.notify_all();
+    }
+}
+
+/// 从共享队列取一条可跑的任务。没有可跑的时：
+/// `wait=true` → 阻塞到有任务或被 Drop 唤醒；`wait=false` → 立刻返回 `None`。
+fn take_job(state: &Arc<(Mutex<QueueState>, Condvar)>, wait: bool) -> Option<Job> {
+    let (lock, cvar) = &**state;
+    let mut g = lock.lock().unwrap();
     loop {
-        let job = shared.lock().unwrap().pop_front();
-        let Some(job) = job else {
-            // 队列空：等唤醒；所有 Downloader 都 drop 掉时 sender 关闭 → 退出线程
-            if wake_rx.recv().is_err() {
-                return;
-            }
-            continue;
-        };
-        let id = job.id;
-        let spec = job.spec;
-        let cancel = job.cancel;
-        // 入队时推一条 Queued（放在这里推，保证顺序：Queued 一定先于 Downloading）
-        notify(Snapshot {
-            id,
-            label: spec.label.clone(),
-            dest: spec.dest.clone(),
-            state: State::Queued,
-            downloaded: 0,
-            total: spec.expected_size,
-            note: String::new(),
-        });
-        if cancel.load(Ordering::Relaxed) {
-            flags.lock().unwrap().remove(&id);
-            notify(snapshot_of(&spec, id, State::Cancelled, 0, None, "已取消"));
-            continue;
+        if let Some(job) = g.queued.pop_front() {
+            return Some(job);
         }
-        notify(snapshot_of(
-            &spec,
-            id,
-            State::Downloading,
-            0,
-            spec.expected_size,
-            "",
-        ));
-        let result = download(&spec, &cancel, |s| {
-            // 进度快照把 id 补上（download 不知道自己的 id）
-            let mut s = s.clone();
-            s.id = id;
-            notify(s);
-        });
-        flags.lock().unwrap().remove(&id);
-        match result {
-            Ok(out) => {
-                let note = if out.resumed {
-                    "断点续传完成".to_string()
-                } else if out.restarted_from_zero {
-                    "服务器不支持续传，已从 0 重下完成".to_string()
-                } else {
-                    "下载完成".to_string()
-                };
-                notify(snapshot_of(
-                    &spec,
-                    id,
-                    State::Done,
-                    out.bytes,
-                    Some(out.bytes),
-                    &note,
-                ));
-            }
-            Err(DownloadError::Cancelled) => {
-                notify(snapshot_of(&spec, id, State::Cancelled, 0, None, "已取消"));
-            }
-            Err(e) => {
-                notify(snapshot_of(
-                    &spec,
-                    id,
-                    State::Failed(e.to_string()),
-                    0,
-                    None,
-                    &e.to_string(),
-                ));
-            }
+        if !wait || g.alive == 0 {
+            return None;
+        }
+        g = cvar.wait(g).unwrap();
+    }
+}
+
+/// 一条活动任务收尾：摘登记、放开名额、唤醒等名额 / 等任务的线程。
+fn finish_job(
+    state: &Arc<(Mutex<QueueState>, Condvar)>,
+    flags: &Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    dest: &Path,
+    id: u64,
+) {
+    flags.lock().unwrap().remove(&id);
+    let (lock, cvar) = &**state;
+    let mut g = lock.lock().unwrap();
+    // 只有登记的确实是自己时才摘（入队去重保证同一 dest 不会有第二个，
+    // 这条判断让"万一被覆盖"也不会误删活跃登记）。
+    if g.active_dests.get(dest).copied() == Some(id) {
+        g.active_dests.remove(dest);
+    }
+    g.in_flight = g.in_flight.saturating_sub(1);
+    cvar.notify_all();
+}
+
+fn worker_loop(
+    state: Arc<(Mutex<QueueState>, Condvar)>,
+    flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    notify: Arc<dyn Fn(Snapshot) + Send + Sync>,
+) {
+    loop {
+        let Some(job) = take_job(&state, true) else {
+            return;
+        };
+        run_one(&job, &notify);
+        finish_job(&state, &flags, &job.spec.dest, job.id);
+    }
+}
+
+/// 执行一条任务（含取消检查与终态快照）。
+fn run_one(job: &Job, notify: &Arc<dyn Fn(Snapshot) + Send + Sync>) {
+    let id = job.id;
+    let spec = &job.spec;
+    if job.cancel.load(Ordering::Relaxed) {
+        notify(snapshot_of(spec, id, State::Cancelled, 0, None, "已取消"));
+        return;
+    }
+    notify(snapshot_of(
+        spec,
+        id,
+        State::Downloading,
+        0,
+        spec.expected_size,
+        "",
+    ));
+    let result = download(spec, &job.cancel, |s| {
+        // 进度快照把 id 补上（download 不知道自己的 id）
+        let mut s = s.clone();
+        s.id = id;
+        notify(s);
+    });
+    match result {
+        Ok(out) => {
+            let note = if out.resumed {
+                "断点续传完成".to_string()
+            } else if out.restarted_from_zero {
+                "服务器不支持续传，已从 0 重下完成".to_string()
+            } else {
+                "下载完成".to_string()
+            };
+            notify(snapshot_of(
+                spec,
+                id,
+                State::Done,
+                out.bytes,
+                Some(out.bytes),
+                &note,
+            ));
+        }
+        Err(DownloadError::Cancelled) => {
+            notify(snapshot_of(spec, id, State::Cancelled, 0, None, "已取消"));
+        }
+        Err(e) => {
+            notify(snapshot_of(
+                spec,
+                id,
+                State::Failed(e.to_string()),
+                0,
+                None,
+                &e.to_string(),
+            ));
         }
     }
 }
@@ -646,6 +769,7 @@ mod tests {
     use std::io::BufRead;
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, Receiver};
     use std::time::{Duration, Instant};
 
     /// 一条被 mock server 收到的请求（记录 Range 头与路径，供断言）。
@@ -1023,10 +1147,19 @@ mod tests {
         let body = vec![3u8; 32 * 1024];
         let srv = MockServer::start(body.clone(), false);
         let (tx, rx) = channel::<Snapshot>();
-        let dl = Downloader::new(move |s| {
-            let _ = tx.send(s);
-        });
-        let id = dl.enqueue(spec(srv.url("/m/model.bin"), root.join("m.bin"), &body));
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(1),
+        );
+        let id = match dl.enqueue(
+            spec(srv.url("/m/model.bin"), root.join("m.bin"), &body),
+            |u| u.to_string(),
+        ) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
         assert_eq!(dl.cancel(id), CancelOutcome::Requested);
         assert_eq!(dl.cancel(id), CancelOutcome::AlreadyRequested);
 
@@ -1141,72 +1274,472 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), body);
     }
 
-    #[test]
-    fn queue_runs_tasks_serially_in_order() {
-        let root = temp_dir("queue");
-        let body_a = vec![1u8; 64 * 1024];
-        let body_b = vec![2u8; 48 * 1024];
-        let srv = MockServer::start(body_a.clone(), false);
-        // 两条任务打同一台 server 的不同路径（server 一律回 body_a）；改用两台更省事：
-        let srv_b = MockServer::start(body_b.clone(), false);
-        let dest_a = root.join("a.bin");
-        let dest_b = root.join("b.bin");
+    // ── 并发队列 ──────────────────────────────────────────────────────────
+    //
+    // 这一组用**进程内确定性同步**证明"真的并行"：mock 服务端要等**两个**请求
+    // 都到齐才回响应。串行队列下第二个请求永远发不出来 → 服务端等到超时 → 该任务失败，
+    // 用例红。不靠 sleep 计时（机器负载会把它变成 flaky 假绿/假红）。
 
-        let (tx, rx) = channel::<Snapshot>();
-        let dl = Downloader::new(move |s| {
-            let _ = tx.send(s);
-        });
-        let id_a = dl.enqueue(spec(srv.url("/a.bin"), dest_a.clone(), &body_a));
-        let id_b = dl.enqueue(spec(srv_b.url("/b.bin"), dest_b.clone(), &body_b));
-        assert_ne!(id_a, id_b);
+    /// 一个"要等 N 个并发连接到齐才放行"的 mock 服务端。
+    struct BarrierServer {
+        addr: std::net::SocketAddr,
+        hits: Arc<Mutex<Vec<String>>>,
+        deal: usize,
+        /// 等到 `deal` 个请求都到了才放行（或者等到超时——串行实现就是这条）
+        gate: Arc<(Mutex<usize>, Condvar)>,
+        stop: Arc<AtomicBool>,
+    }
 
-        // 等两条都到终态（Done），并把**事件顺序**整个留下来。
-        // 注意按"不同的任务 id"数，不能按 Done 事件数：download() 自己发一次 Done、
-        // worker 收尾再发一次，一条任务就有两个 Done——按事件数会提前满足（踩过）。
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut events: Vec<Snapshot> = Vec::new();
-        loop {
-            let done_ids: std::collections::HashSet<u64> = events
-                .iter()
-                .filter(|s| s.state == State::Done)
-                .map(|s| s.id)
-                .collect();
-            if done_ids.len() == 2 {
-                break;
+    impl BarrierServer {
+        fn start(deal: usize, wait: Duration) -> BarrierServer {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(Mutex::new(Vec::new()));
+            let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let hits_srv = Arc::clone(&hits);
+            let gate_srv = Arc::clone(&gate);
+            let stop_srv = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut handles = Vec::new();
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let hits = Arc::clone(&hits_srv);
+                            let gate = Arc::clone(&gate_srv);
+                            handles.push(std::thread::spawn(move || {
+                                // 读到请求行才记账：连接建立 ≠ 请求发出
+                                let mut stream = stream;
+                                let mut reader =
+                                    std::io::BufReader::new(stream.try_clone().unwrap());
+                                let mut request_line = String::new();
+                                if reader.read_line(&mut request_line).is_err() {
+                                    return;
+                                }
+                                let path = request_line
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("")
+                                    .to_string();
+                                hits.lock().unwrap().push(path);
+                                // 关掉读端，让客户端看到连接仍然活着（我们只写响应）
+                                drop(reader);
+                                // 等齐 `deal` 个请求
+                                let (lk, cv) = &*gate;
+                                let mut g = lk.lock().unwrap();
+                                *g += 1;
+                                cv.notify_all();
+                                let deadline = Instant::now() + wait;
+                                while *g < deal {
+                                    let left = deadline.saturating_duration_since(Instant::now());
+                                    if left.is_zero() {
+                                        break;
+                                    }
+                                    let (ng, _) = cv.wait_timeout(g, left).unwrap();
+                                    g = ng;
+                                }
+                                let opened = *g >= deal;
+                                drop(g);
+                                use std::io::Write as _;
+                                if !opened {
+                                    // **没等齐就超时**：这次必须让客户端看到失败，否则
+                                    // "串行 = 第一个请求等到超时也会拿到完整响应"，
+                                    // 用例就变成恒绿（我第一版正是这么被骗过的）。
+                                    // 声明的长度远大于实际写入的字节 → 客户端必然发现截断。
+                                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+                                    let _ = stream.write_all(head.as_bytes());
+                                    let _ = stream.write_all(b"short");
+                                    let _ = stream.flush();
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                    return;
+                                }
+                                let body = b"payload";
+                                let head = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(head.as_bytes());
+                                let _ = stream.write_all(body);
+                                let _ = stream.flush();
+                                let _ = stream.shutdown(Shutdown::Both);
+                            }));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stop_srv.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handles {
+                    let _ = h.join();
+                }
+            });
+            BarrierServer {
+                addr,
+                hits,
+                deal,
+                gate,
+                stop,
             }
-            assert!(Instant::now() < deadline, "两条任务没能在 10s 内跑完");
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{}", self.addr, path)
+        }
+
+        fn hits(&self) -> Vec<String> {
+            self.hits.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for BarrierServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // 唤醒可能还在等 gate 的 handler，别让它们拖住测试进程
+            let (lk, cv) = &*self.gate;
+            if let Ok(mut g) = lk.lock() {
+                *g = self.deal;
+                cv.notify_all();
+            }
+        }
+    }
+
+    /// 等所有 `wanted` 个任务都到终态，返回事件流。
+    fn collect_until<F>(rx: &Receiver<Snapshot>, wanted: &[u64], ok: F) -> Vec<Snapshot>
+    where
+        F: Fn(&Snapshot) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut events: Vec<Snapshot> = Vec::new();
+        while !wanted
+            .iter()
+            .all(|id| events.iter().any(|s| s.id == *id && ok(s)))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "任务 {wanted:?} 没能在 20s 内到达预期终态；已有事件：{:?}",
+                events
+                    .iter()
+                    .map(|s| (s.id, s.state.clone()))
+                    .collect::<Vec<_>>()
+            );
             if let Ok(snap) = rx.recv_timeout(Duration::from_millis(200)) {
                 events.push(snap);
             }
         }
-        let done_ids: std::collections::HashSet<u64> = events
-            .iter()
-            .filter(|s| s.state == State::Done)
-            .map(|s| s.id)
-            .collect();
-        assert!(
-            done_ids.contains(&id_a) && done_ids.contains(&id_b),
-            "两条任务都应完成（实际完成 {done_ids:?}）"
-        );
-        // 验收①要的是**串行**：第二条必须等第一条跑完（Done）才**真正开始下载**。
-        // 比的是乙的 Downloading，不是它的 Queued——Queued 是 worker `pop_front` 时才发的，
-        // 天然晚于甲的 Done；拿 Queued 当"开始"的话，每条 spawn 并行也照样绿（复核指出）。
-        let a_done = events
-            .iter()
-            .position(|s| s.id == id_a && s.state == State::Done)
-            .expect("甲的 Done 必须在事件流里");
-        let b_started = events
-            .iter()
-            .position(|s| s.id == id_b && s.state == State::Downloading)
-            .expect("乙的 Downloading 必须在事件流里");
-        assert!(
-            a_done < b_started,
-            "队列必须串行：甲 Done（位置 {a_done}）要在乙开始下载 Downloading（位置 {b_started}）之前"
-        );
-        assert_eq!(std::fs::read(&dest_a).unwrap(), body_a);
-        assert_eq!(std::fs::read(&dest_b).unwrap(), body_b);
+        events
     }
 
+    /// 并发是真的：两个任务必须**同时在飞**，服务端才肯放行。
+    ///
+    /// 阳性对照：把 `Downloader::new(.., Some(2))` 改成 `Some(1)`（串行）→
+    /// 服务端永远等不到第二个请求 → 5s 超时 → 超时的那个任务失败 → 用例红。
+    #[test]
+    fn two_tasks_are_in_flight_at_the_same_time() {
+        let root = temp_dir("parallel");
+        let body = b"payload";
+        let srv = BarrierServer::start(2, Duration::from_secs(5));
+        let dest_c = root.join("c.bin");
+        let dest_d = root.join("d.bin");
+
+        let (tx, rx) = channel::<Snapshot>();
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(2),
+        );
+        let spec_c = TaskSpec {
+            label: "c".into(),
+            url: srv.url("/c.bin"),
+            dest: dest_c.clone(),
+            expected_sha256: None,
+            expected_size: Some(body.len() as u64),
+        };
+        let spec_d = TaskSpec {
+            label: "d".into(),
+            url: srv.url("/d.bin"),
+            dest: dest_d.clone(),
+            expected_sha256: None,
+            expected_size: Some(body.len() as u64),
+        };
+        let id_c = match dl.enqueue(spec_c, |u| u.to_string()) {
+            Enqueued::Started(id) => id,
+            other => panic!("第一条应排上：{other:?}"),
+        };
+        let id_d = match dl.enqueue(spec_d, |u| u.to_string()) {
+            Enqueued::Started(id) => id,
+            other => panic!("第二条应排上（不同 dest）：{other:?}"),
+        };
+        let events = collect_until(&rx, &[id_c, id_d], |s| s.state.is_terminal());
+        for id in [id_c, id_d] {
+            let last = events
+                .iter()
+                .rev()
+                .find(|s| s.id == id && s.state.is_terminal())
+                .expect("应有终态");
+            assert_eq!(last.state, State::Done, "id={id} 未能完成：{last:?}");
+        }
+        assert_eq!(std::fs::read(&dest_c).unwrap(), body);
+        assert_eq!(std::fs::read(&dest_d).unwrap(), body);
+        // 两个请求都必须到过服务端，而且**必须同时在飞**：服务端是"等齐 2 个才回"，
+        // 并发度 1 时第一个请求会一直等第二个 → 5s 超时 → 该任务失败 → 上面那条 Done
+        // 断言红。所以这条断言不是"两条都完成了"，而是"两条同时在飞"。
+        let mut hits = srv.hits();
+        hits.sort();
+        assert_eq!(hits, vec!["/c.bin".to_string(), "/d.bin".to_string()]);
+    }
+
+    /// 同一个目标路径入队两次：第二次**拒绝**，不产生第二个 writer。
+    ///
+    /// 阳性对照：去掉 `active_dests` 去重 → 第二次会 `Started`，且服务端会收到
+    /// 两个请求（`.part` 被两个 append 同时写）→ 用例红。
+    #[test]
+    fn duplicate_destination_is_refused_and_produces_one_writer() {
+        let root = temp_dir("dup-dest");
+        let body = b"payload";
+        let srv = BarrierServer::start(1, Duration::from_secs(3));
+        let dest = root.join("same.bin");
+        let (tx, rx) = channel::<Snapshot>();
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(2),
+        );
+        let mk = || TaskSpec {
+            label: "same".into(),
+            url: srv.url("/same.bin"),
+            dest: dest.clone(),
+            expected_sha256: None,
+            expected_size: Some(body.len() as u64),
+        };
+        let first = match dl.enqueue(mk(), |u| u.to_string()) {
+            Enqueued::Started(id) => id,
+            other => panic!("第一条应排上：{other:?}"),
+        };
+        let second = dl.enqueue(mk(), |u| u.to_string());
+        assert_eq!(
+            second,
+            Enqueued::Duplicate { existing: first },
+            "同 dest 的第二个请求必须被拒（否则两个 writer 抢同一个 .part）"
+        );
+        let events = collect_until(&rx, &[first], |s| s.state.is_terminal());
+        let last = events
+            .iter()
+            .rev()
+            .find(|s| s.id == first && s.state.is_terminal())
+            .unwrap();
+        assert_eq!(last.state, State::Done, "{last:?}");
+        assert_eq!(srv.hits(), vec!["/same.bin".to_string()], "只允许一次请求");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    /// 去重按**完整目标路径**，不是按文件名。
+    ///
+    /// 反例很常见：两个模型各在 `A/model.gguf` 与 `B/model.gguf`，文件名相同但落点不同，
+    /// 它们**必须能同时下**（否则第二个被拒，用户以为在装两个模型其实只装了一个）。
+    /// 把去重键改成 `file_name()` 就会红。
+    #[test]
+    fn dedup_is_by_full_dest_not_by_basename() {
+        let root = temp_dir("dedup-path");
+        let body = b"payload";
+        let srv = BarrierServer::start(2, Duration::from_secs(5));
+        let dest_a = root.join("A/model.gguf");
+        let dest_b = root.join("B/model.gguf");
+        assert_eq!(
+            dest_a.file_name(),
+            dest_b.file_name(),
+            "构造前提：两个落点文件名相同"
+        );
+        let (tx, rx) = channel::<Snapshot>();
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(2),
+        );
+        let mk = |url: String, dest: PathBuf| TaskSpec {
+            label: dest.display().to_string(),
+            url,
+            dest,
+            expected_sha256: None,
+            expected_size: Some(body.len() as u64),
+        };
+        let id_a = match dl.enqueue(mk(srv.url("/A/model.gguf"), dest_a.clone()), |u| {
+            u.to_string()
+        }) {
+            Enqueued::Started(id) => id,
+            other => panic!("同名的第一条应排上：{other:?}"),
+        };
+        let id_b = match dl.enqueue(mk(srv.url("/B/model.gguf"), dest_b.clone()), |u| {
+            u.to_string()
+        }) {
+            Enqueued::Started(id) => id,
+            other => panic!("**文件名相同但落点不同**的第二条也必须能排上：{other:?}"),
+        };
+        let events = collect_until(&rx, &[id_a, id_b], |s| s.state.is_terminal());
+        for id in [id_a, id_b] {
+            let last = events
+                .iter()
+                .rev()
+                .find(|s| s.id == id && s.state.is_terminal())
+                .expect("应有终态");
+            assert_eq!(last.state, State::Done, "id={id} 未能完成：{last:?}");
+        }
+        assert_eq!(std::fs::read(&dest_a).unwrap(), body);
+        assert_eq!(std::fs::read(&dest_b).unwrap(), body);
+        assert_eq!(srv.hits().len(), 2, "两个不同落点都该真的发过请求");
+    }
+
+    /// 一个任务失败（校验不过）不影响另一个照常完成。
+    #[test]
+    fn one_failure_does_not_stop_the_other() {
+        let root = temp_dir("one-fail");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let hits_srv = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    return;
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                // 读到头部结束
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                hits_srv.lock().unwrap().push(path.clone());
+                let body: &[u8] = if path == "/bad.bin" {
+                    b"WRONG"
+                } else {
+                    b"payload"
+                };
+                use std::io::Write as _;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        let dest_ok = root.join("ok.bin");
+        let dest_bad = root.join("bad.bin");
+        let body = b"payload";
+        let (tx, rx) = channel::<Snapshot>();
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(2),
+        );
+        let ok = match dl.enqueue(
+            TaskSpec {
+                label: "ok".into(),
+                url: format!("http://{addr}/ok.bin"),
+                dest: dest_ok.clone(),
+                expected_sha256: None,
+                expected_size: Some(body.len() as u64),
+            },
+            |u| u.to_string(),
+        ) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
+        // bad.bin 声明了 999 字节但服务端只给 5 字节 → 必然失败
+        let bad = match dl.enqueue(
+            TaskSpec {
+                label: "bad".into(),
+                url: format!("http://{addr}/bad.bin"),
+                dest: dest_bad.clone(),
+                expected_sha256: None,
+                expected_size: Some(999),
+            },
+            |u| u.to_string(),
+        ) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let events = collect_until(&rx, &[ok, bad], |s| s.state.is_terminal());
+        let finish = |id: u64| {
+            events
+                .iter()
+                .rev()
+                .find(|s| s.id == id && s.state.is_terminal())
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(finish(ok).state, State::Done, "好的那条应照常完成");
+        assert!(
+            matches!(finish(bad).state, State::Failed(_)),
+            "坏的那条应失败而不是静默成功：{:?}",
+            finish(bad)
+        );
+        assert_eq!(std::fs::read(&dest_ok).unwrap(), body);
+        assert!(!dest_bad.exists(), "失败的正式路径不该出现");
+    }
+
+    /// 入队时应用镜像：队列真的把 URL 改写了（不是只在界面上写一行）。
+    #[test]
+    fn enqueue_applies_the_mirror_to_the_requested_url() {
+        let root = temp_dir("mirror");
+        let body = b"payload";
+        let srv = MockServer::start(body.to_vec(), false);
+        let dest = root.join("m.bin");
+        // 清单里的原始 URL 是官方域名；镜像前缀把它指到 mock 上
+        let official = "https://huggingface.co/org/repo/resolve/main/m.bin";
+        let mirror_base = format!("http://{}", srv.addr);
+        let (tx, rx) = channel::<Snapshot>();
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(1),
+        );
+        let id = match dl.enqueue(
+            TaskSpec {
+                label: "m".into(),
+                url: official.to_string(),
+                dest,
+                expected_sha256: None,
+                expected_size: Some(body.len() as u64),
+            },
+            |url| crate::download_mirror::rewrite_url(url, &mirror_base),
+        ) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let events = collect_until(&rx, &[id], |s| s.state.is_terminal());
+        assert_eq!(
+            events.iter().rev().find(|s| s.id == id).unwrap().state,
+            State::Done
+        );
+        assert_eq!(
+            srv.hits()[0].path,
+            "/org/repo/resolve/main/m.bin",
+            "请求路径必须来自被改写后的镜像 URL"
+        );
+    }
+
+    /// 取消排队中的任务：它不该占用一个 writer 名额，也不该落地。
     #[test]
     fn cancelling_queued_task_skips_it() {
         let root = temp_dir("queue-cancel");
@@ -1215,30 +1748,54 @@ mod tests {
         let dest_a = root.join("a.bin");
         let dest_b = root.join("b.bin");
         let (tx, rx) = channel::<Snapshot>();
-        let dl = Downloader::new(move |s| {
-            let _ = tx.send(s);
-        });
-        // 排两条：第二条一开始就取消 → 应直接标 Cancelled，且不落地
-        let _id_a = dl.enqueue(spec(srv.url("/a.bin"), dest_a.clone(), &body));
-        let id_b = dl.enqueue(spec(srv.url("/b.bin"), dest_b.clone(), &body));
+        // 1 并发：第二条一定还在排队
+        let dl = Downloader::new(
+            move |s| {
+                let _ = tx.send(s);
+            },
+            Some(1),
+        );
+        let id_a = match dl.enqueue(spec(srv.url("/a.bin"), dest_a.clone(), &body), |u| {
+            u.to_string()
+        }) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let id_b = match dl.enqueue(spec(srv.url("/b.bin"), dest_b.clone(), &body), |u| {
+            u.to_string()
+        }) {
+            Enqueued::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
         assert_eq!(dl.cancel(id_b), CancelOutcome::Requested);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut b_cancelled = false;
-        let mut a_done = false;
-        while !(b_cancelled && a_done) && Instant::now() < deadline {
-            if let Ok(snap) = rx.recv_timeout(Duration::from_millis(200)) {
-                if snap.id == id_b && snap.state == State::Cancelled {
-                    b_cancelled = true;
-                }
-                if snap.id != id_b && snap.state == State::Done {
-                    a_done = true;
-                }
-            }
-        }
-        assert!(b_cancelled, "被取消的排队任务应标为已取消");
-        assert!(a_done, "另一条应照常完成");
+        let events = collect_until(&rx, &[id_a, id_b], |s| s.state.is_terminal());
+        let finish = |id: u64| {
+            events
+                .iter()
+                .rev()
+                .find(|s| s.id == id && s.state.is_terminal())
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            finish(id_b).state,
+            State::Cancelled,
+            "被取消的排队任务应标已取消"
+        );
+        assert_eq!(finish(id_a).state, State::Done, "另一条应照常完成");
         assert!(!dest_b.exists());
         assert_eq!(std::fs::read(&dest_a).unwrap(), body);
+    }
+
+    /// 并发数归一化：缺省 / 0 / 越界都夹到 1..=4。
+    #[test]
+    fn concurrency_is_clamped_to_a_sane_range() {
+        assert_eq!(effective_concurrency(None), 2);
+        assert_eq!(effective_concurrency(Some(0)), 1);
+        assert_eq!(effective_concurrency(Some(1)), 1);
+        assert_eq!(effective_concurrency(Some(3)), 3);
+        assert_eq!(effective_concurrency(Some(4)), 4);
+        assert_eq!(effective_concurrency(Some(9)), 4);
     }
 }

@@ -199,7 +199,14 @@ export component WorkbenchDrawer inherits VerticalLayout {
     in property <bool> server-locked: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
-    // ── 模型下载器（P7）：可下载模型 + 串行下载队列 ──
+    // ── 模型下载器（P7）：下载源 + 可下载模型 + 并发队列 ──
+    // 下载源镜像前缀（空 = 官方）。只有 HF 官方 URL 会被改写，非 HF 链接原样不动；
+    // 填了镜像就只走镜像——地址不通如实报错，不静默回退官方。
+    in-out property <string> download-mirror: "";
+    in-out property <string> download-concurrency: "";
+    // 当前生效的源 / 并发数：**Rust 侧投影**，不在这里拼第二份判断
+    in property <string> download-source-note: "";
+    in property <string> download-concurrency-note: "";
     in property <[DownloadRow]> download-rows: [];
     callback download-model(string);
     callback apply-server-settings();
@@ -388,7 +395,49 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     wrap: word-wrap;
                 }
 
-                // ── 可下载模型 + 串行下载队列（M4-P7）：每条显示状态与进度 ──
+                // ── 下载源镜像（M4-P7）：填了就只有镜像这一条路 ──
+                Text {
+                    text: "模型下载源";
+                    color: PixelTheme.text;
+                    font-size: 12px;
+                }
+                PixelTextInput {
+                    text <=> root.download-mirror;
+                    placeholder: "留空 = 用清单里的官方地址（如 https://hf-mirror.com）";
+                    enabled: !root.busy;
+                }
+                Text {
+                    text: root.download-source-note;
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "只有 HuggingFace 官方地址会被改写到镜像下，其它地址（内网 / 自建仓库）原样不动。填了镜像就只走镜像：连不上会如实报网络错误，不会偷偷改回官方——按「应用并重连」保存后，下一条入队的下载立即生效。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                // ── 下载并发（M4-P7）：默认 2，1..=4 ──
+                Text {
+                    text: "同时下载";
+                    color: PixelTheme.text;
+                    font-size: 12px;
+                }
+                PixelTextInput {
+                    text <=> root.download-concurrency;
+                    placeholder: "留空 = 默认 2（可填 1–4）";
+                    enabled: !root.busy;
+                }
+                Text {
+                    text: root.download-concurrency-note;
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                // ── 可下载模型 + 并发下载队列（M4-P7）：每条显示状态与进度 ──
                 Text {
                     text: "可下载模型";
                     color: PixelTheme.text;

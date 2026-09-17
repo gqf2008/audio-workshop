@@ -16,6 +16,7 @@ mod batch;
 mod cancel;
 mod dictionaries;
 mod download;
+mod download_mirror;
 mod export;
 /// 随包分发的模型下载清单（M4-P7 第二段：下载源）。映射规则与诚实边界都在那里。
 mod model_capabilities;
@@ -521,6 +522,17 @@ struct AppSettings {
     /// 质检报告落盘，三处必须是同一份推导（两份实现必然漂移）。
     #[serde(default)]
     asr_model: Option<String>,
+    /// 模型下载源镜像前缀（M4-P7）：缺省/空 = 用清单里的官方地址。
+    ///
+    /// 只有 HF 官方 URL 会被改写（`src/download_mirror.rs` 是唯一实现）；
+    /// 填了镜像就**只走镜像**——地址不通就如实报错，不静默回退官方
+    /// （"以为在用镜像、其实偷偷走官方"是本仓反复抓的失败形态）。
+    #[serde(default)]
+    download_mirror: Option<String>,
+    /// 同时下载几个模型（默认 2，夹到 1..=4）。归一化只有
+    /// `download::effective_concurrency()` 一处，界面回显也从它算。
+    #[serde(default)]
+    download_concurrency: Option<u32>,
 }
 
 /// BGM 的默认描述：**与 ui/app.slint 里 `bgm-prompt` 的默认值必须一致**
@@ -1338,6 +1350,8 @@ fn load_settings_at(path: &Path) -> AppSettings {
         bgm: json_field(&v, "bgm").unwrap_or_default(),
         update_url: json_field(&v, "update_url"),
         asr_model: json_field(&v, "asr_model"),
+        download_mirror: json_field(&v, "download_mirror"),
+        download_concurrency: json_field(&v, "download_concurrency"),
     }
 }
 
@@ -2573,6 +2587,53 @@ fn download_plan() -> Vec<model_sources::Row> {
     model_sources::plan_rows(&server, model_sources::catalog(), &model_dir())
 }
 
+/// 当前生效的下载镜像前缀（设置里的原文；空前缀 = 用官方）。
+///
+/// **唯一入口**：`download_mirror_rewrite`（真正改写 URL）与界面回显
+/// `download_source_note` 都从它读，免得"回显一套、行为另一套"。
+fn effective_download_mirror(s: &AppSettings) -> String {
+    s.download_mirror.clone().unwrap_or_default()
+}
+
+/// 把清单里的 URL 换成**当前生效的源**。这是唯一一处调用 `download_mirror::rewrite_url`
+/// 的地方——非 HF 链接原样返回，填了镜像就只走镜像（不做静默回退）。
+fn download_mirror_rewrite(url: &str) -> String {
+    let mirror = effective_download_mirror(&settings_snapshot());
+    download_mirror::rewrite_url(url, &mirror)
+}
+
+/// 「当前生效的源」那一行（抽屉里真实显示的那句）。
+fn download_source_note(s: &AppSettings) -> String {
+    download_mirror::source_note(&effective_download_mirror(s))
+}
+
+/// 生效并发数（唯一归一化入口：`download::effective_concurrency`）。
+fn effective_download_concurrency(s: &AppSettings) -> u32 {
+    download::effective_concurrency(s.download_concurrency)
+}
+
+/// 抽屉里「下载源 / 并发」两块回显的**唯一**刷新点。
+///
+/// 三件事一起做、不漏一件：① 输入框填回当前设置；② 生效源那一行从
+/// `download_source_note` 投影；③ 并发行写明"下一次启动生效"（线程池已经起了，
+/// 不这么写就是界面说谎）。
+fn refresh_download_source_view(ui: &MainWindow) {
+    let s = settings_snapshot();
+    ui.set_download_mirror(effective_download_mirror(&s).into());
+    ui.set_download_concurrency(match s.download_concurrency {
+        Some(n) => n.to_string().into(),
+        None => "".into(),
+    });
+    ui.set_download_source_note(download_source_note(&s).into());
+    ui.set_download_concurrency_note(
+        format!(
+            "同时下载 {} 个模型（并发数改动下次启动生效；每个模型的下载/取消互不影响）",
+            effective_download_concurrency(&s)
+        )
+        .into(),
+    );
+}
+
 /// 推荐用的「本机尺度」：物理内存（平台探测）+ 服务守卫要求的余量（`server.json`
 /// 的 `min_free_memory_mb`，缺省 1024 MiB —— 与 `config/models.schema.yaml` 的默认一致）。
 ///
@@ -2827,6 +2888,10 @@ enum ClickEffect {
     AlreadyFinished(u64),
     /// 没有在跑的 → 新排一条
     Enqueued { id: u64, dest: PathBuf },
+    /// 队列里已经有别的任务在写**同一个目标文件**（不同模型 id、同一落点，
+    /// 例如 audio8-tts 与 audio8-tts-stream 指向同一份权重）：第二个 writer 会把
+    /// `.part` 搅坏，所以拒绝，并说清是谁在写。
+    DuplicateDestination { existing: u64 },
     /// 清单里找不到这个模型（点之前清单被改过）
     UnknownModel,
 }
@@ -2842,7 +2907,7 @@ fn apply_download_click(
     state: &Rc<UiState>,
     key: &str,
     cancel: impl FnOnce(u64) -> download::CancelOutcome,
-    enqueue: impl FnOnce() -> Option<(u64, PathBuf)>,
+    enqueue: impl FnOnce() -> Option<(download::Enqueued, PathBuf)>,
 ) -> ClickEffect {
     if let Some(id) = active_download_id(state, key) {
         return match cancel(id) {
@@ -2852,28 +2917,39 @@ fn apply_download_click(
         };
     }
     match enqueue() {
-        Some((id, dest)) => {
+        Some((download::Enqueued::Started(id), dest)) => {
             state.download_ids.borrow_mut().insert(key.to_string(), id);
             ClickEffect::Enqueued { id, dest }
+        }
+        // 队列层去重：**不登记**（登记了就再也取消不掉别人的任务）
+        Some((download::Enqueued::Duplicate { existing }, _)) => {
+            ClickEffect::DuplicateDestination { existing }
         }
         None => ClickEffect::UnknownModel,
     }
 }
 
-/// 模型下载接线：一个后台串行队列 + 每个可下载模型一个「下载/取消」按钮。
+/// 模型下载接线：`effective_download_concurrency()` 个后台 worker + 每个可下载模型
+/// 一个「下载/取消」按钮。
 ///
-/// 队列线程把每条快照通过既有的 tick 消息泵发回 UI（`Msg::DownloadUpdate`，
+/// worker 把每条快照通过既有的 tick 消息泵发回 UI（`Msg::DownloadUpdate`，
 /// 已在 `message_ignores_revision` 白名单里——与工程版本无关，改稿不该丢进度）。
 fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiState>) {
     refresh_download_rows(ui, state);
 
     let tx = msg_tx.clone();
-    let downloader = Rc::new(download::Downloader::new(move |snap| {
-        let _ = tx.send(WorkerMsg {
-            revision: 0,
-            msg: Msg::DownloadUpdate(snap),
-        });
-    }));
+    // 并发数在启动时读一次：改了设置要下次启动才换线程数（"应用并重连"会说清这一点，
+    // 不假装立刻生效——线程池已经起来了，重启才是最诚实的口径）。
+    let concurrency = effective_download_concurrency(&settings_snapshot());
+    let downloader = Rc::new(download::Downloader::new(
+        move |snap| {
+            let _ = tx.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::DownloadUpdate(snap),
+            });
+        },
+        Some(concurrency),
+    ));
 
     let weak = ui.as_weak();
     let st = Rc::clone(state);
@@ -2892,14 +2968,19 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
             move || {
                 // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
                 let model = download_entry_for(&start_key)?;
-                let id = dl_start.enqueue(download::TaskSpec {
-                    label: model.id.clone(),
-                    url: model.url.clone(),
-                    dest: model.dest.clone(),
-                    expected_sha256: model.sha256.clone(),
-                    expected_size: model.size,
-                });
-                Some((id, model.dest))
+                // **入队时**按当前生效的源改写 URL（唯一一处调用 rewrite_url）。
+                // 填了镜像就只走镜像：地址不通就是网络错误，不静默回退官方。
+                let enqueued = dl_start.enqueue(
+                    download::TaskSpec {
+                        label: model.id.clone(),
+                        url: model.url.clone(),
+                        dest: model.dest.clone(),
+                        expected_sha256: model.sha256.clone(),
+                        expected_size: model.size,
+                    },
+                    download_mirror_rewrite,
+                );
+                Some((enqueued, model.dest))
             },
         );
         let text = match effect {
@@ -2913,6 +2994,9 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
                 format!("正在取消下载：{key}（已在取消中，请稍候）")
             }
             ClickEffect::AlreadyFinished(_) => format!("这条下载已经结束了：{key}"),
+            ClickEffect::DuplicateDestination { existing } => format!(
+                "同一个目标文件已在下载队列里（任务 #{existing}）：不重复排第二个 writer，等它结束再操作"
+            ),
             ClickEffect::UnknownModel => format!("清单里找不到可下载模型：{key}"),
         };
         ui.set_status_text(text.into());
@@ -4814,6 +4898,8 @@ fn main() -> Result<(), slint::PlatformError> {
     refresh_voice_library(&ui);
     wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
     wire_downloads(&ui, &msg_tx_ui, &state);
+    // 启动时把「下载源 / 并发」回显填上（同一份设置投影，别在 Slint 里拼）
+    refresh_download_source_view(&ui);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &msg_tx_ui, &state);
@@ -4971,6 +5057,34 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             ui.set_status_text(
                 "模型下载：队列 / 断点续传 / 校验 / 没有下载源 / 落点提醒（示例数据）".into(),
             );
+        }
+        "download-source" => {
+            // 演示态：把「当前生效的源」两种口径都摆出来（本态只读，**不写用户设置**）。
+            //
+            // 这里刻意不走 `settings_snapshot()`——那是**用户真机设置**，给演示态读真值会
+            // 让截图随每个人的配置漂移。文案与真实行为都来自同一个纯函数
+            // `download_mirror::{source_note, rewrite_url}`。
+            ui.set_drawer_open(true);
+            eprintln!(
+                "AW_UI_STATE=download-source：无镜像 -> {}",
+                download_mirror::source_note("")
+            );
+            eprintln!(
+                "AW_UI_STATE=download-source：有镜像 -> {}",
+                download_mirror::source_note("https://hf-mirror.com")
+            );
+            for line in download_source_demo_lines() {
+                eprintln!("{line}");
+            }
+            ui.set_download_mirror("https://hf-mirror.com".into());
+            ui.set_download_source_note(
+                download_mirror::source_note("https://hf-mirror.com").into(),
+            );
+            ui.set_download_concurrency("2".into());
+            ui.set_download_concurrency_note(
+                "同时下载 2 个模型（并发数改动下次启动生效；每个模型的下载/取消互不影响）".into(),
+            );
+            ui.set_status_text("模型下载源：填了镜像就只走镜像，连不上如实报错（示例）".into());
         }
         "model-sources" => {
             // 真机态：不灌示例数据，直接按「server.json ∪ 内置清单」渲一遍，
@@ -9526,6 +9640,28 @@ fn play_all(
     }
 }
 
+/// `AW_UI_STATE=download-source` 的两行对照（演示/核对用）。
+///
+/// 单独一个函数是为了让"改写 URL 只允许一处调用"那条源码守卫能一眼认出演示调用：
+/// 守卫按**函数名**精确排除整个函数体（函数名改了就会失去豁免、守卫会红）。
+/// 它只 `eprintln!`，不参与任何真实请求。
+#[cfg(debug_assertions)]
+fn download_source_demo_lines() -> Vec<String> {
+    vec![
+        format!(
+            "AW_UI_STATE=download-source：改写示例 https://huggingface.co/a/b.gguf -> {}",
+            download_mirror::rewrite_url(
+                "https://huggingface.co/a/b.gguf",
+                "https://hf-mirror.com"
+            )
+        ),
+        format!(
+            "AW_UI_STATE=download-source：非 HF 原样 https://example.com/x -> {}",
+            download_mirror::rewrite_url("https://example.com/x", "https://hf-mirror.com")
+        ),
+    ]
+}
+
 /// 全局设置：服务地址 / 端口 / 模型清单路径。
 ///
 /// 只改**本应用**连哪个服务、从哪份清单读模型；不改写 audio.cpp 自己的配置
@@ -9553,6 +9689,10 @@ fn wire_global_settings(
         let host = ui.get_server_host().trim().to_string();
         let port_raw = ui.get_server_port().trim().to_string();
         let dir = ui.get_model_dir().trim().to_string();
+        // 下载源镜像 + 并发（P7 第二段）。镜像对**下一条入队**立即生效；
+        // 并发数要改线程池，所以**下次启动**才生效（回显里写明）。
+        let mirror_raw = ui.get_download_mirror().trim().to_string();
+        let conc_raw = ui.get_download_concurrency().trim().to_string();
 
         let port = if port_raw.is_empty() {
             None
@@ -9569,6 +9709,35 @@ fn wire_global_settings(
         // 目录不存在**不阻断保存**：默认目录（进程工作目录下的 models/）在开发与打包
         // 环境里常常还不存在，阻断会让"只想改端口"的保存连带失败。存在与否只做提示。
         let dir_missing = !dir.is_empty() && !Path::new(&dir).is_dir();
+
+        // 并发数：空 = 用默认。填了但不在 1..=4 -> **如实报错**，不静默夹
+        // （用户写 9 被悄悄改成 4，等于"设置没生效但界面说保存成功"）。
+        let conc = if conc_raw.is_empty() {
+            None
+        } else {
+            match conc_raw.parse::<u32>() {
+                Ok(n) if (1..=download::MAX_CONCURRENCY).contains(&n) => Some(n),
+                Ok(n) => {
+                    ui.set_server_ok(false);
+                    ui.set_server_status(
+                        format!(
+                            "并发数要在 1-{} 之间（你填的是 {n}）",
+                            download::MAX_CONCURRENCY
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    ui.set_server_ok(false);
+                    ui.set_server_status("并发数要是整数".into());
+                    return;
+                }
+            }
+        };
+        // 镜像前缀写进设置前先归一（去掉尾斜杠）——不归一的话"当前生效的源"
+        // 回显会带一串斜杠，看起来像另一个地址。
+        let mirror = download_mirror::normalize_prefix(&mirror_raw);
 
         // 与默认目录相同时存 None（而不是把当时的绝对路径固化下来）：
         // 应用以后换位置/换工作目录时，默认值应该跟着走，不该被旧快照钉死。
@@ -9591,6 +9760,9 @@ fn wire_global_settings(
             update_url: prev.update_url,
             // 质检回读模型也不在这里改（自己的落盘点 persist_asr_model），原样带上
             asr_model: prev.asr_model,
+            // 下载源镜像 / 并发：本批自己的值，就在这里写
+            download_mirror: mirror.clone(),
+            download_concurrency: conc,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -9602,6 +9774,9 @@ fn wire_global_settings(
         }
         apply_engine_discovery(&ui, Some((&tx, &st)));
         refresh_download_rows(&ui, &st);
+        // 回显是**投影**：从刚落盘的那份设置算，不在这里拼第二份判断
+        // （`LESSON_同一语义两处实现必然漂移`）
+        refresh_download_source_view(&ui);
         ui.set_server_status(
             if dir_missing {
                 format!("设置已保存（模型目录还不存在：{dir}）· 正在测试连接…")
@@ -9624,6 +9799,7 @@ fn wire_global_settings(
         }
         apply_engine_discovery(&ui, Some((&tx, &st)));
         refresh_download_rows(&ui, &st);
+        refresh_download_source_view(&ui);
         ui.set_server_status("已重新扫描模型清单".into());
     });
 
@@ -11496,7 +11672,7 @@ mod tests {
             |_| unreachable!("还没在跑，不该走取消"),
             || {
                 enqueues.push(1);
-                Some((7, dest.clone()))
+                Some((download::Enqueued::Started(7), dest.clone()))
             },
         );
         assert_eq!(
@@ -11518,7 +11694,7 @@ mod tests {
             },
             || {
                 enqueues.push(2);
-                Some((8, dest.clone()))
+                Some((download::Enqueued::Started(8), dest.clone()))
             },
         );
         assert_eq!(fx, ClickEffect::CancelRequested(7));
@@ -11535,7 +11711,7 @@ mod tests {
             |_| download::CancelOutcome::AlreadyRequested,
             || {
                 enqueues.push(3);
-                Some((9, dest.clone()))
+                Some((download::Enqueued::Started(9), dest.clone()))
             },
         );
         assert_eq!(fx, ClickEffect::AlreadyCancelling(7));
@@ -11553,7 +11729,7 @@ mod tests {
             |_| unreachable!("已经摘了 id，不该走取消"),
             || {
                 enqueues.push(4);
-                Some((10, dest.clone()))
+                Some((download::Enqueued::Started(10), dest.clone()))
             },
         );
         assert_eq!(fx, ClickEffect::Enqueued { id: 10, dest });
@@ -15611,6 +15787,143 @@ mod tests {
         assert!(
             unknown_current.last().unwrap().starts_with("qwen3-asr"),
             "有数字的在前（即便比当前大也不装懂）：{unknown_current:?}"
+        );
+    }
+
+    /// 下载源 / 并发也要跨重启：落盘 -> 读回 -> 生效值。
+    ///
+    /// 断言的生效值走 `effective_download_mirror` / `effective_download_concurrency`
+    /// 两个**唯一入口**，不直接读字段——这样"存进去的东西和真正用的东西"被同一条
+    /// 链路钉住（见 LESSON_同一语义两处实现必然漂移）。
+    #[test]
+    fn download_source_and_concurrency_survive_a_settings_roundtrip() {
+        let dir = temp_dir("dl-settings");
+        let path = dir.join("settings.json");
+
+        // 缺省：官方 + 2 并发
+        let none = AppSettings::default();
+        assert_eq!(effective_download_mirror(&none), "");
+        assert_eq!(effective_download_concurrency(&none), 2);
+
+        // 写入镜像（带尾斜杠，落盘前应归一）
+        let st = AppSettings {
+            download_mirror: download_mirror::normalize_prefix("https://hf-mirror.com///"),
+            download_concurrency: Some(3),
+            ..AppSettings::default()
+        };
+        save_settings_at(&path, &st).unwrap();
+
+        let back = load_settings_at(&path);
+        assert_eq!(effective_download_mirror(&back), "https://hf-mirror.com");
+        assert_eq!(effective_download_concurrency(&back), 3);
+        assert_eq!(
+            download_mirror::rewrite_url(
+                "https://huggingface.co/a/b.gguf",
+                &effective_download_mirror(&back)
+            ),
+            "https://hf-mirror.com/a/b.gguf",
+            "读回来的镜像必须真的作用到 URL 上，不只是回显"
+        );
+
+        // 越界 / 0 的配置被归一化到 1..=4（不是当成缺省 2）
+        let st = AppSettings {
+            download_concurrency: Some(0),
+            ..AppSettings::default()
+        };
+        save_settings_at(&path, &st).unwrap();
+        assert_eq!(effective_download_concurrency(&load_settings_at(&path)), 1);
+        let st = AppSettings {
+            download_concurrency: Some(99),
+            ..AppSettings::default()
+        };
+        save_settings_at(&path, &st).unwrap();
+        assert_eq!(effective_download_concurrency(&load_settings_at(&path)), 4);
+
+        // 老 settings.json（没有这两个键）照读，不炸也不丢别的字段
+        std::fs::write(&path, r#"{"host":"10.0.0.9","port":8080}"#).unwrap();
+        let old = load_settings_at(&path);
+        assert_eq!(old.host.as_deref(), Some("10.0.0.9"));
+        assert_eq!(effective_download_mirror(&old), "");
+        assert_eq!(effective_download_concurrency(&old), 2);
+    }
+
+    /// 回显与真实行为同源：`source_note` 说的是哪条源，`rewrite_url` 就真的走去哪条源。
+    #[test]
+    fn source_note_and_rewrite_agree_on_the_effective_source() {
+        let official = "https://huggingface.co/org/repo/resolve/main/m.gguf";
+        assert!(download_mirror::source_note("").contains("官方"));
+        assert_eq!(download_mirror::rewrite_url(official, ""), official);
+
+        let note = download_mirror::source_note("https://hf-mirror.com/");
+        assert!(note.contains("镜像 https://hf-mirror.com"), "note={note}");
+        assert_eq!(
+            download_mirror::rewrite_url(official, "https://hf-mirror.com/"),
+            "https://hf-mirror.com/org/repo/resolve/main/m.gguf"
+        );
+    }
+
+    /// 并发数只允许从 `download::effective_concurrency` 推导，不许在别处写死。
+    ///
+    /// 这条防的是"界面回显 2 并发、队列其实起了 4 个"（或反过来）。
+    #[test]
+    fn concurrency_is_derived_from_one_place() {
+        let src = include_str!("main.rs");
+        let production = src.split("mod tests {").next().unwrap_or(src);
+        let calls = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("download::effective_concurrency("))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "并发数只允许在 `effective_download_concurrency` 里一处归一化（现在 {calls} 处）"
+        );
+        assert!(
+            production.contains("Some(concurrency),"),
+            "队列线程数必须来自 `effective_download_concurrency()`，不能另写一个常量"
+        );
+    }
+
+    /// 「真正决定这次走哪条源」的改写只允许一处：`download_mirror_rewrite`。
+    ///
+    /// 防的是本仓反复抓的形态：界面上写"当前源是镜像"，实际请求另一处悄悄用官方
+    /// （或反过来）。队列的入队回调必须传 `download_mirror_rewrite`。
+    ///
+    /// **刻意豁免**：`AW_UI_STATE=download-source` 那个只读演示态要摆"改写前/后"两行
+    /// 对照——`download_source_demo_lines()` 整个函数体被排除（它只 `eprintln!`，
+    /// 不参与真实请求）。豁免是**按函数名**给的，不是按文件给的：在别的任何地方
+    /// 再加一处改写，计数立刻超标。
+    ///
+    /// 注意针的写法：`rewrite_url` 这个名字在**本用例自己的源码**里也会出现，
+    /// 所以只能统计"调用点"，不能统计裸名字（否则断言会被自己的源码喂饱、恒真——本仓踩过）。
+    #[test]
+    fn rewrite_url_has_exactly_one_production_call_site() {
+        let src = include_str!("main.rs");
+        let production = src.split("mod tests {").next().unwrap_or(src);
+        let demo_start = production
+            .find("fn download_source_demo_lines()")
+            .expect("演示对照函数必须存在（守卫按这个函数名给豁免）");
+        let after = &production[demo_start..];
+        let demo_end = after
+            .find("\n}\n")
+            .map(|i| demo_start + i)
+            .expect("演示对照函数应有结束花括号");
+        let mut needle = production[..demo_start].to_string();
+        needle.push_str(&production[demo_end..]);
+        // 排除注释行（守卫自己的 doc 注释里就会出现这个名字）
+        let calls = needle
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("download_mirror::rewrite_url("))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "改写 URL 只允许在 `download_mirror_rewrite` 里一处（现在 {calls} 处）：\
+             两处实现必然漂移，界面说镜像、实际走官方就是这么来的"
+        );
+        assert!(
+            production.contains("download_mirror_rewrite,"),
+            "入队回调必须传 `download_mirror_rewrite`，不能另写改写逻辑"
         );
     }
 
