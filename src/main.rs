@@ -446,8 +446,12 @@ struct EvalSummary {
     asr_error: Option<String>,
     /// 最差 N 句（按可懂度升序；只含有差异的句子）
     worst: Vec<EvalIssue>,
-    /// 全部评上的分数（句 index → 可懂度%），给句子行展示用
-    scores: Vec<(usize, f64)>,
+    /// 跑完之后**工程里的完整分数集**：句 index → （可懂度% + 这份分的来源模型）。
+    ///
+    /// 来源模型挂在同一个元组里，不另开一个 `Vec` —— 两处分别维护必然漂移，
+    /// 而这里一漂移，界面就会把"分是谁测的"说错（本批要修的就是这个）。
+    /// 元组第二项是 `Option`：`None` = 这份分**来源未知**（本字段引入前的旧记录）。
+    scores: Vec<(usize, f64, Option<String>)>,
     /// 分数/报告没能落盘时的说明（都成功为 None）——分数仍然有效，但要如实告诉你它没落盘
     persist_warning: Option<String>,
     /// 质检报告的落盘路径（人可读的逐句对照表；写失败为 None）
@@ -1846,9 +1850,10 @@ fn refresh_asr_models(ui: &MainWindow) {
 ///
 /// 归属：回读模型只影响配音页的质检，所以放在本页「高级」里，不进全局抽屉
 /// （`LESSON_全局容器只放全局项单Tab独有的放本页`）。
-fn wire_asr_model(ui: &MainWindow, state: &Rc<UiState>) {
+fn wire_asr_model(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
     let weak = ui.as_weak();
     let st = state.clone();
+    let rw = rows.clone();
     ui.on_asr_model_picked(move |i| {
         let Some(ui) = weak.upgrade() else { return };
         // 质检在跑时不让换：worker 手里那条命令已经带着当时的模型名，
@@ -1865,16 +1870,21 @@ fn wire_asr_model(ui: &MainWindow, state: &Rc<UiState>) {
         if let Some(id) = picked.filter(|id| *id != current) {
             match persist_asr_model(&id) {
                 Ok(saved) => {
-                    // 如实说清：盘上那份分数是**上一个模型**测的。本批不给分数打模型标记，
-                    // 所以不能假装它还是当前结论——但也不擅自清分（见 docs 的已知边界）。
-                    let note = if st.eval_scores.borrow().is_empty() {
+                    // 如实说清盘上那些分是**谁**测的：来源取自分数自己的标记，
+                    // 与常驻说明同一句推导（`qa_source_note`）——以前那句"可能是上一个
+                    // 模型测的"没有数据支撑，说不出是哪个模型。仍不擅自清分。
+                    let sources = ledger_score_sources(&st);
+                    let note = if sources.scored == 0 {
                         format!("回读模型已改为 {saved}（下次质检生效）")
                     } else {
                         format!(
-                            "回读模型已改为 {saved}：现有分数是上一个模型测的，建议重新质检一次再看结论"
+                            "回读模型已改为 {saved}。{}",
+                            qa_source_note(&sources, &saved)
                         )
                     };
                     ui.set_status_text(note.into());
+                    // 常驻说明要跟着当前模型刷新（它按"当前模型 vs 分数来源"算）
+                    sync_qa_actions(&ui, &rw, &st);
                 }
                 Err(e) => ui.set_status_text(
                     format!("回读模型没能保存（{e}）：重启后会回到上次的选择").into(),
@@ -3796,7 +3806,9 @@ fn worker_loop(ctx: WorkerCtx) {
                 let total = done.len();
                 let mut project = project;
                 let mut issues: Vec<EvalIssue> = Vec::new();
-                let mut scores: Vec<(usize, f64)> = Vec::new();
+                // (句 index, 可懂度%, 这份分的来源模型)。用真模型 `model` 写下，
+                // 不另算一份——报告与工程标记必须同源。
+                let mut scores: Vec<(usize, f64, Option<String>)> = Vec::new();
                 let mut rows: Vec<EvalRow> = Vec::new();
                 let mut sum = 0.0f64;
                 let mut scored = 0usize;
@@ -3826,7 +3838,7 @@ fn worker_loop(ctx: WorkerCtx) {
                                 aw_core::diff_snippet(&reference, &hypothesis).unwrap_or_default();
                             sum += score.percent;
                             scored += 1;
-                            scores.push((*idx, score.percent));
+                            scores.push((*idx, score.percent, Some(model.clone())));
                             rows.push(EvalRow {
                                 index: *idx,
                                 reference: reference.clone(),
@@ -3835,11 +3847,9 @@ fn worker_loop(ctx: WorkerCtx) {
                                 snippet: snippet.clone(),
                             });
                             // 顺手写进工程：质检结果要能跨会话留存（否则每次开都要重跑 N 句 ASR）
-                            if let Some(sen) =
-                                project.sentences.iter_mut().find(|s| s.index == *idx)
-                            {
-                                sen.eval_percent = Some(score.percent);
-                            }
+                            // 分数与来源模型**同一处写入**（`record_eval_score`）——
+                            // 报告念的也是同一个 `model` 变量，两边不会各说一套。
+                            record_eval_score(&mut project, *idx, score.percent, &model);
                             // 只收"有差异"的句子：worst 为空就等于全部一致
                             // （否则满分句也会被列成"最差 第 1 句 100%"，复核指出过）
                             if score.distance > 0 {
@@ -3905,8 +3915,10 @@ fn worker_loop(ctx: WorkerCtx) {
                 // 少给就会让磁盘有分、界面没分（复核抓到的不一致）。
                 for sen in &project.sentences {
                     if let Some(percent) = sen.eval_percent {
-                        if sen.status == "done" && !scores.iter().any(|(i, _)| *i == sen.index) {
-                            scores.push((sen.index, percent));
+                        if sen.status == "done" && !scores.iter().any(|(i, _, _)| *i == sen.index) {
+                            // 带上这份分**原本**的来源：本轮没测到而沿用的旧分，
+                            // 来源是它当年那次质检的模型，不是本轮这个 `model`。
+                            scores.push((sen.index, percent, sen.eval_model.clone()));
                         }
                     }
                 }
@@ -4746,6 +4758,13 @@ struct UiState {
     eval_task: std::cell::Cell<Option<u32>>,
     /// 质检分数（句 index → 可懂度%）。重新合成/改稿后要清掉——分数会失效
     eval_scores: RefCell<HashMap<usize, f64>>,
+    /// 每份分数**是哪个回读模型测的**（句 index → `Some(model)` / `None`=来源未知）。
+    ///
+    /// 与 `eval_scores` 同生共死：**所有写入都必须走 `replace_eval_ledger` /
+    /// `clear_eval_ledger` / `drop_eval_ledger`**，由 `eval_ledger_is_written_from_one_place`
+    /// 那条源码守卫钉住。单独改一份会造出"分数在、来源丢"，界面会把那种组合
+    /// 误报成"来源未知的旧记录"。
+    eval_models: RefCell<HashMap<usize, Option<String>>>,
     /// 句子列表当前是否按质检分数升序展示。只影响视图，不改工程。
     qa_sorted: std::cell::Cell<bool>,
     /// 连续点「跳到最差句」时给滚动目标加个不可见的亚像素偏移，
@@ -4886,7 +4905,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_versions(&ui, &rows, &cmd_tx, &state);
     wire_dictionary(&ui, &rows, &cmd_tx, &msg_tx_ui, &state);
     load_active_dictionary(&ui, &state);
-    wire_asr_model(&ui, &state);
+    wire_asr_model(&ui, &rows, &state);
     refresh_asr_models(&ui);
     // voice-clone 批给这个函数加了 msg_tx_ui（「自动转写」要后台跑 ASR 再回消息）
     wire_voice_panel(&ui, &cmd_tx, &msg_tx_ui, &state);
@@ -5158,6 +5177,65 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             refresh_download_rows(ui, ui_state);
             ui.set_status_text(
                 format!("模型下载源：{ready} 个有下载入口 · {missing} 个如实标了没有源").into(),
+            );
+        }
+        "qa-tag" => {
+            // 只读演示/核对态：把"换过回读模型"的三条口径都摆出来（纯函数，不碰任何配置）。
+            // 不读用户真设置当输入，否则输出会随每个人的 settings.json 漂移。
+            let mismatch = ScoreSources {
+                models: vec!["fun-asr".into()],
+                unknown: 0,
+                scored: 12,
+            };
+            let same = ScoreSources {
+                models: vec!["audio8-asr".into()],
+                unknown: 0,
+                scored: 12,
+            };
+            let legacy = ScoreSources {
+                models: vec![],
+                unknown: 9,
+                scored: 9,
+            };
+            eprintln!(
+                "AW_UI_STATE=qa-tag：换过模型 -> {}",
+                qa_source_note(&mismatch, "audio8-asr")
+            );
+            eprintln!(
+                "AW_UI_STATE=qa-tag：同一模型 -> {}",
+                qa_source_note(&same, "audio8-asr")
+            );
+            eprintln!(
+                "AW_UI_STATE=qa-tag：旧工程（无来源） -> {}",
+                qa_source_note(&legacy, "audio8-asr")
+            );
+            // 再走一遍真实路径：灌台账 → sync_qa_actions（界面读的就是它）
+            let n = rows.row_count().max(1);
+            replace_eval_ledger(
+                ui_state,
+                &(0..n)
+                    .map(|i| (i, 90.0 + i as f64, Some("fun-asr".to_string())))
+                    .collect::<Vec<_>>(),
+            );
+            sync_qa_actions(ui, rows, ui_state);
+            eprintln!(
+                "AW_UI_STATE=qa-tag：界面 qa-source-note / 换过模型（当前回读模型 = {}）-> {}",
+                effective_asr_model(&settings_snapshot()),
+                ui.get_qa_source_note()
+            );
+            // 旧工程那条也过一遍**真实路径**（`None` = 来源未知），证明它确实能上屏，
+            // 不是只活在纯函数里。
+            replace_eval_ledger(
+                ui_state,
+                &(0..n)
+                    .map(|i| (i, 90.0 + i as f64, None))
+                    .collect::<Vec<_>>(),
+            );
+            sync_qa_actions(ui, rows, ui_state);
+            eprintln!(
+                "AW_UI_STATE=qa-tag：界面 qa-source-note / 旧工程（当前回读模型 = {}）-> {}",
+                effective_asr_model(&settings_snapshot()),
+                ui.get_qa_source_note()
             );
         }
         "engines" => {
@@ -5436,8 +5514,9 @@ fn restore_project(
     state.auto_normalize_seen.set(project.auto_normalize);
     ui.set_gap_ms_text(project.gap_ms.to_string().into());
     let done = apply_project_to_rows(ui, rows, &project);
-    // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）
-    *state.eval_scores.borrow_mut() = scores_from_project(&project);
+    // 质检分数是句级持久化的：启动就把它们贴回行上（否则"重开还能看到"要等下一次合成）。
+    // **分数连同它的来源模型一起回灌**：只灌分数会让旧工程被误报成"来源未知"。
+    replace_eval_ledger(state, &eval_ledger_from_project(&project));
     apply_eval_labels(rows, &state.eval_scores.borrow());
     sync_qa_actions(ui, rows, state);
     // BGM 产物是落盘的：重开应用也要看到上次那几轨（否则"昨天混好的分轨今天导不出来"）
@@ -5586,6 +5665,77 @@ fn eval_done_selection(rows: &[Sentence], scores: &HashMap<usize, f64>) -> (Opti
     }
 }
 
+/// 一份分数集的「来源」投影。
+///
+/// 三种情况必须分开，这正是本批要修的（以前只有一句笼统的"可能是上一个模型测的"）：
+/// · 有明确来源 → 按模型归组；
+/// · **有分但来源未知** → 旧工程在记录来源之前测的，既不能冒充"匹配"、也不能当成"没测过"；
+/// · 没分的句子根本不进这里（那才是真的"没测过"）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ScoreSources {
+    /// 出现过的来源模型（去重 + 排序，保证同输入同输出）
+    models: Vec<String>,
+    /// 有分但**来源未知**的句数
+    unknown: usize,
+    /// 有分的总句数
+    scored: usize,
+}
+
+/// 从 UI 台账投影出"这些分是谁测的"。
+///
+/// 判据只看台账（不看 `Sentence`）：排序 / 最差句按钮消费的也是这份台账，
+/// 口径不会分叉。台账里缺来源条目按"未知"处理——宁可说不知道，也不冒充匹配。
+fn ledger_score_sources(state: &UiState) -> ScoreSources {
+    let scores = state.eval_scores.borrow();
+    let models = state.eval_models.borrow();
+    let mut out = ScoreSources::default();
+    for index in scores.keys() {
+        out.scored += 1;
+        match models.get(index).and_then(|m| m.as_deref()) {
+            Some(model) if !model.trim().is_empty() => out.models.push(model.to_string()),
+            _ => out.unknown += 1,
+        }
+    }
+    out.models.sort();
+    out.models.dedup();
+    out
+}
+
+/// 「现有分数是谁测的」这一句：只陈述事实 + 给下一步，不做任何自动动作
+/// （不自动作废、不自动重测——那是产品决定，见 `docs/quality-check.md` §5）。
+///
+/// `current` 是当前生效的回读模型（唯一入口 `effective_asr_model`）。
+fn qa_source_note(sources: &ScoreSources, current: &str) -> String {
+    if sources.scored == 0 {
+        return String::new();
+    }
+    let scored = sources.scored;
+    let unknown = sources.unknown;
+    let known = scored - unknown;
+    let models = sources.models.join("、");
+    if sources.models.is_empty() {
+        // 全是来源未知的旧记录：既不能说"匹配"，也不能说"没测过"
+        return format!(
+            "现有 {scored} 句的分数是【来源未知】的旧记录（早于本应用记录来源的版本）：\
+             无法判断它们是不是 {current} 测的，建议重新质检一次再看结论"
+        );
+    }
+    if unknown > 0 {
+        return format!(
+            "现有 {scored} 句的分数里：{models} 测的 {known} 句；另 {unknown} 句来源未知（旧记录）。\
+             当前回读模型是 {current}——来源未知的那部分无法判断是不是它测的，建议重新质检一次"
+        );
+    }
+    if sources.models.len() == 1 && sources.models[0] == current {
+        // 来源明确且就是当前模型：不误报
+        return format!("现有 {scored} 句的分数就是 {current} 测的");
+    }
+    format!(
+        "现有 {scored} 句的分数是 {models} 测的，当前回读模型是 {current}\
+         ——换模型会改变质检口径，建议重新质检一次再看结论"
+    )
+}
+
 /// 排序按钮和跳转按钮共用的可用性判据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QaActionView {
@@ -5621,6 +5771,11 @@ fn qa_action_view_for_ui(
 
 fn sync_qa_actions(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiState>) {
     let view = qa_action_view_for_ui(ui, rows, state);
+    // 来源说明与"按钮能不能点"在同一次刷新里算：两者都只在分数集 / 当前回读模型变化时变。
+    // 分两处刷就会出现"按钮按当前状态算、文案还停在上一轮"（本仓反复抓的形态）。
+    // 当前回读模型的**唯一入口**是 `effective_asr_model`（与 worker 请求、报告同源）。
+    let current = effective_asr_model(&settings_snapshot());
+    ui.set_qa_source_note(qa_source_note(&ledger_score_sources(state), &current).into());
     if rows.row_count() == 0 {
         return;
     }
@@ -5703,7 +5858,7 @@ fn jump_to_worst(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiSt
 /// 分数失效的核心状态迁移：清分数、取消排序视角并回到工程原顺序。
 /// 拆出来让单测不用构造窗口也能验证“失效后回原序”。
 fn reset_eval_view(rows: &Rc<VecModel<Sentence>>, state: &UiState) {
-    state.eval_scores.borrow_mut().clear();
+    clear_eval_ledger(state);
     state.qa_sorted.set(false);
     apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
 }
@@ -6519,17 +6674,61 @@ fn run_finished_note(
     }
 }
 
-/// 从工程里取质检分数：**只接受状态是「已合成」的句子**。
+/// 从工程里取质检台账：**只接受状态是「已合成」的句子**。
 ///
 /// 失败/待合成的句子即使文件里还留着旧分数也不贴出来——那种分数描述的不是当前这句
 /// 可用的音频（复核建议：回灌要按状态过滤）。
-fn scores_from_project(project: &Project) -> HashMap<usize, f64> {
+///
+/// 每项带 `Option<String>` 的来源模型。**旧工程缺这个字段时是 `None`，要保持 `None`**：
+/// 那是"来源未知"，不是"没测过"（没测过由 `eval_percent == None` 表达，根本不在这里）。
+fn eval_ledger_from_project(project: &Project) -> Vec<(usize, f64, Option<String>)> {
     project
         .sentences
         .iter()
         .filter(|s| s.status == "done")
-        .filter_map(|s| s.eval_percent.map(|p| (s.index, p)))
+        .filter_map(|s| s.eval_percent.map(|p| (s.index, p, s.eval_model.clone())))
         .collect()
+}
+
+/// 把一次成功的回读结果写进工程：**分数与来源模型同进同出**。
+///
+/// 抽成函数有两个理由：
+/// · 报告念的模型（`qa_report_markdown(.., &model, ..)`）与工程里记的来源必须是
+///   **同一个入参**；两处各写一份 `model.clone()` 就会漂移成"报告写 A、工程记 B"；
+/// · app 侧写 `eval_percent` 只允许在这里一处（源码守卫钉住）。
+fn record_eval_score(project: &mut Project, index: usize, percent: f64, model: &str) {
+    if let Some(sen) = project.sentences.iter_mut().find(|s| s.index == index) {
+        sen.eval_percent = Some(percent);
+        sen.eval_model = Some(model.to_string());
+    }
+}
+
+/// 质检台账（分数 + 来源）的**唯一整体替换入口**。
+///
+/// 两份 map 分开存，是因为 `eval_scores` 的消费者（排序 / 最差句 / 行标签）只关心分数，
+/// 不值得为来源模型改它们的签名；代价就是这条约束：**只能从这里写**。
+fn replace_eval_ledger(state: &UiState, entries: &[(usize, f64, Option<String>)]) {
+    let mut scores = state.eval_scores.borrow_mut();
+    let mut models = state.eval_models.borrow_mut();
+    scores.clear();
+    models.clear();
+    for (index, percent, model) in entries {
+        scores.insert(*index, *percent);
+        models.insert(*index, model.clone());
+    }
+}
+
+/// 台账整体清空（分数与来源一起清）。
+fn clear_eval_ledger(state: &UiState) {
+    state.eval_scores.borrow_mut().clear();
+    state.eval_models.borrow_mut().clear();
+}
+
+/// 摘掉一句的台账（返回"原来有没有分数"）。分数与来源一起摘。
+fn drop_eval_ledger(state: &UiState, index: usize) -> bool {
+    let had = state.eval_scores.borrow_mut().remove(&index).is_some();
+    state.eval_models.borrow_mut().remove(&index);
+    had
 }
 
 /// 质检分数在句子行上的标签。低于阈值加 ⚠ 前缀提醒看一眼。
@@ -8607,8 +8806,9 @@ fn tick(
                 // 载入/续作后先回到工程顺序；分数可以保留，但“按分数看”的视图不跨轮次沿用。
                 state.qa_sorted.set(false);
                 apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
-                // 工程里的质检分数回灌（跨会话留存：重开应用不用重跑 ASR）
-                *state.eval_scores.borrow_mut() = scores_from_project(&project);
+                // 工程里的质检分数回灌（跨会话留存：重开应用不用重跑 ASR）。
+                // 来源模型一起灌，否则"谁测的"会随每次重开丢失（旧工程仍是 None=未知）。
+                replace_eval_ledger(state, &eval_ledger_from_project(&project));
                 apply_project_to_rows(ui, rows, &project);
                 apply_eval_labels(rows, &state.eval_scores.borrow());
                 sync_qa_actions(ui, rows, state);
@@ -8640,7 +8840,8 @@ fn tick(
                 // 与磁盘同一个触发点：aw-core 在**开始重做**时就把旧分作废并落盘，
                 // 所以 UI 在 running（以及随后的 done/error）都清——两边不会说法不一。
                 if sentence_message_invalidates_score(&status) {
-                    let had = state.eval_scores.borrow_mut().remove(&index).is_some();
+                    // 分数与来源一起摘（唯一写入点）；只摘分数会留下"有来源、没分"的孤儿
+                    let had = drop_eval_ledger(state, index);
                     // 这句刚被重做，旧质检结论不再能代表当前音频；排序视角也回原序。
                     state.qa_sorted.set(false);
                     apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
@@ -9052,14 +9253,8 @@ fn tick(
                     continue;
                 }
                 // summary.scores 是**这次跑完之后工程里的完整分数集**（本次评上的 +
-                // ASR 失败但保留的旧分），所以这里是整体替换，与磁盘一致。
-                {
-                    let mut scores = state.eval_scores.borrow_mut();
-                    scores.clear();
-                    for (idx, percent) in &summary.scores {
-                        scores.insert(*idx, *percent);
-                    }
-                }
+                // ASR 失败但保留的旧分），每项自带来源模型，所以这里是整体替换，与磁盘一致。
+                replace_eval_ledger(state, &summary.scores);
                 // 新的一轮质检结束后先回工程原序；排序要不要开由用户点按钮决定。
                 state.qa_sorted.set(false);
                 apply_row_order(rows, restore_project_order(rows_as_vec(rows)));
@@ -14272,7 +14467,11 @@ mod tests {
             asr_failed: 0,
             asr_error: None,
             worst: Vec::new(),
-            scores: vec![(0, 100.0), (1, 100.0), (2, 100.0)],
+            scores: vec![
+                (0, 100.0, Some("fun-asr".into())),
+                (1, 100.0, Some("fun-asr".into())),
+                (2, 100.0, Some("fun-asr".into())),
+            ],
             persist_warning: None,
             report_path: None,
         };
@@ -14286,7 +14485,10 @@ mod tests {
             scored: 57,
             asr_failed: 2,
             asr_error: None,
-            scores: vec![(0, 100.0), (11, 92.3)],
+            scores: vec![
+                (0, 100.0, Some("fun-asr".into())),
+                (11, 92.3, Some("fun-asr".into())),
+            ],
             persist_warning: Some("分数未写入工程：磁盘空间不足（需要 0.1 MB）".into()),
             report_path: Some(std::path::PathBuf::from("/tmp/示例工程/qa-report.md")),
             worst: vec![EvalIssue {
@@ -14520,12 +14722,24 @@ mod tests {
             qa_sorted: std::cell::Cell::new(true),
             ..UiState::default()
         };
-        *state.eval_scores.borrow_mut() = scores;
+        // 走台账的统一写入点：分数与来源一起灌
+        replace_eval_ledger(
+            &state,
+            &[
+                (0, 99.0, Some("fun-asr".into())),
+                (1, 80.0, Some("fun-asr".into())),
+                (2, 90.0, Some("fun-asr".into())),
+            ],
+        );
 
         reset_eval_view(&model, &state);
 
         assert!(!state.qa_sorted.get());
         assert!(state.eval_scores.borrow().is_empty());
+        assert!(
+            state.eval_models.borrow().is_empty(),
+            "失效要连来源一起清，否则会留下'有来源、没分数'的孤儿"
+        );
         assert_eq!(
             rows_as_vec(&model)
                 .iter()
@@ -14601,7 +14815,7 @@ mod tests {
                 percent: 92.3,
                 snippet: "…【应为 例，读到 力】…".into(),
             }],
-            scores: vec![(11, 92.3)],
+            scores: vec![(11, 92.3, Some("fun-asr".into()))],
             persist_warning: Some("分数未写入工程：磁盘空间不足（需要 0.1 MB）".into()),
             report_path: Some(std::path::PathBuf::from("/tmp/示例工程/qa-report.md")),
         };
@@ -14617,9 +14831,10 @@ mod tests {
         );
     }
 
-    /// 从工程取质检分数：只接受「已合成」的句子（失败句即使文件里留着旧分也不贴）。
+    /// 从工程取质检台账：只接受「已合成」的句子（失败句即使文件里留着旧分也不贴），
+    /// 并且**带上这份分的来源模型**——`None`（旧记录）要原样保留，不能顺手填成当前模型。
     #[test]
-    fn scores_from_project_keeps_only_done_sentences() {
+    fn eval_ledger_from_project_keeps_only_done_sentences_and_their_source() {
         let mut prj = Project::new(
             "第一句。第二句。第三句。",
             "audio8-tts",
@@ -14632,16 +14847,244 @@ mod tests {
         );
         prj.sentences[0].status = "done".into();
         prj.sentences[0].eval_percent = Some(99.0);
+        prj.sentences[0].eval_model = Some("fun-asr".into());
         prj.sentences[1].status = "error: 模型没加载".into();
         prj.sentences[1].eval_percent = Some(50.0); // 脏数据：失败句不该贴出来
+        prj.sentences[1].eval_model = Some("fun-asr".into());
         prj.sentences[2].status = "done".into();
-        prj.sentences[2].eval_percent = None;
+        prj.sentences[2].eval_percent = Some(88.0);
+        prj.sentences[2].eval_model = None; // 有分但无来源（本字段引入前的记录）
 
-        let scores = scores_from_project(&prj);
-        assert_eq!(scores.get(&0), Some(&99.0));
-        assert_eq!(scores.get(&1), None, "失败句的旧分数不能贴");
-        assert_eq!(scores.get(&2), None, "没测过的句子没有分数");
-        assert_eq!(scores.len(), 1);
+        let ledger = eval_ledger_from_project(&prj);
+        assert_eq!(
+            ledger,
+            vec![(0, 99.0, Some("fun-asr".to_string())), (2, 88.0, None)],
+            "失败句的旧分数不能贴；有分的那两句要连来源一起带出来"
+        );
+        assert!(
+            ledger.iter().all(|(index, _, _)| *index != 1),
+            "失败句（status=error）不该进台账"
+        );
+        assert_eq!(
+            ledger[1].2, None,
+            "旧工程的「来源未知」要原样保留——回灌时不能被填成当前模型"
+        );
+    }
+
+    /// ② 分数与来源模型**同一次写入**：只写一半就会造出"分在、来源丢"的假未知。
+    #[test]
+    fn record_eval_score_writes_the_score_and_its_source_together() {
+        let mut prj = Project::new(
+            "第一句。第二句。",
+            "audio8-tts",
+            GAP_MS,
+            BASE_SEED,
+            None,
+            DEFAULT_PUNCTUATION,
+            MAX_CHARS,
+            |t| t.to_string(),
+        );
+        record_eval_score(&mut prj, 1, 88.5, "fun-asr");
+        assert_eq!(prj.sentences[1].eval_percent, Some(88.5));
+        assert_eq!(prj.sentences[1].eval_model.as_deref(), Some("fun-asr"));
+        assert_eq!(prj.sentences[0].eval_percent, None, "只写被点名的那一句");
+        assert_eq!(prj.sentences[0].eval_model, None);
+    }
+
+    /// ② 「报告念的模型」与「工程里记的来源」必须来自**同一个入参**。
+    ///
+    /// 本仓反复抓的形态就是两处各写一份：报告写 A、工程记 B，用户看到两个说法。
+    /// 钉两件事 —— ① app 侧写 `eval_percent` 只允许在 `record_eval_score` 里一处；
+    /// ② 报告调用点传的必须是那个 `model` 变量（不是字面量、也不是另算一份）。
+    #[test]
+    fn qa_report_and_the_project_tag_read_the_same_run_model() {
+        let src = include_str!("main.rs");
+        let production = src.split("mod tests {").next().unwrap_or(src);
+        let writes = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("eval_percent = Some("))
+            .count();
+        assert_eq!(
+            writes, 1,
+            "分数只允许在 `record_eval_score` 里一处写（现在 {writes} 处）——\
+             分数与来源模型必须同进同出"
+        );
+        // 报告调用点：折掉空白再比，免得被缩进变化骗过
+        let squashed = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            squashed.contains("qa_report_markdown( &project_name, &model,"),
+            "报告必须念本次实际用的 model，不能写死模型名或另算一份"
+        );
+    }
+
+    /// 台账的唯一写入点：分数与来源必须一起改。
+    ///
+    /// 分两个 map 是为了不动 `eval_scores` 的既有消费者（排序 / 最差句 / 行标签），
+    /// 代价就是这条约束。单独改一份会造出"分数在、来源丢"，
+    /// 而那种组合会被 `ledger_score_sources` 判成"来源未知"——界面开始说谎。
+    #[test]
+    fn eval_ledger_is_written_from_one_place() {
+        let src = include_str!("main.rs");
+        let production = src.split("mod tests {").next().unwrap_or(src);
+        let writes = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("eval_models.borrow_mut()"))
+            .count();
+        assert_eq!(
+            writes, 3,
+            "`eval_models` 只允许在 replace / clear / drop 三个 helper 里写（现在 {writes} 处）"
+        );
+        for f in [
+            "fn replace_eval_ledger(",
+            "fn clear_eval_ledger(",
+            "fn drop_eval_ledger(",
+        ] {
+            assert!(production.contains(f), "台账入口必须存在：{f}");
+        }
+    }
+
+    /// ① 换过回读模型：必须**指名道姓**说出"这些分是谁测的"和当前模型，并给下一步。
+    ///
+    /// 这条就是本批的由来：以前只有一句"现有分数是上一个模型测的"，说不出是哪个。
+    #[test]
+    fn qa_source_note_names_both_models_and_the_next_step_when_the_model_changed() {
+        let sources = ScoreSources {
+            models: vec!["fun-asr".into()],
+            unknown: 0,
+            scored: 12,
+        };
+        let note = qa_source_note(&sources, "audio8-asr");
+        assert!(note.contains("fun-asr"), "要说清是哪个模型测的：{note}");
+        assert!(note.contains("audio8-asr"), "要说出当前模型：{note}");
+        assert!(note.contains("12 句"), "要说清涉及几句：{note}");
+        assert!(note.contains("重新质检"), "要给下一步：{note}");
+        assert!(
+            !note.contains("上一个模型"),
+            "不能再是那句没有数据支撑的笼统说法：{note}"
+        );
+    }
+
+    /// ③ 同一个模型重测 / 换了又换回来：来源一致就**不误报**。
+    #[test]
+    fn qa_source_note_is_quiet_when_the_source_is_the_current_model() {
+        let note = qa_source_note(
+            &ScoreSources {
+                models: vec!["audio8-asr".into()],
+                unknown: 0,
+                scored: 7,
+            },
+            "audio8-asr",
+        );
+        assert!(note.contains("就是 audio8-asr 测的"), "{note}");
+        assert!(
+            !note.contains("建议重新质检"),
+            "来源一致就不该劝重测：{note}"
+        );
+    }
+
+    /// ④ 旧工程（没有 `eval_model`）= **来源未知**：既不能冒充"匹配"，也不能冒充"没测过"。
+    ///
+    /// 从**真实 JSON 形状**走一遍：反序列化旧工程 → 建台账 → 投影 → 文案。
+    /// 不直接构造 `ScoreSources`，否则"旧工程读出来就是 None"这一段会被跳过。
+    #[test]
+    fn legacy_scores_are_unknown_source_not_matching_and_not_untested() {
+        let legacy = r#"{
+            "model": "audio8-tts",
+            "gap_ms": 200,
+            "base_seed": 1,
+            "sentences": [
+                {"index": 0, "text": "甲。", "spoken": "甲。", "seed": 1,
+                 "status": "done", "eval_percent": 96.5}
+            ]
+        }"#;
+        let prj: Project = serde_json::from_str(legacy).expect("旧工程要能读");
+        assert_eq!(
+            prj.sentences[0].eval_model, None,
+            "旧工程没有这个字段 → 来源未知，不能凭空造一个模型名"
+        );
+
+        let state = UiState::default();
+        replace_eval_ledger(&state, &eval_ledger_from_project(&prj));
+        let sources = ledger_score_sources(&state);
+        assert_eq!(
+            sources,
+            ScoreSources {
+                models: vec![],
+                unknown: 1,
+                scored: 1
+            },
+            "有分但无来源 = 来源未知（既不是没测过、也不是匹配）"
+        );
+
+        let note = qa_source_note(&sources, "audio8-asr");
+        assert!(note.contains("来源未知"), "{note}");
+        assert!(!note.contains("没测过"), "来源未知 ≠ 没测过：{note}");
+        assert!(
+            !note.contains("就是 audio8-asr 测的"),
+            "不能冒充匹配：{note}"
+        );
+        assert!(note.contains("建议重新质检"), "要给下一步：{note}");
+    }
+
+    /// 「没测过」与「来源未知」是两回事：前者 `eval_percent == None`，压根不进台账，
+    /// 因此**不该有任何来源提示**（否则会把"还没跑过质检"说成"来源不明的旧记录"）。
+    #[test]
+    fn untested_sentences_produce_no_source_note_at_all() {
+        let state = UiState::default();
+        assert_eq!(ledger_score_sources(&state), ScoreSources::default());
+        assert_eq!(
+            qa_source_note(&ledger_score_sources(&state), "audio8-asr"),
+            "",
+            "一句都没测过时不该冒出来源说明"
+        );
+    }
+
+    /// 混合来源（一部分本轮重测、一部分 ASR 失败沿用旧分）：两边都要说，不能只报一边。
+    #[test]
+    fn qa_source_note_reports_the_mixed_case() {
+        let state = UiState::default();
+        replace_eval_ledger(
+            &state,
+            &[
+                (0, 99.0, Some("audio8-asr".into())),
+                (1, 80.0, None), // 本轮没测到，沿用来源未知的旧分
+            ],
+        );
+        let note = qa_source_note(&ledger_score_sources(&state), "fun-asr");
+        assert!(note.contains("audio8-asr"), "要有已知来源：{note}");
+        assert!(note.contains("来源未知"), "要有未知那部分：{note}");
+        assert!(note.contains("fun-asr"), "当前模型也要出现：{note}");
+        assert!(note.contains("重新质检"), "{note}");
+    }
+
+    /// ⑤ `eval_model` 的 serde 名漂移要能红。
+    ///
+    /// 参照 `server_json_keys_match_the_serde_field_names`：改名会**静默**退化成
+    /// `None`（=来源未知），界面只会说"来源未知"，谁也不会发现是字段名写错了。
+    #[test]
+    fn eval_model_key_matches_the_serde_field_name() {
+        let raw = r#"{
+            "model": "audio8-tts",
+            "gap_ms": 200,
+            "base_seed": 1,
+            "sentences": [
+                {"index": 0, "text": "甲。", "spoken": "甲。", "seed": 1,
+                 "status": "done", "eval_percent": 96.5, "eval_model": "fun-asr"}
+            ]
+        }"#;
+        let prj: Project = serde_json::from_str(raw).expect("工程要能反序列化");
+        assert_eq!(prj.sentences[0].eval_percent, Some(96.5));
+        assert_eq!(
+            prj.sentences[0].eval_model.as_deref(),
+            Some("fun-asr"),
+            "eval_model 必须按这个名字解析（改名就静默变成'来源未知'）"
+        );
+        // 落盘也要用同一个键名：roundtrip 一遍，不只看读的方向
+        let again: Project = serde_json::from_str(&serde_json::to_string(&prj).unwrap())
+            .expect("roundtrip 要能读回");
+        assert_eq!(again.sentences[0].eval_model.as_deref(), Some("fun-asr"));
     }
 
     /// UI 只在 `done`（新 wav 已落盘）作废质检分数；running/error 时音频没变，分数仍成立。
@@ -14805,6 +15248,22 @@ mod tests {
         assert!(
             on_disk.sentences.iter().all(|s| s.eval_percent.is_some()),
             "每句都应写入 eval_percent"
+        );
+        // ② 盘上那份分的**来源模型**必须与报告念的是同一个。
+        // 本次刻意用 audio8-asr（非默认的 qwen3-asr）：写死默认名的实现会在这里红，
+        // 而"报告与工程各写一份"的实现也会在这里红——两边必须同源。
+        let sources: Vec<_> = on_disk
+            .sentences
+            .iter()
+            .map(|s| s.eval_model.clone())
+            .collect();
+        assert!(
+            sources.iter().all(|m| m.as_deref() == Some("audio8-asr")),
+            "每句的 eval_model 都该是本次实际用的 audio8-asr，实得 {sources:?}"
+        );
+        assert!(
+            md.contains("回读模型：audio8-asr"),
+            "报告与工程标记同源：报告里的模型必须也是 audio8-asr：{md}"
         );
     }
 

@@ -283,6 +283,9 @@ export component MainWindow inherits Window {
     in-out property <int> asr-model-index: 0;
     in property <string> asr-model-note: "";
     callback asr-model-picked(int);
+    /// 现有质检分数**是谁测的**（与当前回读模型不一致时指名道姓）。
+    /// 由 Rust 侧 `sync_qa_actions` 投影，Slint 只显示，不自己拼条件。
+    in property <string> qa-source-note: "";
     callback dict-import();
     callback dict-export();
     callback version-save();
@@ -452,6 +455,7 @@ export component MainWindow inherits Window {
                     asr-model-index <=> root.asr-model-index;
                     asr-model-note: root.asr-model-note;
                     asr-model-picked(i) => { root.asr-model-picked(i); }
+                    qa-source-note: root.qa-source-note;
                     dict-import => { root.dict-import(); }
                     dict-export => { root.dict-export(); }
                     template-names: root.template-names;

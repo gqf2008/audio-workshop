@@ -672,6 +672,9 @@ export component DubWorkbench inherits Rectangle {
     in property <[string]> asr-model-names: [];
     in-out property <int> asr-model-index: 0;
     in property <string> asr-model-note: "";
+    /// 现有质检分数**是谁测的**。没分数时为空串（空则该行不占位）。
+    /// 只显示 Rust 侧算好的结论，不在这里拼任何条件。
+    in property <string> qa-source-note: "";
     in property <float> progress: 0.0;
     in property <bool> has-result: false;
     in property <string> export-dir: "";
@@ -895,6 +898,17 @@ export component DubWorkbench inherits Rectangle {
                         font-size: 12px;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                    }
+                    // 现有分数是谁测的：换过回读模型时**指名道姓**说出差异。
+                    // 没有分数时为空串，元素不参与布局（不占位、不挤压后面的按钮）。
+                    Text {
+                        visible: root.qa-source-note != "";
+                        text: root.qa-source-note;
+                        color: PixelTheme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        max-width: 420px;
                     }
                     PixelButton {
                         width: 112px;
