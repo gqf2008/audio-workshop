@@ -425,3 +425,37 @@ fn failed_resynthesis_leaves_no_score_on_disk() {
         on_disk.sentences[0].status
     );
 }
+
+/// 逐句 wav 落盘失败：该句必须标 `error:`（不能停在「待合成」）、状态必须落盘、
+/// 目录里不能留 `.tmp`。这条走的是**真实 synthesize 路径**（mock 服务返回可用 wav，
+/// 失败发生在落盘阶段），不是只测 helper。
+#[test]
+fn failed_sentence_write_is_marked_and_leaves_no_temp() {
+    let wav = support::tiny_wav(&[1i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let dir = temp_dir("write-fail-mark");
+    let mut prj = project();
+    // 第 1 句的目标路径先占成**目录**：rename(file → dir) 必然失败
+    std::fs::create_dir_all(dir.join("sentences/000.wav")).unwrap();
+
+    let err = prj
+        .synthesize(&client(&mock.base), &dir, None, |_, _| {})
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("000.wav"),
+        "错误文案要指到具体是哪一句：{err}"
+    );
+
+    let on_disk = Project::load(&dir).expect("失败状态必须落盘，不能只留在内存");
+    let st = &on_disk.sentences[0].status;
+    assert!(st.starts_with("error:"), "不能停在「待合成」：{st}");
+    assert_ne!(st, "pending", "不能停在「待合成」");
+
+    let leftovers: Vec<String> = std::fs::read_dir(dir.join("sentences"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "落盘失败要清临时文件：{leftovers:?}");
+}

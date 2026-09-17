@@ -186,6 +186,28 @@ class AssembleSpaceCheck(unittest.TestCase):
             self.assertEqual(leftovers, [], f"临时文件没清干净: {leftovers}")
 
 
+class AtomicWriteTemp(unittest.TestCase):
+    """`write_atomic` 失败必须清临时文件（与 Rust 侧 write_atomic / copy_atomic 同一不变式）。"""
+
+    def test_cleans_temp_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "001.wav")
+            os.makedirs(target)              # 目标是目录 → os.replace(file → dir) 必然失败
+            with self.assertRaises(OSError):
+                dub.write_atomic(target, b"payload")
+            leftovers = [f for f in os.listdir(d) if ".tmp" in f]
+            self.assertEqual(leftovers, [], f"临时文件没清干净: {leftovers}")
+            self.assertEqual(os.listdir(target), [], "失败不该把内容塞进目标目录")
+
+    def test_success_path_still_writes_and_leaves_no_temp(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "ok.wav")
+            dub.write_atomic(target, b"payload")
+            with open(target, "rb") as f:
+                self.assertEqual(f.read(), b"payload")
+            self.assertEqual([f for f in os.listdir(d) if ".tmp" in f], [])
+
+
 class AssembleHappyPath(unittest.TestCase):
     """③ 空间充足时正常拼装（新增检查不能把正常路径挡住）。"""
 

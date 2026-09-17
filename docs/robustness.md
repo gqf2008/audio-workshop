@@ -67,9 +67,10 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
   `write_failure_note`），但测试里触发的是**创建阶段**失败（只读目录），不是写到一半时才失败
   ——macOS 上没有便携的办法把某个文件写到一半就报 ENOSPC。这条按"映射已单测、触发时机未被
   e2e 覆盖"如实记录。
-- **逐句标 `error: ENOSPC` 后继续跑**：当前语义是**整轮中止**（继续跑只会每句都失败）。
-  工程里那句仍是「待合成」，所以释放空间后重跑会跳过已完成句、只重做没做完的部分——
-  结果等价，但工程文件里不会留下 `error: ENOSPC` 这条记录。
+- **逐句标 `error: ENOSPC` 后继续跑**：**语义仍是整轮中止**（继续跑只会每句都失败）。但
+  「标 error」这半边已在 `fix/write-fail-residue` 补上：落盘失败时该句标
+  `error: ENOSPC（需要 X MB）` 并 best-effort 落盘工程，所以工程文件里**会**留下哪一句、
+  为什么停的记录；释放空间后重跑依旧是「跳过已完成句、只重做没做完的」。
 - **`settings.json` 的原子写**：损坏时回落默认值，损失可忽略，本批不动。
 - **`tools/audio_dub.py`（M0 的 Python CLI）**：本批（Rust 侧）当时没有改它——它那份
   `write_atomic` 原本抛原始异常。**后续已在 `feat/cli-disk-boundary` 补齐**：`cmd_synth`
