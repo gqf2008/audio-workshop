@@ -464,6 +464,104 @@ pub fn separate_tracks(
 mod tests {
     use super::*;
 
+    /// 测试夹具路径：**运行期**解析，编译期路径只作兜底。
+    ///
+    /// `env!("CARGO_MANIFEST_DIR")` 是编译期常量，会被烧进测试二进制；这个 crate 的
+    /// 产物一旦被跨 worktree 复用（共享 `CARGO_TARGET_DIR`、worktree 改名/搬迁/删除），
+    /// 它指向的就是一个早已不存在的旧目录 —— 夹具找不到，报出来却像是真实代码回归。
+    /// cargo 跑测试时工作目录 = 包根，所以先按 cwd 找，编译期路径只当兜底。
+    ///
+    /// 抽成吃显式参数的函数是为了让"运行期优先"这条本身可测（用例直接喂两个假根）。
+    fn fixture_path_with(
+        rel: &str,
+        cwd: Option<&Path>,
+        manifest_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let mut tried = Vec::new();
+        if let Some(cwd) = cwd {
+            let from_cwd = cwd.join(rel);
+            if from_cwd.is_file() {
+                return Ok(from_cwd);
+            }
+            tried.push(from_cwd);
+        }
+        let from_manifest = manifest_dir.join(rel);
+        if from_manifest.is_file() {
+            return Ok(from_manifest);
+        }
+        tried.push(from_manifest);
+        Err(format!(
+            "找不到测试夹具 {rel}：依次检查了 {}。这通常意味着复用了在别处（别的目录名 / \
+             别的 worktree）编译出来的产物——测试二进制里烧着编译期的 CARGO_MANIFEST_DIR，\
+             指向已经不存在的旧路径。`touch crates/aw-core/src/lib.rs` 或 \
+             `cargo clean -p aw-core` 强制重建后再跑。",
+            tried
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        ))
+    }
+
+    /// `crates/aw-core/tests/fixtures/` 下的夹具路径（运行期解析，见上）。
+    fn fixture_path(rel: &str) -> PathBuf {
+        fixture_path_with(
+            rel,
+            std::env::current_dir().ok().as_deref(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// 夹具必须优先用**运行期** cwd 下那一份：两边都在（旧 worktree 与当前 cwd 各一份）
+    /// 时要拿 cwd 的，只有 cwd 有而编译期根不存在时也要能拿到。
+    ///
+    /// 阳性对照：把 `fixture_path_with` 改成先查 `manifest_dir`（或退回直接用编译期常量），
+    /// 本用例转红。
+    #[test]
+    fn fixture_path_prefers_runtime_cwd_over_baked_manifest_dir() {
+        let rel = "tests/fixtures/probe-0.2s.flac";
+        let root = std::env::temp_dir().join(format!("aw-fixture-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = root.join("current-worktree");
+        let gone = root.join("old-deleted-worktree-name");
+        std::fs::create_dir_all(cwd.join("tests/fixtures")).unwrap();
+        std::fs::write(cwd.join(rel), b"cwd-copy").unwrap();
+
+        // 1. 编译期那个根压根不存在（模拟"产物来自已被删掉的旧 worktree"）→ 仍能拿到夹具
+        let got = fixture_path_with(rel, Some(&cwd), &gone).unwrap();
+        assert_eq!(got, cwd.join(rel));
+
+        // 2. 两边都在 → 必须是运行期 cwd 那一份，而不是烧进产物的编译期路径
+        std::fs::create_dir_all(gone.join("tests/fixtures")).unwrap();
+        std::fs::write(gone.join(rel), b"from-old-worktree").unwrap();
+        let got = fixture_path_with(rel, Some(&cwd), &gone).unwrap();
+        assert_eq!(got, cwd.join(rel), "必须优先用运行期 cwd 下的夹具");
+        assert_eq!(std::fs::read(&got).unwrap(), b"cwd-copy");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 两条路径都不在时，错误信息要**同时列出两条被检查过的路径**，并点明"通常意味着
+    /// 复用了别处编译出来的产物"——否则跨 worktree 复用 target 的假红会被当成真实回归。
+    ///
+    /// 阳性对照：从错误里去掉任一条路径，或去掉"复用产物"那句提示，本用例转红。
+    #[test]
+    fn fixture_path_error_names_both_roots_and_the_reused_artifact_hint() {
+        let rel = "tests/fixtures/probe-0.2s.flac";
+        let cwd = Path::new("/definitely/not/here/current-cwd");
+        let manifest = Path::new("/definitely/not/here/old-worktree/crates/aw-core");
+        let err = fixture_path_with(rel, Some(cwd), manifest).unwrap_err();
+        assert!(err.contains(&cwd.join(rel).display().to_string()), "{err}");
+        assert!(
+            err.contains(&manifest.join(rel).display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains("复用"), "{err}");
+        assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
+        assert!(err.contains("aw-core"), "{err}");
+    }
+
     #[test]
     fn output_paths_use_the_stem_prefix() {
         let (v, a) = output_paths(Path::new("/tmp/out"), "0921 开箱口播");
@@ -608,7 +706,7 @@ mod tests {
         assert_eq!(input_sample_rate(&good).unwrap(), 8_000);
 
         // 2. 非 wav 但格式可探测（flac fixture，0.2s 8kHz 单声道）：拿到真实采样率
-        let flac = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-0.2s.flac");
+        let flac = fixture_path("tests/fixtures/probe-0.2s.flac");
         assert_eq!(
             input_sample_rate(&flac).unwrap(),
             8_000,
@@ -623,7 +721,7 @@ mod tests {
 
         // 2c. 上游同样不支持的容器（m4a/aac：symphonia 默认不含 aac/isomp4，上游也没开）
         //     —— 必须在**进模型之前**失败，并给出"支持哪些格式"的动作提示
-        let m4a = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-0.2s.m4a");
+        let m4a = fixture_path("tests/fixtures/probe-0.2s.m4a");
         let err = separate_tracks(
             &SeparationRequest {
                 input: m4a,
