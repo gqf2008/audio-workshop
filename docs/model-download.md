@@ -2,8 +2,9 @@
 
 > 2026-09-17。第一段（队列 / 校验 / 断点续传）见 §3–§4，对应 issue thread
 > `cc-ai-audio-workshop-model-download`；第二段（**下载源**）见 §1–§2，对应
-> `cc-ai-audio-workshop-model-sources`。
-> 只写**已经实现**的行为与边界，不写愿景。按机器推荐量化档 / 并行 / 镜像仍明确没做。
+> `cc-ai-audio-workshop-model-sources`；第三段（**体积 + 按机器推荐量化档**）见
+> §1.3–§1.4，对应 `cc-ai-audio-workshop-quant-recommend`。
+> 只写**已经实现**的行为与边界，不写愿景。并行多任务与下载源镜像仍明确没做。
 
 ## 1. 入口与数据来源
 
@@ -28,13 +29,19 @@
 `config/model-downloads.json`：
 
 ```sh
-python3 tools/gen_model_downloads.py           # 生成（AUDIOCPP_DIR 可覆盖上游位置）
-python3 tools/gen_model_downloads.py --check   # 与上游比对，不一致退出 1（发现"改了 spec 忘了重生成"）
+python3 tools/gen_model_downloads.py                 # 离线生成：体积沿用盘上已有的值
+python3 tools/gen_model_downloads.py --fetch-sizes   # 联网补体积后生成
+python3 tools/gen_model_downloads.py --check         # 与上游比对，不一致退出 1（不联网）
 ```
 
-- **不联网**：`size` / `sha256` 一律留空（生成必须离线可复现），下载器退化成按响应
-  `Content-Length` 校验大小。
+- **默认离线**：`sha256` 一律留空（生成不下载权重、不算哈希）；每个文件的 `bytes`
+  **沿用盘上清单里已有的值**（按 URL 对齐），没有就 `null`——不填 0、不拿别的档推算。
+  跑完会打印"这次没联网，N 条沿用清单里已有的值"。
+- `--fetch-sizes` 联网对每个文件发 `HTTP HEAD`，把**最终落点**的 `Content-Length` 写进
+  `files[].bytes`；包级 `packages[].bytes` 是文件之和，**任一文件未知就是 `null`**。
+- `--check` 与 `--fetch-sizes` 互斥（校验不联网）。
 - **逐字节稳定**：固定键序 + 固定缩进 + 行尾换行；同一份输入跑两次 `diff` 为空。
+  实测：联网跑两次产物逐字节相同；离线就地重生成与联网产物**逐字节相同**（体积沿用了回来）。
 
 ### 1.2 映射规则：**按落点，不按 family**
 
@@ -61,7 +68,74 @@ python3 tools/gen_model_downloads.py --check   # 与上游比对，不一致退�
 - 匹配不上 / 上游包没有公开下载源（`kind: unsupported`，如 `audio8-asr` 是
   CC-BY-NC-4.0 需本地转换）→ `status = "no-source"`，界面显示原因，**不猜地址**。
 
-### 1.3 服务清单的字段
+### 1.3 体积（`bytes`）是怎么取的
+
+**只认最终 2xx 那一跳的头。** HF 的 `/resolve/` 端点先回 302，那一跳的 `content-length`
+是**跳转响应体**的长度（实测 1038 B）——照着"HEAD 一下取 Content-Length"写，每个模型的
+体积都会变成 1 KB 左右，看起来还挺正常。所以生成脚本**自己跟跳转**（默认的 urllib 跳转
+处理器还会把 HEAD 降级成 GET，对着 2 GB 权重跑就等于为了量体积把整份下回来），只取最终
+落点那一跳的 `Content-Length`；最终落点没给长度时，退回跳转链上 HF 给的 `x-linked-size`。
+
+取不到（404 / 401 / 没有 `Content-Length` / 超时 / 跳转成环）一律写 `null` 并把原因打到
+stderr，**不填 0、不拿别的档累加、不猜**。不可下载的包（gated / 上游不支持）**根本不去探**：
+gated 仓库匿名 HEAD 必然 401，白跑一趟还会在日志里制造"取体积失败"的噪音。
+
+**辅助权重**（`session_options`，如 `qwen3_asr.forced_aligner_model_path`）也会折成
+`aux_bytes` + `aux_files`：它们常常是**另一个 family** 的包，按落点在全部 spec 里反查
+（`qwen3-asr` 的 forced aligner 就落在 `qwen3_forced_aligner` 这个 family 下）；查不到就把
+键名记进 `aux_unresolved`，不做无根据的估算。`aux_files` 单列一份是为了让**离线**重生成也
+能把它的体积沿用回来（它不在 `models[].packages` 里，没地方存）。
+
+### 1.4 档位与「本机推荐哪一档」
+
+**档位 = 与入口同一个目录里的可下载单文件包。** 不按 `target_directory`、更不按 family：
+
+- `target_directory` 太粗：`ace-step` 的 turbo / base / xl 是**不同变体**，都挂在
+  `ACE-Step1.5-GGUF` 下，混在一起会把"另一个模型"当成"另一档"；
+- family 更粗：`qwen3_asr` 同时管 0.6B 与 1.7B，`index_tts2` 同时管 2.0 与 2.5。
+
+多文件包（safetensors 等）不进档位列表：下载器还不支持多文件包（§6），列出来等于给一个
+点不了的入口。
+
+**推荐判据是纯函数**（`model_sources::recommend_tier`，输入 = 各档体积 + 本机尺度）：
+
+```text
+占用估算(档) = (下载体积 + 辅助权重) × 1.5 + 128 MiB     ← 服务内存守卫自己的公式
+需求(档)     = 占用估算(档) + 服务余量(min_free_memory_mb，缺省 1024 MiB)
+预算         = 物理内存 × 50%
+推荐         = 需求 ≤ 预算 里最大的那一档（体积升序里最后一个满足的）
+```
+
+- **为什么抄服务的公式**：只看下载体积会把运行时那部分全漏掉。实测 `qwen3-asr` 0.6B q8_0
+  权重 1.07 GiB、服务估的是 **3.31 GiB**（差 3 倍）；`index-tts2` 3.26 GiB → **5.02 GiB**；
+  `stable-audio-small-music` 目录树 1.57 GiB → **2.48 GiB**。三个数字都是真机 503 原文，
+  回归用例逐位钉住（上游改了系数这里不会自动知道，所以界面上说的始终是"估算"）。
+- **X = 50% 的理由**：服务的守卫比的是**当时可用**内存（macOS 上 free+inactive+purgeable），
+  而应用只知道**物理**内存总量；可用永远小于物理，而且差得很远——同一台 16 GiB 的机器上，
+  并行编译时服务只拿到 1.0–3.9 GiB 可用（物理的 6%–24%）。所以推荐是"这台机器适合哪一档"的
+  **规划口径**（一半留给系统、桌面、引擎常驻的其它模型与文件缓存），**天花板不是承诺**：
+  真正能不能加载由服务守卫决定，文案里不写"保证装得下"。
+- **为什么用物理内存而不是当时可用**：可用每秒钟都在变（同一台机器实测 1.0→3.9 GiB），
+  一个会跳的推荐等于没推荐；物理内存是稳定的机器属性。物理内存探测在
+  `model_sources::physical_memory_bytes()`（macOS `sysctl -n hw.memsize` / Linux
+  `/proc/meminfo` 的 `MemTotal` / Windows PowerShell 的 `TotalPhysicalMemory`），
+  解析是纯函数、平台探测走可注入的缝，两种格式在任一平台上都有用例。
+
+四种"没有答案"的情况**都有明确行为**（都不许瞎推荐）：
+
+| 情况 | 行为 |
+|---|---|
+| 只有一档 | 不给"推荐"（没得选），但说清这一档按本机内存**装得下 / 装不下** |
+| 体积未知 | 未知档不参与比较，理由里点明"另有 N 档体积未知，未参与比较"；全未知则不给结论 |
+| 内存未知 | 不给推荐，理由说"拿不到本机物理内存，不猜推荐"（**不是**"装不下"） |
+| 全都装不下 | 不给推荐档，理由给最小档的需求与预算两个数字 |
+
+**下载按钮下的仍然是"与清单 `path` 对应的那一档"**（`packages[].default` /
+`precision_preference` 选出来的入口）。推荐档与入口档不同时，界面上会补一句
+"下载按钮取的是 X"——否则就成了"推荐 f16、按钮却在 q8_0"的回显与行为分叉。
+要真按推荐档装，得同时把服务清单的 `path` 指过去，**本批不自动做**。
+
+### 1.5 服务清单的字段
 
 P7 给每个模型加了三个可选字段：
 
@@ -174,6 +248,18 @@ P7 给每个模型加了三个可选字段：
   `cancel` 如实区分 首次请求取消 / 已在取消中 / 其实已收尾。
   另有 UI 侧的点击语义测试（取消未收尾期间再点不会再排一条）。
 - 生成脚本：输出逐字节稳定（同输入跑两次 `diff` 为空）、`--check` 能发现被改过的产物。
+  体积解析（`tools/tests/test_gen_model_downloads.py`，stdlib `unittest`，用**真的本地 HTTP
+  服务器**）：取到 `Content-Length` / **跟跳转只认最终那一跳**（阳性对照：不跟跳转就会拿到
+  跳转响应体的 1038 B）/ 最终没有长度时退回 `x-linked-size` / 没有 `Content-Length` 要 `null`
+  不能填 0 / 404 与 401 如实报状态 / 超时要报超时；另有 `package_bytes` 任一文件未知即 `null`、
+  `aux_local_path` 的三类落点、`read_existing_sizes` 覆盖 `packages[].files` 与 `aux_files`，
+  以及"离线重生成与盘上逐字节一致"的端到端用例。
+  跑法：`python3 tools/tests/test_gen_model_downloads.py`。
+- 档位与推荐（`src/model_sources.rs`）：估算公式**逐位复现三个真机 503 数字**；多档取预算内
+  最大档、不是入口档时点明按钮取哪档；全都装不下 / 体积未知 / 内存未知 / 只有一档各有用例，
+  且 `tier` 为 `None`（界面不显示推荐档）；档位只收同目录单文件包（去掉目录过滤会把 ace-step
+  的 turbo / base 混成一堆"档位"）；辅助权重计入占用、未核实的辅助权重会带"估算偏低"；物理内存
+  三种平台格式 + 探测失败返回 `None`。
 - 规划纯函数（`src/model_sources.rs`）四类各有能红的用例：
   **服务清单带 url 时以服务为准**、**gated / 没有源不给入口**、**内置清单读不出来 ≠ 没有源**、
   **映射歧义**（同一个 `audio8_tts` family 下 0.6B 有包、0.1B 没有；`index_tts2` 选 2.5 而非
@@ -189,9 +275,11 @@ P7 给每个模型加了三个可选字段：
 
 ## 6. 本批没做（别按已实现宣传）
 
-- **按机器推荐量化档**（读 RAM / 显存）——内置清单里**已经带上每个 family 的全部可下载
-  量化档**（`packages[]`），但界面还不会按机器挑、也只给**单文件包**下载入口；
-  多文件包（safetensors 等）不在本批范围。
+- **按显存推荐**：现在只看**物理内存**，没查 GPU 显存（服务的守卫也会查后端显存，见上游
+  `ensure_model_fits_memory` 的第二段）。多 GPU / 小显存大内存的机器上推荐会偏乐观。
+- **不自动替用户下推荐档、也不自动改服务清单**：只"列出哪几档 + 推荐 + 为什么"。
+  按推荐档装需要用户自己把清单 `path` 指过去（见 §1.4 末）。
+- **只给单文件包下载入口**：多文件包（safetensors 等）不在本批范围，所以它们也不进档位列表。
 - **下载完自动改服务清单 / 重启服务**：下载只是把文件放到模型目录（见 §2 的落点校验）。
 - `size` / `sha256` 内置清单里**没有**（生成不联网），所以校验退化成按 `Content-Length` 核大小；
   要强校验只能由 `server.json` 显式给 `sha256`。
