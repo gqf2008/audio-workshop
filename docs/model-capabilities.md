@@ -1,8 +1,14 @@
 # 模型能力清单：App 的兜底来源（`config/model-capabilities.json`）
 
-`role` / `requires` / `known_issues` / `product_excluded` / `mode` 这几个字段是**产品侧**的
-模型元数据：服务端 (`app/server/config.cpp`) 只 `find` 它认识的键、从不读这几个，
-**只有 App 在读**。它们决定界面上的三件事：
+`role` / `requires` / `known_issues` / `product_excluded` 这四个字段是**纯产品侧**的模型元数据：
+服务端 (`app/server/config.cpp`) 只 `find` 它认识的键，**这四个一个都不读**，只有 App 在读。
+
+> **`mode` 是例外，单列**：服务端**也读它**（`config.cpp` 里 `optional_string(item, "mode", …)`），
+> 并在 `runtime.cpp` 强制「streaming / live 必须 `mode=streaming`」。这里把它一起兜底，
+> 方向只会**更保守**——服务端缺省是 `offline`，随包清单说 `streaming` 时 App 选择把该模型
+> 从可选引擎里藏起来；不会反过来放出服务端会拒的引擎。
+
+这几个字段决定界面上的三件事：
 
 - 哪些模型**不出现在**可选引擎里（`product_excluded`：选了会静默产出听不懂的音频）；
 - 哪个引擎**必须**给参考音频才能开工（`requires.voice_ref`：不给就 500）；

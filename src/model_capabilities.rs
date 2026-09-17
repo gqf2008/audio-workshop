@@ -1,10 +1,15 @@
 //! 随包分发的模型**能力清单**（`config/model-capabilities.json`）。
 //!
 //! ## 为什么要有它
-//! `role` / `requires` / `known_issues` / `product_excluded` / `mode` 是**产品侧**的模型元数据
-//! —— 服务端 `app/server/config.cpp` 只 `find` 它认识的键，从不读这几个，只有 App 在读。
+//! `role` / `requires` / `known_issues` / `product_excluded` 这四个是**纯产品侧**元数据
+//! —— 服务端 `app/server/config.cpp` 只 `find` 它认识的键，这四个一个都不读，只有 App 在读。
 //! 它们原本只能靠 `tools/audio_config.py render --write` 透传进 `server.json` 才能到界面，
 //! 而那一步**覆盖用户的服务配置**：于是"看到能力提示"变成了用户必须先手工做一次的动作。
+//!
+//! **`mode` 是例外**：服务端也读它（`config.cpp` 的 `optional_string(item, "mode", …)`），
+//! 并在 `runtime.cpp` 强制"streaming/live 必须 `mode=streaming`"。这里把它一起兜底，
+//! 方向只会**更保守**（把 streaming-only 的模型藏起来），不会放出服务端会拒的引擎 ——
+//! 服务端的缺省是 `offline`，而随包清单说 `streaming` 时 App 选择隐藏。
 //!
 //! 现在同一份 schema 走**两条投递路径**，App **逐字段**回落：
 //!
