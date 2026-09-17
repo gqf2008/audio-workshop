@@ -122,7 +122,7 @@
 - 失败 ④**音色参考缺失**：`index-tts2` 硬要求 `voice_ref`，缺则直接 500 —— 在 UI 层强制先选音色（配置里已登记该 known_issue），不让用户撞到这个错。
 - 失败 ⑤**句子合成出来时长异常**（对照文本字数估的期望时长偏离 > 2×）：不直接判失败，标黄"疑似异常"并在校听时排在前面 —— 这正是 0.1B 变体的失效特征（时长 0.37~9.89s 乱跳），0.6B 偶发时也要能被发现。
 - 失败 ⑥**服务进程被杀/机器休眠**：正在合成的句子保持 `pending`（不是 error）；下次进入工程提示"有 N 句未完成，继续合成？"（`cmd_synth` 重跑时天然跳过 `done`、重试 `error`）。
-- 失败 ⑦**落盘时磁盘满**（数据丢失路径；**如实描述，评审要求**）：写 `sentences/NNN.wav` 走 `write_atomic`（临时文件 + `fsync` + `os.replace`，`fix/text-layer-and-dataloss` 实现）→ **磁盘满发生在临时文件阶段，抛 `OSError`（ENOSPC）进程级报错退出**；**原文件不被破坏、不会留下半个 wav 冒充成品**（这条成立），但该句状态**仍是 `pending`**。**"该句标 `error: ENOSPC` + 提示'需释放约 X MB'（wav 体积 ≈ 采样率 × 2B × 时长）+ 释放后只重跑 error 句"尚未实现**（`write_atomic` 没有 try/except），**列为待补**，M0 之前不要按"可逐句恢复"宣传。
+- 失败 ⑦**落盘时磁盘满**（数据丢失路径；**如实描述，评审要求**）：写 `sentences/NNN.wav` 走 `write_atomic`（临时文件 + `fsync` + `os.replace`，`fix/text-layer-and-dataloss` 实现）→ **磁盘满发生在临时文件阶段**：原文件不被破坏、不会留下半个 wav 冒充成品。**已实现（`feat/cli-disk-boundary`，`tools/audio_dub.py::cmd_synth` + `write_failure_note`/`is_enospc`）**：捕获 `errno.ENOSPC` 后把该句标成 `error: ENOSPC（需要 X MB）`（字节数取本次实际要写的 `len(raw)`，不估）、把工程落盘、然后**本轮收尾**（不再继续合成——继续只会每句都失败），退出码 1，**不再冒泡裸 traceback**；释放空间后重跑 `audio-dub synth <dir>` 只会处理 `status != done` 的句子（error 句天然在其中）。
 - 失败 ⑧**写盘完整性**（尾部截断 / 文件系统异常；**如实描述**）：完整性由 `write_atomic` 保证——"写满 `len(raw)` 字节 + `fsync` 之后才 rename，失败即抛异常"，因此**不会出现"状态 `done` 但文件是残的"**。v0.2 写的"`cmd_synth` 写完回读 `os.path.getsize(path) != len(raw)`"**在 `fix/eval-tn-convergence` 中已删除**（恒为假、属装饰性守卫）；截断检测改由 `cmd_assemble` 在拼装前按实际字节数拦截（见步骤 6 失败③，`fix/text-layer-and-dataloss`）。
 
 ### 步骤 5 · 校听
@@ -142,7 +142,7 @@
 ### 步骤 7 · 导出
 - 产物：`out/final.wav`（单声道/双声道按源，16-bit）+ `out/final.srt`（句子级时间轴）。
 - 付费点：无损 wav 导出在 M0 免费；**批量导出 / 分轨导出属于付费（P6）**（§4.2）。
-- 失败 ①**磁盘空间不足**：拼装走"临时文件 + 原子替换"（`cmd_assemble`，`fix/text-layer-and-dataloss` 实现），磁盘满时**旧成品保持可用**（这条成立）；"**写前检查目标卷剩余空间（成品大小 ≈ 采样率 × 2B × 时长）+ 报'需要 X MB'**"**尚未实现**——当前表现为 `OSError` 直接退出，**列为待补**。
+- 失败 ①**磁盘空间不足**：拼装走"临时文件 + 原子替换"（`cmd_assemble`，`fix/text-layer-and-dataloss` 实现），磁盘满时**旧成品保持可用**（这条成立），**已实现写前检查**（`feat/cli-disk-boundary`，`tools/audio_dub.py::cmd_assemble`）：拼装前按「Σ逐句 wav 字节 + 句间静音」估算需要量（句数按工程全量句数算，是上界），与 `shutil.disk_usage` 的可用量比较，不足即报「需要 X MB / 可用 Y MB」并中止，**不创建临时文件**；若写的过程中仍然 ENOSPC（检查与实际之间有竞态），清理临时文件并给出同一口径的可执行文案，旧成品不受影响。
 - 失败 ②**目标文件被占用**（Windows/剪映正打开着）：写到临时文件再原子替换（`os.replace`），失败则报占用进程提示。
 - 失败 ③**文件名非法/过长**：以工程目录名生成，非法字符替换，超长截断并保证唯一。
 - 失败 ④**工程文件损坏**（`project.json` 被截断 / JSON 不可解析，例如旧版非原子写留下半截文件）：`load_project` 直接 `json.load` —— **不猜测、不半读、不自动修复**，解析失败即抛 `JSONDecodeError` 回溯退出。**"读取即报'工程文件损坏'并给出路径"这句友好提示尚未实现**（v0.2 描述与代码不符），**列为待补**。`project.json` 现在也是原子写（`fix/text-layer-and-dataloss`，随本轮合并进入 main）；同目录若残留 `project.json.tmp<pid>` 属可辨识残留，人工确认后处理。M0 的恢复路径是**重建工程**（稿子 + `base_seed` 决定内容），代价可接受。

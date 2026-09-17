@@ -12,7 +12,7 @@
   audio-dub assemble <dir>                             # 重新拼装（不重新合成）
   audio-dub status <dir>                               # 看每句状态/时长/时间轴
 """
-import argparse, base64, json, os, re, sys, time, urllib.request, wave, io
+import argparse, base64, errno, json, os, re, shutil, sys, time, urllib.request, wave, io
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
@@ -80,6 +80,42 @@ def write_atomic(path, data: bytes):
     os.replace(tmp, path)
 
 
+def is_enospc(err):
+    """POSIX ENOSPC=28；Windows 上 Python 同样归到这个 errno。"""
+    return getattr(err, "errno", None) == errno.ENOSPC
+
+
+def write_failure_note(path, need_bytes, err):
+    """落盘失败的统一文案（口径对齐 crates/aw-core/src/dub.rs::write_failure_note）。
+
+    顺序是有意的：先说「发生了什么 + 该做什么」，完整路径放最后 —— 界面/终端截断时
+    丢的是路径而不是动作。「已写好的文件不会被破坏」只写在真的成立那一条上（ENOSPC
+    发生在临时文件阶段，os.replace 还没执行）。
+    """
+    need = f"（需要 {need_bytes / 1048576:.1f} MB）" if need_bytes else ""
+    code = getattr(err, "errno", None)
+    if code == errno.ENOSPC:
+        return f"磁盘空间不足{need}：请释放空间后重跑（已写好的文件不会被破坏）。路径：{path}"
+    if code in (errno.EACCES, errno.EPERM):
+        return f"没有写入权限：检查该目录权限，或把工程/导出目录换到有权限的位置。路径：{path}"
+    if code == errno.ENOENT:
+        return f"路径不存在（父目录可能被删除或移动）：重建目录后再重跑。路径：{path}"
+    return f"写入失败：{err}。请检查磁盘与目录权限后重跑。路径：{path}"
+
+
+def save_project_checked(d, prj):
+    """落盘工程失败时不吞异常，但也不让磁盘满把已完成的状态只留在内存里。
+
+    返回 None 表示写成功；否则返回一句可执行的告警（调用方负责打印）。
+    """
+    path = os.path.join(d, "project.json")
+    try:
+        save_project(d, prj)
+        return None
+    except OSError as e:
+        return write_failure_note(path, 0, e)
+
+
 # ── 工程文件 ────────────────────────────────────────────────────────
 def load_project(d):
     p = os.path.join(d, "project.json")
@@ -140,8 +176,20 @@ def cmd_synth(a):
             s["status"] = f"error: {err}"; print(f"    [{s['index']:>3}] ❌ {err[:70]}"); continue
         path = os.path.join(a.dir, s["wav"])
         # write_atomic 保证"写完 len(raw) 字节 + fsync 后才 rename"：返回即完整，
-        # 落盘失败会抛异常而不是留下半截文件（此前这里的 getsize 校验恒为假，是装饰）
-        write_atomic(path, raw)
+        # 落盘失败会抛异常而不是留下半截文件（此前这里的 getsize 校验恒为假，是装饰）。
+        # 磁盘满（ENOSPC）不再冒泡成裸 traceback：该句标 error + 本轮收尾，已写好的
+        # 句子不受影响；释放空间后重跑只处理 status != done（含 error 句）。
+        try:
+            write_atomic(path, raw)
+        except OSError as e:
+            s["status"] = (f"error: ENOSPC（需要 {len(raw) / 1048576:.1f} MB）"
+                           if is_enospc(e) else f"error: {write_failure_note(path, len(raw), e)}")
+            warn = save_project_checked(a.dir, prj)
+            print(f"    [{s['index']:>3}] ❌ {write_failure_note(path, len(raw), e)}")
+            if warn: print(f"  ⚠️  工程状态未写入：{warn}")
+            print(f"  本轮收尾，不再继续合成：释放空间后重跑 "
+                  f"`audio-dub synth {a.dir}`，只会处理未完成的句子。")
+            sys.exit(1)
         sr, ch, sw, n = wav_meta(raw)
         s.update({"duration": round(n / sr, 3), "sample_rate": sr, "channels": ch,
                   "status": "done"})
@@ -186,25 +234,40 @@ def cmd_assemble(a):
     os.makedirs(os.path.join(a.dir, "out"), exist_ok=True)
     final = os.path.join(a.dir, "out", "final.wav")
     final_tmp = f"{final}.tmp{os.getpid()}"
-    cursor, srt = 0, []
-    with wave.open(final_tmp, "wb") as out:
-        out.setnchannels(ch); out.setsampwidth(2); out.setframerate(sr)
-        for k, s in enumerate(prj["sentences"]):
-            if s["status"] != "done":
-                s["start"] = None; continue
-            s["start"] = round(cursor / sr, 3)
-            with wave.open(os.path.join(a.dir, s["wav"]), "rb") as w:
-                frames = w.readframes(w.getnframes())
-            out.writeframes(frames)
-            cursor += s["duration"] * sr
-            if k != len(prj["sentences"]) - 1:
-                out.writeframes(b"\x00" * (gap * ch * 2)); cursor += gap
-            m0, s0 = divmod(s["start"], 60); m1, s1 = divmod(s["start"] + s["duration"], 60)
-            srt.append(f"{len(srt)+1}\n{int(m0):02d}:{s0:06.3f}".replace(".", ",") +
-                       f" --> {int(m1):02d}:{s1:06.3f}".replace(".", ",") + f"\n{s['text']}\n")
-    with open(final_tmp, "rb+") as f:                  # 成品是本工程最要紧的产物：
-        f.flush()                                      # wave 关闭后补一次 fsync，否则
-        os.fsync(f.fileno())                           # 掉电可能留下已 rename 到位的空文件
+    # 写前检查目标卷剩余空间：成品 ≈ Σ(逐句 wav 字节) + 句间静音。句间静音按工程全量
+    # 句数算（不依赖「最后一句是不是 done」），所以是上界 —— 宁可多报一点也不等到写
+    # 一半才 ENOSPC（那时旧成品虽仍在，但用户已经白等了整段拼装）。
+    need_bytes = (sum(os.path.getsize(os.path.join(a.dir, s["wav"])) for s in done)
+                  + gap * ch * 2 * max(0, len(prj["sentences"]) - 1))
+    free_bytes = shutil.disk_usage(os.path.join(a.dir, "out")).free
+    if free_bytes < need_bytes:
+        sys.exit(f"  磁盘空间不足：需要 {need_bytes / 1048576:.1f} MB，"
+                 f"可用 {free_bytes / 1048576:.1f} MB。请释放空间后重跑；旧成品未被改动。")
+    try:
+        cursor, srt = 0, []
+        with wave.open(final_tmp, "wb") as out:
+            out.setnchannels(ch); out.setsampwidth(2); out.setframerate(sr)
+            for k, s in enumerate(prj["sentences"]):
+                if s["status"] != "done":
+                    s["start"] = None; continue
+                s["start"] = round(cursor / sr, 3)
+                with wave.open(os.path.join(a.dir, s["wav"]), "rb") as w:
+                    frames = w.readframes(w.getnframes())
+                out.writeframes(frames)
+                cursor += s["duration"] * sr
+                if k != len(prj["sentences"]) - 1:
+                    out.writeframes(b"\x00" * (gap * ch * 2)); cursor += gap
+                m0, s0 = divmod(s["start"], 60); m1, s1 = divmod(s["start"] + s["duration"], 60)
+                srt.append(f"{len(srt)+1}\n{int(m0):02d}:{s0:06.3f}".replace(".", ",") +
+                           f" --> {int(m1):02d}:{s1:06.3f}".replace(".", ",") + f"\n{s['text']}\n")
+        with open(final_tmp, "rb+") as f:                  # 成品是本工程最要紧的产物：
+            f.flush()                                      # wave 关闭后补一次 fsync，否则
+            os.fsync(f.fileno())                           # 掉电可能留下已 rename 到位的空文件
+    except OSError as e:
+        # 临时文件是本次拼装的残留：失败就清掉，别把它留在 out/ 里冒充产物。
+        try: os.unlink(final_tmp)
+        except OSError: pass
+        sys.exit("  " + write_failure_note(final, need_bytes, e))
     os.replace(final_tmp, final)                       # 原子替换：旧成品在写完前不受影响
     write_atomic(os.path.join(a.dir, "out", "final.srt"), "\n".join(srt).encode("utf-8"))
     save_project(a.dir, prj)

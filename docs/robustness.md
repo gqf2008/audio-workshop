@@ -58,8 +58,10 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
 
 ## 3. 本轮**没有**做的（别按已实现宣传）
 
-- **写前用 `statvfs` 预检剩余空间**：需要新依赖，而且"失败后给出准确字节数"已经覆盖了
-  可执行性。产品方案步骤 7 失败①里的"写前检查 + 报需要 X MB"这一半仍未实现。
+- **写前预检剩余空间（Rust 桌面侧）**：桌面应用仍未做——理由是"失败后给出准确字节数"已经
+  覆盖了可执行性。**注意口径**：产品方案步骤 7 失败①说的是 **CLI 的 `cmd_assemble`**，
+  那条已在 `feat/cli-disk-boundary` 实现（`shutil.disk_usage`，标准库，**不需要新依赖**，
+  原先"需要新依赖"的判断不成立）；这里留下的未做项仅指 Rust 桌面侧。
 - **流式写"写到一半磁盘满"没有端到端模拟**：`assemble_bgm` / `assemble` / 混音的
   `write_sample`/`finalize` 都走同一对已单测的映射函数（`hound_error_note` /
   `write_failure_note`），但测试里触发的是**创建阶段**失败（只读目录），不是写到一半时才失败
@@ -69,8 +71,10 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
   工程里那句仍是「待合成」，所以释放空间后重跑会跳过已完成句、只重做没做完的部分——
   结果等价，但工程文件里不会留下 `error: ENOSPC` 这条记录。
 - **`settings.json` 的原子写**：损坏时回落默认值，损失可忽略，本批不动。
-- **`tools/audio_dub.py`（M0 的 Python CLI）**：它自己那份 `write_atomic` 仍抛原始异常，
-  不经过本批文案。本批范围是桌面应用（Rust 侧）的用户可见行为；CLI 属于 M0 工具链，未改。
+- **`tools/audio_dub.py`（M0 的 Python CLI）**：本批（Rust 侧）当时没有改它——它那份
+  `write_atomic` 原本抛原始异常。**后续已在 `feat/cli-disk-boundary` 补齐**：`cmd_synth`
+  捕获 ENOSPC 并把该句标 `error: ENOSPC（需要 X MB）`、`cmd_assemble` 有写前空间检查，
+  文案口径与本文件的 Rust 版对齐。
 
 ## 4. 复现命令
 
