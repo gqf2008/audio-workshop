@@ -148,16 +148,22 @@ pub fn load(project_dir: &Path, id: &str) -> Result<Version, String> {
     serde_json::from_str(&raw).map_err(|e| format!("版本解析失败：{}（{e}）", path.display()))
 }
 
-/// 回滚：把版本里的工程写回 `project.json`，并把这份工程返回给调用方（界面据此回灌）。
+/// 回滚第一步：读出这份版本（**不写盘**）。
 ///
-/// 只写 `project.json`，**不动** `sentences/` 与 `out/`：音频交给下一次「开始合成」按
-/// 文本继承（同一个工程目录里，文本没变的句子照样复用）。
-pub fn rollback(project_dir: &Path, id: &str) -> Result<Project, String> {
-    let v = load(project_dir, id)?;
-    v.project
+/// 为什么不在这里直接覆盖 `project.json`：版本快照里的句子都是 `pending`（它是"稿件 + 设置"，
+/// 不含音频也不含句级状态）。直接写回去，下一次 `load_resumable` 会因为文本/设置匹配走快路径、
+/// 原样返回这份全 pending 工程——"文本相同的句子自动复用"就落空了（复核抓到）。
+/// 所以回滚由调用方分两步做：`load_for_rollback` 出版本 → 用**当前磁盘工程**按文本继承
+/// 音频与句级状态后再落盘。
+pub fn load_for_rollback(project_dir: &Path, id: &str) -> Result<Project, String> {
+    Ok(load(project_dir, id)?.project)
+}
+
+/// 回滚第二步：把（已经按文本继承过状态的）工程写回 `project.json`。
+pub fn commit_rollback(project_dir: &Path, project: &Project) -> Result<(), String> {
+    project
         .save(project_dir)
-        .map_err(|e| format!("回滚写盘失败：{e}"))?;
-    Ok(v.project)
+        .map_err(|e| format!("回滚写盘失败：{e}"))
 }
 
 /// 句级差异的一步。
@@ -265,27 +271,36 @@ pub fn diff(before: &Project, after: &Project) -> ProjectDiff {
     }
 
     let mut settings = Vec::new();
-    let mut push = |field: &'static str, before: String, after: String| {
-        if before != after {
-            settings.push(SettingChange {
-                field,
-                before,
-                after,
-            });
-        }
-    };
-    push("引擎", before.model.clone(), after.model.clone());
-    push("音色", voice_label(before), voice_label(after));
-    push(
-        "句间停顿",
-        format!("{}ms", before.gap_ms),
-        format!("{}ms", after.gap_ms),
-    );
-    push(
-        "兜底规则",
-        if before.auto_normalize { "开" } else { "关" }.to_string(),
-        if after.auto_normalize { "开" } else { "关" }.to_string(),
-    );
+    // 音色单独处理（它比的是 ref + hash，显示还要标"内容已变"），所以整个循环里
+    // 不再用闭包去 borrow `settings`，避免两处可变借用的冲突。
+    if before.model != after.model {
+        settings.push(SettingChange {
+            field: "引擎",
+            before: before.model.clone(),
+            after: after.model.clone(),
+        });
+    }
+    if let Some((b, a)) = voice_change(before, after) {
+        settings.push(SettingChange {
+            field: "音色",
+            before: b,
+            after: a,
+        });
+    }
+    if before.gap_ms != after.gap_ms {
+        settings.push(SettingChange {
+            field: "句间停顿",
+            before: format!("{}ms", before.gap_ms),
+            after: format!("{}ms", after.gap_ms),
+        });
+    }
+    if before.auto_normalize != after.auto_normalize {
+        settings.push(SettingChange {
+            field: "兜底规则",
+            before: if before.auto_normalize { "开" } else { "关" }.to_string(),
+            after: if after.auto_normalize { "开" } else { "关" }.to_string(),
+        });
+    }
 
     ProjectDiff {
         lines,
@@ -293,6 +308,28 @@ pub fn diff(before: &Project, after: &Project) -> ProjectDiff {
         removed,
         settings,
     }
+}
+
+/// 音色差异：**比的是 `voice_ref` 与 `voice_ref_hash`**，不是显示用的文件名。
+///
+/// 只用文件名比会漏两种情况：同一路径的参考音被换了内容（hash 变）、以及不同目录下
+/// 同名的两个参考音——这两种在产物里就是换了音色（复核指出）。
+fn voice_change(before: &Project, after: &Project) -> Option<(String, String)> {
+    if before.voice_ref == after.voice_ref && before.voice_ref_hash == after.voice_ref_hash {
+        return None;
+    }
+    let content_changed = before.voice_ref.is_some()
+        && before.voice_ref == after.voice_ref
+        && before.voice_ref_hash != after.voice_ref_hash;
+    let mark = |p: &Project| {
+        let base = voice_label(p);
+        if content_changed {
+            format!("{base}（内容已变）")
+        } else {
+            base
+        }
+    };
+    Some((mark(before), mark(after)))
 }
 
 /// 音色在差异里怎么显示：内置默认 / 参考文件名（不泄露整条路径，用户认的是文件名）。
@@ -412,8 +449,9 @@ mod tests {
         // 之后工程被改成另一份
         project("完全不同的稿子。").save(&dir).unwrap();
 
-        let restored = rollback(&dir, &id).unwrap();
+        let restored = load_for_rollback(&dir, &id).unwrap();
         assert_eq!(restored.sentences.len(), old.sentences.len());
+        commit_rollback(&dir, &restored).unwrap();
         let on_disk = Project::load(&dir).unwrap();
         assert_eq!(
             on_disk
@@ -426,7 +464,7 @@ mod tests {
         );
 
         // 不存在的 id 要报错（不能静默当成功）
-        assert!(rollback(&dir, "不存在").is_err());
+        assert!(load_for_rollback(&dir, "不存在").is_err());
     }
 
     /// 句子文本不同 → diff 里能看到删除 + 新增；完全一样 → 没有变化。
@@ -483,6 +521,34 @@ mod tests {
         );
         assert!(!voice.after.contains("/x/"), "别把整条路径摊开：{voice:?}");
         assert!(d.summary().contains("设置改了 4 项"), "{}", d.summary());
+
+        // 同一路径、参考音内容变了 → 也要报"音色变了"（hash 比路径更能说明问题）
+        let mut same_path = project("第一句。");
+        same_path.voice_ref = Some("/x/我的声线.wav".into());
+        same_path.voice_ref_hash = Some("hash-a".into());
+        let mut changed_content = same_path.clone();
+        changed_content.voice_ref_hash = Some("hash-b".into());
+        let d = diff(&same_path, &changed_content);
+        let voice = d
+            .settings
+            .iter()
+            .find(|c| c.field == "音色")
+            .expect("要报音色变化");
+        assert!(voice.after.contains("内容已变"), "{voice:?}");
+        assert!(
+            voice.before.contains("内容已变"),
+            "两边都要标，免得看不出来谁变了：{voice:?}"
+        );
+
+        // 不同目录、同名参考音 → 也是换音色
+        let mut same_name = same_path.clone();
+        same_name.voice_ref = Some("/y/我的声线.wav".into());
+        same_name.voice_ref_hash = Some("hash-a".into());
+        let d = diff(&same_path, &same_name);
+        assert!(
+            d.settings.iter().any(|c| c.field == "音色"),
+            "同名不同路径也要报：{d:?}"
+        );
 
         // 顺序稳定：引擎 → 音色 → 停顿 → 兜底
         assert_eq!(

@@ -4526,6 +4526,23 @@ fn project_from_ui(ui: &MainWindow) -> Project {
     project
 }
 
+/// 版本快照 → 可继续合成的工程。
+///
+/// 快照里的句子状态是留档那一刻的（全 pending），这里**按稿件与设置重建**，
+/// 句级状态交给调用方用"按文本继承"补——保持"状态由合成决定"这条不变式。
+fn project_from_version(snapshot: &Project) -> Project {
+    let script: String = snapshot.sentences.iter().map(|s| s.text.as_str()).collect();
+    let mut project = new_project_from_inputs(
+        &script,
+        &snapshot.model,
+        snapshot.voice_ref.clone(),
+        snapshot.gap_ms,
+        snapshot.auto_normalize,
+    );
+    project.voice_ref_hash = snapshot.voice_ref_hash.clone();
+    project
+}
+
 /// 时间戳 → 人话（版本列表用；不引日期库，按"多久以前"说）。
 fn relative_time(now_ms: u64, then_ms: u64) -> String {
     if now_ms < then_ms {
@@ -4680,8 +4697,21 @@ fn wire_versions(
             return;
         };
         let id = id.to_string();
-        match versions::rollback(&dir, &id) {
-            Ok(project) => {
+        // 两步回滚（复核抓到的关键点）：版本快照里的句子全是 pending，
+        // 直接写回再跑时 `load_resumable` 走快路径会原样返回它 —— "文本相同的句子复用"就落空。
+        // 所以先拿当前磁盘工程（它带着已完成句子的音频与状态）按文本继承，再落盘。
+        let inherited = Project::load_if_present(&dir).ok().flatten();
+        let rolled = versions::load_for_rollback(&dir, &id).and_then(|snapshot| {
+            let mut restored = project_from_version(&snapshot);
+            let reused = match inherited.as_ref() {
+                Some(saved) => reuse_done_sentences(&mut restored, saved, &dir)?,
+                None => 0,
+            };
+            versions::commit_rollback(&dir, &restored)?;
+            Ok((restored, reused))
+        });
+        match rolled {
+            Ok((project, reused)) => {
                 // 界面回灌：稿件 + 引擎/音色/停顿/兜底，全部走与手工编辑同一条路径
                 let script: String = project.sentences.iter().map(|s| s.text.as_str()).collect();
                 ui.set_script_text(script.clone().into());
@@ -4703,9 +4733,16 @@ fn wire_versions(
                 ui.set_has_result(false);
                 refresh_versions(&ui, &st);
                 ui.set_version_diff_text("".into());
+                let todo = project
+                    .sentences
+                    .iter()
+                    .filter(|s| s.status != "done")
+                    .count();
                 ui.set_status_text(
-                    "已回滚到该版本：点「开始合成」继续（文本相同的句子会自动复用，不用重录）"
-                        .into(),
+                    format!(
+                        "已回滚到该版本：复用 {reused} 句已合成的音频，还要合成 {todo} 句；点「开始合成」继续"
+                    )
+                    .into(),
                 );
             }
             Err(e) => ui.set_status_text(e.into()),
@@ -7420,6 +7457,38 @@ mod tests {
         assert!(over.contains("上限") && over.contains("2000"), "{over}");
         let ok = gap_hint_for("300");
         assert!(ok.contains("300"), "{ok}");
+    }
+
+    /// 复核抓到的关键点：版本快照里的句子全是 pending，**回滚必须先把音频按文本继承过来**
+    /// 再落盘——否则下一次合成走 `load_resumable` 快路径会原样返回这份全 pending 工程，
+    /// "文本相同的句子自动复用"就落空了。
+    #[test]
+    fn rollback_inherits_audio_for_unchanged_sentences() {
+        let dir = temp_dir("rollback-inherit");
+        // 当前工程：两句都已合成（有 wav + done 状态）
+        let mut current = saved_project("第一句。第二句。", None);
+        save_done_project(&dir, &mut current);
+        let inherited = Project::load(&dir).unwrap();
+
+        // 版本快照 = 稿件 + 设置（重建出来全是 pending），这正是留档写下的那份
+        let mut restored =
+            new_project_from_inputs("第一句。第二句。", "audio8-tts", None, GAP_MS, true);
+        assert!(
+            restored.sentences.iter().all(|s| s.status == "pending"),
+            "前提：重建成的新工程没有句级状态"
+        );
+
+        let reused = reuse_done_sentences(&mut restored, &inherited, &dir).unwrap();
+        assert_eq!(reused, 2, "文本相同的两句都该继承到音频");
+        versions::commit_rollback(&dir, &restored).unwrap();
+
+        // 关键断言：下一次「开始合成」不会把这句当成待录
+        let loaded =
+            load_resumable(&dir, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap();
+        assert!(
+            loaded.project.sentences.iter().all(|s| s.status == "done"),
+            "回滚后同文本的句子必须仍是已合成（否则会全部重录）"
+        );
     }
 
     /// 版本列表里的时间用"多久以前"说（不引日期库）：四档 + 未来时间兜底。
