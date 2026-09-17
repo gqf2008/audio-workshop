@@ -4526,6 +4526,26 @@ fn project_from_ui(ui: &MainWindow) -> Project {
     project
 }
 
+/// 回滚（不碰界面）：读版本 → 用**当前磁盘工程**按文本继承音频与状态 → 落盘。
+///
+/// 关键契约：当前 `project.json` **存在但读不出来**（损坏/权限）时，直接中止并返回
+/// Err——绝不 commit。`Project::load_if_present` 的契约就是"损坏工程不自动重建、不覆盖"，
+/// 回滚如果把 `Err` 当成"没有当前工程"继续写盘，就会把唯一可人工恢复的现场抹掉。
+fn rollback_with_inheritance(dir: &Path, id: &str) -> Result<(Project, usize), String> {
+    let inherited = match Project::load_if_present(dir) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("当前工程读不出来，回滚已中止（不会覆盖现场）：{e}")),
+    };
+    let snapshot = versions::load_for_rollback(dir, id)?;
+    let mut restored = project_from_version(&snapshot);
+    let reused = match inherited.as_ref() {
+        Some(saved) => reuse_done_sentences(&mut restored, saved, dir)?,
+        None => 0,
+    };
+    versions::commit_rollback(dir, &restored)?;
+    Ok((restored, reused))
+}
+
 /// 版本快照 → 可继续合成的工程。
 ///
 /// 快照里的句子状态是留档那一刻的（全 pending），这里**按稿件与设置重建**，
@@ -4697,20 +4717,10 @@ fn wire_versions(
             return;
         };
         let id = id.to_string();
-        // 两步回滚（复核抓到的关键点）：版本快照里的句子全是 pending，
-        // 直接写回再跑时 `load_resumable` 走快路径会原样返回它 —— "文本相同的句子复用"就落空。
-        // 所以先拿当前磁盘工程（它带着已完成句子的音频与状态）按文本继承，再落盘。
-        let inherited = Project::load_if_present(&dir).ok().flatten();
-        let rolled = versions::load_for_rollback(&dir, &id).and_then(|snapshot| {
-            let mut restored = project_from_version(&snapshot);
-            let reused = match inherited.as_ref() {
-                Some(saved) => reuse_done_sentences(&mut restored, saved, &dir)?,
-                None => 0,
-            };
-            versions::commit_rollback(&dir, &restored)?;
-            Ok((restored, reused))
-        });
-        match rolled {
+        // 两步回滚（复核抓到的关键点）：版本快照里的句子全是 pending，直接写回再跑时
+        // `load_resumable` 走快路径会原样返回它 —— "文本相同的句子复用"就落空；
+        // 而当前工程损坏时必须中止（不能覆盖现场）。两件事都在下面这个函数里定义清楚。
+        match rollback_with_inheritance(&dir, &id) {
             Ok((project, reused)) => {
                 // 界面回灌：稿件 + 引擎/音色/停顿/兜底，全部走与手工编辑同一条路径
                 let script: String = project.sentences.iter().map(|s| s.text.as_str()).collect();
@@ -7489,6 +7499,36 @@ mod tests {
             loaded.project.sentences.iter().all(|s| s.status == "done"),
             "回滚后同文本的句子必须仍是已合成（否则会全部重录）"
         );
+    }
+
+    /// **当前工程损坏时回滚必须中止、一个字节都不写**：损坏的 project.json 是唯一可人工
+    /// 恢复的现场，回滚把它当成"没有当前工程"继续写盘就把它抹了（复核抓到的数据安全阻塞）。
+    #[test]
+    fn rollback_refuses_when_current_project_is_corrupt() {
+        let dir = temp_dir("rollback-corrupt");
+        let id = versions::save(
+            &dir,
+            "好版本",
+            &new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true),
+            1,
+        )
+        .unwrap();
+        let corrupt = b"{ this is not json";
+        std::fs::write(dir.join("project.json"), corrupt).unwrap();
+
+        let err = rollback_with_inheritance(&dir, &id).unwrap_err();
+        assert!(err.contains("不会覆盖现场"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("project.json")).unwrap(),
+            corrupt,
+            "损坏的现场必须原样保留"
+        );
+
+        // 对照：工程文件正常时回滚照常完成
+        new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true)
+            .save(&dir)
+            .unwrap();
+        assert!(rollback_with_inheritance(&dir, &id).is_ok());
     }
 
     /// 版本列表里的时间用"多久以前"说（不引日期库）：四档 + 未来时间兜底。

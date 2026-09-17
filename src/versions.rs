@@ -106,6 +106,11 @@ pub fn list(project_dir: &Path) -> (Vec<VersionRow>, usize) {
             broken += 1;
             continue;
         };
+        // id 不合法的文件不列出来（列出来也会被 `load` 拒绝，点一下才知道是坏的）
+        if !is_valid_id(id) {
+            broken += 1;
+            continue;
+        }
         let Ok(raw) = std::fs::read_to_string(&path) else {
             broken += 1;
             continue;
@@ -405,10 +410,18 @@ mod tests {
         std::fs::write(versions_dir(&dir).join("坏的.json"), b"{ not json").unwrap();
         // 非 json 文件不算坏
         std::fs::write(versions_dir(&dir).join("README.txt"), b"x").unwrap();
+        // JSON 合法但 id 不合法（手改的文件名）：也不列出来，计入坏文件
+        let good = serde_json::to_vec(&Version {
+            label: "名字不合法".into(),
+            created_at: 2,
+            project: project("第二句。"),
+        })
+        .unwrap();
+        std::fs::write(versions_dir(&dir).join("名字不合法.json"), good).unwrap();
 
         let (rows, broken) = list(&dir);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(broken, 1, "坏文件要计数并报出来");
+        assert_eq!(rows.len(), 1, "只列得出来的那一份：{rows:?}");
+        assert_eq!(broken, 2, "坏 JSON + 非法 id 都要计数");
     }
 
     /// 版本 id 不合法（路径穿越、绝对路径、空）一律拒绝：不能把工程目录之外的
