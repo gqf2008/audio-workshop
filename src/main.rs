@@ -7549,7 +7549,8 @@ mod tests {
         ));
 
         // 版本与当前工程只在"被 tweak 的那一项"上不同（其余整份克隆，避免测试自己写错）
-        let cases: Vec<(&str, fn(&mut Project))> = vec![
+        type Tweak = fn(&mut Project);
+        let cases: Vec<(&str, Tweak)> = vec![
             ("模型不同", |p: &mut Project| {
                 p.model = "audio8-tts".into()
             }),
