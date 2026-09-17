@@ -118,9 +118,23 @@ def save_project_checked(d, prj):
 
 # ── 工程文件 ────────────────────────────────────────────────────────
 def load_project(d):
+    """读工程。三条路必须分得清：不存在 / 在但坏 / 正常。
+
+    口径对齐 Rust 侧 `aw-core::dub::Project::load_if_present`：**不猜测、不半读、
+    不自动重建**。尤其是解析失败时绝不能顺手 `save_project` —— 损坏的 project.json
+    是唯一可人工恢复的现场，覆盖掉就真没了（Rust 侧同一条注释写的就是这个理由）。
+    """
     p = os.path.join(d, "project.json")
     if not os.path.exists(p): sys.exit(f"不是工程目录（缺 project.json）: {d}")
-    return json.load(open(p, encoding="utf-8"))
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        sys.exit("  工程文件损坏：没有自动重建，也没有覆盖它——请把 project.json 改名或移走后重开"
+                 f"（那样会按当前稿件从零合成），或先修好它。完整路径：{p}。解析错误：{e}")
+    except OSError as e:
+        sys.exit(f"  工程文件读不了：检查文件权限后重试；修不好就把它改名或移走再重开。"
+                 f"完整路径：{p}。原因：{e}")
 
 
 def save_project(d, prj):
