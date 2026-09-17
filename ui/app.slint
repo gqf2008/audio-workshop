@@ -209,6 +209,11 @@ export component MainWindow inherits Window {
 
     // 音色设计 Tab
     in-out property <string> voice-ref-path: "";
+    /// 参考音频的**文本**：服务端要求与参考音频成对下发（只给路径会 500）；
+    /// 它同时是音色的一部分——改文本就等于换音色，旧音频要作废重录。
+    in-out property <string> voice-ref-text: "";
+    in property <string> voice-ref-text-status: "";
+    in property <bool> voice-ref-text-busy: false;
 
     // ── 音色库（P4）：自建的多音色存档 ──
     in property <[VoiceLibRow]> library-rows: [];
@@ -242,6 +247,8 @@ export component MainWindow inherits Window {
     callback project-edited();
     callback model-changed();
     callback voice-ref-changed();
+    callback voice-ref-text-changed();
+    callback transcribe-reference();
     callback script-edited();
     callback use-sample();
     callback clear-script();
@@ -484,6 +491,9 @@ export component MainWindow inherits Window {
                     voice-index <=> root.voice-index;
                     engine-label: root.engine-label;
                     voice-ref-path <=> root.voice-ref-path;
+                    voice-ref-text <=> root.voice-ref-text;
+                    voice-ref-text-status: root.voice-ref-text-status;
+                    voice-ref-text-busy: root.voice-ref-text-busy;
                     reference-exists: root.reference-exists;
                     show-voice <=> root.dub-voice;
                     change-voice => { root.dub-voice = !root.dub-voice; }
@@ -491,6 +501,8 @@ export component MainWindow inherits Window {
                     audition-voice => { root.preview-voice(); }
                     clear-reference => { root.clear-voice-reference(); }
                     voice-ref-changed => { root.voice-ref-changed(); }
+                    voice-ref-text-changed => { root.voice-ref-text-changed(); }
+                    transcribe-reference => { root.transcribe-reference(); }
                     library-rows: root.library-rows;
                     library-status: root.library-status;
                     library-note <=> root.library-note;
@@ -577,8 +589,13 @@ export component MainWindow inherits Window {
                 if root.scene == 4 : VoiceDesignTab {
                     vertical-stretch: 1;
                     reference-path <=> root.voice-ref-path;
+                    reference-text <=> root.voice-ref-text;
+                    reference-text-status: root.voice-ref-text-status;
+                    transcribing: root.voice-ref-text-busy;
                     busy: root.busy || root.running;
                     edited => { root.voice-ref-changed(); }
+                    reference-text-edited => { root.voice-ref-text-changed(); }
+                    transcribe-reference => { root.transcribe-reference(); }
                     clear-reference => { root.clear-voice-reference(); }
                     use-in-dubbing => {
                         root.scene = 0;

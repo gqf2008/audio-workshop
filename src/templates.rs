@@ -21,7 +21,9 @@ pub fn clamp_gap_ms(ms: u64) -> u64 {
 }
 
 /// 一份配音模板。字段刻意是"能真的影响产物（或试听）的那些输入"：
-/// - `model` / `voice_ref`：引擎与音色（换任一都要重录）
+/// - `model` / `voice_ref` / `voice_ref_text`：引擎与音色（换任一都要重录）。
+///   `voice_ref_text` 必须一起存：服务端要求它与参考音成对，只存路径的模板
+///   应用回来就是个跑不起来的克隆音色。
 /// - `auto_normalize`：兜底规则开关（改的是 spoken 文本，也要重录）
 /// - `gap_ms`：句间停顿（只影响拼装，改了重新导出即可）
 /// - `speed`：**试听语速**，不进产物（模板里带上它，是因为它属于"这套工作方式"）
@@ -32,6 +34,9 @@ pub struct DubTemplate {
     pub model: String,
     #[serde(default)]
     pub voice_ref: Option<String>,
+    /// 参考音频里实际念的内容（服务端要求与 `voice_ref` 成对，见 `aw_core::VoiceClone`）
+    #[serde(default)]
+    pub voice_ref_text: Option<String>,
     #[serde(default = "default_speed")]
     pub speed: f32,
     #[serde(default = "default_gap_ms")]
@@ -82,6 +87,8 @@ impl ApplyEffect {
 pub struct ProjectInputs {
     pub model: String,
     pub voice_ref: Option<String>,
+    /// 参考音频的文本：与 `voice_ref` 同类，改它 = 换音色（服务端拿它做条件）
+    pub voice_ref_text: Option<String>,
     pub gap_ms: u64,
     pub auto_normalize: bool,
 }
@@ -93,6 +100,8 @@ pub struct ProjectInputs {
 pub fn apply_effect(current: &ProjectInputs, template: &DubTemplate) -> ApplyEffect {
     if current.model != template.model
         || current.voice_ref != template.voice_ref
+        // 参考文本也算音色的一部分：同一段音频换个转写文本，克隆出来是另一个声音
+        || current.voice_ref_text != template.voice_ref_text
         || current.auto_normalize != template.auto_normalize
     {
         return ApplyEffect::Resynthesize;
@@ -174,6 +183,7 @@ mod tests {
             name: name.into(),
             model: model.into(),
             voice_ref: voice.map(str::to_string),
+            voice_ref_text: None,
             speed: 1.0,
             gap_ms: gap,
             auto_normalize: normalize,
@@ -231,6 +241,7 @@ mod tests {
         let current = ProjectInputs {
             model: "audio8-tts".into(),
             voice_ref: None,
+            voice_ref_text: None,
             gap_ms: 250,
             auto_normalize: true,
         };
@@ -241,6 +252,18 @@ mod tests {
         assert_eq!(
             apply_effect(&current, &gap_only),
             ApplyEffect::ReassembleOnly
+        );
+
+        // 参考文本变了 = 换音色：服务端拿它做条件，同一段音频换个转写是另一个声音
+        let mut text_changed = tpl("改参考文本", "audio8-tts", Some("/v.wav"), 250, true);
+        text_changed.voice_ref_text = Some("旧转写。".into());
+        let mut current_clone = current.clone();
+        current_clone.voice_ref = Some("/v.wav".into());
+        current_clone.voice_ref_text = Some("新转写。".into());
+        assert_eq!(
+            apply_effect(&current_clone, &text_changed),
+            ApplyEffect::Resynthesize,
+            "只改参考文本也必须按重录处理"
         );
 
         for heavier in [

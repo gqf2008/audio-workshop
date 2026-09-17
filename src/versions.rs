@@ -315,21 +315,28 @@ pub fn diff(before: &Project, after: &Project) -> ProjectDiff {
     }
 }
 
-/// 音色差异：**比的是 `voice_ref` 与 `voice_ref_hash`**，不是显示用的文件名。
+/// 音色差异：**比的是 `voice_ref` / `voice_ref_hash` / `voice_ref_text`**，
+/// 不是显示用的文件名。
 ///
-/// 只用文件名比会漏两种情况：同一路径的参考音被换了内容（hash 变）、以及不同目录下
-/// 同名的两个参考音——这两种在产物里就是换了音色（复核指出）。
+/// 只用文件名比会漏三种情况：同一路径的参考音被换了内容（hash 变）、不同目录下同名的
+/// 两个参考音、以及**参考文本被改**（服务端拿它做条件，改一个字克隆出来就是另一个声音）
+/// ——这三种在产物里都是换了音色（复核指出前两种，第三种是 `reference_text` 接入后补的）。
 fn voice_change(before: &Project, after: &Project) -> Option<(String, String)> {
-    if before.voice_ref == after.voice_ref && before.voice_ref_hash == after.voice_ref_hash {
+    if before.voice_ref == after.voice_ref
+        && before.voice_ref_hash == after.voice_ref_hash
+        && before.voice_ref_text == after.voice_ref_text
+    {
         return None;
     }
-    let content_changed = before.voice_ref.is_some()
-        && before.voice_ref == after.voice_ref
-        && before.voice_ref_hash != after.voice_ref_hash;
+    let same_audio = before.voice_ref.is_some() && before.voice_ref == after.voice_ref;
+    let audio_content_changed = same_audio && before.voice_ref_hash != after.voice_ref_hash;
+    let text_changed = same_audio && before.voice_ref_text != after.voice_ref_text;
     let mark = |p: &Project| {
         let base = voice_label(p);
-        if content_changed {
+        if audio_content_changed {
             format!("{base}（内容已变）")
+        } else if text_changed {
+            format!("{base}（参考文本已改）")
         } else {
             base
         }
@@ -551,6 +558,20 @@ mod tests {
         assert!(
             voice.before.contains("内容已变"),
             "两边都要标，免得看不出来谁变了：{voice:?}"
+        );
+
+        // 同一路径、同一内容，只改了参考文本 → 也是换音色（服务端拿文本做条件）
+        let mut text_changed = same_path.clone();
+        text_changed.voice_ref_text = Some("改过的转写。".into());
+        let d = diff(&same_path, &text_changed);
+        let voice = d
+            .settings
+            .iter()
+            .find(|c| c.field == "音色")
+            .expect("只改参考文本也要报音色变化");
+        assert!(
+            voice.after.contains("参考文本已改"),
+            "要把原因说对（不是音频内容变了）：{voice:?}"
         );
 
         // 不同目录、同名参考音 → 也是换音色

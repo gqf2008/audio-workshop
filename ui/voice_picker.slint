@@ -93,6 +93,12 @@ export component VoicePanel inherits Rectangle {
     in property <string> engine-label: "";
     // 参考音频路径：空=内置，非空=克隆。唯一状态来源。
     in-out property <string> reference-path: "";
+    // 参考音频里**实际念的内容**。服务端（audio8-tts / index-tts2）要求它与
+    // 参考音频成对下发——只给路径会 500。它也是音色的一部分：改文本 = 换音色。
+    in-out property <string> reference-text: "";
+    // 自动转写的状态（"正在转写…" / "已填入，请核对" / 失败原因）
+    in property <string> reference-text-status: "";
+    in property <bool> transcribing: false;
     in property <bool> busy: false;
     in property <bool> reference-exists: false;
 
@@ -100,6 +106,8 @@ export component VoicePanel inherits Rectangle {
     callback clear-reference();
     callback preview();
     callback open-design();
+    callback reference-text-edited();
+    callback transcribe-reference();
     // 音色库（P4）：保存当前参考音 / 应用库里某条 / 导出 / 导入
     in property <[VoiceLibRow]> library-rows: [];
     in property <string> library-status: "";
@@ -193,6 +201,44 @@ export component VoicePanel inherits Rectangle {
                 text: "试听";
                 enabled: !root.busy;
                 clicked => { root.preview(); }
+            }
+        }
+
+        // 参考音频的文本：与参考音频**成对**（缺它服务端每句都 500）。
+        // 只在克隆态出现——用内置音色时这里没有意义，摆出来只是噪音。
+        if root.cloning : VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                spacing: 10px;
+                Text {
+                    width: 56px;
+                    text: "参考文本";
+                    color: PixelTheme.dim;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+                PixelTextInput {
+                    horizontal-stretch: 1;
+                    // 转写中禁编辑：否则落地的转写结果会**覆盖用户此刻打进去的字**
+                    // （复核指出；按钮早就按 !transcribing 灰掉了，输入框漏了这一条）
+                    enabled: !root.busy && !root.transcribing;
+                    text <=> root.reference-text;
+                    placeholder: "这段参考音频里实际念的内容（服务端要求与音频成对）";
+                    edited => { root.reference-text-edited(); }
+                }
+                PixelButton {
+                    width: 96px;
+                    text: root.transcribing ? "转写中…" : "自动转写";
+                    Tooltip { text: @markdown("让本机 ASR 听一遍参考音频、把内容填进左边的框。\n填完**请自己核对**——转写错字会让克隆音色跑偏。"); }
+                    enabled: !root.busy && !root.transcribing && root.reference-path != "";
+                    clicked => { root.transcribe-reference(); }
+                }
+            }
+            if root.reference-text-status != "" : Text {
+                text: root.reference-text-status;
+                color: root.reference-text == "" ? PixelTheme.danger : PixelTheme.dim;
+                font-size: 11px;
+                wrap: word-wrap;
             }
         }
 

@@ -212,6 +212,73 @@ impl std::fmt::Display for ClientError {
     }
 }
 
+/// `voice_ref` 给了但参考文本为空时的**前置拦截**文案。
+///
+/// 服务端原文 `Audio8 TTS prepare with inline reference audio requires reference_text option`
+/// 用户看不懂，而且是在**每一句**上重复撞出来的（N 句 = N 条一样的 500）。
+/// 这里一次说清"缺什么 / 去哪填 / 怎么免手填"。
+/// 调用了克隆但没给参考音频路径时的**前置拦截**文案。
+///
+/// 正常 UI 走不到（路径为空就是内置音色、不会走 `VoiceClone`），但 `VoiceClone::new`
+/// 是公开入口，类型自己的不变式该自己守。
+pub const MISSING_REFERENCE_PATH: &str = concat!(
+    "调用了参考音频克隆，但没有给参考音频路径。",
+    "内置音色不需要参考音；要克隆就先在「参考音频」里填一段干净的 5–30 秒人声。",
+);
+
+pub const MISSING_REFERENCE_TEXT: &str = concat!(
+    "参考音频已选，但缺少它的文本（reference_text）。",
+    "克隆音色时服务端要求音频与文本成对：请在「参考音频的文本」里填这段音频实际念的内容，",
+    "或点「自动转写」让 ASR 填好、确认无误后再开始。",
+);
+
+/// 参考音频克隆的**成对**输入：`voice_ref`（音频路径）+ `reference_text`
+/// （这段音频实际念的内容）。服务端（audio8-tts / index-tts2）要求两者同时给，
+/// 只给路径必然失败（真机：HTTP 500
+/// `Audio8 TTS prepare with inline reference audio requires reference_text option`）。
+///
+/// 为什么是结构体而不是两个相邻的 `Option<&str>` 参数：两个同类型参数挨在一起，
+/// 传反了编译器不会拦（见 `LESSON_同类型参数批量插入会静默错位`）。
+/// 字段私有 + `new()` 校验 ⇒ "只给路径不给文本"在**类型上**不可表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceClone<'a> {
+    path: &'a str,
+    reference_text: &'a str,
+}
+
+impl<'a> VoiceClone<'a> {
+    /// 唯一构造入口：路径或文本为空白即 `Err`（不是 `None`，也不是"悄悄发个空串"）。
+    ///
+    /// 空串发过去服务端照样报错，只是换了个看不懂的说法；在**发起前**拦住，
+    /// 用户拿到的是一次可执行的提示，而不是 N 句 `error:`。
+    ///
+    /// 路径也要校验：只校文本的话，"空路径 + 有文本"会通过，然后发出
+    /// `voice_ref: ""` —— 与这个类型自称的"成对"不一致（复核指出；
+    /// 当前 UI 走不到，但类型不变式不该依赖 UI 恰好拦得住）。
+    pub fn new(path: &'a str, reference_text: &'a str) -> Result<Self, ClientError> {
+        if path.trim().is_empty() {
+            return Err(ClientError::Local(MISSING_REFERENCE_PATH.into()));
+        }
+        if reference_text.trim().is_empty() {
+            return Err(ClientError::Local(MISSING_REFERENCE_TEXT.into()));
+        }
+        Ok(Self {
+            path,
+            reference_text,
+        })
+    }
+
+    /// 参考音频路径（原样透传，不做归一）。
+    pub fn path(self) -> &'a str {
+        self.path
+    }
+
+    /// 参考音频里实际念的内容（原样透传，**不 trim**：服务端要的是真实文本）。
+    pub fn reference_text(self) -> &'a str {
+        self.reference_text
+    }
+}
+
 pub struct Client {
     base: String,
     retries: u32,
@@ -234,12 +301,15 @@ impl Client {
     }
 
     /// 合成一句话，返回 wav 字节。seed 固定可复现（audio8-* 支持）。
+    ///
+    /// `clone` 为 `Some` 时**成对**发送 `voice_ref` + `reference_text`
+    /// ——服务端硬要求两者同时给，见 `VoiceClone`。
     pub fn synth(
         &self,
         model: &str,
         text: &str,
         seed: Option<u64>,
-        voice_ref: Option<&str>,
+        clone: Option<VoiceClone<'_>>,
         instruction: Option<&str>,
     ) -> Result<Vec<u8>, ClientError> {
         let mut options = serde_json::Map::new();
@@ -250,8 +320,10 @@ impl Client {
             options.insert("instruction".into(), json!(i));
         }
         let mut request = json!({ "text": text, "options": Value::Object(options) });
-        if let Some(v) = voice_ref {
-            request["voice_ref"] = json!(v);
+        if let Some(c) = clone {
+            // 两行必须同进同出：只发 voice_ref 就是那个"每句都 500"的老 bug。
+            request["voice_ref"] = json!(c.path());
+            request["reference_text"] = json!(c.reference_text());
         }
         self.run_audio(model, request)
     }
