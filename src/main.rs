@@ -585,12 +585,18 @@ fn refresh_dictionaries(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_dict_names(ModelRc::from(Rc::new(VecModel::from(names))));
     // 下拉第 0 项固定是「不使用词典」，所以库里的排 1..n
     let active = state.active_dict_file.borrow().clone();
-    let idx = active
+    let position = active
         .as_deref()
-        .and_then(|f| rows.iter().position(|r| r.file == f))
-        .map(|i| i as i32 + 1)
-        .unwrap_or(0);
-    ui.set_dict_index(idx);
+        .and_then(|f| rows.iter().position(|r| r.file == f));
+    if active.is_some() && position.is_none() {
+        // 启用的那套被删了/读不出来了：必须把内存里的词条也清掉，
+        // 否则下一次合成还会用着"界面上已经没有"的那套读法
+        *state.active_dict_file.borrow_mut() = None;
+        state.active_dict.borrow_mut().clear();
+        persist_active_dictionary(ui, None);
+        ui.set_status_text("启用的词典已不在库里，已退回「不使用词典」".into());
+    }
+    ui.set_dict_index(position.map(|i| i as i32 + 1).unwrap_or(0));
     let mut status = if rows.is_empty() {
         "还没有词典".to_string()
     } else {
@@ -6801,6 +6807,11 @@ fn tick(
                     ui.set_status_text("取消了导入词条".into());
                     return;
                 };
+                // 文件框是异步的：打开期间可能已经起了任务/批量，这时不能再换词典
+                if project_editing_blocked(ui, state) || batch_in_flight(state) {
+                    ui.set_status_text("任务进行中：这次导入没有应用（等这轮跑完再导入）".into());
+                    return;
+                }
                 let outcome = match dictionaries::import_file(Path::new(&path)) {
                     Ok(o) => o,
                     Err(e) => {
@@ -6817,20 +6828,35 @@ fn tick(
                     ui.set_status_text(note.into());
                     return;
                 }
-                // 目标词典：当前启用的那套；没启用就按文件名新建一套
+                // 目标词典：当前启用的那套；没启用就按文件名找/建一套。
+                // **库里已有同名（未启用）的那套时，先把它的词条读出来再合并**——
+                // 直接 save 会按"同名覆盖"把原词条丢掉（复核指出）。
                 let current_file = state.active_dict_file.borrow().clone();
-                let current_name = current_file
+                let active_loaded = current_file
                     .as_deref()
-                    .and_then(|f| dictionaries::load_file(&dictionaries_root(), f).ok())
-                    .map(|d| d.name)
-                    .unwrap_or_else(|| {
-                        Path::new(&path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("导入的词典")
-                            .to_string()
-                    });
-                let mut merged = state.active_dict.borrow().clone();
+                    .and_then(|f| dictionaries::load_file(&dictionaries_root(), f).ok());
+                let fallback_name = Path::new(&path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("导入的词典")
+                    .to_string();
+                let current_name = active_loaded
+                    .as_ref()
+                    .map(|d| d.name.clone())
+                    .unwrap_or(fallback_name);
+                let mut merged = match active_loaded {
+                    Some(d) => d.entries,
+                    None => {
+                        let (rows, _) = dictionaries::list(&dictionaries_root());
+                        rows.iter()
+                            .filter(|r| r.name.eq_ignore_ascii_case(&current_name))
+                            .find_map(|r| {
+                                dictionaries::load_file(&dictionaries_root(), &r.file).ok()
+                            })
+                            .map(|d| d.entries)
+                            .unwrap_or_default()
+                    }
+                };
                 for e in &outcome.entries {
                     merged.insert(e.from.clone(), e.to.clone());
                 }
@@ -8309,6 +8335,38 @@ mod tests {
             let err = template_from_inputs(blank, "audio8-tts", None, 1.0, 250, true).unwrap_err();
             assert!(err.contains("名字"), "{err}");
         }
+    }
+
+    /// 复核抓到的：没启用词典时导入，若库里已有同名词典，**必须合并而不是覆盖**
+    /// （否则原词条被同名覆盖语义吃掉）。这里直接测"合并策略"这段逻辑本身。
+    #[test]
+    fn importing_without_active_dict_merges_an_existing_same_name_dict() {
+        let root = temp_dir("dict-import-merge");
+        // 库里已有一套"甲"（未启用）
+        let existing = dictionaries::save(
+            &root,
+            "甲",
+            [("a".to_string(), "1".to_string())].into_iter().collect(),
+            1,
+            file_stem,
+        )
+        .unwrap();
+        // 模拟导入：目标是同名"甲"，先把已有条目读出来
+        let (rows, _) = dictionaries::list(&root);
+        let mut merged = rows
+            .iter()
+            .filter(|r| r.name.eq_ignore_ascii_case("甲"))
+            .find_map(|r| dictionaries::load_file(&root, &r.file).ok())
+            .map(|d| d.entries)
+            .unwrap_or_default();
+        merged.insert("b".to_string(), "2".to_string());
+        let saved = dictionaries::save(&root, "甲", merged, 2, file_stem).unwrap();
+
+        assert_ne!(saved.file, existing.file, "写新文件、不覆盖旧资产");
+        let after = dictionaries::load_file(&root, &saved.file).unwrap();
+        assert_eq!(after.entries.len(), 2, "原词条 + 新词条：{after:?}");
+        assert_eq!(after.entries.get("a").map(String::as_str), Some("1"));
+        assert_eq!(after.entries.get("b").map(String::as_str), Some("2"));
     }
 
     /// 词典真的进了文本层：同一个稿件，带词典时 spoken 变成替换后的读法；

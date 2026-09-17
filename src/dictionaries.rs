@@ -251,13 +251,16 @@ pub fn parse_entries(text: &str) -> ImportOutcome {
     out
 }
 
+/// 取**行内最早出现**的分隔符切分。
+///
+/// 不能按固定优先级找（先 Tab 再 `=` 再逗号）：`重庆,桥=大桥` 这种"逗号分隔、替换里带等号"
+/// 的行，按优先级会被切成 `重庆,桥` → `大桥`（复核指出的静默错位）。取最早位置才对得上
+/// 用户的直觉：第一个出现的那个就是分隔符。
 fn split_entry(line: &str) -> Option<(&str, &str)> {
-    for sep in ['\t', '=', '＝', ','] {
-        if let Some((a, b)) = line.split_once(sep) {
-            return Some((a, b));
-        }
-    }
-    None
+    const SEPS: [char; 4] = ['\t', '=', '＝', ','];
+    let (idx, sep) = line.char_indices().find(|(_, c)| SEPS.contains(c))?;
+    let after = idx + sep.len_utf8();
+    Some((&line[..idx], &line[after..]))
 }
 
 /// 从文件读词条（大小上限先按元数据判，别先读进内存）。
@@ -296,7 +299,12 @@ pub fn export_tsv(
     for (k, v) in &dict.entries {
         body.push_str(&format!("{k}\t{v}\n"));
     }
-    let path = dest_dir.join(format!("dict-{}.tsv", sanitize(&dict.name)));
+    // 与库内文件名同一个道理：只归一化名字会让 `a/b` 与 `a_b` 两套词典导到同一个文件
+    let path = dest_dir.join(format!(
+        "dict-{}-{}.tsv",
+        sanitize(&dict.name),
+        &name_suffix(&dict.name.to_lowercase())[..8]
+    ));
     aw_core::dub::write_atomic_explained(&path, body.as_bytes())
         .map_err(|e| format!("词条导出失败（{}）：{e}", path.display()))?;
     Ok(path)
@@ -307,10 +315,14 @@ pub fn fingerprint(entries: &BTreeMap<String, String>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for (k, v) in entries {
+        // **长度前缀**：直接拼 `k=v\n` 会让 {"a=b":"c"} 与 {"a":"b=c"} 产生同一串字节、
+        // 同一个指纹 —— 换词典时就可能错误复用旧音频（复核指出）。
+        h.update(format!("{}:", k.len()).as_bytes());
         h.update(k.as_bytes());
-        h.update(b"=");
+        h.update(b"\0");
+        h.update(format!("{}:", v.len()).as_bytes());
         h.update(v.as_bytes());
-        h.update(b"\n");
+        h.update(b"\0");
     }
     format!("{:x}", h.finalize())
 }
@@ -417,6 +429,21 @@ mod tests {
         assert_eq!(out.entries[2].to, "很行");
     }
 
+    /// 分隔符取"最早出现"的那个：逗号分隔的行里，替换文本自带 `=` 不该被当成分隔符。
+    #[test]
+    fn parse_uses_the_earliest_separator() {
+        let out = parse_entries("重庆,桥=大桥\n");
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].from, "重庆");
+        assert_eq!(out.entries[0].to, "桥=大桥", "替换里的 = 要保留");
+
+        // 反过来：等号在前、逗号在后 → 等号是分隔符
+        let out = parse_entries("重庆=桥,大桥\n");
+        assert_eq!(out.entries[0].from, "重庆");
+        assert_eq!(out.entries[0].to, "桥,大桥");
+    }
+
     #[test]
     fn parse_reports_each_skip_with_line_number_and_lets_later_win() {
         let text = "好的一行\t替换\n没有分隔符\n空替换=\n重庆\t崇庆\n重庆\t重庆\n";
@@ -476,7 +503,11 @@ mod tests {
         .unwrap();
         let out = root.join("导出的词条");
         let path = export_tsv(&root, &e.file, &out, sanitize).unwrap();
-        assert_eq!(path.file_name().unwrap(), "dict-口播专用.tsv");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("dict-口播专用-") && name.ends_with(".tsv"),
+            "导出名 = slug + 名字哈希后缀：{name}"
+        );
 
         let text = std::fs::read_to_string(&path).unwrap();
         let back = parse_entries(&text);
@@ -488,6 +519,29 @@ mod tests {
             .map(|e| (e.from.clone(), e.to.clone()))
             .collect();
         assert_eq!(map.get("重庆").map(String::as_str), Some("崇庆"));
+    }
+
+    /// 指纹的长度前缀反例：`{"a=b":"c"}` 与 `{"a":"b=c"}` 是两套不同词典，指纹必须不同。
+    #[test]
+    fn fingerprint_has_no_delimiter_collision() {
+        let a = fingerprint(&entries(&[("a=b", "c")]));
+        let b = fingerprint(&entries(&[("a", "b=c")]));
+        assert_ne!(a, b, "不同的词典映射不能有同一个指纹");
+    }
+
+    /// 两套名字归一后相同的词典：导出文件名也要区分开（否则互相覆盖）。
+    #[test]
+    fn export_file_names_do_not_collide_after_sanitize() {
+        let root = temp_dir("export-collision");
+        let a = save(&root, "a/b", entries(&[("x", "1")]), 1, sanitize).unwrap();
+        let b = save(&root, "a_b", entries(&[("y", "2")]), 2, sanitize).unwrap();
+        let out = root.join("out");
+        let pa = export_tsv(&root, &a.file, &out, sanitize).unwrap();
+        let pb = export_tsv(&root, &b.file, &out, sanitize).unwrap();
+        assert_ne!(pa, pb, "两套词典不能导到同一个文件");
+        assert!(pa.is_file() && pb.is_file());
+        assert!(std::fs::read_to_string(&pa).unwrap().contains("x\t1"));
+        assert!(std::fs::read_to_string(&pb).unwrap().contains("y\t2"));
     }
 
     #[test]
