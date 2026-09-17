@@ -35,7 +35,7 @@ Linux 原生（Colima aarch64 + rust:1.95-bookworm）：
 docker run --rm -v "$HOME/.cache/audio-workshop-m3-snapshot:/work:ro" \
   -e CARGO_TARGET_DIR=/tmp/target -w /work rust:1.95-bookworm bash -c \
   'apt-get update -qq && apt-get install -y -qq pkg-config libx11-dev libxkbcommon-dev \
-   libwayland-dev libasound2-dev libfontconfig1-dev clang >/dev/null && cargo check --workspace'
+   libwayland-dev libasound2-dev libfontconfig1-dev libssl-dev clang >/dev/null && cargo check --workspace'
 ```
 
 结果：通过（2026-09-16，约 2m20s；日志 `/tmp/m3-linux-docker-check2.log`）。
@@ -88,7 +88,7 @@ cargo check --workspace --target x86_64-pc-windows-msvc
 - 这套代码在 Linux / Windows 上**编译得起来、clippy 干净、单测能过** —— 也就是本机因为
   没有目标 sysroot 而做不到的那部分；
 - Linux 侧的系统依赖清单是完整的（pkg-config / libx11 / libxkbcommon / libwayland /
-  libasound2 / libfontconfig / clang），后来者照抄不会再踩一遍；
+  libasound2 / libfontconfig / libssl-dev / clang），后来者照抄不会再踩一遍；
 - 三平台之间没有**门禁层面**的回归。
 
 **不能证明（所以不能拿它替代 M3 的关闭判据）**：
