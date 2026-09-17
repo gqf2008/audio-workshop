@@ -8133,57 +8133,154 @@ fn clear_separation_result(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_sep_progress(0.0);
 }
 
-/// 读取当前工程目录下的历史，只投影最近 5 条；每条的两轨在投影前已做安全解析。
-fn refresh_separation_history(ui: &MainWindow, state: &Rc<UiState>) {
-    let stems_dir = project_dir(&file_stem(&ui.get_project_name())).join("stems");
-    let mut items = Vec::new();
-    let mut ui_rows = Vec::new();
-    let status = match sep_history::load(&stems_dir) {
-        Ok(sep_history::HistoryLoad::Missing) => "还没有分离历史".to_string(),
+/// 「回看某条分离历史」要写进界面的那组值（纯投影，便于单测）。
+struct SepHistoryView {
+    input_path: String,
+    input_summary: String,
+    has_result: bool,
+    progress: f32,
+    result_available: bool,
+    vocals_label: String,
+    accompaniment_label: String,
+    /// 可用时是工程内的两轨；不可用时**必须是 `None`**（不能留下上一条的两轨）。
+    tracks: Option<(PathBuf, PathBuf)>,
+    sep_status: String,
+    main_status: String,
+}
+
+/// 一条历史 → 回看时要应用的界面状态。
+///
+/// 抽成纯函数是为了让"不可用条目要如实报原因、且不留下可试听的两轨"这条有测试隔离，
+/// 闭包本身（`on_sep_history_open`）需要 `MainWindow`，单测造不出来。
+fn sep_history_view_for(item: &SepHistoryItem) -> SepHistoryView {
+    let entry = &item.entry;
+    let label = file_label(Path::new(&entry.input_path));
+    let (tracks, sep_status, main_status) = match item.tracks.paths() {
+        Some((vocals, accompaniment)) => (
+            Some((vocals.to_path_buf(), accompaniment.to_path_buf())),
+            format!("历史结果：{label} · 可试听/导出"),
+            format!("已切到分离历史：{label}"),
+        ),
+        None => (
+            None,
+            item.tracks.note.clone(),
+            format!("这条分离历史不可用：{}", item.tracks.note),
+        ),
+    };
+    SepHistoryView {
+        input_path: entry.input_path.clone(),
+        input_summary: format!("已回看：{label}"),
+        has_result: true,
+        progress: 1.0,
+        result_available: item.tracks.available(),
+        vocals_label: format!("人声 · {}", entry.vocals_file),
+        accompaniment_label: format!("伴奏 · {}", entry.accompaniment_file),
+        tracks,
+        sep_status,
+        main_status,
+    }
+}
+
+/// 分离历史列表一次展示多少条（只投影最近几条，不提供翻页）。
+const SEP_HISTORY_VISIBLE: usize = 5;
+
+/// 读取 `stems_dir` 下的历史，投影成"时间倒序、最多 `SEP_HISTORY_VISIBLE` 条"的只读快照
+/// 与状态行文案；每条的两轨在投影前都做过工程内安全解析。
+///
+/// 抽成纯函数（只吃目录，不碰 `MainWindow`）是为了让"倒序取最近 5 条"和"坏索引不当成
+/// 没有历史"这两条行为有测试隔离——外层 `refresh_separation_history` 需要 `MainWindow`，
+/// 单测里造不出来。
+fn separation_history_view(stems_dir: &Path) -> (String, Vec<SepHistoryItem>) {
+    match sep_history::load(stems_dir) {
+        Ok(sep_history::HistoryLoad::Missing) => ("还没有分离历史".to_string(), Vec::new()),
         Ok(sep_history::HistoryLoad::Loaded(mut entries)) => {
             entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_ms));
-            let now = now_ms();
-            for entry in entries.into_iter().take(5) {
-                let tracks = sep_history::resolve_tracks(&stems_dir, &entry);
-                let input = file_label(Path::new(&entry.input_path));
-                let detail = if tracks.available() {
-                    let media = match (entry.duration_secs, entry.sample_rate_hz) {
-                        (Some(duration), Some(rate)) => format!(" · {duration:.1}s / {rate}Hz"),
-                        (Some(duration), None) => format!(" · {duration:.1}s"),
-                        (None, Some(rate)) => format!(" · {rate}Hz"),
-                        (None, None) => String::new(),
-                    };
-                    format!(
-                        "人声 {} · 伴奏 {}{media}",
-                        entry.vocals_file, entry.accompaniment_file
-                    )
-                } else {
-                    tracks.note.clone()
-                };
-                ui_rows.push(SeparationHistoryRow {
-                    index: items.len() as i32,
-                    created: relative_time(now, entry.created_at_ms).into(),
-                    input: input.into(),
-                    detail: detail.into(),
-                    available: tracks.available(),
-                });
-                items.push(SepHistoryItem { entry, tracks });
-            }
-            if ui_rows.is_empty() {
-                "还没有分离历史".to_string()
+            let items: Vec<SepHistoryItem> = entries
+                .into_iter()
+                .take(SEP_HISTORY_VISIBLE)
+                .map(|entry| SepHistoryItem {
+                    tracks: sep_history::resolve_tracks(stems_dir, &entry),
+                    entry,
+                })
+                .collect();
+            if items.is_empty() {
+                ("还没有分离历史".to_string(), items)
             } else {
-                format!("最近 {} 条（时间倒序）", ui_rows.len())
+                (format!("最近 {} 条（时间倒序）", items.len()), items)
             }
         }
         Err(e) => {
             // 坏索引不能显示成“没有历史”：状态行保留损坏原因，列表为空。
-            format!("分离历史读不出来：{e}")
+            (format!("分离历史读不出来：{e}"), Vec::new())
         }
+    }
+}
+
+/// 一条历史 → 界面行（纯投影；`index` 是它在快照里的下标，点击时原样回传）。
+fn separation_history_row(i: usize, now: u64, item: &SepHistoryItem) -> SeparationHistoryRow {
+    let entry = &item.entry;
+    let detail = if item.tracks.available() {
+        let media = match (entry.duration_secs, entry.sample_rate_hz) {
+            (Some(duration), Some(rate)) => format!(" · {duration:.1}s / {rate}Hz"),
+            (Some(duration), None) => format!(" · {duration:.1}s"),
+            (None, Some(rate)) => format!(" · {rate}Hz"),
+            (None, None) => String::new(),
+        };
+        format!(
+            "人声 {} · 伴奏 {}{media}",
+            entry.vocals_file, entry.accompaniment_file
+        )
+    } else {
+        item.tracks.note.clone()
     };
+    SeparationHistoryRow {
+        index: i as i32,
+        created: relative_time(now, entry.created_at_ms).into(),
+        input: file_label(Path::new(&entry.input_path)).into(),
+        detail: detail.into(),
+        available: item.tracks.available(),
+    }
+}
+
+/// 读取当前工程目录下的历史，只投影最近 5 条；每条的两轨在投影前已做安全解析。
+fn refresh_separation_history(ui: &MainWindow, state: &Rc<UiState>) {
+    let stems_dir = project_dir(&file_stem(&ui.get_project_name())).join("stems");
+    let (status, items) = separation_history_view(&stems_dir);
+    let now = now_ms();
+    let ui_rows: Vec<SeparationHistoryRow> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| separation_history_row(i, now, item))
+        .collect();
 
     *state.sep_history.borrow_mut() = items;
     ui.set_sep_history_rows(ModelRc::from(Rc::new(VecModel::from(ui_rows))));
     ui.set_sep_history_status(status.into());
+}
+
+/// 「当前结果」的两轨能不能试听/导出：必须**同一个工程目录**、都是工程内的普通文件。
+///
+/// 抽成纯函数（吃两个路径，不碰 `MainWindow`）是为了让"跨工程目录拒绝"这条有测试隔离
+/// ——外层 `current_separation_tracks_usable` 需要 `MainWindow`，单测造不出来。
+fn separation_tracks_check(vocals: &Path, accompaniment: &Path) -> Result<(), String> {
+    let Some(stems_dir) = vocals.parent() else {
+        return Err("分离结果路径不完整，不能试听/导出".to_string());
+    };
+    if accompaniment.parent() != Some(stems_dir) {
+        return Err("两轨不在同一个工程目录，拒绝试听/导出".to_string());
+    }
+    let (Some(vocals_file), Some(accompaniment_file)) = (
+        vocals.file_name().and_then(|name| name.to_str()),
+        accompaniment.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Err("两轨文件名不是 UTF-8，不能试听/导出".to_string());
+    };
+    let resolution = sep_history::resolve_track_names(stems_dir, vocals_file, accompaniment_file);
+    if resolution.available() {
+        Ok(())
+    } else {
+        Err(resolution.note)
+    }
 }
 
 /// 试听/导出前重新检查“当前结果”的两轨：文件可能已被删除，或缓存快照已过期。
@@ -8195,31 +8292,13 @@ fn current_separation_tracks_usable(ui: &MainWindow, state: &Rc<UiState>) -> boo
         ui.set_sep_status_text("还没有分离结果".into());
         return false;
     };
-    let Some(stems_dir) = vocals.parent() else {
-        ui.set_sep_result_available(false);
-        ui.set_sep_status_text("分离结果路径不完整，不能试听/导出".into());
-        return false;
-    };
-    if accompaniment.parent() != Some(stems_dir) {
-        ui.set_sep_result_available(false);
-        ui.set_sep_status_text("两轨不在同一个工程目录，拒绝试听/导出".into());
-        return false;
-    }
-    let (Some(vocals_file), Some(accompaniment_file)) = (
-        vocals.file_name().and_then(|name| name.to_str()),
-        accompaniment.file_name().and_then(|name| name.to_str()),
-    ) else {
-        ui.set_sep_result_available(false);
-        ui.set_sep_status_text("两轨文件名不是 UTF-8，不能试听/导出".into());
-        return false;
-    };
-    let resolution = sep_history::resolve_track_names(stems_dir, vocals_file, accompaniment_file);
-    if resolution.available() {
-        true
-    } else {
-        ui.set_sep_result_available(false);
-        ui.set_sep_status_text(resolution.note.clone().into());
-        false
+    match separation_tracks_check(&vocals, &accompaniment) {
+        Ok(()) => true,
+        Err(note) => {
+            ui.set_sep_result_available(false);
+            ui.set_sep_status_text(note.into());
+            false
+        }
     }
 }
 
@@ -8492,38 +8571,19 @@ fn wire_separation(
             ui.set_sep_status_text("历史条目已刷新，请重新点击".into());
             return;
         };
-        let entry = item.entry;
-        let tracks = item.tracks;
-        ui.set_sep_input_path(entry.input_path.clone().into());
-        ui.set_sep_input_summary(
-            format!("已回看：{}", file_label(Path::new(&entry.input_path))).into(),
-        );
-        *st_history.sep_input.borrow_mut() = Some(entry.input_path.clone());
-        ui.set_sep_has_result(true);
-        ui.set_sep_progress(1.0);
-        ui.set_sep_result_available(tracks.available());
-        ui.set_sep_vocals_label(format!("人声 · {}", entry.vocals_file).into());
-        ui.set_sep_accompaniment_label(format!("伴奏 · {}", entry.accompaniment_file).into());
-        if let Some((vocals, accompaniment)) = tracks.paths() {
-            *st_history.sep_tracks.borrow_mut() =
-                Some((vocals.to_path_buf(), accompaniment.to_path_buf()));
-            let note = format!(
-                "历史结果：{} · 可试听/导出",
-                file_label(Path::new(&entry.input_path))
-            );
-            ui.set_sep_status_text(note.into());
-            ui.set_status_text(
-                format!(
-                    "已切到分离历史：{}",
-                    file_label(Path::new(&entry.input_path))
-                )
-                .into(),
-            );
-        } else {
-            st_history.sep_tracks.borrow_mut().take();
-            ui.set_sep_status_text(tracks.note.clone().into());
-            ui.set_status_text(format!("这条分离历史不可用：{}", tracks.note).into());
-        }
+        let view = sep_history_view_for(&item);
+        ui.set_sep_input_path(view.input_path.clone().into());
+        ui.set_sep_input_summary(view.input_summary.into());
+        *st_history.sep_input.borrow_mut() = Some(view.input_path);
+        ui.set_sep_has_result(view.has_result);
+        ui.set_sep_progress(view.progress);
+        ui.set_sep_result_available(view.result_available);
+        ui.set_sep_vocals_label(view.vocals_label.into());
+        ui.set_sep_accompaniment_label(view.accompaniment_label.into());
+        // 不可用时必须是 None：不能把上一条历史的两轨留在槽位里（否则试听会放错音频）
+        *st_history.sep_tracks.borrow_mut() = view.tracks;
+        ui.set_sep_status_text(view.sep_status.into());
+        ui.set_status_text(view.main_status.into());
     });
 
     // 启动/接线时先读一次当前工程的历史；换工程名时也会刷新。
@@ -11286,6 +11346,170 @@ mod tests {
         // fmt 块从 12 开始：12..16 = "fmt "，+4 = 长度，+8 = 格式，+10 = 声道，+12 = 采样率
         assert_eq!(&bytes[12..16], b"fmt ");
         u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]])
+    }
+
+    /// 造一条分离历史（主仓接线单测用；两轨文件由用例自己放）。
+    fn sep_history_entry_fixture(
+        created_at_ms: u64,
+        vocals: &str,
+        accompaniment: &str,
+    ) -> sep_history::SeparationHistoryEntry {
+        sep_history::SeparationHistoryEntry {
+            created_at_ms,
+            input_path: format!("/tmp/in-{created_at_ms}.wav"),
+            vocals_file: vocals.into(),
+            accompaniment_file: accompaniment.into(),
+            duration_secs: None,
+            sample_rate_hz: None,
+        }
+    }
+
+    /// `refresh_separation_history` 的纯投影：**时间倒序**、最多 5 条；坏索引不能被显示成
+    /// "没有历史"（否则用户以为历史丢了）。
+    ///
+    /// 阳性对照：把排序改成升序、或把 `take(5)` 放宽/去掉、或把 `Err` 分支写成"没有历史"，
+    /// 本用例都会转红。
+    #[test]
+    fn separation_history_view_is_newest_first_and_caps_at_five() {
+        let root = temp_dir("sep-history-view");
+        let stems = root.join("stems");
+        std::fs::create_dir_all(&stems).unwrap();
+        for i in 1..=7u64 {
+            let entry = sep_history_entry_fixture(i, &format!("v{i}.wav"), &format!("a{i}.wav"));
+            sep_history::append_entry(&stems, &entry).unwrap();
+        }
+
+        let (status, items) = separation_history_view(&stems);
+        assert_eq!(items.len(), 5, "只投影最近 5 条");
+        assert_eq!(status, "最近 5 条（时间倒序）");
+        let times: Vec<u64> = items.iter().map(|item| item.entry.created_at_ms).collect();
+        assert_eq!(times, vec![7, 6, 5, 4, 3], "最新的必须排在最前");
+        // 两轨文件不存在不该让条目消失，只是不可用
+        assert!(!items[0].tracks.available());
+        assert!(items[0].tracks.note.contains("文件不在了"));
+
+        // 空索引（文件存在但 entries 为空）也要说"还没有"，不是"最近 0 条"
+        std::fs::write(
+            sep_history::history_path(&stems),
+            br#"{"version":1,"entries":[]}"#,
+        )
+        .unwrap();
+        let (status, items) = separation_history_view(&stems);
+        assert_eq!(status, "还没有分离历史");
+        assert!(items.is_empty());
+
+        // 坏索引：保留损坏原因，不能被当成"没有历史"
+        std::fs::write(
+            sep_history::history_path(&stems),
+            br#"{"version":1,"entries":"broken"}"#,
+        )
+        .unwrap();
+        let (status, items) = separation_history_view(&stems);
+        assert!(status.contains("读不出来"), "{status}");
+        assert!(items.is_empty());
+
+        // 目录都不在 = 没有历史（新工程）
+        let (status, items) = separation_history_view(&root.join("nope"));
+        assert_eq!(status, "还没有分离历史");
+        assert!(items.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 两轨**不在同一个工程目录**时必须拒绝（拿另一个工程的两轨去试听/导出 = 放错音频）。
+    ///
+    /// 阳性对照：去掉 `accompaniment.parent() != Some(stems_dir)` 这一句，本用例转红
+    /// （用例特意在 stems_a 里也放了一份同名 a.wav，好让"少一道检查"真的能溜过去）。
+    #[test]
+    fn separation_tracks_check_rejects_cross_project_dirs() {
+        let root = temp_dir("sep-cross");
+        let stems_a = root.join("a/stems");
+        let stems_b = root.join("b/stems");
+        std::fs::create_dir_all(&stems_a).unwrap();
+        std::fs::create_dir_all(&stems_b).unwrap();
+        std::fs::write(stems_a.join("v.wav"), b"x").unwrap();
+        std::fs::write(stems_a.join("a.wav"), b"x").unwrap();
+        std::fs::write(stems_b.join("v.wav"), b"x").unwrap();
+        std::fs::write(stems_b.join("a.wav"), b"x").unwrap();
+
+        assert_eq!(
+            separation_tracks_check(&stems_a.join("v.wav"), &stems_a.join("a.wav")),
+            Ok(())
+        );
+
+        let err =
+            separation_tracks_check(&stems_a.join("v.wav"), &stems_b.join("a.wav")).unwrap_err();
+        assert!(err.contains("不在同一个工程目录"), "{err}");
+
+        // 同目录但文件被删掉 → 如实说"文件不在了"，不能当成可用
+        let err =
+            separation_tracks_check(&stems_a.join("gone.wav"), &stems_a.join("a.wav")).unwrap_err();
+        assert!(err.contains("文件不在了"), "{err}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 回看一条历史要写进界面的值：可用时给出两轨与"可试听/导出"，不可用时如实报原因、
+    /// 且**不能留下任何可试听的两轨**（否则会放到上一条历史的音频）。
+    ///
+    /// 阳性对照：把不可用分支的 `tracks` 改成 `Some(...)`（忘了清旧两轨），本用例转红。
+    #[test]
+    fn sep_history_view_for_available_and_missing_items() {
+        let root = temp_dir("sep-view-item");
+        let stems = root.join("stems");
+        std::fs::create_dir_all(&stems).unwrap();
+        std::fs::write(stems.join("v.wav"), b"x").unwrap();
+        std::fs::write(stems.join("a.wav"), b"x").unwrap();
+
+        let entry = sep_history_entry_fixture(7, "v.wav", "a.wav");
+        let item = SepHistoryItem {
+            tracks: sep_history::resolve_tracks(&stems, &entry),
+            entry,
+        };
+        let view = sep_history_view_for(&item);
+        assert!(view.has_result, "回看就要亮成品区");
+        assert_eq!(view.progress, 1.0);
+        assert!(view.result_available);
+        assert_eq!(
+            view.tracks.as_ref().map(|(vocals, _)| vocals.clone()),
+            Some(stems.join("v.wav"))
+        );
+        assert_eq!(view.vocals_label, "人声 · v.wav");
+        assert_eq!(view.accompaniment_label, "伴奏 · a.wav");
+        assert!(
+            view.input_summary.starts_with("已回看："),
+            "{}",
+            view.input_summary
+        );
+        assert!(view.input_path.ends_with("in-7.wav"), "{}", view.input_path);
+        assert!(
+            view.sep_status.contains("可试听/导出"),
+            "{}",
+            view.sep_status
+        );
+        assert!(
+            view.main_status.contains("已切到分离历史"),
+            "{}",
+            view.main_status
+        );
+
+        // 两轨都不在 → 不给出路径，状态行带原因
+        let missing = sep_history_entry_fixture(8, "gone_v.wav", "gone_a.wav");
+        let item = SepHistoryItem {
+            tracks: sep_history::resolve_tracks(&stems, &missing),
+            entry: missing,
+        };
+        let view = sep_history_view_for(&item);
+        assert!(!view.result_available);
+        assert!(view.tracks.is_none(), "不可用时不能留下可试听的两轨");
+        assert!(
+            view.sep_status.contains("文件不在了"),
+            "{}",
+            view.sep_status
+        );
+        assert!(view.main_status.contains("不可用"), "{}", view.main_status);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// 真机（默认 ignored）：**人声分离走 worker 的命令通道**，覆盖统一队列的两个关键语义——
