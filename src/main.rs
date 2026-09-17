@@ -1926,6 +1926,34 @@ fn active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
     state.download_ids.borrow().get(key).copied()
 }
 
+/// 摘掉某模型的下载登记——**只有"登记的确实就是这条任务"才摘**。
+///
+/// 复核第二轮 B1：一条成功的下载会推两个终态快照（`download()` 自己发一个 Done、
+/// worker 收尾再发一个）。第一个终态会把登记摘掉、放行下一次下载；如果这时只按 label
+/// 摘、不看 `id`，紧接着到的**第二个（旧任务的）终态**就会把用户刚登记的新任务摘掉——
+/// UI 以为空闲，「下载」按钮又可点，于是同一个 dest 上叠出第二条任务抢同一个 `.part`。
+fn release_download_id(ids: &mut HashMap<String, u64>, label: &str, id: u64) -> bool {
+    if ids.get(label) == Some(&id) {
+        ids.remove(label);
+        true
+    } else {
+        false
+    }
+}
+
+/// 把一条快照并进列表：同一模型只保留**最新那条任务**的快照。
+///
+/// id 单调递增，"最新"就是 id 最大。旧任务的迟到快照（尤其是它的终态）不能盖掉新任务的
+/// 进度与状态——否则界面会显示旧任务的「已取消 / 已完成」，而新任务其实正在跑，
+/// 按钮文案与 `download_ids` 的登记也会对不上。
+fn merge_download_snapshot(list: &mut Vec<download::Snapshot>, snap: download::Snapshot) {
+    match list.iter_mut().find(|s| s.label == snap.label) {
+        Some(slot) if snap.id >= slot.id => *slot = snap,
+        Some(_) => {}
+        None => list.push(snap),
+    }
+}
+
 /// 一次「下载/取消」点击实际发生了什么（UI 只据它发提示）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickEffect {
@@ -7183,19 +7211,18 @@ fn tick(
                 ui.set_status_text(error.into());
             }
             Msg::DownloadUpdate(snap) => {
-                // 队列线程推来的快照：按 label（模型 id）覆盖同一条，重建列表。
+                // 队列线程推来的快照：同一模型只保留最新那条任务的，重建列表。
                 let label = snap.label.clone();
+                let id = snap.id;
                 let terminal = snap.state.is_terminal();
                 {
                     let mut list = state.downloads.borrow_mut();
-                    match list.iter_mut().find(|s| s.label == label) {
-                        Some(slot) => *slot = snap,
-                        None => list.push(snap),
-                    }
+                    merge_download_snapshot(&mut list, snap);
                 }
                 if terminal {
-                    // 终态才摘掉映射：中途摘掉会让「取消」按钮又变成「下载」再排一条
-                    state.download_ids.borrow_mut().remove(&label);
+                    // 终态才摘登记：中途摘掉会让「取消」按钮又变成「下载」再排一条。
+                    // 而且要**认领自己的 id**——旧任务的迟到终态不能把新任务摘掉（复核 B1）。
+                    release_download_id(&mut state.download_ids.borrow_mut(), &label, id);
                 }
                 refresh_download_rows(ui, state);
             }
@@ -8388,6 +8415,63 @@ mod tests {
         assert_eq!(fx, ClickEffect::AlreadyFinished(7));
         // 终态快照还没到，id 仍在册；下一次点击还是按"取消"这条路走
         assert_eq!(active_download_id(&state, "m"), Some(7));
+    }
+
+    /// 复核第二轮 B1：旧任务的**迟到终态快照**不能把用户刚登记的新任务摘掉。
+    ///
+    /// 一条成功下载会推两个终态（`download()` 自己一个 Done、worker 收尾一个）。第一个
+    /// 摘掉登记、放行下一次下载；若只按 label 摘不看 id，第二个（旧任务的）终态就会把
+    /// 新任务的登记摘掉——UI 以为空闲，「下载」又可点，同一个 dest 上叠出第二条任务抢
+    /// 同一个 `.part`。
+    ///
+    /// 这条对"只按 label 摘"的旧实现会红：第一、二条断言都会失败。
+    #[test]
+    fn stale_terminal_snapshot_does_not_release_the_new_task() {
+        let mut ids: HashMap<String, u64> = HashMap::new();
+        ids.insert("m".to_string(), 2); // 用户已经给同一个模型登记了新任务
+                                        // 旧任务（id=1）迟到来的终态：不许摘掉新任务
+        assert!(
+            !release_download_id(&mut ids, "m", 1),
+            "旧任务的终态不该认领新任务的登记"
+        );
+        assert_eq!(
+            ids.get("m"),
+            Some(&2),
+            "旧任务的终态快照不能把新任务的 id 摘掉"
+        );
+        // 确实是这条任务自己的终态才摘
+        assert!(release_download_id(&mut ids, "m", 2));
+        assert!(ids.is_empty());
+    }
+
+    /// 同理，旧任务的迟到快照也不能盖掉**界面行**里新任务的状态：
+    /// 否则按钮显示「下载/重下」，而 `download_ids` 里其实还挂着在跑的新任务。
+    ///
+    /// 这条对"按 label 无条件覆盖"的旧实现会红（旧实现会把 id=1 的 Cancelled 盖上去）。
+    #[test]
+    fn stale_snapshot_does_not_overwrite_the_newer_task_row() {
+        let snap = |id: u64, label: &str, state: download::State| download::Snapshot {
+            id,
+            label: label.to_string(),
+            dest: PathBuf::from("/models/m.gguf"),
+            state,
+            downloaded: 0,
+            total: None,
+            note: String::new(),
+        };
+        let mut list: Vec<download::Snapshot> = Vec::new();
+        merge_download_snapshot(
+            &mut list,
+            snap(2, "m", download::State::Downloading), // 新任务正在跑
+        );
+        // 旧任务（id=1）的迟到终态：直接丢掉，不许盖掉新任务那一行
+        merge_download_snapshot(&mut list, snap(1, "m", download::State::Cancelled));
+        assert_eq!(list.len(), 1, "同一模型只占一行");
+        assert_eq!(list[0].id, 2, "留下的必须是新任务那条");
+        assert_eq!(list[0].state, download::State::Downloading);
+        // 新任务自己的终态照常合并
+        merge_download_snapshot(&mut list, snap(2, "m", download::State::Done));
+        assert_eq!(list[0].state, download::State::Done);
     }
 
     /// 清单里找不到模型时如实报 UnknownModel（点之前清单被改过），不静默排空任务。
