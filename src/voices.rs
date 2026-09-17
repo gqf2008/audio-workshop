@@ -130,6 +130,19 @@ pub fn file_is_safe(file: &str) -> bool {
         && Path::new(file).components().count() == 1
 }
 
+/// 允许被清理的库内文件：文件名合法 + 是库目录里的**普通文件**（不是软链/目录）。
+///
+/// 清理路径必须过这一关：旧条目来自 `index.json`，而那是磁盘上的普通文件——手改成
+/// `../../important.txt` 就能让"覆盖保存"顺手删掉库外的东西（复核指出的数据安全阻塞）。
+fn removable_library_file(root: &Path, file: &str) -> Option<PathBuf> {
+    if !file_is_safe(file) {
+        return None;
+    }
+    let path = library_dir(root).join(file);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    (!meta.file_type().is_symlink() && meta.is_file()).then_some(path)
+}
+
 /// 取一个**可以安全读写**的库内音频路径：文件名合法 + 确实是库内的文件。
 pub fn usable_audio_path(root: &Path, entry: &VoiceEntry) -> Result<PathBuf, String> {
     if !file_is_safe(&entry.file) {
@@ -203,7 +216,17 @@ pub fn add_from_file(
     // **先读索引**：索引坏了就别动任何音色文件（否则会留下"索引没有、文件被换"的残局）
     let mut index = load(root)?;
     let slug = sanitize(name);
-    let file = library_file_name(&slug, &name.to_lowercase(), &ext);
+    let lower = name.to_lowercase();
+    // 每次保存写一个**新的**库内文件（同名也换新文件），索引落盘成功后才清理旧文件。
+    // 这样"索引写失败"只会留下一个没被引用的新文件（哑文件），旧资产一个字节都没动。
+    let base = library_file_name(&slug, &lower, &ext);
+    let mut file = base.clone();
+    let mut n = 2u32;
+    while library_dir(root).join(&file).exists() {
+        let stem = base.rsplit_once('.').map(|(a, _)| a).unwrap_or(&base);
+        file = format!("{stem}-{n}.{ext}");
+        n += 1;
+    }
     let dir = library_dir(root);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("建音色库目录失败：{}（{e}）", dir.display()))?;
@@ -218,10 +241,10 @@ pub fn add_from_file(
         note: note.trim().to_string(),
         created_at: now_ms,
     };
-    // 覆盖旧条目时记住旧文件；**索引落盘成功之后**再清（顺序反了会留下"索引指向已删文件"）
+    // 覆盖旧条目时记住旧文件（**过一遍安全校验**）；索引落盘成功之后才清
     let stale_old = index
         .get(name)
-        .map(|old| audio_path(root, old))
+        .and_then(|old| removable_library_file(root, &old.file))
         .filter(|p| *p != dst);
     index.upsert(entry.clone());
     save_index(root, &index)?;
@@ -513,6 +536,73 @@ mod tests {
         .unwrap();
         let err = import_from(&root, &pkg, 1, sanitize).unwrap_err();
         assert!(err.contains("不合法"), "{err}");
+    }
+
+    /// 复核的数据安全阻塞：旧条目来自 `index.json`（磁盘上的普通文件），手改成
+    /// `../重要.txt` 后覆盖保存，**清理路径会删掉库外的文件**。现在清理前要过
+    /// `removable_library_file`（裸文件名 + 库内普通文件），非法路径一律不删。
+    #[test]
+    fn overwrite_never_deletes_outside_files_from_tampered_index() {
+        let root = temp_dir("tamper-cleanup");
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("aw-voices-重要-{}.txt", std::process::id()));
+        std::fs::write(&outside, "不能被删".as_bytes()).unwrap();
+
+        let src = root.join("good.wav");
+        write_wav(&src, 3);
+        add_from_file(&root, "被篡改的", &src, "", 1, sanitize).unwrap();
+        // 手改索引：把这条的 file 指到库外
+        let mut index = load(&root).unwrap();
+        index.voices[0].file = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        save_index(&root, &index).unwrap();
+
+        // 覆盖保存同名条目：库外那个文件必须原样存在
+        let src2 = root.join("good2.wav");
+        write_wav(&src2, 4);
+        add_from_file(&root, "被篡改的", &src2, "重存", 2, sanitize).unwrap();
+        assert!(outside.is_file(), "库外文件被删了：{}", outside.display());
+        assert_eq!(std::fs::read(&outside).unwrap(), "不能被删".as_bytes());
+
+        // 绝对路径同样不许删
+        let mut index = load(&root).unwrap();
+        index.voices[0].file = outside.display().to_string();
+        save_index(&root, &index).unwrap();
+        add_from_file(&root, "被篡改的", &src2, "再存", 3, sanitize).unwrap();
+        assert!(
+            outside.is_file(),
+            "绝对路径也不该被删：{}",
+            outside.display()
+        );
+
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    /// 同名连存两次：每次写的是**新文件**（旧资产在索引落盘前不被改动），
+    /// 索引最终只指向新文件、且它确实存在。
+    #[test]
+    fn overwrite_writes_a_new_file_then_leaves_one_valid_entry() {
+        let root = temp_dir("new-file-each-save");
+        let a = root.join("a.wav");
+        let b = root.join("b.wav");
+        write_wav(&a, 11);
+        write_wav(&b, 22);
+        let first = add_from_file(&root, "同一个名字", &a, "", 1, sanitize).unwrap();
+        let second = add_from_file(&root, "同一个名字", &b, "", 2, sanitize).unwrap();
+        assert_ne!(
+            first.file, second.file,
+            "每次保存都用新文件，旧资产才不会被提前改写"
+        );
+
+        let index = load(&root).unwrap();
+        assert_eq!(index.voices.len(), 1);
+        let entry = index.get("同一个名字").unwrap();
+        assert_eq!(entry.file, second.file);
+        assert_eq!(
+            std::fs::read(usable_audio_path(&root, entry).unwrap()).unwrap(),
+            std::fs::read(&b).unwrap()
+        );
     }
 
     /// 两个不同的名字归一后是**同一个 slug**（`a/b` vs `a_b`）：文件名必须仍然不同，
