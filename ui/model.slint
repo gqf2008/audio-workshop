@@ -12,6 +12,8 @@ export struct Sentence {
     no: int,                 // 句序号（从 1 开始）
     text: string,            // 句子文本
     status: string,          // 待合成 / 合成中 / 已合成 / 失败
+    error-detail: string,    // 失败时的可执行原因（含 error: oom 的模型/内存/三个动作）
+    oom: bool,               // 这条失败是不是内存不足；只有它显示「释放模型内存」按钮
     duration: float,         // 该句时长（秒），未合成为 0
     start: float,            // 在整段音频中的起始时间（秒）
     duration-label: string,  // 展示用，如 "2.4s"

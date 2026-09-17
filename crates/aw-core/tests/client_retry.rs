@@ -27,6 +27,23 @@ fn retries_on_503_until_success() {
     assert_eq!(mock.hit_count(), 3, "503 后应重试直到成功");
 }
 
+/// 结构化内存不足是“明确拒绝”，不是“服务忙”：不能在后台白等 5 次退避，
+/// 要把控制权立刻交回配音队列，让用户释放内存后点继续。
+#[test]
+fn insufficient_memory_is_not_retried() {
+    let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+    let mock = support::Mock::start(vec![(503, body.into())]);
+    let c = client(&mock.base, 6);
+    let err = c
+        .synth("audio8-tts", "你好", Some(1), None, None)
+        .unwrap_err();
+    assert_eq!(mock.hit_count(), 1, "OOM 必须只发一次，不能自动重试");
+    let note = err.to_string();
+    assert!(note.contains("卸载空闲模型"), "提示要有可执行动作: {note}");
+    assert!(note.contains("q4_0"), "提示要有可执行动作: {note}");
+    assert!(note.contains("3.84 GiB"), "服务端原文不能被吞: {note}");
+}
+
 #[test]
 fn gives_up_after_six_attempts_like_python() {
     let mock = support::Mock::start(vec![(503, r#"{"error":"一直忙"}"#.into())]);
@@ -42,6 +59,46 @@ fn gives_up_after_six_attempts_like_python() {
     );
     // 错误体必须透出，否则看不见 503 的原因
     assert!(err.to_string().contains("一直忙"), "错误体应透出: {err}");
+}
+
+#[test]
+fn unload_all_models_reports_names_and_service_errors_truthfully() {
+    use std::io::{Read as _, Write as _};
+
+    // 成功路径用裸 TCP mock 钉住**真实 endpoint**；support::Mock 只看 body，
+    // 不能在测试里证明服务端路径没写错。
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            request.starts_with("POST /v1/tasks/unload_all_models HTTP/1.1"),
+            "unload endpoint 写错: {request}"
+        );
+        let body = r#"{"unloaded":["yue2","qwen3-asr"]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let note = client(&base, 1).unload_all_models().expect("200 应成功");
+    assert!(
+        note.contains("yue2") && note.contains("qwen3-asr"),
+        "{note}"
+    );
+    server.join().unwrap();
+
+    let failed = support::Mock::start(vec![(500, r#"{"error":"unload failed"}"#.into())]);
+    let err = client(&failed.base, 1)
+        .unload_all_models()
+        .expect_err("500 必须报错，不能假装卸载成功");
+    assert!(err.to_string().contains("unload failed"), "{err}");
 }
 
 /// 评审原话：500 且 body 恰好含 "503" 会被旧实现的 `contains("503")` 误判成可重试

@@ -246,6 +246,7 @@ export component MainWindow inherits Window {
     callback preview-all();
     callback preview-one(int);
     callback redo-one(int);
+    callback unload-models();
     callback speed-changed(float);
     callback gap-edited();
     callback dict-picked(int);
@@ -447,6 +448,7 @@ export component MainWindow inherits Window {
                     select-sentence(i) => { root.select-sentence(i); }
                     preview-one(i) => { root.preview-one(i); }
                     redo-one(i) => { root.redo-one(i); }
+                    unload-models => { root.unload-models(); }
                     start-run => { root.start-run(); }
                     stop-run => { root.stop-run(); }
                     stop-preview => { root.stop-preview(); }

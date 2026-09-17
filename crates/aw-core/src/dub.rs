@@ -281,8 +281,15 @@ impl Project {
                 }
                 Err(e) => {
                     failed += 1;
-                    self.sentences[i].status = format!("error: {e}");
-                    format!("error {e}")
+                    // `error: oom` 是队列可识别的失败标记；后面的文案仍由
+                    // `ClientError` 的唯一 Display 入口生成，五条链路共用。
+                    let status = if e.is_insufficient_memory() {
+                        format!("error: oom: {e}")
+                    } else {
+                        format!("error: {e}")
+                    };
+                    self.sentences[i].status = status.clone();
+                    status
                 }
             };
             // 逐句落盘（Python `cmd_synth` 同款）：中途被杀/断电，已完成句与状态不丢。
@@ -298,6 +305,18 @@ impl Project {
             on_progress(index, &outcome);
         }
         Ok(failed)
+    }
+
+    /// 本轮失败（`error:` 前缀，含 OOM）的工程句子下标。
+    ///
+    /// 用户点「继续合成」时只喂这些下标，不再重跑已经 done 的句子；整轮
+    /// 失败数也由同一份状态口径决定，不会把 done 误报成全失败。
+    pub fn failed_sentence_indices(&self) -> Vec<usize> {
+        self.sentences
+            .iter()
+            .filter(|s| s.status.starts_with("error"))
+            .map(|s| s.index)
+            .collect()
     }
 
     /// 单句重录（对应 Python `cmd_redo`）：换 seed → 可选改文本 → 重合成该句。

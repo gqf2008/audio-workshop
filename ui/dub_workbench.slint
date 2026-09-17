@@ -50,6 +50,7 @@ component SentenceRow inherits Rectangle {
     callback pick();
     callback audition();
     callback redo();
+    callback unload-models();
 
     // 未选中 48px、选中 92px（48px 主行 + 44px 展开行）——行高 ≥44px
     height: root.picked ? 92px : 48px;
@@ -127,6 +128,7 @@ component SentenceRow inherits Rectangle {
                 horizontal-stretch: 1;
                 // 质检分数并进状态行：展开区仍是「状态/分数 + 试听 + 重录」3 个元素
                 text: root.item.status
+                    + (root.item.error-detail == "" ? "" : " · " + root.item.error-detail)
                     + (root.item.eval-label == "" ? "" : " · " + root.item.eval-label);
                 color: PixelTheme.dim;
                 font-size: 12px;
@@ -148,6 +150,15 @@ component SentenceRow inherits Rectangle {
                 enabled: !root.busy;
                 Tooltip { text: @markdown("只重跑这一句"); }
                 clicked => { root.redo(); }
+            }
+            PixelButton {
+                visible: root.item.oom;
+                width: 104px;
+                size: "small";
+                text: "释放模型内存";
+                enabled: !root.busy;
+                Tooltip { text: @markdown("手动调用本地服务卸载已加载模型；只在你点击时执行，可能影响其它正在使用服务的任务"); }
+                clicked => { root.unload-models(); }
             }
         }
     }
@@ -547,6 +558,7 @@ export component DubWorkbench inherits Rectangle {
     callback select-sentence(int);
     callback preview-one(int);
     callback redo-one(int);
+    callback unload-models();
     callback start-run();
     callback stop-run();
     /// 打开 / 收起批量面板（M4-P1：一次导入 N 篇稿子）
@@ -765,7 +777,9 @@ export component DubWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 104px;
                         variant: "primary";
-                        text: root.running ? "停止合成" : (root.playing ? "停止试听" : "开始合成");
+                        text: root.running ? "停止合成"
+                            : (root.playing ? "停止试听"
+                            : (root.done-count > 0 && root.done-count < root.sentences.length ? "继续合成" : "开始合成"));
                         enabled: (root.running || root.playing || (root.sentences.length > 0 && root.voice-ready)) && !root.busy;
                         clicked => {
                             if root.running { root.stop-run(); }
@@ -1206,6 +1220,7 @@ export component DubWorkbench inherits Rectangle {
                             pick => { root.select-sentence(i); }
                             audition => { root.preview-one(i); }
                             redo => { root.redo-one(i); }
+                            unload-models => { root.unload-models(); }
                         }
                     }
                 }

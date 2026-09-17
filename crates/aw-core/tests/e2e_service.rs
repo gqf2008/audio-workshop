@@ -54,7 +54,14 @@ fn eval_roundtrip_end_to_end() {
     assert_eq!(failed, 0, "不该有失败句");
 
     let wav = dir.join("sentences/000.wav");
-    let hypothesis = client.asr(&wav).expect("ASR 应返回文本");
+    let hypothesis = match client.asr(&wav) {
+        Ok(text) => text,
+        Err(e) => {
+            // 真机复核要看的是**应用侧用户可见文案**，不是 Debug 里的原始 body：
+            // OOM 会被 ClientError::Display 转成含模型/内存/三个动作的可执行提示。
+            panic!("ASR 应返回文本；应用侧把 503 转成了：{e}");
+        }
+    };
     let score = aw_core::intelligibility(text, &hypothesis);
     eprintln!(
         "  参考: {text}\n  回读: {hypothesis}\n  可懂度 {:.1}%（编辑距离 {} / {} 字）",
