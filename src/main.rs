@@ -18,6 +18,7 @@ mod dictionaries;
 mod download;
 mod export;
 /// 随包分发的模型下载清单（M4-P7 第二段：下载源）。映射规则与诚实边界都在那里。
+mod model_capabilities;
 mod model_sources;
 /// 路径比较的唯一入口（`..` / 软链都按真实路径消解）。
 mod paths;
@@ -1401,27 +1402,60 @@ fn config_path() -> PathBuf {
         .unwrap_or(legacy)
 }
 
-#[derive(serde::Deserialize)]
+/// **生效**的服务清单（所有消费者读这个；解析入口只有 `parse_server_config`）。
 struct ServerConfig {
     host: Option<String>,
     port: Option<u16>,
     /// 服务内存守卫要求的余量（MiB）；0 = 服务侧关掉了守卫。
     /// 缺省时按 `model_sources::DEFAULT_HEADROOM_BYTES`（schema 的默认 1024 MiB）。
-    #[serde(default)]
     min_free_memory_mb: Option<u32>,
     models: Vec<ServerModel>,
 }
 
-/// 模型的「产品层能力 / 硬要求」声明（来自 `config/models.schema.yaml`，
-/// 由 `tools/audio_config.py render` 透传进 server.json）。
-#[derive(serde::Deserialize, Default)]
-struct ModelRequires {
-    #[serde(default)]
-    voice_ref: bool,
+/// 解析 server.json 的**唯一入口**：原始形状 → 逐字段回落随包能力清单 → 生效形状。
+///
+/// 这里也是"哪个来源说了算"的**唯一**答案（合并逻辑在 `model_capabilities::resolve`）；
+/// 调用方只做无条件赋值，别再写第二份判断
+/// （见 `LESSON_同一语义两处实现必然漂移`）。
+fn parse_server_config(raw: &str) -> Result<ServerConfig, String> {
+    let doc: RawServerConfig =
+        serde_json::from_str(raw).map_err(|e| format!("server.json 解析失败: {e}"))?;
+    // 随包清单是我们自己的产物：读不出来要如实报，不能静默当成"没有兜底"
+    // ——那正是本批要消灭的失败形态（能力提示悄悄消失）。
+    let cat = model_capabilities::catalog()
+        .map_err(|e| format!("随包能力清单（config/model-capabilities.json）读不出来：{e}"))?;
+    Ok(ServerConfig {
+        host: doc.host,
+        port: doc.port,
+        min_free_memory_mb: doc.min_free_memory_mb,
+        models: doc
+            .models
+            .into_iter()
+            .map(|m| {
+                let caps = model_capabilities::resolve(&m.caps, cat.find(&m.id));
+                ServerModel {
+                    id: m.id,
+                    task: m.task,
+                    family: m.family,
+                    path: m.path,
+                    url: m.url,
+                    sha256: m.sha256,
+                    size: m.size,
+                    caps,
+                }
+            })
+            .collect(),
+    })
 }
 
+/// server.json 一条记录的**原始**形状（serde 直接解析它）。
+///
+/// 能力字段走 `model_capabilities::RawCaps`（全是 `Option`）：只有原文能区分
+/// "服务端写了 `false`"与"服务端没写这一项"，而回落的判据恰恰是这个。
+/// serde 的 `default` 会把两者抹成同一个值，所以**不能**从生效值反推。
 #[derive(serde::Deserialize, Default)]
-struct ServerModel {
+struct RawServerModel {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     task: String,
@@ -1438,43 +1472,43 @@ struct ServerModel {
     /// 期望字节数（可选）：没有 sha256 时按它核大小。
     #[serde(default)]
     size: Option<u64>,
-    /// 产品层已排除（schema 的 `product_excluded`）：仍然注册（便于上游修好后复测），
-    /// 但**不作为可选项在界面暴露**。真机反例：`audio8-tts-01b` 选中后 HTTP 200
-    /// 却产出听不懂的音频（可懂度 0~3%、时长乱跳），全程无报错 —— 最坏的失败形态。
-    #[serde(default)]
-    product_excluded: bool,
-    /// `offline` / `streaming`（schema 的 `mode`）。
-    #[serde(default)]
-    mode: String,
-    /// 能力角色（schema 的 `role`）：`scoring` / `streaming` / `fast-asr` / …
-    #[serde(default)]
-    role: String,
-    /// 后端硬要求（schema 的 `requires`）：如 index-tts2 的 `voice_ref: true`。
-    #[serde(default)]
-    requires: Option<ModelRequires>,
-    /// 已知缺陷（schema 的 `known_issues`）：在选择处**只读**展示，不参与自动决策。
-    #[serde(default)]
-    known_issues: Vec<String>,
+    #[serde(flatten)]
+    caps: model_capabilities::RawCaps,
 }
 
-impl ServerModel {
-    /// 只在流式通道上跑（`/v1/audio/speech/live`）：离线批量与评估不适用，不能当离线引擎选。
+/// server.json 的**原始**形状（`#[serde(flatten)]` 之上再包一层）。
+#[derive(serde::Deserialize, Default)]
+struct RawServerConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    #[serde(default)]
+    min_free_memory_mb: Option<u32>,
+    #[serde(default)]
+    models: Vec<RawServerModel>,
+}
+
+/// 一条**生效**的模型记录（下游消费者读的都是它）。
+#[derive(Default)]
+struct ServerModel {
+    id: String,
+    task: String,
+    family: String,
+    path: String,
+    /// 上游下载地址（P7）：有它才算"可下载模型"，没有就不显示下载入口。
+    url: String,
+    /// 期望 sha256（可选）：给了就下载后必校验，不匹配直接丢弃。
+    sha256: String,
+    /// 期望字节数（可选）：没有 sha256 时按它核大小。
+    size: Option<u64>,
+    /// **生效**能力（服务端显式 → 随包清单兜底）。不是 serde 直接填的：
+    /// 由 `parse_server_config` 走 `model_capabilities::resolve` 算出来。
     ///
-    /// `mode` 与 `role` 都可能承载这个信息（schema 里两种写法都出现过：audio8-tts-stream
-    /// 是 `mode: streaming`，audio8-tts-01b-stream 同时有 `mode` 与 `role`），两个都认。
-    fn is_streaming_only(&self) -> bool {
-        self.mode.eq_ignore_ascii_case("streaming") || self.role.eq_ignore_ascii_case("streaming")
-    }
-
-    /// 该引擎是否**必须**提供参考音频（index-tts2：不接 voice_ref 直接报错）。
-    fn requires_voice_ref(&self) -> bool {
-        self.requires.as_ref().is_some_and(|r| r.voice_ref)
-    }
-
-    /// 已知缺陷的一句话只读说明（空 = 没登记）。
-    fn known_issues_note(&self) -> String {
-        self.known_issues.join("；")
-    }
+    /// - `product_excluded`：产品层已排除；真机反例 `audio8-tts-01b` 选中后 HTTP 200
+    ///   却产出听不懂的音频（可懂度 0~3%、时长乱跳），全程无报错 —— 最坏的失败形态。
+    /// - `mode` / `role`：`offline` / `streaming` / `scoring` / `fast-asr` …
+    /// - `requires`：后端硬要求（如 index-tts2 的 `voice_ref: true`）。
+    /// - `known_issues`：在选择处**只读**展示，不参与自动决策。
+    caps: model_capabilities::Capability,
 }
 
 /// 配音可选引擎的**唯一判据**：tts 任务 + 没被产品层排除 + 不是流式专用。
@@ -1482,7 +1516,7 @@ impl ServerModel {
 /// 下拉列表、默认引擎、能力判定都必须走它 —— 别再写第二份过滤
 /// （见 `LESSON_同一语义两处实现必然漂移`：同一语义两份实现必然漂移）。
 fn is_selectable_tts_engine(m: &ServerModel) -> bool {
-    m.task == "tts" && !m.product_excluded && !m.is_streaming_only()
+    m.task == "tts" && !m.caps.product_excluded && !m.caps.is_streaming_only()
 }
 
 /// 清单里的可选 TTS 引擎 → 音色下拉行（配音「高级 → 引擎」消费它）。
@@ -1498,8 +1532,8 @@ fn tts_engine_voices(models: &[ServerModel]) -> Vec<Voice> {
             engine: format!("{} · 本地", m.family).into(),
             note: short_path(&m.path).into(),
             license: "仅自用".into(),
-            requires_voice_ref: m.requires_voice_ref(),
-            known_issues: m.known_issues_note().into(),
+            requires_voice_ref: m.caps.requires_voice_ref(),
+            known_issues: m.caps.known_issues_note().into(),
         })
         .collect()
 }
@@ -1522,26 +1556,24 @@ fn default_engine_index(voices: &[Voice]) -> i32 {
 /// 文件缺失/解析失败返回空清单 + 原因说明（不 panic：服务没配时界面也可打开）。
 fn discover_engine() -> (Vec<Voice>, Option<String>, String) {
     let cfg_path = config_path();
-    let raw = std::fs::read_to_string(&cfg_path).ok();
     let over = settings_snapshot();
-    let cfg = raw.as_deref().and_then(|r| {
-        serde_json::from_str::<ServerConfig>(r)
-            .map_err(|e| e.to_string())
-            .ok()
-    });
-    // 与界面回显共用同一个解析入口（见 resolve_base 的注释）
     let env_base = std::env::var("AW_SERVER").ok();
+    // **只解析一次**：地址回显与引擎列表共用同一份结果（解析两遍就是两份判据，
+    // 见 `LESSON_同一语义两处实现必然漂移`）。解析失败/文件缺失都退化成"没有清单"。
+    let (cfg, note) = match std::fs::read_to_string(&cfg_path) {
+        Ok(raw) => match parse_server_config(&raw) {
+            Ok(c) => (Some(c), String::new()),
+            Err(e) => (None, e),
+        },
+        Err(_) => (None, format!("没找到 {}", cfg_path.display())),
+    };
+    // 与界面回显共用同一个解析入口（见 resolve_base 的注释）
     let (base_url, _) = resolve_base(&over, &cfg, env_base.as_deref());
     let base = has_endpoint_source(&over, &cfg, env_base.as_deref()).then_some(base_url);
-    let Some(raw) = raw else {
-        return (Vec::new(), base, format!("没找到 {}", cfg_path.display()));
-    };
-    let cfg: ServerConfig = match serde_json::from_str(&raw) {
-        Ok(c) => c,
-        Err(e) => return (Vec::new(), base, format!("server.json 解析失败: {e}")),
-    };
-    let voices = tts_engine_voices(&cfg.models);
-    (voices, base, String::new())
+    let voices = cfg
+        .map(|c| tts_engine_voices(&c.models))
+        .unwrap_or_default();
+    (voices, base, note)
 }
 
 /// 清单里的模型总数（读不到清单就是 0，不算错误）。
@@ -1550,10 +1582,13 @@ fn config_summary() -> usize {
 }
 
 /// 读模型清单（读不到就是"没有清单"）。
+///
+/// 解析走唯一入口 `parse_server_config`：所以服务没声明的能力字段，在这里也已经
+/// 回落过随包能力清单（不是"只有 discover_engine 才回落"）。
 fn read_server_config() -> Option<ServerConfig> {
     std::fs::read_to_string(config_path())
         .ok()
-        .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok())
+        .and_then(|raw| parse_server_config(&raw).ok())
 }
 
 // ===========================================================================
@@ -5045,7 +5080,7 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             {
                 eprintln!(
                     "  [不出现在下拉] {} · product_excluded={} · mode={:?} · role={:?}",
-                    m.id, m.product_excluded, m.mode, m.role
+                    m.id, m.caps.product_excluded, m.caps.mode, m.caps.role
                 );
             }
             let song = song_engine_options(&models);
@@ -8099,7 +8134,7 @@ fn builtin_song_label(id: &str) -> Option<&'static str> {
 fn song_engine_options(models: &[ServerModel]) -> Vec<SongEngineOption> {
     let from_manifest: Vec<SongEngineOption> = models
         .iter()
-        .filter(|m| m.task == "gen" && !m.product_excluded && !m.is_streaming_only())
+        .filter(|m| m.task == "gen" && !m.caps.product_excluded && !m.caps.is_streaming_only())
         .map(|m| SongEngineOption {
             label: builtin_song_label(&m.id)
                 .unwrap_or(m.id.as_str())
@@ -10524,6 +10559,7 @@ fn toast(ui: &MainWindow, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model_capabilities::{Capability, Requires};
 
     /// 目录扫描：深度 ≤2（覆盖 `models/<模型名>/*.gguf`），深度 3 的文件不算；
     /// 目录不存在不能假装扫到东西。
@@ -10792,6 +10828,14 @@ mod tests {
         }
     }
 
+    /// 造一条清单模型并直接给它一组**生效能力**（其余取默认）。
+    fn sm_with_caps(id: &str, task: &str, caps: Capability) -> ServerModel {
+        ServerModel {
+            caps,
+            ..sm(id, task)
+        }
+    }
+
     /// 把清单模型转成"下拉行"（要求它是可选的 tts 引擎）。
     fn voice_of(m: &ServerModel) -> Voice {
         tts_engine_voices(std::slice::from_ref(m))
@@ -10811,20 +10855,32 @@ mod tests {
     fn tts_engine_list_drops_product_excluded_and_streaming_only() {
         let models = vec![
             sm("audio8-tts", "tts"),
-            ServerModel {
-                product_excluded: true,
-                ..sm("audio8-tts-01b", "tts")
-            },
-            ServerModel {
-                mode: "streaming".into(),
-                ..sm("audio8-tts-stream", "tts")
-            },
-            ServerModel {
-                mode: "streaming".into(),
-                role: "streaming".into(),
-                product_excluded: true,
-                ..sm("audio8-tts-01b-stream", "tts")
-            },
+            sm_with_caps(
+                "audio8-tts-01b",
+                "tts",
+                Capability {
+                    product_excluded: true,
+                    ..Default::default()
+                },
+            ),
+            sm_with_caps(
+                "audio8-tts-stream",
+                "tts",
+                Capability {
+                    mode: "streaming".into(),
+                    ..Default::default()
+                },
+            ),
+            sm_with_caps(
+                "audio8-tts-01b-stream",
+                "tts",
+                Capability {
+                    mode: "streaming".into(),
+                    role: "streaming".into(),
+                    product_excluded: true,
+                    ..Default::default()
+                },
+            ),
             sm("index-tts2", "tts"),
             sm("yue2", "gen"), // 不是 tts：本来就不该出现在配音下拉
             sm("qwen3-asr", "asr"),
@@ -10839,10 +10895,14 @@ mod tests {
             "只留没被排除、且是离线的 tts 模型"
         );
         // role 单独承载流式时也要认（schema 里 audio8-tts-01b-stream 两种都写了）
-        let role_only = vec![ServerModel {
-            role: "streaming".into(),
-            ..sm("stream-only", "tts")
-        }];
+        let role_only = vec![sm_with_caps(
+            "stream-only",
+            "tts",
+            Capability {
+                role: "streaming".into(),
+                ..Default::default()
+            },
+        )];
         assert!(
             tts_engine_voices(&role_only).is_empty(),
             "role=streaming 也算流式专用"
@@ -10855,10 +10915,14 @@ mod tests {
     /// → 第一条断言变 `Ready`，本用例红。
     #[test]
     fn engine_requiring_reference_cannot_start_on_builtin_voice() {
-        let needs_ref = ServerModel {
-            requires: Some(ModelRequires { voice_ref: true }),
-            ..sm("index-tts2", "tts")
-        };
+        let needs_ref = sm_with_caps(
+            "index-tts2",
+            "tts",
+            Capability {
+                requires: Some(Requires { voice_ref: true }),
+                ..Default::default()
+            },
+        );
         let v = voice_of(&needs_ref);
         assert!(v.requires_voice_ref, "能力要跟着行走到判据里");
 
@@ -10918,11 +10982,15 @@ mod tests {
     /// 验收②（续）：引擎说明里要带上清单登记的 `known_issues`，且硬要求要点名。
     #[test]
     fn engine_note_surfaces_requires_and_known_issues() {
-        let m = ServerModel {
-            requires: Some(ModelRequires { voice_ref: true }),
-            known_issues: vec!["不接 voice_ref 会直接报错".into()],
-            ..sm("index-tts2", "tts")
-        };
+        let m = sm_with_caps(
+            "index-tts2",
+            "tts",
+            Capability {
+                requires: Some(Requires { voice_ref: true }),
+                known_issues: vec!["不接 voice_ref 会直接报错".into()],
+                ..Default::default()
+            },
+        );
         let note = engine_note(Some(&voice_of(&m)));
         assert!(note.contains("必须提供参考音频"), "{note}");
         assert!(note.contains("不接 voice_ref 会直接报错"), "{note}");
@@ -10938,10 +11006,17 @@ mod tests {
     #[test]
     fn default_engine_follows_capability_not_a_hardcoded_id() {
         // 清单里没有 audio8-tts（只有 index-tts2）→ 仍要选得到一个可用 TTS
-        let only_index = vec![voice_of(&ServerModel {
-            requires: Some(ModelRequires { voice_ref: true }),
-            ..sm("index-tts2", "tts")
-        })];
+        let needs_ref = || {
+            sm_with_caps(
+                "index-tts2",
+                "tts",
+                Capability {
+                    requires: Some(Requires { voice_ref: true }),
+                    ..Default::default()
+                },
+            )
+        };
+        let only_index = vec![voice_of(&needs_ref())];
         assert_eq!(
             default_engine_index(&only_index),
             0,
@@ -10949,13 +11024,7 @@ mod tests {
         );
 
         // 都在时优先"免参考音"的那个：新用户第一次进来就能直接合成
-        let both = vec![
-            voice_of(&ServerModel {
-                requires: Some(ModelRequires { voice_ref: true }),
-                ..sm("index-tts2", "tts")
-            }),
-            voice_of(&sm("audio8-tts", "tts")),
-        ];
+        let both = vec![voice_of(&needs_ref()), voice_of(&sm("audio8-tts", "tts"))];
         assert_eq!(
             default_engine_index(&both),
             1,
@@ -10963,10 +11032,7 @@ mod tests {
         );
 
         // 全都要参考音时退回第一个，而不是 -1
-        let all_need_ref = vec![voice_of(&ServerModel {
-            requires: Some(ModelRequires { voice_ref: true }),
-            ..sm("index-tts2", "tts")
-        })];
+        let all_need_ref = vec![voice_of(&needs_ref())];
         assert_eq!(default_engine_index(&all_need_ref), 0);
         assert_eq!(default_engine_index(&[]), -1, "一个引擎都没有才是 -1");
     }
@@ -10995,14 +11061,22 @@ mod tests {
             sm("yue2", "gen"),
             sm("experimental-gen", "gen"),
             sm("audio8-tts", "tts"), // 不是 gen
-            ServerModel {
-                product_excluded: true,
-                ..sm("excluded-gen", "gen")
-            },
-            ServerModel {
-                mode: "streaming".into(),
-                ..sm("stream-gen", "gen")
-            },
+            sm_with_caps(
+                "excluded-gen",
+                "gen",
+                Capability {
+                    product_excluded: true,
+                    ..Default::default()
+                },
+            ),
+            sm_with_caps(
+                "stream-gen",
+                "gen",
+                Capability {
+                    mode: "streaming".into(),
+                    ..Default::default()
+                },
+            ),
         ];
         let opts = song_engine_options(&models);
         assert_eq!(
@@ -11049,13 +11123,15 @@ mod tests {
     /// （或把 `ModelRequires::voice_ref` 改名）→ 本用例红。
     #[test]
     fn server_json_keys_match_the_serde_field_names() {
-        // 与真实 server.json 形状一致的最小片段（键名逐字取自 schema 的渲染落点）
+        // **故意用不在随包清单里的 id**：用真 id 的话，键名漂移会退化成"服务端没写"
+        // → 落回随包清单 → 断言照样绿，这条用例就没牙了（本批的兜底正会把漂移盖住）。
+        // 形状与真实 server.json 一致（键名逐字取自 schema 的渲染落点）。
         let raw = r#"{
             "host": "127.0.0.1",
             "port": 8080,
             "models": [
                 {
-                    "id": "audio8-tts-01b",
+                    "id": "srv-excluded",
                     "task": "tts",
                     "family": "audio8_tts",
                     "path": "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
@@ -11063,7 +11139,7 @@ mod tests {
                     "product_excluded": true
                 },
                 {
-                    "id": "index-tts2",
+                    "id": "srv-needs-ref",
                     "task": "tts",
                     "family": "index_tts2",
                     "path": "/models/IndexTTS2.5-GGUF/i.gguf",
@@ -11072,7 +11148,7 @@ mod tests {
                     "known_issues": ["不接 voice_ref 会直接报错"]
                 },
                 {
-                    "id": "audio8-tts-01b-stream",
+                    "id": "srv-stream",
                     "task": "tts",
                     "family": "audio8_tts",
                     "path": "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
@@ -11081,39 +11157,56 @@ mod tests {
                     "product_excluded": true
                 },
                 {
-                    "id": "qwen3-asr",
+                    "id": "srv-scoring",
                     "task": "asr",
                     "family": "qwen3_asr",
                     "path": "/models/Qwen3-ASR-0.6B-GGUF/q.gguf",
                     "mode": "offline",
                     "role": "scoring"
+                },
+                {
+                    "id": "srv-plain",
+                    "task": "tts",
+                    "family": "audio8_tts",
+                    "path": "/models/plain/a.gguf"
                 }
             ]
         }"#;
 
-        let cfg: ServerConfig = serde_json::from_str(raw).expect("最小清单要能解析");
+        let cfg = parse_server_config(raw).expect("最小清单要能解析");
         assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(cfg.port, Some(8080));
-        assert_eq!(cfg.models.len(), 4);
+        assert_eq!(cfg.models.len(), 5);
 
         assert!(
-            cfg.models[0].product_excluded,
+            cfg.models[0].caps.product_excluded,
             "product_excluded 必须解析到（漂移就会静默变成 false=照旧暴露）"
         );
+        assert_eq!(
+            cfg.models[0].path, "/models/Audio8-TTS-Preview-0.1B-GGUF/a.gguf",
+            "path 也必须解析到（漂移会让模型目录推导与落点校验全错）"
+        );
         assert!(
-            cfg.models[1].requires_voice_ref(),
+            cfg.models[1].caps.requires_voice_ref(),
             "requires.voice_ref 必须解析到（漂移就会静默变成 false=不拦）"
         );
         assert_eq!(
-            cfg.models[1].known_issues_note(),
+            cfg.models[1].caps.known_issues_note(),
             "不接 voice_ref 会直接报错",
             "known_issues 必须解析到（漂移就会静默变成空）"
         );
         assert!(
-            cfg.models[2].is_streaming_only(),
+            cfg.models[2].caps.is_streaming_only(),
             "mode / role = streaming 必须解析到"
         );
-        assert_eq!(cfg.models[3].role, "scoring", "role 必须解析到");
+        assert_eq!(cfg.models[3].caps.role, "scoring", "role 必须解析到");
+        assert_eq!(cfg.models[4].url, "", "没写 url 就是空串，不是解析失败");
+        assert!(
+            cfg.models[4].caps.known_issues.is_empty()
+                && !cfg.models[4].caps.product_excluded
+                && cfg.models[4].caps.mode.is_empty(),
+            "随包清单里没有这个 id → 没写的字段就是未声明默认，不编造"
+        );
 
         // 端到端：判据作用在"从 JSON 来的"清单上，结果要和 Rust 结构体的一致
         let names: Vec<String> = tts_engine_voices(&cfg.models)
@@ -11122,12 +11215,134 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["index-tts2"],
-            "JSON 来的清单走同一条过滤：0.1b 被排除、stream 只走流式"
+            vec!["srv-needs-ref", "srv-plain"],
+            "JSON 来的清单走同一条过滤：被排除的与流式专用的不进下拉"
         );
         assert!(
             tts_engine_voices(&cfg.models)[0].requires_voice_ref,
             "能力也要穿过 JSON 到达下拉行"
+        );
+    }
+
+    // ── 随包能力清单兜底（批次 cc-ai-audio-workshop-capability-fallback）─────
+    //
+    // 每条都写了阳性对照：故意改坏哪一处会让它红。
+
+    /// 验收①：**不改 server.json** 也能拿到能力提示 —— 服务端没写的字段回落随包清单。
+    ///
+    /// 本机真机的形状就是这条：13 个模型里 `requires` / `role` / `known_issues`
+    /// 一个都没有（只有 `mode`，两个 0.1b 有 `product_excluded`），所以改前界面
+    /// "不误禁、但也不提示"。
+    ///
+    /// 阳性对照：把 `parse_server_config` 里的 `model_capabilities::resolve` 换成
+    /// 直接抄原始值（或删掉随包清单回落）→ `requires_voice_ref` 掉成 false，本用例红。
+    #[test]
+    fn server_omitting_capabilities_still_gets_them_from_the_bundled_catalog() {
+        let raw = r#"{"models":[
+            {"id":"index-tts2","task":"tts","family":"index_tts2","path":"/m/i.gguf","mode":"offline"},
+            {"id":"audio8-tts","task":"tts","family":"audio8_tts","path":"/m/a.gguf","mode":"offline"}
+        ]}"#;
+        let cfg = parse_server_config(raw).expect("清单要能解析");
+
+        let index = &cfg.models[0];
+        assert!(
+            index.caps.requires_voice_ref(),
+            "服务端没写 requires → 必须回落随包清单（这是本批的核心价值）"
+        );
+        assert!(
+            !index.caps.known_issues.is_empty(),
+            "known_issues 也要回落，否则提示上不了屏"
+        );
+        assert_eq!(index.caps.mode, "offline", "服务端写了 mode → 用服务端的");
+
+        // 端到端：这条能力真的走到了"能不能开工"的判据上
+        let v = voice_of(index);
+        assert!(v.requires_voice_ref, "能力要穿过清单到达下拉行");
+        assert_eq!(
+            voice_readiness(Some(&v), "", false, ""),
+            VoiceReadiness::EngineNeedsReference,
+            "不填参考音就该被拦（改前这里会放行）"
+        );
+        let note = engine_note(Some(&v));
+        assert!(note.contains("必须提供参考音频"), "{note}");
+        assert!(
+            note.contains("不接 voice_ref 会直接报错"),
+            "随包的 known_issues 要上屏：{note}"
+        );
+
+        // 不吃参考音的引擎不能被顺带禁掉
+        assert!(!cfg.models[1].caps.requires_voice_ref());
+        assert_eq!(
+            voice_readiness(Some(&voice_of(&cfg.models[1])), "", false, ""),
+            VoiceReadiness::Ready
+        );
+    }
+
+    /// 验收②：服务端**显式**给了就以服务端为准，而且是**逐字段**（不是整条二选一）。
+    ///
+    /// 阳性对照：把 `resolve` 改成"服务端任一能力字段存在就整条用服务端"
+    /// → 第二条断言（没补的 requires 仍回落）红。
+    #[test]
+    fn server_explicit_capabilities_win_field_by_field() {
+        let raw = r#"{"models":[
+            {"id":"index-tts2","task":"tts","path":"/m/i.gguf",
+             "mode":"offline","role":"fast-asr","requires":{"voice_ref":false},"known_issues":[]}
+        ]}"#;
+        let cfg = parse_server_config(raw).expect("清单要能解析");
+        let caps = &cfg.models[0].caps;
+        assert!(
+            !caps.requires_voice_ref(),
+            "服务端显式 voice_ref=false 必须压过随包清单的 true"
+        );
+        assert!(
+            caps.known_issues.is_empty(),
+            "服务端显式空数组必须压过随包清单的非空（否则用户删不掉随包登记的提示）"
+        );
+        assert_eq!(caps.role, "fast-asr", "服务端显式 role 优先");
+        assert_eq!(caps.mode, "offline");
+        assert!(!caps.product_excluded);
+
+        // 逐字段：服务端只补了 mode，其余仍要拿到兜底
+        let raw = r#"{"models":[
+            {"id":"index-tts2","task":"tts","path":"/m/i.gguf","mode":"streaming"}
+        ]}"#;
+        let caps = parse_server_config(raw)
+            .expect("清单要能解析")
+            .models
+            .remove(0)
+            .caps;
+        assert_eq!(caps.mode, "streaming", "服务端补的 mode 生效");
+        assert!(caps.requires_voice_ref(), "服务端没补的 requires 仍要回落");
+        assert!(
+            !caps.known_issues.is_empty(),
+            "服务端没补的 known_issues 仍要回落"
+        );
+        assert!(caps.is_streaming_only());
+    }
+
+    /// 验收③：**不渲染** server.json 时，`product_excluded` 与 streaming-only 的过滤也生效。
+    ///
+    /// 真机反例：`audio8-tts-01b` 会产出听不懂的音频却全程不报错（最坏的失败形态）；
+    /// `audio8-tts-stream` 只走 `/v1/audio/speech/live`，离线批量与评估都不适用。
+    ///
+    /// 阳性对照：去掉 `parse_server_config` 的兜底 → 这两个 id 回到下拉，本用例红。
+    #[test]
+    fn excluded_and_streaming_are_filtered_even_when_the_server_declares_nothing() {
+        let raw = r#"{"models":[
+            {"id":"audio8-tts","task":"tts","path":"/m/a.gguf","mode":"offline"},
+            {"id":"audio8-tts-01b","task":"tts","path":"/m/b.gguf","mode":"offline"},
+            {"id":"audio8-tts-stream","task":"tts","path":"/m/c.gguf"},
+            {"id":"index-tts2","task":"tts","path":"/m/i.gguf","mode":"offline"}
+        ]}"#;
+        let cfg = parse_server_config(raw).expect("清单要能解析");
+        let names: Vec<String> = tts_engine_voices(&cfg.models)
+            .iter()
+            .map(|v| v.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["audio8-tts", "index-tts2"],
+            "服务端没声明 product_excluded/mode 时，靠随包清单也要把 0.1b 与 stream 挡在下拉外"
         );
     }
 
