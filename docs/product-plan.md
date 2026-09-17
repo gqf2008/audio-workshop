@@ -70,7 +70,7 @@
 | # | 功能 | 级别 | 判据 |
 |---|---|---|---|
 | S1 | 命令行/菜单隐藏入口跑通 yue2 / ace-step | **[M4]** | 可懂度 85% / 71%，达不到产品级；阶段随 CHARTER §9「M4 = 歌曲场景」 |
-| S2 | 转谱接翻唱（sheetsage2 → yue2 cot=melody） | **[M4]** | 链路已登记在配置 known_issues 里；阶段随 CHARTER §9（M4） |
+| S2 | 转谱接翻唱（sheetsage2 → yue2 cot=melody） | **[M4]** | **仅 `aw-core` 库 + `examples/song_cover.rs`（命令行）可用**：`generate_cover` + mock 回归 `cover_runs_sheetsage_then_yue2_melody`；**桌面「音乐制作」Tab 无翻唱入口**（该 Tab 只接 `generate_song` 文生歌）。要接界面的前提是把 `Cmd::RunSong` 扩出"源音频"一路 + 选文件入口，并以真机跑通（yue2 约 8 分钟/首）——**尚未排期**，别按"已交付"对外说 |
 | S3 | 歌曲专用界面（作词/结构/多轨） | **不做** | 8 分钟/首，不值得占界面 |
 
 ---

@@ -556,7 +556,8 @@ export component MainWindow inherits Window {
                     history-open(i) => { root.sep-history-open(i); }
                 }
 
-                // 场景 3 = 音乐制作（歌曲）：链路来自 feat/m4-song（yue2 / ace-step / S2 翻唱）
+                // 场景 3 = 音乐制作（歌曲）：本 Tab 只接文生歌（generate_song，yue2 / ace-step）；
+                // S2 翻唱（sheetsage2→yue2）只有库/命令行入口，没有界面接线，别在这儿补假设。
                 if root.scene == 3 : SongWorkbench {
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
