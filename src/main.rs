@@ -11,6 +11,7 @@
 //!   projects/<工程名>/out/final.wav|srt 成品
 //!   <工程名>.wav / <工程名>.srt          导出（复制自 out/）
 
+mod backup;
 mod batch;
 mod cancel;
 mod dictionaries;
@@ -285,6 +286,15 @@ enum Msg {
     /// 全局设置里「选择模型目录」的结果
     ModelDirPicked {
         path: Option<String>,
+    },
+    /// 一键备份：目标目录选择结果（`None` = 用户取消）
+    BackupDirPicked {
+        path: Option<String>,
+    },
+    /// 一键备份终态：`Ok(note)` 是给状态行的那句话，`Err` 是**可执行**的失败原因。
+    /// 后台线程发回、与工程版本无关（用户点按钮那一刻和稿件版本没关系）。
+    BackupDone {
+        result: Result<String, String>,
     },
     /// 人声分离进度 / 终态（都带 task_id 以便与当前任务对齐）
     SeparationProgress {
@@ -1597,6 +1607,30 @@ fn spawn_folder_pick(msg_tx: Sender<WorkerMsg>, revision: u64) {
     });
 }
 
+/// 一键备份：**一条后台线程走完"选目录 → 复制"两步**。
+///
+/// 目录选择框是阻塞式的（与其它选择器同款），备份本身也是长 IO——两步都必须在后台，
+/// 否则点下去界面就冻住了。中间先回一条 `BackupDirPicked`，让状态行能立刻显示
+/// "正在备份到 <路径>"，而不是让人对着"正在打开目录选择框…"猜有没有开始。
+fn spawn_backup(msg_tx: Sender<WorkerMsg>, workshop_dir: PathBuf) {
+    std::thread::spawn(move || {
+        let picked = pick_folder_with_prompt("选择备份目标目录");
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::BackupDirPicked {
+                path: picked.clone(),
+            },
+        });
+        let Some(root) = picked else { return };
+        let result = backup::backup_all(&workshop_dir, Path::new(&root), &backup::stamp_now())
+            .map(|s| s.note());
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::BackupDone { result },
+        });
+    });
+}
+
 /// 选一段待分离音频（系统文件框，后台线程 + 消息回传）。
 fn spawn_file_pick(msg_tx: Sender<WorkerMsg>) {
     std::thread::spawn(move || {
@@ -1743,6 +1777,68 @@ fn export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> 
         return Some("拼装/合成/导出正在进行：等它结束再导出");
     }
     None
+}
+
+/// 能不能起一次新备份。理由与 `export_refusal` 同一族（都是"别抄到写了一半的文件"），
+/// 但**判据必须比它宽**：备份抄的是整棵 `projects/`，而写 `projects/` 的不止"拼装"——
+/// 歌曲写 `song/`、人声分离写 `stems/`、质检写报告、批量每篇都在写。这些任务**不设
+/// 全局 `busy`**（各自页面 busy + 一条台账），所以只查 `busy` 会漏（复核第二轮抓到的阻塞）。
+/// 这里把四类来源都收进来：
+///   · `backup_running`：连点会起一堆线程，两批同时往同一个目标目录里写；
+///   · `tasks_in_flight`：台账里还有排队/运行中的任务（配音/BGM/歌曲/分离/质检/批量都在里面）；
+///   · `ui_busy` / `ui_running`：正在拼装，或单篇配音在跑（单篇设的是 `running` 不是 `busy`）。
+fn backup_refusal(
+    ui_busy: bool,
+    ui_running: bool,
+    tasks_in_flight: bool,
+    batch_in_flight: bool,
+    backup_running: bool,
+) -> Option<&'static str> {
+    if backup_running {
+        return Some("备份还在进行：等它写完（工程大时要一会儿）");
+    }
+    if tasks_in_flight || batch_in_flight {
+        return Some("还有任务在跑（配音/BGM/歌曲/人声分离/质检/批量）：等它跑完再备份（否则会抄到写了一半的产物）");
+    }
+    if ui_busy || ui_running {
+        return Some("合成/拼装正在进行：等它结束再备份（否则会抄到写了一半的产物）");
+    }
+    None
+}
+
+/// 「一键备份…」当前该不该灰掉——**只做投影，不另设判据**。
+///
+/// 三轮复核都在同一条线上：按钮的 enabled 与回调的判据一旦各算各的，就会出现
+/// 「按钮亮着却点不动」（`AW_UI_STATE=batch` 的演示行：`batch_in_flight` 真、
+/// 而 Slint 侧拼的计数不真）或「按钮灰着但判据说不忙」（`AW_UI_STATE=tasks` 的
+/// 演示任务：Slint 计数真、而 `tasks_in_flight` 对演示态短路为假）。
+/// 所以按钮**不再自己拼计数**，一律走这一份——与点击回调同一个 `backup_refusal`。
+fn backup_blocked(
+    ui_busy: bool,
+    ui_running: bool,
+    tasks_in_flight: bool,
+    batch_in_flight: bool,
+    backup_running: bool,
+) -> bool {
+    backup_refusal(
+        ui_busy,
+        ui_running,
+        tasks_in_flight,
+        batch_in_flight,
+        backup_running,
+    )
+    .is_some()
+}
+
+/// 把上面那份判据投影到 UI（每 tick 同步一次；值没变时 Slint 不会重绘）。
+fn refresh_backup_availability(ui: &MainWindow, state: &Rc<UiState>) {
+    ui.set_backup_blocked(backup_blocked(
+        ui.get_busy(),
+        ui.get_running(),
+        tasks_in_flight(state),
+        batch_in_flight(state),
+        state.backup_running.get(),
+    ));
 }
 
 /// 批量导出：扫 projects/ 下有成品的工程，按导出开关复制到导出目录。
@@ -3091,9 +3187,17 @@ fn make_client() -> Result<Client, String> {
     Ok(Client::new(base))
 }
 
+/// 应用数据目录：~/Documents/音频作坊/
+///
+/// 工程、设置、模板、词典库、音色库都在这一层——也就是一键备份要打包的全部内容
+/// （见 `src/backup.rs` 的 `ITEMS`，两边必须同源）。
+fn workshop_dir() -> PathBuf {
+    documents_dir().join(WORKSHOP_DIR)
+}
+
 /// 工程目录：~/Documents/音频作坊/projects/<stem>/
 fn projects_root() -> PathBuf {
-    documents_dir().join(WORKSHOP_DIR).join("projects")
+    workshop_dir().join("projects")
 }
 
 fn project_dir(stem: &str) -> PathBuf {
@@ -3449,6 +3553,10 @@ struct UiState {
     batch_skipped_notes: RefCell<Vec<String>>,
     /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
     batch_export_running: std::cell::Cell<bool>,
+    /// 一键备份是否在跑（后台线程，**含正在弹目录选择框那段**）。
+    /// 防连点起一堆线程、两批同时往同一个目标目录里写。这是真相，
+    /// ui 的 `backup-running` 只是它的投影（按钮据此禁用）。
+    backup_running: std::cell::Cell<bool>,
     /// 当前启用的发音词典：库内文件名（None = 不启用）与词条内容（送给 worker 的那份）。
     active_dict_file: RefCell<Option<String>>,
     active_dict: RefCell<std::collections::BTreeMap<String, String>>,
@@ -6391,6 +6499,10 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::TaskStage { .. }
         | Msg::ServerHealth { .. }
         | Msg::ModelDirPicked { .. }
+        // 备份：目录选择结果来自对话框，终态来自长 IO，两者都与工程版本无关；
+        // 不在名单里就会出现"备份好了但状态行还停在正在备份"（期间改一次稿就永远停住）
+        | Msg::BackupDirPicked { .. }
+        | Msg::BackupDone { .. }
         | Msg::VoiceImportDirPicked { .. }
         | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
@@ -6591,6 +6703,26 @@ fn tick(
                     ui.set_status_text("取消了选择模型目录".into());
                 }
             },
+            Msg::BackupDirPicked { path } => match path {
+                Some(p) => ui.set_backup_info(
+                    format!("正在备份到 {p} …（工程大时要一会儿，中途别关窗口）").into(),
+                ),
+                None => {
+                    state.backup_running.set(false);
+                    ui.set_backup_running(false);
+                    ui.set_backup_info("已取消备份".into());
+                }
+            },
+            Msg::BackupDone { result } => {
+                // 终态一定要把在飞标志放掉：它同时是按钮的禁用条件，
+                // 忘了放就等于把「一键备份…」永久锁死
+                state.backup_running.set(false);
+                ui.set_backup_running(false);
+                match result {
+                    Ok(note) => ui.set_backup_info(note.into()),
+                    Err(error) => ui.set_backup_info(format!("备份失败：{error}").into()),
+                }
+            }
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());
                 ui.set_server_ok(ok);
@@ -7217,6 +7349,9 @@ fn tick(
     // 值没变时 Slint 不会重绘。
     ui.set_dub_product_ready(state.assembled.borrow().is_some());
 
+    // ── 一键备份能不能点：与点击回调同一份判据（改动见 backup_blocked 的注释）──
+    refresh_backup_availability(ui, state);
+
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
         ui.set_playing(false);
@@ -7435,6 +7570,31 @@ fn wire_global_settings(
         }
         ui.set_status_text("正在打开系统目录选择框…".into());
         spawn_folder_pick(msg.clone(), st.project_revision.get());
+    });
+
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let msg = msg_tx.clone();
+    ui.on_backup_all(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        // 按钮的 enabled 与这里必须用**同一份判据**：只让按钮变灰、回调不拦，
+        // 快捷键/程序化触发照样能起备份；只拦回调、按钮不灰，用户会以为点了没反应。
+        if let Some(refusal) = backup_refusal(
+            ui.get_busy(),
+            ui.get_running(),
+            tasks_in_flight(&st),
+            batch_in_flight(&st),
+            st.backup_running.get(),
+        ) {
+            ui.set_backup_info(refusal.into());
+            return;
+        }
+        // 在飞标志在**点下去那一刻**就要置位：目录选择框会把控制权交回事件循环，
+        // 不置位的话连点两下就是两条后台线程（两条都去弹选择框、都往同一目标写）
+        st.backup_running.set(true);
+        ui.set_backup_running(true);
+        ui.set_backup_info("正在打开系统目录选择框…".into());
+        spawn_backup(msg.clone(), workshop_dir());
     });
 
     let weak = ui.as_weak();
@@ -9918,6 +10078,117 @@ mod tests {
             should_handle_message(&stale_sentence, 0),
             "revision 对得上就该处理"
         );
+    }
+
+    /// 备份的两条消息同样不过滤：目录选择来自对话框，终态来自长 IO，两者都与稿件
+    /// 版本无关。之前复核已经两次抓到"忘了加名单"，所以这里也钉一条。
+    #[test]
+    fn backup_messages_survive_revision_changes() {
+        let msgs = vec![
+            Msg::BackupDirPicked {
+                path: Some("/tmp/备份盘".into()),
+            },
+            Msg::BackupDone {
+                result: Ok(
+                    "已备份 6 个文件（1.2KB）到 /tmp/备份盘/音频作坊备份-20260917-143012".into(),
+                ),
+            },
+            // 失败路径也不能被当成"过期消息"丢掉，否则状态行停在正在备份
+            Msg::BackupDone {
+                result: Err("备份目标不能放在应用数据目录里面".into()),
+            },
+        ];
+        let names = ["BackupDirPicked", "BackupDone(Ok)", "BackupDone(Err)"];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
+    /// 备份的起跑守卫：连点、以及和别的写盘动作撞车，都要被挡住（复核的阻塞项 2）。
+    #[test]
+    fn backup_refusal_blocks_double_click_and_concurrent_writers() {
+        // 参数顺序：(ui_busy, ui_running, tasks_in_flight, batch_in_flight, backup_running)
+        assert!(
+            backup_refusal(false, false, false, false, false).is_none(),
+            "空闲时该放行"
+        );
+        let again = backup_refusal(false, false, false, false, true).expect("已经在备份时必须拒绝");
+        assert!(again.contains("备份还在进行"), "{again}");
+        // 单篇配音：设的是 ui.running（不是 busy）——只查 busy 的老版本会漏
+        assert!(
+            backup_refusal(false, true, false, false, false).is_some(),
+            "单篇配音在跑（ui.running）时不能备份"
+        );
+        assert!(
+            backup_refusal(true, false, false, false, false).is_some(),
+            "合成/拼装在跑时不能备份（会抄到写了一半的产物）"
+        );
+        // 歌曲 / 人声分离 / 质检：**只登记台账、不设全局 busy**，这是复核第二轮抓到的漏网
+        let from_tasks = backup_refusal(false, false, true, false, false)
+            .expect("台账里有任务在飞时必须拒绝（歌曲/分离写 projects/，正是备份要抄的）");
+        assert!(from_tasks.contains("还有任务在跑"), "{from_tasks}");
+        assert!(
+            backup_refusal(false, false, false, true, false).is_some(),
+            "批量在跑时不能备份（同上）"
+        );
+        // 已经在备份时，别的理由不该抢答——否则用户看到的是"合成中"而不是"备份中"
+        let both = backup_refusal(true, true, true, true, true).unwrap();
+        assert!(both.contains("备份还在进行"), "{both}");
+    }
+
+    /// 按钮的禁用态必须**就是**回调用那份判据的投影（复核第三轮的阻塞）。
+    ///
+    /// 只要按钮在 Slint 里另拼一套 busy（`busy || task-running` 之类），演示态就会
+    /// 出现「按钮亮着却点不动」或「按钮灰着但判据说不忙」两种自相矛盾 —— 这条逐项钉住
+    /// `backup_blocked` 与 `backup_refusal` 的等价：refusal 有理由 ⇔ 按钮该灰。
+    #[test]
+    fn backup_button_state_is_the_projection_of_the_same_refusal() {
+        let cases = [
+            (false, false, false, false, false),
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ];
+        for (busy, running, tasks, batch, backup) in cases {
+            assert_eq!(
+                backup_blocked(busy, running, tasks, batch, backup),
+                backup_refusal(busy, running, tasks, batch, backup).is_some(),
+                "按钮灰不灰必须与回调判据同源：\
+                 busy={busy} running={running} tasks={tasks} batch={batch} backup={backup}"
+            );
+        }
+        // 全空闲必须能点（别为了"同源"把按钮钉死）
+        assert!(!backup_blocked(false, false, false, false, false));
+    }
+
+    /// 按钮的 `enabled` 只能来自 Rust 投影，**不许在 Slint 里另拼计数**。
+    ///
+    /// 这条是源码级守卫：第三轮复核抓到的正是"Slint 侧自己算 `task-running > 0`"
+    /// 与 `tasks_in_flight` 各说各话。谁再把计数拼回 Slint，这条立刻红。
+    #[test]
+    fn backup_button_enabled_does_not_recompute_busyness_in_slint() {
+        let src = include_str!("../ui/dub_workbench.slint");
+        let at = src
+            .find("text: root.backup-running ? \"备份中…\" : \"一键备份…\";")
+            .expect("备份按钮的文案行必须在（改了就同步改这条用例）");
+        let button = &src[at..(at + 400).min(src.len())];
+        assert!(
+            button.contains("enabled: !root.backup-blocked;"),
+            "按钮的 enabled 必须直接吃 Rust 投影 backup-blocked：{button}"
+        );
+        for forbidden in ["root.busy", "task-running", "task-pending", "tasks-busy"] {
+            assert!(
+                !button.contains(forbidden),
+                "按钮不该自己拼忙判据（出现 `{forbidden}`）：{button}"
+            );
+        }
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。

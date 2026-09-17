@@ -190,6 +190,12 @@ export component WorkbenchDrawer inherits VerticalLayout {
     callback rescan-models();
     callback check-server();
     callback pick-model-dir();
+    // ── 备份：把工程与自建资产复制成一份自包含目录（M4-P8）──
+    in property <string> backup-info: "";
+    in property <bool> backup-running: false;
+    /// 能不能点备份：**Rust 侧 `backup_blocked` 的投影**，与点击回调同一份判据
+    in property <bool> backup-blocked: false;
+    callback backup-all();
 
     // 细分隔线：比面板边框轻，只做分组不制造方框
     property <color> hairline: PixelTheme.hover;
@@ -348,6 +354,37 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
                 Text {
                     text: "默认是应用工作目录下的 models/。目录只描述模型文件放在哪，用于核对模型盘挂上没；引擎仍按服务清单里的 id 加载。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+
+            Rectangle { height: 2px; background: root.hairline; }
+
+            // ── 备份：把工程与自建资产复制成一份自包含目录 ──
+            VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 12px;
+                SectionLabel { text: "备份"; }
+                Text {
+                    text: "把工程、设置、模板、词典库、音色库复制成一份自包含的备份目录。先写临时目录，全部成功后才改名；中断留下的不会被当成一份完成备份。";
+                    color: PixelTheme.dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    PixelButton {
+                        width: 120px;
+                        text: root.backup-running ? "备份中…" : "一键备份…";
+                        enabled: !root.backup-blocked;
+                        clicked => { root.backup-all(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Text {
+                    text: root.backup-info;
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;

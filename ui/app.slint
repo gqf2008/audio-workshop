@@ -156,6 +156,13 @@ export component MainWindow inherits Window {
     in property <bool> server-locked: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
+    // 备份状态行（设置抽屉的「一键备份…」用；与工程版本无关）
+    in property <string> backup-info: "";
+    // 备份在飞（含正在弹目录选择框那段）：只用于按钮文案「备份中…」
+    in property <bool> backup-running: false;
+    // 备份当前能不能点：**Rust 侧 `backup_blocked` 的投影**（与点击回调同一份判据）。
+    // 不要在 Slint 里拿 busy/task-running 另拼一套——那样按钮与回调会各说各话。
+    in property <bool> backup-blocked: false;
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
@@ -285,6 +292,7 @@ export component MainWindow inherits Window {
     callback rescan-models();
     callback check-server();
     callback pick-model-dir();
+    callback backup-all();
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
@@ -707,6 +715,10 @@ export component MainWindow inherits Window {
                     rescan-models => { root.rescan-models(); }
                     check-server => { root.check-server(); }
                     pick-model-dir => { root.pick-model-dir(); }
+                    backup-info: root.backup-info;
+                    backup-running: root.backup-running;
+                    backup-blocked: root.backup-blocked;
+                    backup-all => { root.backup-all(); }
                 }
             }
         }
