@@ -73,11 +73,22 @@ def synth_one(text, model, seed, voice_ref=None, extra=None):
 # 留下静默损坏的产物或不可读的工程。这里统一收口。
 def write_atomic(path, data: bytes):
     tmp = f"{path}.tmp{os.getpid()}"
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        # 失败别留半截临时文件：磁盘满时它可能和成品一样大（整份 wav），既白占空间，
+        # 又容易被当成"已经写了一部分"（cmd_assemble 那条路径早就这么清了，这里是同一个
+        # 不变式，此前只有它漏了）。清理自身失败不再抛——调用方要看的是最初那个可执行的
+        # 原因；只删 tmp，**绝不碰目标 path**。
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def is_enospc(err):

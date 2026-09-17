@@ -299,8 +299,20 @@ impl Project {
             ) {
                 Ok(wav) => {
                     let path = dir.join(format!("sentences/{index:03}.wav"));
-                    write_atomic_explained(&path, &wav)
-                        .map_err(|e| ClientError::Local(e.to_string()))?;
+                    if let Err(e) = write_atomic_explained(&path, &wav) {
+                        // 落盘失败不能让这句停在"待合成"上：本轮确实会中止（继续跑只会每句
+                        // 都失败，这是既有决策），但如果状态没变，用户从工程/界面里看不出是
+                        // **哪一句**、为什么停的。文案与 CLI 的 `cmd_synth` 对齐：磁盘满标
+                        // `error: ENOSPC（需要 X MB）`，字节数取本次要写的 `wav.len()`，不估。
+                        self.sentences[i].status = write_failure_status(wav.len(), &e);
+                        // best-effort 落盘：磁盘满时 project.json 大概率也写不进去，那就把
+                        // 两件事一起说清楚——不能让"状态没持久化"静默发生。
+                        let note = match self.save(dir) {
+                            Ok(()) => e.to_string(),
+                            Err(se) => format!("{e}（另外，失败状态也没能写进工程：{se}）"),
+                        };
+                        return Err(ClientError::Local(note));
+                    }
                     let d = wav_duration(&wav)?;
                     let s = &mut self.sentences[i];
                     s.duration = Some(d);
@@ -582,6 +594,22 @@ impl Project {
 ///
 /// 原先的 `e.to_string()` 只会给出 `No space left on device (os error 28)`——
 /// 用户既不知道是哪个目录（模型目录？导出目录？工程目录？），也不知道要释放多少。
+/// 落盘失败时写进**句子状态**的串（不是给用户看的长文案，那个是 `write_failure_note`）。
+///
+/// 抽成纯函数是为了能隔离 ENOSPC 分支：macOS 上没有便携办法让某个文件"写到一半"报
+/// ENOSPC，真机路径造不出这个错误，只能钉住这段映射本身。文案与 CLI 的
+/// `tools/audio_dub.py::cmd_synth` 对齐（同为 `error: ENOSPC（需要 X MB）`）。
+pub fn write_failure_status(bytes: usize, err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::StorageFull {
+        format!(
+            "error: ENOSPC（需要 {:.1} MB）",
+            bytes as f64 / (1024.0 * 1024.0)
+        )
+    } else {
+        format!("error: {err}")
+    }
+}
+
 pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> String {
     let mb = bytes as f64 / (1024.0 * 1024.0);
     let need = if bytes == 0 {
@@ -712,12 +740,24 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
         std::process::id()
     ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+    let r = (|| -> std::io::Result<()> {
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        // File 必须在这里已经 drop：Windows 上 rename 打不开仍被占用的句柄。
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        // 失败就别留半截临时文件：磁盘满时它可能和成品一样大（整份 wav），既白占空间，
+        // 又容易被当成"已经写了一部分"。`copy_atomic` 早就是这么做的，这里是同一个不变式。
+        //
+        // 清理本身失败不再报错：用户要看的是最初那个可执行的原因，不是"清理也失败了"。
+        // 只删 tmp，**绝不碰目标 path**——旧内容要么还在，要么已经被新内容原子替换。
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    r
 }
 
 /// 从 wav 字节读时长（秒）
@@ -843,6 +883,61 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("路径不存在"), "实得 {msg}");
         assert!(msg.contains("001.wav"), "实得 {msg}");
+    }
+
+    /// 落盘失败也要清临时文件：磁盘满时它可能和成品一样大（整份 wav），既白占空间，
+    /// 又容易被当成"已经写了一部分"。`copy_atomic` 早有等价用例，`write_atomic` 是同一个
+    /// 不变式却漏了 —— 这条把它钉住。
+    #[test]
+    fn write_atomic_cleans_temp_when_rename_fails() {
+        let dir = std::env::temp_dir().join(format!("aw-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 目标位置是个目录：rename(file → dir) 必然失败
+        let target = dir.join("001.wav");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = write_atomic(&target, b"payload").unwrap_err();
+        assert!(err.raw_os_error().is_some(), "应是真实 io 错误：{err}");
+        assert!(
+            std::fs::read_dir(&target).unwrap().next().is_none(),
+            "失败不该把内容塞进目标目录"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rename 失败也要清临时文件：{leftovers:?}"
+        );
+    }
+
+    /// 落盘失败时句子的状态串必须与 CLI（`tools/audio_dub.py::cmd_synth`）同一口径。
+    ///
+    /// 真机造不出"写到一半 ENOSPC"（macOS 上没有便携办法），所以这里只钉这段映射本身：
+    /// 若把 StorageFull 分支删掉，这条会红。
+    #[test]
+    fn write_failure_status_maps_enospc_to_the_cli_wording() {
+        let enospc = std::io::Error::from_raw_os_error(28); // POSIX ENOSPC
+        assert_eq!(
+            enospc.kind(),
+            std::io::ErrorKind::StorageFull,
+            "前提：ENOSPC 要归到 StorageFull，否则下面的映射走不到"
+        );
+        assert_eq!(
+            write_failure_status(3 * 1024 * 1024, &enospc),
+            "error: ENOSPC（需要 3.0 MB）"
+        );
+        // 非磁盘满的错误：原样带出可执行文案，不要冒充 ENOSPC
+        let other = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "没有写入权限");
+        let s = write_failure_status(0, &other);
+        assert!(s.starts_with("error: "), "{s}");
+        assert!(s.contains("没有写入权限"), "{s}");
+        assert!(!s.contains("ENOSPC"), "别把权限问题说成磁盘满：{s}");
     }
 
     /// 「没有工程」与「工程坏了」必须分开：前者是从零开始，后者必须报错（不能静默重建，
