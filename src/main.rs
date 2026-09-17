@@ -10471,6 +10471,31 @@ mod tests {
         assert!(row.error_detail.contains("所有已加载模型"), "{row:?}");
     }
 
+    /// 源码级接线守卫：单测 helper 不足以证明生产 wrapper 真的走它。
+    /// 若 apply_project_to_rows 改成不调用 helper，或自己把错误压成裸 error，
+    /// 这条会红（对应第三轮复核的“只测 helper 不等于有隔离”）。
+    #[test]
+    fn apply_project_to_rows_routes_through_status_helper() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn apply_project_to_rows(")
+            .expect("生产恢复 wrapper 必须存在");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("apply_project_to_rows 必须有函数级结束")
+            + 2;
+        let wrapper = &rest[..end];
+        assert!(
+            wrapper.contains("apply_project_sentence_statuses(rows, project)"),
+            "wrapper 必须走共享状态回灌，否则恢复详情会再次丢失"
+        );
+        assert!(
+            !wrapper.contains("set_status(rows, i, \"error\")"),
+            "wrapper 不得绕过 helper 把完整 error status 压成裸 error"
+        );
+    }
+
     #[test]
     fn unload_button_requires_confirmation_and_warns_global_effect() {
         let source = include_str!("../ui/dub_workbench.slint");
