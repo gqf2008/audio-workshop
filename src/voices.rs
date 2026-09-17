@@ -95,9 +95,39 @@ fn save_index(root: &Path, index: &VoiceIndex) -> Result<(), String> {
         .map_err(|e| format!("音色库索引写入失败：{e}"))
 }
 
-/// 条目对应的音频绝对路径。
+/// 条目对应的音频绝对路径（只用于展示/比对；要用它读写请走 `usable_audio_path`）。
 pub fn audio_path(root: &Path, entry: &VoiceEntry) -> PathBuf {
     library_dir(root).join(&entry.file)
+}
+
+/// 索引里的 `file` 是否是我们自己生成的那种**裸文件名**。
+///
+/// `import_from` 已经校验过导入清单，但 `index.json` 是磁盘上的普通文件——手改（或被人
+/// 骗着改）成 `../../x.wav` 就能让"音色"指向库外。这里做同一道判断。
+pub fn file_is_safe(file: &str) -> bool {
+    !file.is_empty()
+        && !file.contains('/')
+        && !file.contains('\\')
+        && Path::new(file).components().count() == 1
+}
+
+/// 取一个**可以安全读写**的库内音频路径：文件名合法 + 确实是库内的文件。
+pub fn usable_audio_path(root: &Path, entry: &VoiceEntry) -> Result<PathBuf, String> {
+    if !file_is_safe(&entry.file) {
+        return Err(format!(
+            "音色「{}」的索引里文件名不合法（{}）——修好 index.json，或重新存一次",
+            entry.name, entry.file
+        ));
+    }
+    let path = audio_path(root, entry);
+    if !path.is_file() {
+        return Err(format!(
+            "音色「{}」的音频不在库里（{}）——重新存一次，或从备份导入",
+            entry.name,
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 /// 把一个音频文件收进音色库（自包含：复制副本）。
@@ -163,6 +193,8 @@ pub fn add_from_file(
     if let Some(old) = index.get(name) {
         let old_path = audio_path(root, old);
         if old_path != dst && old_path.is_file() {
+            // 清不掉也无所谓：那个文件已经没有任何条目引用（哑文件，不影响使用），
+            // 但绝不因为"清理失败"就把新音色回滚掉
             let _ = std::fs::remove_file(&old_path);
         }
     }
@@ -182,13 +214,7 @@ pub fn export_to(
     let Some(entry) = index.get(name) else {
         return Err(format!("音色库里没有「{name}」"));
     };
-    let src = audio_path(root, entry);
-    if !src.is_file() {
-        return Err(format!(
-            "这个音色的音频文件不在库里（{}）——重新存一次音色，或从备份导入",
-            src.display()
-        ));
-    }
+    let src = usable_audio_path(root, entry)?;
     let dir = dest_root.join(sanitize(&entry.name));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("建导出目录失败：{}（{e}）", dir.display()))?;
@@ -214,9 +240,7 @@ pub fn import_from(
     let entry: VoiceEntry = serde_json::from_str(&raw)
         .map_err(|e| format!("导入失败：{} 解析不了（{e}）", meta_path.display()))?;
     // 清单里的 audio 名只允许裸文件名：`../x.wav` 这种既可能是坏包，也可能是恶意构造
-    let audio_name = Path::new(&entry.file);
-    if audio_name.components().count() != 1 || entry.file.contains('/') || entry.file.contains('\\')
-    {
+    if !file_is_safe(&entry.file) {
         return Err(format!(
             "导入失败：清单里的音频名不合法（{}）——只允许裸文件名",
             entry.file
@@ -441,6 +465,33 @@ mod tests {
         .unwrap();
         let err = import_from(&root, &pkg, 1, sanitize).unwrap_err();
         assert!(err.contains("不合法"), "{err}");
+    }
+
+    /// 手改 `index.json` 把 `file` 写成库外路径：导出/应用都必须拒绝，不能顺着它读库外文件。
+    #[test]
+    fn unsafe_index_file_names_are_refused() {
+        let root = temp_dir("unsafe-index");
+        let src = root.join("ok.wav");
+        write_wav(&src, 5);
+        add_from_file(&root, "正常", &src, "", 1, sanitize).unwrap();
+
+        // 手改索引：这条"音色"指向库外
+        let mut index = load(&root).unwrap();
+        index.voices[0].file = "../外面的.wav".into();
+        save_index(&root, &index).unwrap();
+
+        let entry = load(&root).unwrap().voices[0].clone();
+        let err = usable_audio_path(&root, &entry).unwrap_err();
+        assert!(err.contains("文件名不合法"), "{err}");
+        let err = export_to(&root, "正常", &root.join("out"), sanitize).unwrap_err();
+        assert!(err.contains("文件名不合法"), "导出也要挡住：{err}");
+
+        // 绝对路径同样不行
+        let mut index = load(&root).unwrap();
+        index.voices[0].file = "/etc/passwd".into();
+        save_index(&root, &index).unwrap();
+        let entry = load(&root).unwrap().voices[0].clone();
+        assert!(usable_audio_path(&root, &entry).is_err());
     }
 
     #[test]

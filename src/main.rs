@@ -663,16 +663,19 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
             ui.set_status_text(format!("音色库里没有「{name}」").into());
             return;
         };
-        let path = voices::audio_path(&voices_root(), &entry);
-        if !path.is_file() {
-            ui.set_status_text(
-                format!(
-                    "「{}」的音频不在库里（{}）——重新存一次或从备份导入",
-                    entry.name,
-                    path.display()
-                )
-                .into(),
-            );
+        // 文件名校验 + 库内路径 + 文件存在，三件事都在这里（手改索引也挡得住）
+        let path = match voices::usable_audio_path(&voices_root(), &entry) {
+            Ok(p) => p,
+            Err(e) => {
+                ui.set_status_text(e.into());
+                return;
+            }
+        };
+        if non_empty(ui.get_voice_ref_path().to_string()).as_deref()
+            == Some(path.to_string_lossy().as_ref())
+        {
+            // UI 上这条已经禁用了，回调里再兜一下：避免"重复应用"白白作废一次工程
+            ui.set_status_text(format!("已经在用「{}」", entry.name).into());
             return;
         }
         ui.set_voice_ref_path(path.display().to_string().into());
