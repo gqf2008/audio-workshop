@@ -4087,6 +4087,19 @@ fn lowest_scored_index(rows: &[Sentence], scores: &HashMap<usize, f64>) -> Optio
         .map(|(index, _)| index)
 }
 
+/// 质检跑完（`Msg::EvalDone`）自动选中的那一句 + 追加到状态行的文案。
+///
+/// 判据与「跳到最差句」同源：都是 `lowest_scored_index`（工程**当前完整分数集**里的
+/// 最低分句）。这里不能改用 `summary.worst.first()`——那份只收**本轮有差异**的句子，
+/// ASR 失败而保留下来的旧分不在其中，同一份分数集会在两条路径上指向不同的句。
+/// 返回值第二项为 `None` 时（一句都没分）调用方要清掉选中。
+fn eval_done_selection(rows: &[Sentence], scores: &HashMap<usize, f64>) -> (Option<usize>, String) {
+    match lowest_scored_index(rows, scores) {
+        Some(index) => (Some(index), format!("·已选中第 {} 句", index + 1)),
+        None => (None, String::new()),
+    }
+}
+
 /// 排序按钮和跳转按钮共用的可用性判据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QaActionView {
@@ -7203,14 +7216,20 @@ fn tick(
                 let mut note = eval_summary_note(&summary);
                 // 质检是用户主动发起的"找问题"动作：跑完先把最差那句选中，
                 // 用户也可以随时用「跳到最差句」重新定位并滚动。
-                if let Some(worst) = summary.worst.first() {
-                    if let Some(i) = row_position(rows, worst.index) {
+                //
+                // 同源：自动选中和「跳到最差句」共用 `eval_done_selection`（也就是
+                // `lowest_scored_index`）的推导，不再各写一份。
+                // 借用分两句写：临时借用活到语句末尾，后续要改这块时不容易踩 RefCell。
+                let (auto_index, auto_note) =
+                    eval_done_selection(&rows_as_vec(rows), &state.eval_scores.borrow());
+                if let Some(index) = auto_index {
+                    if let Some(i) = row_position(rows, index) {
                         ui.set_selected(i as i32);
                     }
-                    note.push_str(&format!("·已选中第 {} 句", worst.index + 1));
                 } else {
                     ui.set_selected(-1);
                 }
+                note.push_str(&auto_note);
                 // 一句都没评上分 = 这次质检没得出结论，不能标成绿色的"完成"
                 let outcome = if summary.scored == 0 {
                     tasks::TaskState::Failed
@@ -10704,6 +10723,42 @@ mod tests {
         assert_eq!(by_index(0).start, 0.0);
         assert_eq!(by_index(1).start, 1.0);
         assert_eq!(by_index(2).start, 3.0);
+    }
+
+    /// `Msg::EvalDone` 的"自动选中"必须看**工程当前完整分数集**（与「跳到最差句」同源），
+    /// 不能只看本轮有差异的句子：ASR 失败保留旧分的那句才是真正该先看的。
+    ///
+    /// 阳性对照：把判据缩成"只有前两行参与"（等价于 `summary.worst` 只看本轮差异），
+    /// 本用例转红。
+    #[test]
+    fn eval_done_selection_uses_full_scores_not_round_worst() {
+        let rows = vec![
+            test_sentence_row(0),
+            test_sentence_row(1),
+            test_sentence_row(2),
+        ];
+        // 本轮只评上 0/1 两句；第 2 句 ASR 失败，保留旧分 10%
+        let scores = HashMap::from([(0, 92.0), (1, 88.0), (2, 10.0)]);
+        // 前提：两条推导确实分叉——本轮差异句里最差是第 1 句，完整分数集里最差是第 2 句
+        let round_only = HashMap::from([(0, 92.0), (1, 88.0)]);
+        assert_eq!(lowest_scored_index(&rows, &round_only), Some(1));
+        assert_ne!(
+            lowest_scored_index(&rows, &round_only),
+            lowest_scored_index(&rows, &scores),
+            "本用例必须落在两条推导分叉的那一侧，否则钉不住同源收敛"
+        );
+
+        let (index, note) = eval_done_selection(&rows, &scores);
+        assert_eq!(index, Some(2), "自动选中要看当前完整分数集");
+        assert_eq!(note, "·已选中第 3 句");
+        // 与「跳到最差句」的判据同源
+        assert_eq!(qa_action_view(&rows, &scores, false).worst_index, index);
+
+        // 一句都没分 → 不清空选中，交给调用方（文案为空）
+        assert_eq!(
+            eval_done_selection(&rows, &HashMap::new()),
+            (None, String::new())
+        );
     }
 
     /// 真正的失效入口也要回原序，不只是排序函数本身。
