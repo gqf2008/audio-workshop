@@ -322,14 +322,21 @@ fn resolve_track(stems_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
         ));
     }
 
-    // 再做一次 canonicalize 前缀核对：即使父目录里混入链接，也不允许解析到工程外。
-    let canonical_dir =
-        std::fs::canonicalize(stems_dir).map_err(|e| format!("分离目录无法规范化：{e}"))?;
-    let canonical_path =
-        std::fs::canonicalize(&path).map_err(|e| format!("{file_name} 无法规范化：{e}"))?;
-    if !canonical_path.starts_with(&canonical_dir) {
-        return Err(format!("{file_name} 解析到了工程目录之外，拒绝使用"));
-    }
+    // 这里原先还有一道 `canonicalize` 前缀核对（"解析后的文件必须仍在解析后的 stems 目录下"）。
+    // 复核实测：删掉它，8 条用例全绿 ⇒ 它当不成任何已知逃逸的判定者。原因可以证出来：
+    // 设 X = stems_dir，n 是单个 `Component::Normal` 分量；上面已经拒绝 X 是软链/非目录、
+    // 拒绝 X/n 是软链并要求它是普通文件。此时 canonicalize(X/n) 必然等于
+    // canonicalize(X)/n（两边会一起解析，末段只是个普通名），前缀核对恒为真。
+    // 想让它真的开枪，得先放宽上游某一条（例如允许 `stems/<批次>/vocals.wav` 这类子目录）；
+    // **在那之前不要加回来**——没有隔离的守卫只会让人误以为"包含性"是它保证的
+    // （见 LESSON 一类的"无测试隔离的守卫等于装饰"）。
+    //
+    // 现在真正拦住"工程外"的是两条可测的检查，各自都有"喂故障→变红"的对照：
+    //   ① `validate_bare_file_name`：只接受单个裸文件名（`..`、绝对路径、`/`、`\` 全拒）；
+    //   ② `symlink_metadata`：stems 目录与两轨都不是软链、文件必须是普通文件。
+    // 回归：bare_file_name_whitelist_rejects_escape_attempts /
+    //       symlinked_stems_dir_is_refused /
+    //       symlinked_parent_stems_dir_escape_is_refused / symlinked_tracks_are_refused。
     Ok(path)
 }
 
@@ -570,6 +577,47 @@ mod tests {
         let resolution = resolve_tracks(&stems, &entry("vocals.wav", "accompaniment.wav"));
         assert!(!resolution.available());
         assert!(resolution.note.contains("普通文件"), "{}", resolution.note);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 「父目录是软链」这条逃逸：工程内的 `stems/` 由软链指向工程外的目录，里面放着
+    /// **真实的两轨**。读和写两条入口都必须拒绝。
+    ///
+    /// 端到端这里由 `symlink_metadata` 的目录软链检查拦下——把它去掉本用例即变红。
+    /// 原先还有一道 canonicalize 前缀核对，但它在这种构造下恒真（canonicalize 会把
+    /// 两边一起解析，前缀关系不变），当不了本用例的判定者，已删除（见 `resolve_track` 注释）。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_stems_dir_escape_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("parent-symlink");
+        let outside = root.join("outside-stems");
+        let stems = root.join("stems");
+        std::fs::create_dir_all(&outside).unwrap();
+        write_test_wav(&outside.join("vocals.wav"), 8_000, 80);
+        write_test_wav(&outside.join("accompaniment.wav"), 8_000, 80);
+        symlink(&outside, &stems).unwrap();
+
+        let resolution = resolve_tracks(&stems, &entry("vocals.wav", "accompaniment.wav"));
+        assert!(
+            !resolution.available(),
+            "工程外的目录不能被当成工程内的 stems：{resolution:?}"
+        );
+        assert!(resolution.note.contains("软链"), "{}", resolution.note);
+
+        // 写入口（追加历史）同样要拒绝，不能只挡读
+        let err = record_success(
+            &stems,
+            1,
+            &outside.join("vocals.wav"),
+            &outside.join("vocals.wav"),
+            &outside.join("accompaniment.wav"),
+        )
+        .unwrap_err();
+        assert!(err.contains("软链"), "{err}");
+        assert!(load(&stems).unwrap_err().contains("软链"));
 
         let _ = std::fs::remove_dir_all(root);
     }
