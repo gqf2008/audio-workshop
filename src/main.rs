@@ -17,6 +17,10 @@ mod cancel;
 mod dictionaries;
 mod download;
 mod export;
+/// 随包分发的模型下载清单（M4-P7 第二段：下载源）。映射规则与诚实边界都在那里。
+mod model_sources;
+/// 路径比较的唯一入口（`..` / 软链都按真实路径消解）。
+mod paths;
 mod player;
 mod sep_history;
 mod tasks;
@@ -2000,60 +2004,57 @@ fn spawn_batch_export(
 // 模型下载器（M4-P7）：可下载模型 → 串行队列 → UI 行
 // ===========================================================================
 
-/// 清单里"可下载模型"：只有带 `url` 的才算。老清单没有 url，列表就是空的——
-/// 不显示假下载入口（与"接入前不显示假按钮"同一条口径）。
+/// 一条真的能点的下载入口（落点 / 校验依据 / 来源 / 落点提醒）。
 struct DownloadableModel {
     id: String,
     url: String,
     sha256: Option<String>,
     size: Option<u64>,
     dest: PathBuf,
+    origin: model_sources::Origin,
+    /// 与 server.json 声明的 path 对不上时的提醒（下完服务可能仍加载不了）。
+    conflict: Option<String>,
 }
 
-/// 从模型清单挑出可下载项，目标目录取全局设置的「模型目录」（`model_dir()`，不写死）。
-fn downloadable_models() -> Vec<DownloadableModel> {
-    let dir = model_dir();
-    let Some(cfg) = read_server_config() else {
-        return Vec::new();
-    };
-    cfg.models
-        .into_iter()
-        .filter(|m| !m.url.trim().is_empty())
-        .map(|m| {
-            let dest = download_dest_for(&m, &dir);
-            let sha = m.sha256.trim();
-            DownloadableModel {
-                id: m.id,
-                url: m.url,
-                sha256: (!sha.is_empty()).then(|| sha.to_string()),
-                size: m.size,
-                dest,
-            }
+/// 下载面板的完整规划：**显示与点击共用这一份**（两处各拼一次判据已经被复核抓过）。
+///
+/// 来源 = `server.json` ∪ 内置清单（`config/model-downloads.json`，由
+/// `tools/gen_model_downloads.py` 从上游 `model_specs` 生成）。服务清单里显式给了
+/// `url` 的以服务为准——服务侧可以覆盖内置清单（内网镜像、自建仓库）。
+fn download_plan() -> Vec<model_sources::Row> {
+    let server: Vec<model_sources::ServerEntry> = read_server_config()
+        .map(|cfg| {
+            cfg.models
+                .into_iter()
+                .map(|m| model_sources::ServerEntry {
+                    id: m.id,
+                    url: m.url,
+                    sha256: m.sha256,
+                    size: m.size,
+                    path: m.path,
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+    model_sources::plan_rows(&server, model_sources::catalog(), &model_dir())
 }
 
-/// 下载目标文件名：优先沿用清单里 `path` 的文件名（服务才能按原路径找到），
-/// 没有就取 url 末段，最后退回 `<id>.gguf`。**目录一律取模型目录**。
-fn download_dest_for(m: &ServerModel, dir: &Path) -> PathBuf {
-    let from_path = Path::new(&m.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .map(str::to_string);
-    let from_url = m
-        .url
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .next_back()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let name = from_path
-        .or(from_url)
-        .unwrap_or_else(|| format!("{}.gguf", m.id));
-    dir.join(name)
+/// 从规划里取一条真的能点的入口（点击时用；没有入口的模型这里返回 None）。
+fn download_entry_for(key: &str) -> Option<DownloadableModel> {
+    download_plan()
+        .into_iter()
+        .find(|r| r.id == key)
+        .and_then(|r| {
+            r.action.map(|a| DownloadableModel {
+                id: r.id,
+                url: a.url,
+                sha256: a.sha256,
+                size: a.size,
+                dest: a.dest,
+                origin: a.origin,
+                conflict: a.conflict,
+            })
+        })
 }
 
 /// 人类可读的字节数（进度行用；与备份的 human_bytes 不同档，这里只求短）。
@@ -2071,7 +2072,7 @@ fn short_bytes(n: u64) -> String {
 
 /// 一条下载任务 → 界面行。没有队列快照时按磁盘上有没有正式文件给出"未下载/已就位"。
 fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) -> DownloadRow {
-    let (state_text, detail, progress, active) = match latest {
+    let (state_text, base, progress, active) = match latest {
         Some(snap) => {
             let downloading = matches!(
                 snap.state,
@@ -2117,6 +2118,13 @@ fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) 
             false,
         ),
     };
+    // 来源 + 落点提醒都要写在行上：否则用户看不出"权重是哪来的"，也看不出
+    // "下完了服务为什么还是加载不了"。
+    let mut detail = format!("{} · {}", m.origin.label(), base);
+    if let Some(conflict) = &m.conflict {
+        detail.push_str(" · ⚠ ");
+        detail.push_str(conflict);
+    }
     DownloadRow {
         key: m.id.clone().into(),
         label: m.id.clone().into(),
@@ -2124,17 +2132,48 @@ fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) 
         detail: detail.into(),
         progress,
         active,
+        actionable: true,
+    }
+}
+
+/// 没有下载源的模型也占一行：如实说为什么，**按钮不可点**。
+/// 诚实边界——不给一个点了必然失败的入口（gated / 上游没有该权重的包 / 没有 spec）。
+fn no_source_row_for(id: &str, reason: &str) -> DownloadRow {
+    DownloadRow {
+        key: id.into(),
+        label: id.into(),
+        state: "没有下载源".into(),
+        detail: reason.into(),
+        progress: 0.0,
+        active: false,
+        actionable: false,
     }
 }
 
 /// 重建"可下载模型"列表：清单元数据 + 队列里每条的最新快照。
 fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
     let snapshots = state.downloads.borrow();
-    let rows: Vec<DownloadRow> = downloadable_models()
-        .iter()
-        .map(|m| {
-            let latest = snapshots.iter().rev().find(|s| s.label == m.id);
-            download_row_for(m, latest)
+    let rows: Vec<DownloadRow> = download_plan()
+        .into_iter()
+        .map(|row| {
+            // 先解构：`action` 会被 move，拆成三个局部变量后两个分支都不带部分移动
+            let model_sources::Row { id, action, reason } = row;
+            match action {
+                Some(action) => {
+                    let model = DownloadableModel {
+                        id,
+                        url: action.url,
+                        sha256: action.sha256,
+                        size: action.size,
+                        dest: action.dest,
+                        origin: action.origin,
+                        conflict: action.conflict,
+                    };
+                    let latest = snapshots.iter().rev().find(|s| s.label == model.id);
+                    download_row_for(&model, latest)
+                }
+                None => no_source_row_for(&id, &reason),
+            }
         })
         .collect();
     drop(snapshots);
@@ -2252,9 +2291,7 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
             move |id| dl_cancel.cancel(id),
             move || {
                 // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
-                let model = downloadable_models()
-                    .into_iter()
-                    .find(|m| m.id == start_key)?;
+                let model = download_entry_for(&start_key)?;
                 let id = dl_start.enqueue(download::TaskSpec {
                     label: model.id.clone(),
                     url: model.url.clone(),
@@ -4182,44 +4219,98 @@ fn apply_shot_state(ui: &MainWindow, ui_state: &Rc<UiState>) {
             ui.set_status_text("主题已切换：暗色".into());
         }
         "downloads" => {
-            // 渲染核对（不是真跑）：把下载队列的四种状态各摆一条，肉眼核对进度/按钮
+            // 渲染核对（不是真跑）：把下载队列的四种状态 + 没有下载源 + 落点警告各摆一条
             ui.set_drawer_open(true);
             ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(vec![
                 DownloadRow {
                     key: "audio8-tts".into(),
                     label: "audio8-tts".into(),
                     state: "下载中".into(),
-                    detail: "已下载 412 MB / 2.1 GB · 从 412 MB 字节断点续传".into(),
+                    detail: "来源：内置下载清单 · 已下载 412 MB / 2.1 GB · 从 412 MB 字节断点续传".into(),
                     progress: 0.19,
                     active: true,
+                    actionable: true,
                 },
                 DownloadRow {
                     key: "indextts2".into(),
                     label: "indextts2".into(),
                     state: "排队".into(),
-                    detail: "/Users/me/models/indextts2".into(),
+                    detail: "来源：server.json（服务清单） · /Users/me/models/indextts2".into(),
                     progress: 0.0,
                     active: true,
+                    actionable: true,
                 },
                 DownloadRow {
                     key: "yue2".into(),
                     label: "yue2".into(),
                     state: "已完成".into(),
-                    detail: "下载完成 · /Users/me/models/yue2.gguf".into(),
+                    detail: "来源：内置下载清单 · 下载完成 · /Users/me/models/yue2.gguf".into(),
                     progress: 1.0,
                     active: false,
+                    actionable: true,
                 },
                 DownloadRow {
                     key: "ace-step".into(),
                     label: "ace-step".into(),
                     state: "失败".into(),
-                    detail: "网络错误：服务器返回 HTTP 404 · /Users/me/models/ace.gguf".into(),
+                    detail: "来源：内置下载清单 · 网络错误：服务器返回 HTTP 404 · /Users/me/models/ace.gguf".into(),
                     progress: 0.0,
                     active: false,
+                    actionable: true,
+                },
+                DownloadRow {
+                    key: "qwen3-asr".into(),
+                    label: "qwen3-asr".into(),
+                    state: "未下载".into(),
+                    detail: "来源：内置下载清单 · /Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf · ⚠ 落点与 server.json 对不上：清单 path 是 /Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf，本次会下到 /Users/me/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf —— 下完服务仍可能加载不到".into(),
+                    progress: 0.0,
+                    active: false,
+                    actionable: true,
+                },
+                DownloadRow {
+                    key: "yue-2-no-source".into(),
+                    label: "yue2".into(),
+                    state: "没有下载源".into(),
+                    detail: "上游 model_specs 里没有 family=yue2 的 spec —— 暂无下载源，不猜地址".into(),
+                    progress: 0.0,
+                    active: false,
+                    actionable: false,
                 },
             ]))));
             ui.set_status_text(
-                "模型下载：队列 / 断点续传 / 校验（示例数据，用于核对进度与终态）".into(),
+                "模型下载：队列 / 断点续传 / 校验 / 没有下载源 / 落点提醒（示例数据）".into(),
+            );
+        }
+        "model-sources" => {
+            // 真机态：不灌示例数据，直接按「server.json ∪ 内置清单」渲一遍，
+            // 并报出"几个真的有下载入口、几个如实标了没有源"。
+            ui.set_drawer_open(true);
+            let plan = download_plan();
+            let ready = plan.iter().filter(|r| r.action.is_some()).count();
+            let missing = plan.len() - ready;
+            // 无头核对用（这个态就是给"跑一次看真实数字"用的）：把每行的结论打到 stderr，
+            // 屏幕上也能看，但屏幕锁着时只有 stderr 拿得到。
+            eprintln!("AW_UI_STATE=model-sources：{ready} 个有下载入口 / {missing} 个没有下载源");
+            for r in &plan {
+                match &r.action {
+                    Some(a) => {
+                        let warn = match &a.conflict {
+                            Some(c) => format!(" ⚠ {c}"),
+                            None => String::new(),
+                        };
+                        eprintln!(
+                            "  {} → {}（{}）{warn}",
+                            r.id,
+                            a.dest.display(),
+                            a.origin.label()
+                        )
+                    }
+                    None => eprintln!("  {} → 没有下载源：{}", r.id, r.reason),
+                }
+            }
+            refresh_download_rows(ui, ui_state);
+            ui.set_status_text(
+                format!("模型下载源：{ready} 个有下载入口 · {missing} 个如实标了没有源").into(),
             );
         }
         "voice" => {
@@ -9159,51 +9250,9 @@ mod tests {
         assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
     }
 
-    /// 下载落盘位置：**目录一律取全局设置的模型目录**（不写死、也不跟清单 path 走），
-    /// 文件名优先沿用清单 path（服务才能按原路径找到）。
-    #[test]
-    fn download_dest_uses_model_dir_with_manifest_filename() {
-        // (id, path, url) → 期望落盘路径
-        let model = |id: &str, path: &str, url: &str| ServerModel {
-            id: id.into(),
-            task: "tts".into(),
-            family: "audio8".into(),
-            path: path.into(),
-            url: url.into(),
-            sha256: String::new(),
-            size: None,
-        };
-        let dir = Path::new("/models");
-        assert_eq!(
-            download_dest_for(
-                &model(
-                    "audio8-tts",
-                    "/somewhere/else/audio8-tts.gguf",
-                    "https://huggingface.co/x/audio8-tts.gguf"
-                ),
-                dir
-            ),
-            Path::new("/models/audio8-tts.gguf"),
-            "目录取模型目录，文件名沿用清单 path"
-        );
-        // 清单没给 path：取 url 末段（且剥掉 query）
-        assert_eq!(
-            download_dest_for(
-                &model(
-                    "indextts2",
-                    "",
-                    "https://example.com/w/indextts2.gguf?token=abc"
-                ),
-                dir
-            ),
-            Path::new("/models/indextts2.gguf")
-        );
-        // url 末段是空（以 / 结尾）：退回 <id>.gguf，不能把目录当文件名
-        assert_eq!(
-            download_dest_for(&model("yue2", "", "https://example.com/dir/"), dir),
-            Path::new("/models/yue2.gguf")
-        );
-    }
+    // 下载落盘位置现在由 `model_sources::plan_rows` 统一算（内置清单的上游布局优先，
+    // 服务清单没给布局时按 path/url 兜底）：那些分支的用例在 `src/model_sources.rs`，
+    // 这里不重复一份——两份实现正是这条链路上被抓过的错。
 
     /// B1（复核阻塞项）：点取消之后**不能**立刻允许为同一模型再排一条。
     ///

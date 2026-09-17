@@ -382,7 +382,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     font-size: 12px;
                 }
                 if root.download-rows.length == 0 : Text {
-                    text: "清单里没有带下载地址的模型（在 server.json 给模型补 url / sha256 后这里会出现「下载」入口）。";
+                    text: "没有可列的模型：server.json 里没有模型、内置下载清单里也没有。";
                     color: PixelTheme.dim;
                     font-size: 11px;
                     wrap: word-wrap;
@@ -414,7 +414,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
                                     font-size: 11px;
                                     vertical-alignment: center;
                                 }
-                                PixelButton {
+                                // 没有下载源的模型不给按钮（点了必然失败），只显示状态与原因
+                                if d.actionable : PixelButton {
                                     width: 64px;
                                     size: "small";
                                     text: d.active ? "取消" : (d.state == "已完成" ? "重下" : (d.state == "失败" ? "重试" : "下载"));
