@@ -116,8 +116,8 @@ class ExistingBoundaryTestsStillGreen(unittest.TestCase):
     def test_save_project_is_still_atomic(self):
         with tempfile.TemporaryDirectory() as d:
             dub.save_project(d, VALID)
-            self.assertEqual(json.load(open(os.path.join(d, "project.json"), encoding="utf-8"))["model"],
-                             "audio8-tts")
+            with open(os.path.join(d, "project.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["model"], "audio8-tts")
 
 
 if __name__ == "__main__":
