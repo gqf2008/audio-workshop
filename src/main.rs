@@ -6872,11 +6872,7 @@ fn tick(
                     }
                     sync_qa_actions(ui, rows, state);
                 }
-                if let Some(d) = duration {
-                    set_row_duration_by_project_index(rows, index, d as f32);
-                    recompute_total(rows);
-                }
-                set_status_by_project_index(rows, index, &status);
+                apply_sentence_msg(rows, index, &status, duration);
                 if status == "done" || status == "error" {
                     let done = (0..rows.row_count())
                         .filter(|&i| {
@@ -8081,6 +8077,27 @@ fn set_status_by_project_index(rows: &Rc<VecModel<Sentence>>, project_index: usi
     if let Some(i) = row_position(rows, project_index) {
         set_status(rows, i, status);
     }
+}
+
+/// 句级消息（`Msg::Sentence` 的负载）→ 行更新：**按工程 index 定位那一句**再写回
+/// 时长与状态，而不是按显示行号。
+///
+/// 抽出来是为了让"排序视角下按行号写错句"这条路径有测试隔离：真正的调用点（`tick`
+/// 里的 `Msg::Sentence`）需要 `MainWindow`，单测造不出来；这里只吃 rows + 消息负载，
+/// 用例可以直接喂一份排好序的行模型。把下面两行改回按行号写
+/// （`set_status(rows, project_index, …)` / `set_row_duration(rows, project_index, …)`）
+/// 必须让 `sentence_message_lands_on_project_index_row` 变红。
+fn apply_sentence_msg(
+    rows: &Rc<VecModel<Sentence>>,
+    project_index: usize,
+    status: &str,
+    duration: Option<f64>,
+) {
+    if let Some(d) = duration {
+        set_row_duration_by_project_index(rows, project_index, d as f32);
+        recompute_total(rows);
+    }
+    set_status_by_project_index(rows, project_index, status);
 }
 
 /// 同上：时长属于工程句子，不属于当前展示位置。
@@ -10723,6 +10740,41 @@ mod tests {
         assert_eq!(by_index(0).start, 0.0);
         assert_eq!(by_index(1).start, 1.0);
         assert_eq!(by_index(2).start, 3.0);
+    }
+
+    /// 排序视角下，句级消息必须写回**它那一句**，而不是显示行第 N 行。
+    ///
+    /// 复核实测：把 `apply_sentence_msg` 里的 `set_status_by_project_index` 换回
+    /// `set_status(rows, project_index, …)`，全量测试仍全绿——这条路径原本没有任何隔离。
+    /// 阳性对照：改回按行号写，本用例必须变红。
+    #[test]
+    fn sentence_message_lands_on_project_index_row() {
+        let rows = vec![
+            test_sentence_row(0),
+            test_sentence_row(1),
+            test_sentence_row(2),
+        ];
+        let scores = HashMap::from([(0, 90.0), (1, 80.0), (2, 95.0)]);
+        let model: Rc<VecModel<Sentence>> =
+            Rc::new(VecModel::from(sort_rows_for_eval(rows, &scores)));
+        let by_index = |index: usize| {
+            model
+                .row_data(row_position(&model, index).expect("index should map to a row"))
+                .expect("row should exist")
+        };
+        // 前提：排序后第 0 行是工程第 1 句（否则"写错行"与本用例分不开）
+        assert_eq!(model.row_data(0).unwrap().index, 1);
+        assert_eq!(by_index(1).status, "已合成");
+
+        apply_sentence_msg(&model, 0, "error", Some(2.5));
+
+        assert_eq!(by_index(0).status, "失败", "必须写回工程第 0 句");
+        assert_eq!(by_index(0).duration, 2.5);
+        assert_eq!(
+            by_index(1).status,
+            "已合成",
+            "第 0 行是工程第 1 句，不能被顺手改掉"
+        );
     }
 
     /// `Msg::EvalDone` 的"自动选中"必须看**工程当前完整分数集**（与「跳到最差句」同源），
