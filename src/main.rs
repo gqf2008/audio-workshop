@@ -10487,9 +10487,9 @@ mod tests {
                     task: "tts".into(),
                     family: "f".into(),
                     path: (*path).to_string(),
-                    url: String::new(),
-                    sha256: String::new(),
-                    size: None,
+                    // 本批只关心 path；新增字段（known_issues/mode/product_excluded/requires/role）
+                    // 走默认，免得每加一个字段都要回来补这里。
+                    ..Default::default()
                 })
                 .collect(),
         }
