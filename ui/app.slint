@@ -130,6 +130,15 @@ export component MainWindow inherits Window {
     in property <string> song-status-text: "歌曲质量未达主线产品级，作为彩蛋使用。";
     // 音乐制作页的「高级」展开态（引擎等独有参数在里面）
     in-out property <bool> song-advanced: false;
+    // 音乐制作模式（S2）：0 = 文生歌、1 = 翻唱。翻唱固定 yue2。
+    in-out property <int> song-mode-index: 0;
+    // 翻唱源音频的投影（真相在 Rust state.song_source）
+    in property <bool> song-cover-source-picked: false;
+    in property <string> song-cover-source-path: "";
+    in property <string> song-cover-source-summary: "";
+    // 主按钮可用性与原因（Rust 侧 song_generate_refusal 的投影）
+    in property <bool> song-generate-blocked: false;
+    in property <string> song-generate-reason: "";
 
     // ── 跨 Tab 任务台账（配音 / BGM / 音乐制作共用；见 src/tasks.rs）──
     in property <[TaskRow]> task-rows: [];
@@ -317,6 +326,8 @@ export component MainWindow inherits Window {
     callback song-stop();
     callback song-preview();
     callback song-export-track();
+    callback song-mode-selected(int);
+    callback song-cover-pick-file();
     callback sep-pick-file();
     callback sep-path-edited();
     callback sep-run();
@@ -586,8 +597,8 @@ export component MainWindow inherits Window {
                     history-open(i) => { root.sep-history-open(i); }
                 }
 
-                // 场景 3 = 音乐制作（歌曲）：本 Tab 只接文生歌（generate_song，yue2 / ace-step）；
-                // S2 翻唱（sheetsage2→yue2）只有库/命令行入口，没有界面接线，别在这儿补假设。
+                // 场景 3 = 音乐制作（歌曲）：文生歌（generate_song，yue2 / ace-step）
+                // 与翻唱（generate_cover：源音频 → sheetsage2 → yue2 cot=melody）。
                 if root.scene == 3 : SongWorkbench {
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
@@ -600,10 +611,18 @@ export component MainWindow inherits Window {
                     has-result: root.song-has-result;
                     status-text: root.song-status-text;
                     show-advanced <=> root.song-advanced;
+                    mode-index <=> root.song-mode-index;
+                    cover-source-picked: root.song-cover-source-picked;
+                    cover-source-path: root.song-cover-source-path;
+                    cover-source-summary: root.song-cover-source-summary;
+                    generate-blocked: root.song-generate-blocked;
+                    generate-reason: root.song-generate-reason;
                     generate => { root.song-generate(); }
                     stop => { root.song-stop(); }
                     preview => { root.song-preview(); }
                     export-track => { root.song-export-track(); }
+                    mode-selected(index) => { root.song-mode-selected(index); }
+                    cover-pick-file => { root.song-cover-pick-file(); }
                 }
 
                 if root.scene == 4 : VoiceDesignTab {

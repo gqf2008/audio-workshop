@@ -45,8 +45,9 @@ use std::time::{Duration, Instant};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use aw_core::{
-    assemble_bgm, bgm_only_artifacts, generate_segments_stoppable, generate_song, mix_project,
-    BgmArtifacts, BgmOptions, BgmRun, Client, Project, SongModel, SongOptions, DEFAULT_PUNCTUATION,
+    assemble_bgm, bgm_only_artifacts, generate_cover, generate_segments_stoppable, generate_song,
+    mix_project, BgmArtifacts, BgmOptions, BgmRun, Client, Project, SongModel, SongOptions,
+    DEFAULT_PUNCTUATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -199,6 +200,19 @@ enum Cmd {
         model: String,
         lyrics: String,
         style: String,
+    },
+    /// 翻唱（S2）：源音频 → sheetsage2 转 ABC 谱 → yue2 cot=melody 唱新词。
+    ///
+    /// 与 `RunSong` 共用同一套任务身份（`task_id`）与 `SongDone / SongStopped /
+    /// SongFailed` 终态——不新造并行的终态通道。引擎**固定 yue2**，这里不接
+    /// `model` 字段，避免 UI 传错引擎（翻唱换引擎不是换模型，是另一条链路）。
+    RunCover {
+        revision: u64,
+        task_id: u32,
+        project_name: String,
+        lyrics: String,
+        style: String,
+        source_audio: PathBuf,
     },
 }
 
@@ -379,6 +393,10 @@ enum Msg {
     },
     /// 选择待分离音频的结果（三态）
     SeparationInputPicked {
+        pick: picker::Outcome<String>,
+    },
+    /// 翻唱源音频选择结果（三态；与分离同一套 picker 语义）
+    SongSourcePicked {
         pick: picker::Outcome<String>,
     },
     /// 音色试听失败（保留音色名，便于在状态栏说清是哪个音色挂了）
@@ -2349,6 +2367,21 @@ fn spawn_file_pick(msg_tx: Sender<WorkerMsg>) {
     });
 }
 
+/// 选翻唱源音频（系统文件框，后台线程 + 消息回传；与分离共用 `picker` 三态）。
+fn spawn_song_source_pick(msg_tx: Sender<WorkerMsg>) {
+    std::thread::spawn(move || {
+        let pick = picker::pick_file(
+            "选择翻唱源音频",
+            "音频",
+            &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
+        );
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::SongSourcePicked { pick },
+        });
+    });
+}
+
 /// 界面上那个「数字 / 年份规范化」开关被切换时：作废当前工程。
 ///
 /// 它改的是 **spoken 文本**（数字/年份怎么念），所以旧音频一律不能复用——
@@ -4078,6 +4111,92 @@ fn worker_loop(ctx: WorkerCtx) {
                     }
                 }
             }
+            Cmd::RunCover {
+                // 翻唱与 RunSong 共用 task_id + SongDone/Stopped/Failed 终态（不另造通道）
+                revision: _revision,
+                task_id,
+                project_name,
+                lyrics,
+                style,
+                source_audio,
+            } => {
+                if task_take_started(&ctx, task_id) {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::SongStopped { task_id },
+                    });
+                    continue;
+                }
+                if !source_audio.is_file() {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::SongFailed {
+                            task_id,
+                            error: format!("源音频不存在或不可读：{}", source_audio.display()),
+                        },
+                    });
+                    continue;
+                }
+                let dir = ctx
+                    .projects_root
+                    .join(file_stem(&project_name))
+                    .join("song");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::SongFailed {
+                            task_id,
+                            error: e.to_string(),
+                        },
+                    });
+                    continue;
+                }
+                let client = match make_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::SongFailed { task_id, error: e },
+                        });
+                        continue;
+                    }
+                };
+                let options = SongOptions {
+                    model: SongModel::Yue2,
+                    lyrics,
+                    style,
+                    ..Default::default()
+                };
+                // 翻唱固定 yue2：generate_cover 内部会再强制一次（源音频 → ABC → yue2 cot=melody）
+                let outcome = with_song_stage(&ctx, task_id, "yue2", || {
+                    generate_cover(&client, &dir, &source_audio, "cover", &options)
+                });
+                match outcome {
+                    Ok(path) => {
+                        let duration = std::fs::read(&path)
+                            .ok()
+                            .and_then(|bytes| aw_core::dub::wav_duration(&bytes).ok())
+                            .unwrap_or(0.0);
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::SongDone {
+                                task_id,
+                                path,
+                                duration,
+                            },
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision: 0,
+                            msg: Msg::SongFailed {
+                                task_id,
+                                error: format!("翻唱失败: {e}"),
+                            },
+                        });
+                    }
+                }
+            }
             Cmd::Redo { revision, index } => {
                 let Some((current_revision, dir, project)) = current.as_mut() else {
                     let _ = ctx.tx.send(WorkerMsg {
@@ -4743,6 +4862,9 @@ struct UiState {
     bgm_artifacts: RefCell<Option<BgmArtifacts>>,
     /// 最近一次歌曲产物（路径、时长）。
     song_artifact: RefCell<Option<(PathBuf, f64)>>,
+    /// 翻唱源音频路径（None = 未选择）。与 `sep_input` 同族：路径是真相，
+    /// UI 的 source-path / source-summary / source-picked 都只是它的投影。
+    song_source: RefCell<Option<String>>,
     /// 人声分离：当前输入路径（用于 stale 判定）与两轨产物
     sep_input: RefCell<Option<String>>,
     sep_tracks: RefCell<Option<(PathBuf, PathBuf)>>,
@@ -4921,7 +5043,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
     wire_export(&ui, &cmd_tx, &msg_tx_ui, &state);
     wire_bgm(&ui, &cmd_tx, &state, &player, &stop);
-    wire_song(&ui, &cmd_tx, &state, &player);
+    wire_song(&ui, &cmd_tx, &msg_tx_ui, &state, &player);
     wire_keys(&ui, &rows, &player, &state);
     wire_task_center(&ui, &state, &stop, &sep_stop, &eval_stop);
     wire_batch(&ui, &cmd_tx, &msg_tx_ui, &state, &stop);
@@ -5373,6 +5495,13 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
         "song" => {
             ui.set_scene(3);
             ui.set_status_text("音乐制作：写歌 / 文生音乐（yue2 · ace-step）".into());
+        }
+        "music-cover" => {
+            // 翻唱模式渲染核对（不真跑：sheetsage2 + yue2 要 8 分钟级）
+            ui.set_scene(3);
+            ui.set_song_mode_index(1);
+            ui.set_song_status_text("翻唱：选源音频 → sheetsage2 转谱 → yue2 唱新词".into());
+            ui.set_status_text("音乐制作：翻唱模式（源音频入口 + 引擎固定 yue2）".into());
         }
         "music-done" => {
             // 结果条渲染的真机证据：不真跑生成（song 要 6–8 分钟），直接置 has-result
@@ -8508,6 +8637,104 @@ fn song_model_for_id(id: &str) -> Result<SongModel, String> {
     }
 }
 
+/// 音乐制作 Tab 的模式（S2 翻唱入口）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SongMode {
+    Text2Song,
+    Cover,
+}
+
+impl SongMode {
+    fn from_ui(mode_index: i32) -> Self {
+        if mode_index == 1 {
+            Self::Cover
+        } else {
+            Self::Text2Song
+        }
+    }
+}
+
+/// 翻唱源音频是否已就绪（路径非空）。
+fn song_source_is_ready(source: Option<&str>) -> bool {
+    source.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// 生成/翻唱主按钮的可用性与原因（**唯一判据**，Slint 里不重拼）。
+///
+/// 与 `backup_refusal` / `update_refusal` 同一条约定：按钮 enabled 与点击回调
+/// 都吃这一份，避免「按钮亮着却点不动」或「按钮灰着但判据说不忙」。
+/// `song_queued` 时按钮是「取消排队」——可点，所以不产生 refusal。
+fn song_generate_refusal(
+    mode: SongMode,
+    lyrics: &str,
+    style: &str,
+    cover_source: Option<&str>,
+    song_busy: bool,
+    song_queued: bool,
+) -> Option<String> {
+    if song_queued {
+        return None;
+    }
+    if song_busy {
+        return Some("歌曲生成中：等它完成（整段生成，没有中间进度）".into());
+    }
+    if lyrics.trim().is_empty() {
+        return Some("先填歌词".into());
+    }
+    if style.trim().is_empty() {
+        return Some("先填歌曲风格".into());
+    }
+    if mode == SongMode::Cover && !song_source_is_ready(cover_source) {
+        return Some("翻唱需要先选择源音频（源音频 → sheetsage2 转谱 → yue2 唱新词）".into());
+    }
+    None
+}
+
+fn song_generate_blocked(
+    mode: SongMode,
+    lyrics: &str,
+    style: &str,
+    cover_source: Option<&str>,
+    song_busy: bool,
+    song_queued: bool,
+) -> bool {
+    song_generate_refusal(mode, lyrics, style, cover_source, song_busy, song_queued).is_some()
+}
+
+/// 把主按钮可用性/原因投影到 UI（每 tick 同步一次；值没变时 Slint 不会重绘）。
+///
+/// 可用性与原因都从 `song_generate_refusal` 一份判据派生：`song_generate_blocked`
+/// 只是它的 bool 形态，二者不会漂移。
+fn refresh_song_action(ui: &MainWindow, state: &Rc<UiState>) {
+    let mode = SongMode::from_ui(ui.get_song_mode_index());
+    let lyrics = ui.get_song_lyrics();
+    let style = ui.get_song_style();
+    let source = state.song_source.borrow();
+    let busy = ui.get_song_busy();
+    let queued = ui.get_song_queued();
+    let blocked = song_generate_blocked(mode, &lyrics, &style, source.as_deref(), busy, queued);
+    let reason = song_generate_refusal(mode, &lyrics, &style, source.as_deref(), busy, queued)
+        .unwrap_or_default();
+    ui.set_song_generate_blocked(blocked);
+    ui.set_song_generate_reason(reason.into());
+}
+
+/// 写入翻唱源音频（唯一写入点）：路径是真相，UI 的 source-path / source-summary /
+/// source-picked 都是它的投影。源音频变了就作废旧歌曲产物（试听/导出别指向旧输入）。
+fn set_song_source(ui: &MainWindow, state: &Rc<UiState>, path: String) {
+    let same = state.song_source.borrow().as_deref() == Some(path.as_str());
+    ui.set_song_cover_source_path(path.clone().into());
+    ui.set_song_cover_source_summary(format!("源音频：{}", file_label(Path::new(&path))).into());
+    *state.song_source.borrow_mut() = Some(path);
+    ui.set_song_cover_source_picked(true);
+    if !same {
+        ui.set_song_has_result(false);
+        *state.song_artifact.borrow_mut() = None;
+        ui.set_song_status_text("源音频已就绪，可生成翻唱（yue2，约 8 分钟/首）".into());
+    }
+    refresh_song_action(ui, state);
+}
+
 /// 把清单里的歌曲引擎投影到界面（选项文案 + 收窄当前下标）。
 fn refresh_song_engine_options(ui: &MainWindow) {
     let models = read_server_config().map(|c| c.models).unwrap_or_default();
@@ -8524,9 +8751,42 @@ fn refresh_song_engine_options(ui: &MainWindow) {
 fn wire_song(
     ui: &MainWindow,
     cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
     state: &Rc<UiState>,
     player: &Rc<player::Player>,
 ) {
+    // 模式切换：文生歌 ↔ 翻唱。切换即作废旧产物（旧产物不对应新模式的输入）。
+    let weak = ui.as_weak();
+    let state_mode = state.clone();
+    ui.on_song_mode_selected(move |cover_index| {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_song_mode_index(if cover_index == 1 { 1 } else { 0 });
+        ui.set_song_has_result(false);
+        *state_mode.song_artifact.borrow_mut() = None;
+        if cover_index == 1 {
+            ui.set_song_status_text(
+                "翻唱：选源音频 → sheetsage2 转谱 → yue2 唱新词（约 8 分钟/首）".into(),
+            );
+        } else {
+            ui.set_song_status_text(
+                "写歌 / 文生音乐（yue2 约 8 分钟/首；ACE-Step 120s 约 6.4 分钟）".into(),
+            );
+        }
+        refresh_song_action(&ui, &state_mode);
+    });
+
+    // 选择翻唱源音频（系统文件框，后台线程 + 消息回传；三态语义见 picker）
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    ui.on_song_cover_pick_file(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_song_busy() {
+            return;
+        }
+        ui.set_song_status_text("正在打开系统文件选择框…".into());
+        spawn_song_source_pick(msg.clone());
+    });
+
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
     let state1 = state.clone();
@@ -8535,34 +8795,100 @@ fn wire_song(
         // 歌曲不依赖配音工程的可变状态（只复用工程目录写 song/），所以运行中也能
         // 提交：排进同一条队列。本 Tab 只有一个结果槽位，同一条歌曲还没结束时不接第二条。
         if state1.song_task.get().is_some() {
-            ui.set_status_text("已有一首歌在队列里：等它结束，或去任务中心看进度".into());
+            ui.set_song_status_text("已有一首歌在队列里：等它结束，或去任务中心看进度".into());
             return;
         }
+        let mode_index = ui.get_song_mode_index();
+        let cover_mode = mode_index == 1;
+        let mode = SongMode::from_ui(mode_index);
         let lyrics = ui.get_song_lyrics().to_string();
         let style = ui.get_song_style().to_string();
-        if lyrics.trim().is_empty() || style.trim().is_empty() {
-            ui.set_status_text("先填歌词和歌曲风格".into());
+        let cover_source = state1.song_source.borrow().clone();
+        // 按钮的 enabled 与这里必须用**同一份判据**（改动见 song_generate_refusal 的注释）
+        if let Some(refusal) = song_generate_refusal(
+            mode,
+            &lyrics,
+            &style,
+            cover_source.as_deref(),
+            ui.get_song_busy(),
+            ui.get_song_queued(),
+        ) {
+            ui.set_song_generate_reason(refusal.clone().into());
+            ui.set_song_status_text(refusal.into());
             return;
         }
         ui.set_song_busy(true);
+        let task_label = if cover_mode {
+            "音乐制作 · 翻唱"
+        } else {
+            "音乐制作 · 生成歌曲"
+        };
         let task_id = enqueue_task(
             &ui,
             &state1,
             &state1.song_task,
             tasks::TaskKind::Song,
-            "音乐制作 · 生成歌曲",
+            task_label,
         );
         ui.set_song_has_result(false);
         let song_note = queue_note(&state1, task_id);
         // 真的排在别人后面才给"取消排队"：空闲提交时 worker 立刻接手，没有可取消的窗口
         ui.set_song_queued(song_note.is_some());
+        let running_note = if cover_mode {
+            "翻唱生成中（yue2，约 8 分钟/首；无中间进度）…".to_string()
+        } else {
+            "歌曲生成中（yue2 可能约 8 分钟，ACE-Step 120s 约 6.4 分钟）…".to_string()
+        };
         ui.set_song_status_text(
             match song_note {
                 Some(note) => format!("{note} · 轮到它时自动开始"),
-                None => "歌曲生成中（yue2 可能约 8 分钟，ACE-Step 120s 约 6.4 分钟）…".to_string(),
+                None => running_note,
             }
             .into(),
         );
+        if cover_mode {
+            let Some(source_audio) = cover_source.filter(|p| !p.trim().is_empty()) else {
+                ui.set_song_busy(false);
+                ui.set_song_queued(false);
+                let note = "翻唱需要先选择源音频";
+                finish_task(
+                    &ui,
+                    &state1,
+                    &state1.song_task,
+                    tasks::TaskState::Failed,
+                    note,
+                );
+                ui.set_song_status_text(note.into());
+                ui.set_status_text(note.into());
+                return;
+            };
+            if tx
+                .send(Cmd::RunCover {
+                    revision: state1.project_revision.get(),
+                    task_id,
+                    project_name: file_stem(&ui.get_project_name()),
+                    lyrics,
+                    style,
+                    source_audio: PathBuf::from(source_audio),
+                })
+                .is_err()
+            {
+                ui.set_song_busy(false);
+                ui.set_song_queued(false);
+                let note = "工作线程不可用：翻唱未发出，请重启应用";
+                finish_task(
+                    &ui,
+                    &state1,
+                    &state1.song_task,
+                    tasks::TaskState::Failed,
+                    note,
+                );
+                ui.set_song_status_text(note.into());
+                ui.set_status_text(note.into());
+            }
+            return;
+        }
+
         let song_engines =
             song_engine_options(&read_server_config().map(|c| c.models).unwrap_or_default());
         let model = usize::try_from(ui.get_song_model_index().max(0))
@@ -8752,6 +9078,7 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::ReferenceTranscribed { .. }
         | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
+        | Msg::SongSourcePicked { .. }
         | Msg::SeparationProgress { .. }
         | Msg::SeparationDone { .. }
         | Msg::SeparationStopped { .. }
@@ -9175,6 +9502,21 @@ fn tick(
                 }
                 picker::Outcome::Unavailable(trouble) => {
                     ui.set_status_text(format!("没能选择音频：{}", trouble.note()).into());
+                }
+            },
+            Msg::SongSourcePicked { pick } => match pick {
+                picker::Outcome::Picked(p) => {
+                    set_song_source(ui, state, p);
+                    ui.set_status_text("翻唱源音频已选择".into());
+                }
+                picker::Outcome::Cancelled => {
+                    ui.set_song_status_text("取消了选择源音频".into());
+                    ui.set_status_text("取消了选择源音频".into());
+                }
+                picker::Outcome::Unavailable(trouble) => {
+                    let note = format!("没能选择源音频：{}", trouble.note());
+                    ui.set_song_status_text(note.clone().into());
+                    ui.set_status_text(note.into());
                 }
             },
             Msg::SeparationProgress {
@@ -9740,6 +10082,9 @@ fn tick(
 
     // ── 检查更新/打开发布页能不能点：同上，只做投影 ──
     refresh_update_availability(ui, state);
+
+    // ── 音乐制作主按钮能不能点 + 原因：同一处投影，不在 Slint 重拼 ──
+    refresh_song_action(ui, state);
 
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
@@ -13791,6 +14136,120 @@ mod tests {
         assert!(!tasks::TaskKind::Song.reports_progress());
     }
 
+    /// S2 翻唱入口：音乐制作 Tab 的模式切换（0 = 文生歌、1 = 翻唱）。
+    #[test]
+    fn song_mode_switch_distinguishes_text2song_from_cover() {
+        assert_eq!(SongMode::from_ui(0), SongMode::Text2Song);
+        assert_eq!(SongMode::from_ui(1), SongMode::Cover);
+        // 模式开关只有两档；任何未知下标都按文生歌兜底，不静默跳到翻唱
+        assert_eq!(SongMode::from_ui(-1), SongMode::Text2Song);
+        assert_eq!(SongMode::from_ui(2), SongMode::Text2Song);
+    }
+
+    /// S2 翻唱入口：主按钮可用性由**一份判据**按模式/输入投影。
+    #[test]
+    fn song_generate_availability_projects_mode_and_inputs() {
+        // 文生歌：歌词 + 风格齐 → 可点
+        assert!(!song_generate_blocked(
+            SongMode::Text2Song,
+            "词",
+            "风格",
+            None,
+            false,
+            false
+        ));
+        // 文生歌：缺歌词 / 缺风格 → 灰
+        assert!(song_generate_blocked(
+            SongMode::Text2Song,
+            "",
+            "风格",
+            None,
+            false,
+            false
+        ));
+        assert!(song_generate_blocked(
+            SongMode::Text2Song,
+            "词",
+            "",
+            None,
+            false,
+            false
+        ));
+        // 翻唱：没选源音频（None 或空串）→ 灰
+        assert!(song_generate_blocked(
+            SongMode::Cover,
+            "词",
+            "风格",
+            None,
+            false,
+            false
+        ));
+        assert!(song_generate_blocked(
+            SongMode::Cover,
+            "词",
+            "风格",
+            Some(""),
+            false,
+            false
+        ));
+        // 翻唱：源音频就绪 → 可点
+        assert!(!song_generate_blocked(
+            SongMode::Cover,
+            "词",
+            "风格",
+            Some("/tmp/source.wav"),
+            false,
+            false
+        ));
+        // 排队中 → 可点（按钮变「取消排队」）
+        assert!(!song_generate_blocked(
+            SongMode::Cover,
+            "",
+            "",
+            None,
+            true,
+            true
+        ));
+        // 运行中（busy 且还没轮到的窗口已关闭）→ 灰
+        assert!(song_generate_blocked(
+            SongMode::Text2Song,
+            "词",
+            "风格",
+            None,
+            true,
+            false
+        ));
+    }
+
+    /// S2 翻唱入口：未选源文件的禁用原因要能**做点什么**——点名源音频与两条链路。
+    #[test]
+    fn song_generate_refusal_names_missing_cover_source() {
+        let reason =
+            song_generate_refusal(SongMode::Cover, "词", "风格", None, false, false).unwrap();
+        assert!(reason.contains("源音频"), "要说出缺的是源音频：{reason}");
+        assert!(reason.contains("sheetsage2"), "要说清转谱链路：{reason}");
+        assert!(reason.contains("yue2"), "要说清唱新词的引擎：{reason}");
+    }
+
+    /// 源码级守卫：音乐制作主按钮的可用性必须**消费 Rust 的投影**，不能在 Slint 里
+    /// 重拼「歌词/风格是否为空、翻唱有没有源音频」（与 backup-blocked 同一条约定）。
+    #[test]
+    fn song_generate_button_consumes_projection_not_recomputed_in_slint() {
+        let workbench = include_str!("../ui/song_workbench.slint");
+        assert!(
+            workbench.contains("enabled: !root.generate-blocked;"),
+            "主按钮的 enabled 必须直接吃 Rust 投影 generate-blocked"
+        );
+        assert!(
+            !workbench.contains("root.lyrics != \"\""),
+            "不许在 Slint 里重拼歌词判据"
+        );
+        assert!(
+            !workbench.contains("root.style != \"\""),
+            "不许在 Slint 里重拼风格判据"
+        );
+    }
+
     /// 工程损坏时开始合成必须**中止**而不是静默重建：以前 `Project::load(dir).ok()` 会把它
     /// 当成"没有工程"，已合成句全变待合成且没有一句解释；更糟的是随后落盘会覆盖掉损坏
     /// 文件——那是唯一可人工恢复的现场。这里同时守住"缺文件仍是全新工程"这条回归。
@@ -16600,7 +17059,7 @@ mod tests {
         // （分支还在、文案却撒谎）→ 下面这一条立刻红。
         let notes = src.matches("trouble.note()").count();
         assert_eq!(
-            calls, 6,
+            calls, 7,
             "选择器调用点数量变了（{calls}）——加/删调用点时同步更新这条守卫"
         );
         assert_eq!(

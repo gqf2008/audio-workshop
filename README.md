@@ -5,8 +5,8 @@
 三主线统一设计（配音 / BGM / 音乐制作），另有「人声分离」「音色设计」两个 Tab，**配音先行**。立项依据、实测基线、风险与路线图见 [CHARTER.md](CHARTER.md)。
 
 > 当前阶段：**M2 已稳定；M4 歌曲彩蛋开发中**。配音 + BGM 主链路已可用；歌曲场景已接入
-> yue2/ACE-Step 文生歌与 sheetsage2→yue2 翻唱（**命令行/库形态**；音乐制作 Tab 只接了
-> 文生歌，翻唱没有界面入口），作为质量未达主线产品级的彩蛋能力。
+> yue2/ACE-Step 文生歌与 sheetsage2→yue2 翻唱（音乐制作 Tab 提供「文生歌 / 翻唱」模式切换，
+> 翻唱固定 yue2 并选源音频），作为质量未达主线产品级的彩蛋能力。
 
 ## 本仓库（开源层）
 
@@ -74,8 +74,8 @@ cargo run --release        # 打开配音工作台
 cargo run -p aw-core --example bgm_run -- ~/Documents/音频作坊/projects/工程名 \
   "温暖克制的科技感口播背景音乐，钢琴与轻电子，无人声，循环友好"
 # M4 歌曲：文生歌（yue2 / ACE-Step；ACE-Step 本机内存不够）
-#   翻唱（sheetsage2 → yue2 cot=melody）只有**库 + 命令行示例**这一条入口，
-#   桌面「音乐制作」Tab 里没有翻唱按钮——README 早先写成"已交付"是过头了。
+#   翻唱（sheetsage2 → yue2 cot=melody）桌面入口在「音乐制作」Tab：切到「翻唱」模式，
+#   选源音频后走 transcribe_abc → generate_cover（固定 yue2）。命令行示例仍可用：
 # ACE-Step 的门槛是**可用内存** 9.77 GiB（引擎估算 8.77 GiB + 1 GiB 余量）；
 # 本机 16GB 实测（2026-09-17 三次采样，可用值是变量不是硬件常量）：
 #   7.32 GiB（TTS+ASR 常驻）/ 8.24 GiB（全部卸载后）/ 6.60 GiB（复核时）

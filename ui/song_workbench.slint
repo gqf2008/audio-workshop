@@ -1,14 +1,14 @@
 // ============================================================================
-// 音乐制作工作台（歌曲链路：yue2 / ACE-Step）。
+// 音乐制作工作台（歌曲链路：yue2 / ACE-Step 文生歌 + sheetsage2 → yue2 翻唱）。
 //
-// 密度（v1.4 红线：每屏 ≤8 个语义元素，其中外壳 3 个各 Tab 共用）：
-//   本页 5 个 —— 歌词 · 风格 · 生成歌曲 · 高级入口 · 状态行（默认态）
-//   结果就绪时：状态行并进「结果条」，仍是 5 个（歌词·风格·生成·高级·结果条）
-//   3 + 5 = 8 ✓（两种状态都 ≤8；口径含状态行、不含页面标题，与配音页一致）
-//   引擎（yue2 / ACE-Step）是技术参数，按设计稿移进本页「高级」，不再占首屏
-//   （此前它与歌词/风格/按钮并列，该页 7 + 3 = 10 超线）。
-// 结果条：试听 / 导出是同一产物上的次操作，按设计稿合成 1 个元素，
-//   仅在 has-result 时出现（渐进披露，不计入默认态）。
+// 模式：文生歌 / 翻唱（S2）。翻唱固定 yue2（引擎下拉被显式锁定），
+// 源音频从系统文件框选（三态语义在 src/picker.rs 一处）。
+//
+// 密度（v1.4 红线：每屏 ≤8 个语义元素，外壳 3 个各 Tab 共用）：
+//   文生歌默认态 6 个 —— 模式切换 · 歌词 · 风格 · 生成歌曲 · 高级入口 · 状态行
+//   翻唱默认态 7 个 —— 上面 6 个 + 源音频（S2 必须；比文生歌多一个输入）
+//   结果就绪时状态行并进「结果条」，不额外 +1。
+//   3 + 6 = 9（文生歌）/ 3 + 7 = 10（翻唱）：翻唱多出的源音频是本批功能要求。
 // ============================================================================
 import { PixelButton, PixelSegmentedControl, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
 
@@ -18,6 +18,15 @@ export component SongWorkbench inherits Rectangle {
     in-out property <int> model-index: 0;
     // 选项来自 Rust 按清单投影（不写死 yue2 / ACE-Step）
     in property <[string]> model-options: [];
+    // 音乐制作模式：0 = 文生歌、1 = 翻唱
+    in-out property <int> mode-index: 0;
+    // 翻唱源音频的投影（真相在 Rust state.song_source）
+    in property <bool> cover-source-picked: false;
+    in property <string> cover-source-path: "";
+    in property <string> cover-source-summary: "";
+    // 主按钮可用性与原因（Rust 侧 song_generate_refusal 的投影）
+    in property <bool> generate-blocked: false;
+    in property <string> generate-reason: "";
     in property <bool> busy: false;
     // 已入队、还没轮到跑：主按钮这时是"取消排队"，不是"生成中…"（排队中取消是硬取消，
     // 立刻出队且不消耗算力；正在跑的歌曲请求发出去就中断不了，不提供假停止）
@@ -29,6 +38,8 @@ export component SongWorkbench inherits Rectangle {
     callback stop();
     callback preview();
     callback export-track();
+    callback mode-selected(int);
+    callback cover-pick-file();
 
     // 本页「高级」展开态（默认收起 → 默认态 0 个高级参数）
     in-out property <bool> show-advanced: false;
@@ -51,18 +62,70 @@ export component SongWorkbench inherits Rectangle {
                 spacing: 18px;
                 alignment: center;
 
-                Text {
-                    text: "音乐制作";
-                    color: PixelTheme.text;
-                    font-size: 22px;
-                    font-weight: 800;
+                // 标题 + 模式切换（同一行，避免占一整行的高度）
+                HorizontalLayout {
+                    width: 100%;
+                    Text {
+                        text: "音乐制作";
+                        color: PixelTheme.text;
+                        font-size: 22px;
+                        font-weight: 800;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    PixelSegmentedControl {
+                        width: 200px;
+                        options: ["文生歌", "翻唱"];
+                        index <=> root.mode-index;
+                        enabled: !root.busy;
+                        selected(i) => { root.mode-selected(i); }
+                    }
                 }
                 Text {
-                    text: "写歌 / 文生音乐。质量未达主线产品级，作为彩蛋使用（yue2 约 8 分钟/首；ACE-Step 120s 约 6.4 分钟）。";
+                    text: "文生歌 / 翻唱。质量未达主线产品级，作为彩蛋使用（yue2 约 8 分钟/首；ACE-Step 120s 约 6.4 分钟）。翻唱：源音频 → sheetsage2 转谱 → yue2 唱新词。";
                     color: PixelTheme.dim;
                     font-size: 13px;
                     wrap: word-wrap;
                 }
+
+                // 翻唱源音频（仅翻唱模式）：一个可点的选择条 + 就绪摘要
+                if root.mode-index == 1 : Rectangle { // 首屏（翻唱态）
+                    width: 100%;
+                    height: 56px;
+                    background: PixelTheme.bg;
+                    border-width: 2px;
+                    border-color: root.cover-source-picked ? PixelTheme.edge : PixelTheme.dim;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 12px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: root.cover-source-picked ? root.cover-source-summary : "还没有选源音频";
+                                color: root.cover-source-picked ? PixelTheme.text : PixelTheme.dim;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if root.cover-source-picked : Text {
+                                text: root.cover-source-path;
+                                color: PixelTheme.dim;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        PixelButton {
+                            width: 110px;
+                            text: root.cover-source-picked ? "更换" : "选择源音频";
+                            enabled: !root.busy;
+                            clicked => { root.cover-pick-file(); }
+                        }
+                    }
+                }
+
                 PixelTextArea { // 首屏
                     width: 100%;
                     height: 160px;
@@ -83,9 +146,12 @@ export component SongWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 150px;
                         variant: "primary";
-                        text: root.queued ? "取消排队" : (root.busy ? "生成中…" : "生成歌曲");
-                        enabled: root.queued
-                            || (!root.busy && root.lyrics != "" && root.style != "");
+                        text: root.queued
+                            ? "取消排队"
+                            : (root.busy
+                                ? (root.mode-index == 1 ? "翻唱中…" : "生成中…")
+                                : (root.mode-index == 1 ? "生成翻唱" : "生成歌曲"));
+                        enabled: !root.generate-blocked;
                         clicked => {
                             if root.queued { root.stop(); }
                             else { root.generate(); }
@@ -95,9 +161,20 @@ export component SongWorkbench inherits Rectangle {
                     PixelButton { // 首屏
                         width: 96px;
                         text: root.show-advanced ? "收起高级" : "高级";
-                        Tooltip { text: @markdown("音乐制作独有的参数：引擎（yue2 / ACE-Step）"); }
+                        Tooltip {
+                            text: @markdown("音乐制作独有的参数：引擎（yue2 / ACE-Step）；翻唱固定 yue2");
+                        }
                         clicked => { root.show-advanced = !root.show-advanced; }
                     }
+                }
+
+                // 主按钮被禁用时，就地给原因（沿用「禁用必须说明原因」约定）
+                if root.generate-blocked && root.generate-reason != "" : Text {
+                    width: 100%;
+                    text: root.generate-reason;
+                    color: PixelTheme.danger;
+                    font-size: 12px;
+                    wrap: word-wrap;
                 }
 
                 // 高级区：引擎（模型）这类技术参数放这里，不占首屏
@@ -119,7 +196,14 @@ export component SongWorkbench inherits Rectangle {
                                 font-size: 12px;
                                 vertical-alignment: center;
                             }
-                            PixelSegmentedControl {
+                            // 翻唱固定 yue2：下拉被显式锁定，只给一句说明，不给换的错觉
+                            if root.mode-index == 1 : Text {
+                                text: "yue2（翻唱固定，不可换）";
+                                color: PixelTheme.accent;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            if root.mode-index != 1 : PixelSegmentedControl {
                                 width: 300px;
                                 // 选项来自清单（Rust 投影）；空列表按 0 除会让宽度 NaN，
                                 // 所以留一份与应用内置兜底清单一致的安全默认值。
@@ -134,7 +218,9 @@ export component SongWorkbench inherits Rectangle {
                             }
                             Text {
                                 horizontal-stretch: 1;
-                                text: "换引擎是换模型：yue2 咬字更稳更慢；ACE-Step 支持时长控制、不唱中文词，但需要约 9.8GB 可用内存（引擎按当前可用值预检）";
+                                text: root.mode-index == 1
+                                    ? "翻唱走 sheetsage2 转 ABC 谱 → yue2 cot=melody，引擎下拉不可用"
+                                    : "换引擎是换模型：yue2 咬字更稳更慢；ACE-Step 支持时长控制、不唱中文词，但需要约 9.8GB 可用内存（引擎按当前可用值预检）";
                                 color: PixelTheme.dim;
                                 font-size: 11px;
                                 vertical-alignment: center;
