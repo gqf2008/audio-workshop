@@ -1,0 +1,84 @@
+# 三平台门禁：填上「本机只有 macOS」这个缺口。
+#
+# 背景：docs/m3-platform-status.md 记录过——本机交叉编译到 Linux GNU / Windows MSVC
+# 都会卡在 ring 的 C 工具链（macOS 上没有目标 sysroot），只有 Colima 容器里的 Linux
+# `cargo check` 与 Windows GNU 交叉 check 能过。M3 的关闭判据是「第二个平台可自用」，
+# 需要真机；在拿到真机之前，这套矩阵至少把**编译/clippy/单测**这三件在真机上跑。
+#
+# 成本提醒：仓库是私有的，私有仓库的 Actions 会消耗账号额度。workflow_dispatch 与
+# pull_request/push 都会触发；额度策略未定前不要在每次提交都依赖它。
+name: ci
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的新推送取消旧的进行中任务，别让排队吃掉私有仓库额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 让 clippy/测试失败时的回溯可读（不带会只剩一行 panic 位置）。
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台红了也要看到另外两个的结果——这正是本矩阵存在的意义。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Slint 的 Linux 后端（x11/wayland）、ALSA、fontconfig —— 照
+      # docs/m3-platform-status.md 里已在容器中验证过的那份清单。
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libasound2-dev libfontconfig1-dev clang
+
+      # components 里带上 rustfmt/clippy —— 否则下面两条会以「命令不存在」失败，
+      # 那会被误读成代码有问题。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo registry / git / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # Windows 的 GitHub runner 上解释器叫 python（python3 不在 PATH 里）；
+      # 这不是「跳过测试」，两边跑的是同一条 unittest 命令。
+      - name: python 单测
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s tools/tests
+
+      - name: python 单测（Windows）
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tools/tests
