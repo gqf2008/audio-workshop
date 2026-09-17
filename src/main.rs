@@ -494,7 +494,8 @@ struct AppSettings {
     host: Option<String>,
     #[serde(default)]
     port: Option<u16>,
-    /// 模型目录：本机模型文件的存放位置（默认 <应用工作目录>/models，用户可选）
+    /// 模型目录：本机模型文件的存放位置。缺省 = `default_model_dir()`
+    /// （跟着服务清单里模型 path 的公共父目录走，推不出来才回落 <应用工作目录>/models）。
     #[serde(default)]
     model_dir: Option<String>,
     /// 当前启用的发音词典（库内文件名）；缺省 = 不启用。
@@ -554,14 +555,16 @@ impl Default for BgmSettings {
     }
 }
 
-/// 默认模型目录：应用工作目录下的 models/（打包后即应用目录下的 models/）。
-fn default_model_dir() -> PathBuf {
+/// 旧默认值：`<应用工作目录>/models`（打包后即应用目录下的 models/）。
+/// **清单里推不出模型根时的回落。**
+///
+/// cwd 是 `/`（Finder 双击启动的常见情况）时退回可执行文件所在目录：
+/// 否则默认值成了 `/models`，界面只说"目录不存在"，看不出根因。
+fn fallback_model_dir() -> PathBuf {
     let cwd = std::env::current_dir().ok();
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    // cwd 是 `/`（Finder 双击启动的常见情况）时退回可执行文件所在目录：
-    // 否则默认值成了 `/models`，界面只说"目录不存在"，看不出根因。
     let base = match cwd {
         Some(d) if d != Path::new("/") => d,
         _ => exe_dir.unwrap_or_else(|| PathBuf::from(".")),
@@ -569,12 +572,135 @@ fn default_model_dir() -> PathBuf {
     base.join("models")
 }
 
-/// 当前生效的模型目录（设置 > 默认）。
+/// 从清单里的模型 `path` 反推「模型根目录」。**纯函数**（落盘探测走 `volume` 注入）。
+///
+/// 语义：根 = 所有非空 `path` 的**父目录**的最长公共祖先。文件与目录两种 `path` 一视同仁
+/// 取 `parent()`——`path` 可能指向文件（`…/Qwen3-ASR-0.6B-GGUF/x.gguf`），也可能指向目录
+/// （gen 类 `…/Yue2-3B-GGUF`），我们要的是"服务会去哪一层找"的那层，不是某个模型自己的子目录。
+///
+/// 返回 `None` 的几种情形都是**推不出可信答案**，调用方必须回落，不许瞎猜一个根：
+/// 1. 没有可用 path（清单缺、字段全空）；
+/// 2. 有相对路径——服务按它自己的 cwd 解析，我们猜不到；让它参与比较会算出错误的公共根；
+/// 3. 跨根（不同卷 / 不同盘）——硬算出的是 `/Volumes` 这种"挂载点容器"，当模型目录用只会
+///    把权重放到服务永远不看的地方；
+/// 4. 公共祖先只剩文件系统根（Unix `/`、Windows `C:\`）——等于什么都没推出来。
+fn model_root_from_paths(paths: &[&str]) -> Option<PathBuf> {
+    model_root_with(paths, &volume_of)
+}
+
+/// `volume` = 「这条路径所在的那个根」的标识（Unix: `st_dev`；Windows: 盘符 / UNC 前缀）。
+///
+/// 参数化是为了让「跨根必须回落」这条**可测**：一台机器上造不出第二个文件系统，
+/// 不注入就只能写一条换个平台就恒真的断言。
+fn model_root_with(paths: &[&str], volume: &dyn Fn(&Path) -> Option<String>) -> Option<PathBuf> {
+    let mut common: Option<PathBuf> = None;
+    let mut vol: Option<String> = None;
+    for raw in paths {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let p = Path::new(raw);
+        if !p.is_absolute() {
+            return None;
+        }
+        let parent = p.parent()?.to_path_buf();
+        let v = volume(&parent)?;
+        match &vol {
+            None => vol = Some(v),
+            Some(seen) if *seen == v => {}
+            Some(_) => return None,
+        }
+        common = Some(match common {
+            None => parent,
+            Some(acc) => common_ancestor(&acc, &parent)?,
+        });
+    }
+    let root = common?;
+    // 收敛到文件系统根不算"公共父目录"：`/` 或 `C:\` 当模型目录用毫无意义，回落。
+    root.parent()?;
+    Some(root)
+}
+
+/// 两条绝对路径的最长公共祖先目录。按**路径组件**比，不是字符串前缀：
+/// `/models-2` 不会被当成 `/models` 里面（见 `LESSON_路径包含判定必须按真实路径而非字面前缀.md`）。
+fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
+    a.ancestors()
+        .find(|c| b.starts_with(c))
+        .map(Path::to_path_buf)
+}
+
+/// 路径所在文件系统的标识。路径可能还不存在（模型还没下过），所以先向上找最近的**存在**祖先。
+/// 找不到（相对路径、整条链都不可达）→ `None`，调用方整批回落。
+#[cfg(unix)]
+fn volume_of(p: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let existing = nearest_existing(p)?;
+    std::fs::metadata(existing)
+        .ok()
+        .map(|m| m.dev().to_string())
+}
+
+/// Windows：卷的标识就是路径前缀（`C:` / `\\server\share`）。
+/// 不用 `volume_serial_number()`：那个要求路径存在，而模型目录常常还没建出来。
+#[cfg(not(unix))]
+fn volume_of(p: &Path) -> Option<String> {
+    match p.components().next()? {
+        std::path::Component::Prefix(pre) => Some(pre.as_os_str().to_string_lossy().to_uppercase()),
+        _ => None,
+    }
+}
+
+/// 最近的、真实存在的祖先；一个都没有就是 `None`。
+///
+/// 只有 Unix 的 `volume_of` 用它（Windows 用路径前缀当卷标识，不需要碰盘）。
+/// 不加 cfg 会让 Windows 侧的 `-D warnings` 挂在 dead_code 上。
+#[cfg(unix)]
+fn nearest_existing(p: &Path) -> Option<PathBuf> {
+    let mut cur = Some(p);
+    while let Some(c) = cur {
+        if c.exists() {
+            return Some(c.to_path_buf());
+        }
+        cur = c.parent();
+    }
+    None
+}
+
+/// 默认模型目录：**优先跟着服务清单的模型根走**（`server.json` 里那些 path 的公共父目录），
+/// 推不出来才回落到 `<应用工作目录>/models`。
+///
+/// 动机（2026-09-17 真机）：默认值是 `<cwd>/models`，本机根本不存在，而 13 个模型的 path 全在
+/// `/Volumes/DataExt/models/...` —— 抽屉里「模型目录」长期显示"目录不存在（清单里有 13 个模型）"，
+/// 下载面板 8 条入口**每条**都挂着「⚠ 落点与 server.json 对不上」（照默认值下完，服务确实找不到）。
+fn default_model_dir() -> PathBuf {
+    default_model_dir_from(read_server_config().as_ref())
+}
+
+/// `default_model_dir()` 的可注入版本（清单由调用方给；单测不碰进程环境变量，见
+/// `LESSON_多线程测试中set_var修改进程环境是UB`）。
+fn default_model_dir_from(cfg: Option<&ServerConfig>) -> PathBuf {
+    cfg.and_then(|c| {
+        let paths: Vec<&str> = c.models.iter().map(|m| m.path.as_str()).collect();
+        model_root_from_paths(&paths)
+    })
+    .unwrap_or_else(fallback_model_dir)
+}
+
+/// 当前生效的模型目录（显式设置 > 默认）。**这是唯一入口**，别再写第二份"哪个目录生效"的判据。
 fn model_dir() -> PathBuf {
-    settings_snapshot()
-        .model_dir
+    effective_model_dir(&settings_snapshot(), read_server_config().as_ref())
+}
+
+/// `model_dir()` 的纯投影（两个输入都由调用方给，便于单测）。
+///
+/// 只有设置了 `model_dir` 才走设置：推导出来的默认值**永远不许盖掉用户选过的目录**
+/// （界面回显、扫描、下载落点、设置回存都消费 `model_dir()`，所以它们不会各说各话）。
+fn effective_model_dir(s: &AppSettings, cfg: Option<&ServerConfig>) -> PathBuf {
+    s.model_dir
+        .as_ref()
         .map(PathBuf::from)
-        .unwrap_or_else(default_model_dir)
+        .unwrap_or_else(|| default_model_dir_from(cfg))
 }
 
 /// 目录扫描的条目上限：目录是用户自选的，选到 $HOME 或 / 时不至于把 UI 线程扫死。
@@ -4848,9 +4974,30 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             let plan = download_plan();
             let ready = plan.iter().filter(|r| r.action.is_some()).count();
             let missing = plan.len() - ready;
+            let conflicts = plan
+                .iter()
+                .filter(|r| r.action.as_ref().is_some_and(|a| a.conflict.is_some()))
+                .count();
             // 无头核对用（这个态就是给"跑一次看真实数字"用的）：把每行的结论打到 stderr，
             // 屏幕上也能看，但屏幕锁着时只有 stderr 拿得到。
-            eprintln!("AW_UI_STATE=model-sources：{ready} 个有下载入口 / {missing} 个没有下载源");
+            //
+            // 「模型目录」与「清单推出的模型根」都打出来：落点冲突的根因就是这两个值，
+            // 只看行数看不出是谁的问题（见 default_model_dir 的注释）。
+            eprintln!(
+                "AW_UI_STATE=model-sources：模型目录 = {}（清单推出的模型根 = {}）",
+                model_dir().display(),
+                default_model_dir().display()
+            );
+            // 抽屉里那条「模型目录」提示也打出来：以前默认目录不存在时会显示
+            // "目录不存在（清单里有 13 个模型）"。读的是启动时 `apply_engine_discovery`
+            // → `refresh_settings_view` 已经投影好的 UI 真实值，不在这里另拼一份文案。
+            eprintln!(
+                "AW_UI_STATE=model-sources：模型区提示 = {}",
+                ui.get_model_dir_info()
+            );
+            eprintln!(
+                "AW_UI_STATE=model-sources：{ready} 个有下载入口 / {missing} 个没有下载源 / {conflicts} 条带「落点与 server.json 对不上」"
+            );
             for r in &plan {
                 match &r.action {
                     Some(a) => {
@@ -10128,6 +10275,200 @@ mod tests {
 
         let missing = dir.join("nope");
         assert_eq!(scan_model_dir(&missing), (false, 0));
+    }
+
+    // ---------- 默认模型目录：跟着 server.json 的模型根走 ----------
+
+    /// 测试里拼一个**本平台意义上的绝对路径**。
+    /// Windows 上裸 `/x` 不算绝对（没有盘符），会走"相对路径必须回落"那条，
+    /// 断言就变成在测另一件事——这里统一拼成各平台的绝对形状。
+    fn abs_path(rest: &str) -> String {
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let body: String = rest
+            .trim_start_matches('/')
+            .chars()
+            .map(|c| if c == '/' { sep } else { c })
+            .collect();
+        if cfg!(windows) {
+            format!("C:\\{body}")
+        } else {
+            format!("/{body}")
+        }
+    }
+
+    /// 一批 path 拼成本仓 `server.json` 那种清单（只关心 path 的模型根推导）。
+    fn cfg_with_paths(paths: &[&str]) -> ServerConfig {
+        ServerConfig {
+            host: None,
+            port: None,
+            models: paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| ServerModel {
+                    id: format!("m{i}"),
+                    task: "tts".into(),
+                    family: "f".into(),
+                    path: (*path).to_string(),
+                    url: String::new(),
+                    sha256: String::new(),
+                    size: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// ① 多条 path（文件 + 目录混着，就是真机 13 条的形状）→ 收敛到它们的公共父目录。
+    #[test]
+    fn model_root_is_the_common_parent_of_declared_paths() {
+        let a = abs_path("models/ModelA/a.gguf");
+        let b = abs_path("models/ModelB/b.gguf");
+        let dir_model = abs_path("models/ModelC"); // gen 类：path 指目录
+        let same = |_: &Path| Some("root".to_string());
+        assert_eq!(
+            model_root_with(&[a.as_str(), b.as_str(), dir_model.as_str()], &same),
+            Some(PathBuf::from(abs_path("models")))
+        );
+        // 顺序无关
+        assert_eq!(
+            model_root_with(&[dir_model.as_str(), a.as_str(), b.as_str()], &same),
+            Some(PathBuf::from(abs_path("models")))
+        );
+        // 与真机同一形状：`/Volumes/DataExt/models/<模型目录>/<文件>`
+        let real = abs_path("Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr.gguf");
+        let real2 = abs_path("Volumes/DataExt/models/Yue2-3B-GGUF");
+        assert_eq!(
+            model_root_with(&[real.as_str(), real2.as_str()], &same),
+            Some(PathBuf::from(abs_path("Volumes/DataExt/models")))
+        );
+
+        // 祖先要按**路径组件**找，不是字符串前缀：`/models-2` 不是 `/models` 里的东西。
+        // 字面前缀比较会把这两条判成"公共根 = /models"，而那根本不是 `/models-2/y.gguf` 的祖先。
+        let sibling_a = abs_path("models/in/x.gguf");
+        let sibling_b = abs_path("models-2/y.gguf");
+        assert_eq!(
+            model_root_with(&[sibling_a.as_str(), sibling_b.as_str()], &same),
+            None,
+            "`/models-2` 与 `/models` 没有公共模型根，不能被字符串前缀凑成一个"
+        );
+    }
+
+    /// ① 单条 path：它的**父目录**就是模型根（文件与目录两种都取 `parent()`）。
+    #[test]
+    fn model_root_of_a_single_path_is_its_parent() {
+        let same = |_: &Path| Some("root".to_string());
+        let file = abs_path("models/ModelA/a.gguf");
+        assert_eq!(
+            model_root_with(&[file.as_str()], &same),
+            Some(PathBuf::from(abs_path("models/ModelA")))
+        );
+        let dir_model = abs_path("models/DirModel");
+        assert_eq!(
+            model_root_with(&[dir_model.as_str()], &same),
+            Some(PathBuf::from(abs_path("models")))
+        );
+    }
+
+    /// ① 空：清单缺失 / 字段全空 → 推不出来 → 回落旧默认值。
+    #[test]
+    fn model_root_is_none_when_there_is_no_path() {
+        let same = |_: &Path| Some("root".to_string());
+        assert_eq!(model_root_with(&[], &same), None);
+        assert_eq!(model_root_with(&["", "   "], &same), None);
+        assert_eq!(model_root_from_paths(&[]), None);
+        assert_eq!(default_model_dir_from(None), fallback_model_dir());
+        assert_eq!(
+            default_model_dir_from(Some(&cfg_with_paths(&[]))),
+            fallback_model_dir()
+        );
+    }
+
+    /// ① 相对路径：服务按**它自己的** cwd 解析，我们猜不到 → 整批回落，
+    /// 不许"只用绝对的那几条"拼一个看起来能用的根出来。
+    #[test]
+    fn model_root_is_none_when_any_path_is_relative() {
+        let same = |_: &Path| Some("root".to_string());
+        let rel = "models/ModelA/a.gguf";
+        assert_eq!(model_root_with(&[rel], &same), None);
+
+        let abs = abs_path("models/ModelA/a.gguf");
+        assert_eq!(
+            model_root_with(&[abs.as_str(), rel], &same),
+            None,
+            "有一条相对路径就不能给出「公共根」"
+        );
+        assert_eq!(model_root_from_paths(&[abs.as_str(), rel]), None);
+    }
+
+    /// ① 跨根 → 回落，不许瞎猜一个根。两类各测一次，且都能单独变红：
+    /// · 两条 path 唯一的公共祖先是**文件系统根**（Unix `/`、Windows `C:\`）→ 不算公共父目录；
+    /// · 两条 path 落在**不同卷/盘**上 → 硬算出来的是 `/mnt` 这种"挂载点容器"，不是模型根。
+    ///   （后一类注入假 volume：一台机器上造不出第二个文件系统。）
+    #[test]
+    fn model_root_is_none_across_roots() {
+        let same = |_: &Path| Some("same".to_string());
+        // 唯一的公共祖先是文件系统根 → 回落（删掉 `root.parent()?` 这道守卫这条会红）
+        let a = abs_path("volA/models/x.gguf");
+        let b = abs_path("volB/models/y.gguf");
+        assert_eq!(model_root_with(&[a.as_str(), b.as_str()], &same), None);
+        assert_eq!(model_root_from_paths(&[a.as_str(), b.as_str()]), None);
+
+        // 两条 path 有公共祖先（`/mnt`、`C:\mnt`），但分属两个卷 → 也回落
+        let ma = abs_path("mnt/volA/models/x.gguf");
+        let mb = abs_path("mnt/volB/models/y.gguf");
+        assert_eq!(
+            model_root_with(&[ma.as_str(), mb.as_str()], &same),
+            Some(PathBuf::from(abs_path("mnt"))),
+            "同一个卷时公共父目录必须推得出来（否则下面那条断言就是在骗自己）"
+        );
+        let two_volumes = |p: &Path| {
+            let s = p.to_string_lossy();
+            Some(if s.contains("volA") { "A" } else { "B" }.to_string())
+        };
+        assert_eq!(
+            model_root_with(&[ma.as_str(), mb.as_str()], &two_volumes),
+            None,
+            "跨卷不许拿挂载点容器当模型根"
+        );
+    }
+
+    /// ② 用户显式设置过 `model_dir` 时**一定**优先：推出来的默认值不许盖掉它。
+    #[test]
+    fn explicit_model_dir_beats_the_manifest_derived_root() {
+        let a = abs_path("models/ModelA/a.gguf");
+        let b = abs_path("models/ModelB/b.gguf");
+        let cfg = cfg_with_paths(&[a.as_str(), b.as_str()]);
+        let picked = AppSettings {
+            model_dir: Some(abs_path("my/own/models")),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            effective_model_dir(&picked, Some(&cfg)),
+            PathBuf::from(abs_path("my/own/models"))
+        );
+        assert_eq!(
+            effective_model_dir(&AppSettings::default(), Some(&cfg)),
+            PathBuf::from(abs_path("models")),
+            "没设置过才用推导出来的模型根"
+        );
+        assert_eq!(
+            effective_model_dir(&picked, None),
+            PathBuf::from(abs_path("my/own/models")),
+            "清单读不出来时显式设置照样优先"
+        );
+        // 清单推不出来（跨根）时也是显式设置优先、否则回落旧默认值
+        let cross = cfg_with_paths(&[
+            abs_path("volA/models/x.gguf").as_str(),
+            abs_path("volB/models/y.gguf").as_str(),
+        ]);
+        assert_eq!(
+            effective_model_dir(&AppSettings::default(), Some(&cross)),
+            fallback_model_dir()
+        );
+        assert_eq!(
+            effective_model_dir(&picked, Some(&cross)),
+            PathBuf::from(abs_path("my/own/models"))
+        );
     }
 
     /// 「清单里有多少模型落在该目录下」是**路径组件前缀**判定：
