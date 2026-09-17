@@ -864,7 +864,7 @@ fn wire_dictionary(
     let st_import = state.clone();
     ui.on_dict_import(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() || !state_dictionary_idle(&st_import) {
+        if dictionary_controls_busy(&ui, &st_import) {
             ui.set_status_text("任务进行中：词典等这轮跑完再导入".into());
             return;
         }
@@ -904,6 +904,80 @@ fn wire_dictionary(
 /// 词典区现在能不能动（任务在飞/批量在飞都不行）。
 fn state_dictionary_idle(state: &Rc<UiState>) -> bool {
     !project_editing_blocked_dummy(state) && !batch_in_flight(state)
+}
+
+/// 词典控件的统一忙碌判据：UI 在飞（配音/BGM/试听）+ **台账里任何任务在飞**
+/// （含歌曲/分离/质检这类不设全局 `running`/`busy` 的）+ 批量在飞。
+///
+/// 点击时与**异步回调到达时**必须用同一个：文件框打开后用户可能已经起了别的任务。
+fn dictionary_controls_busy(ui: &MainWindow, state: &Rc<UiState>) -> bool {
+    ui.get_running() || ui.get_busy() || !state_dictionary_idle(state)
+}
+
+/// 词条导入的应用结果（供状态行报告）。
+#[derive(Debug)]
+struct DictImportApplied {
+    entry: dictionaries::Entry,
+    imported: usize,
+    skipped: Vec<String>,
+}
+
+/// 把词条文件导入词典库（**不含文件框**）。
+///
+/// `busy` 由调用方用 `dictionary_controls_busy` 算好传进来——这样"文件框打开期间起了任务"
+/// 这条竞态就能被单测直接覆盖（复核要求：回归要真的覆盖 handler 用的那条判据，而不只是判据本身）。
+fn import_entries_into_library(
+    root: &Path,
+    path: &Path,
+    active_file: Option<&str>,
+    busy: bool,
+    now_ms: u64,
+) -> Result<DictImportApplied, String> {
+    if busy {
+        return Err("任务进行中：这次导入没有应用（等这轮跑完再导入）".into());
+    }
+    let outcome = dictionaries::import_file(path)?;
+    if outcome.entries.is_empty() {
+        return Err(if outcome.skipped.is_empty() {
+            "这个文件里没有词条".to_string()
+        } else {
+            format!("没有可导入的词条（{} 条被跳过）", outcome.skipped.len())
+        });
+    }
+    // 目标词典：当前启用的那套；没启用就按文件名找/建一套。
+    // **库里已有同名（未启用）的那套时，先把它的词条读出来再合并**——
+    // 直接 save 会按"同名覆盖"把原词条丢掉。
+    let active_loaded = active_file.and_then(|f| dictionaries::load_file(root, f).ok());
+    let fallback_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("导入的词典")
+        .to_string();
+    let current_name = active_loaded
+        .as_ref()
+        .map(|d| d.name.clone())
+        .unwrap_or(fallback_name);
+    let mut merged = match active_loaded {
+        Some(d) => d.entries,
+        None => {
+            let (rows, _) = dictionaries::list(root);
+            rows.iter()
+                .filter(|r| r.name.eq_ignore_ascii_case(&current_name))
+                .find_map(|r| dictionaries::load_file(root, &r.file).ok())
+                .map(|d| d.entries)
+                .unwrap_or_default()
+        }
+    };
+    let imported = outcome.entries.len();
+    for e in &outcome.entries {
+        merged.insert(e.from.clone(), e.to.clone());
+    }
+    let entry = dictionaries::save(root, &current_name, merged, now_ms, file_stem)?;
+    Ok(DictImportApplied {
+        entry,
+        imported,
+        skipped: outcome.skipped,
+    })
 }
 
 /// `project_editing_blocked` 需要 `&MainWindow`，这里只用状态判"有没有任务在飞"。
@@ -6807,83 +6881,32 @@ fn tick(
                     ui.set_status_text("取消了导入词条".into());
                     return;
                 };
-                // 文件框是异步的：打开期间可能已经起了任务/批量，这时不能再换词典
-                if project_editing_blocked(ui, state) || batch_in_flight(state) {
-                    ui.set_status_text("任务进行中：这次导入没有应用（等这轮跑完再导入）".into());
-                    return;
-                }
-                let outcome = match dictionaries::import_file(Path::new(&path)) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        ui.set_status_text(e.into());
-                        return;
-                    }
-                };
-                if outcome.entries.is_empty() {
-                    let note = if outcome.skipped.is_empty() {
-                        "这个文件里没有词条".to_string()
-                    } else {
-                        format!("没有可导入的词条（{} 条被跳过）", outcome.skipped.len())
-                    };
-                    ui.set_status_text(note.into());
-                    return;
-                }
-                // 目标词典：当前启用的那套；没启用就按文件名找/建一套。
-                // **库里已有同名（未启用）的那套时，先把它的词条读出来再合并**——
-                // 直接 save 会按"同名覆盖"把原词条丢掉（复核指出）。
-                let current_file = state.active_dict_file.borrow().clone();
-                let active_loaded = current_file
-                    .as_deref()
-                    .and_then(|f| dictionaries::load_file(&dictionaries_root(), f).ok());
-                let fallback_name = Path::new(&path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("导入的词典")
-                    .to_string();
-                let current_name = active_loaded
-                    .as_ref()
-                    .map(|d| d.name.clone())
-                    .unwrap_or(fallback_name);
-                let mut merged = match active_loaded {
-                    Some(d) => d.entries,
-                    None => {
-                        let (rows, _) = dictionaries::list(&dictionaries_root());
-                        rows.iter()
-                            .filter(|r| r.name.eq_ignore_ascii_case(&current_name))
-                            .find_map(|r| {
-                                dictionaries::load_file(&dictionaries_root(), &r.file).ok()
-                            })
-                            .map(|d| d.entries)
-                            .unwrap_or_default()
-                    }
-                };
-                for e in &outcome.entries {
-                    merged.insert(e.from.clone(), e.to.clone());
-                }
-                match dictionaries::save(
+                // 文件框是异步的：打开期间可能已经起了**任何**任务（含歌曲/分离这类不设
+                // 全局 running/busy 的），所以这里用与点击时同一个忙判据再查一次。
+                let busy = dictionary_controls_busy(ui, state);
+                let active_file = state.active_dict_file.borrow().clone();
+                match import_entries_into_library(
                     &dictionaries_root(),
-                    &current_name,
-                    merged,
+                    Path::new(&path),
+                    active_file.as_deref(),
+                    busy,
                     now_ms(),
-                    file_stem,
                 ) {
-                    Ok(entry) => {
-                        let skipped = if outcome.skipped.is_empty() {
+                    Ok(applied) => {
+                        let skipped = if applied.skipped.is_empty() {
                             String::new()
                         } else {
                             format!(
                                 "，跳过 {} 条（{}）",
-                                outcome.skipped.len(),
-                                outcome.skipped[0]
+                                applied.skipped.len(),
+                                applied.skipped[0]
                             )
                         };
-                        activate_dictionary(ui, state, cmd_tx, Some(entry.file.clone()));
+                        activate_dictionary(ui, state, cmd_tx, Some(applied.entry.file.clone()));
                         ui.set_status_text(
                             format!(
                                 "已导入 {} 条词条到「{}」{}",
-                                outcome.entries.len(),
-                                entry.name,
-                                skipped
+                                applied.imported, applied.entry.name, skipped
                             )
                             .into(),
                         );
@@ -8335,6 +8358,30 @@ mod tests {
             let err = template_from_inputs(blank, "audio8-tts", None, 1.0, 250, true).unwrap_err();
             assert!(err.contains("名字"), "{err}");
         }
+    }
+
+    /// 复核要求的"真正覆盖 handler 那条判据"：导入应用函数收到 `busy=true`
+    /// （= 文件框打开期间起了任何任务）时必须**什么都不做**；空闲时才真的导入。
+    #[test]
+    fn dict_import_is_refused_while_busy_and_applies_when_idle() {
+        let root = temp_dir("dict-import-busy");
+        let file = root.join("词条.tsv");
+        std::fs::write(&file, "重庆\t崇庆\n单于\t蝉于\n").unwrap();
+
+        // 忙：一个词条都不许进库（这就是"文件框开着时起了歌曲/分离"的场景）
+        let err = import_entries_into_library(&root, &file, None, true, 1).unwrap_err();
+        assert!(err.contains("任务进行中"), "{err}");
+        assert!(
+            dictionaries::list(&root).0.is_empty(),
+            "忙的时候不许动词典库"
+        );
+
+        // 空闲：正常导入，并按文件名建一套
+        let applied = import_entries_into_library(&root, &file, None, false, 2).unwrap();
+        assert_eq!(applied.imported, 2);
+        assert!(applied.skipped.is_empty(), "{:?}", applied.skipped);
+        let d = dictionaries::load_file(&root, &applied.entry.file).unwrap();
+        assert_eq!(d.entries.get("重庆").map(String::as_str), Some("崇庆"));
     }
 
     /// 复核抓到的竞态：**文件框打开后再起别的任务**（歌曲/分离这类不设全局
