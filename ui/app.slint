@@ -23,14 +23,14 @@ import {
     PixelToast, PixelWindowResize,
 } from "@slint_pixel";
 
-import { BatchRow, Sentence, TaskRow, VersionRow, Voice } from "model.slint";
+import { BatchRow, Sentence, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
 import { DubWorkbench, WorkbenchDrawer } from "dub_workbench.slint";
 import { BgmWorkbench } from "bgm_workbench.slint";
 import { VoiceDesignTab } from "extra_tabs.slint";
 import { SeparationWorkbench } from "separation_workbench.slint";
 import { SongWorkbench } from "song_workbench.slint";
 
-export { BatchRow, Sentence, TaskRow, VersionRow, Voice } from "model.slint";
+export { BatchRow, Sentence, TaskRow, VersionRow, Voice, VoiceLibRow } from "model.slint";
 
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
@@ -186,6 +186,17 @@ export component MainWindow inherits Window {
 
     // 音色设计 Tab
     in-out property <string> voice-ref-path: "";
+
+    // ── 音色库（P4）：自建的多音色存档 ──
+    in property <[VoiceLibRow]> library-rows: [];
+    in property <string> library-status: "音色库还是空的";
+    in-out property <string> library-note: "";
+    in-out property <string> library-name-text: "";
+    callback library-save();
+    callback library-note-edited();
+    callback library-apply(string);
+    callback library-export(string);
+    callback library-import();
 
     // ── 通知 ──
     in property <string> toast-text: "";
@@ -429,6 +440,15 @@ export component MainWindow inherits Window {
                     audition-voice => { root.preview-voice(); }
                     clear-reference => { root.clear-voice-reference(); }
                     voice-ref-changed => { root.voice-ref-changed(); }
+                    library-rows: root.library-rows;
+                    library-status: root.library-status;
+                    library-note <=> root.library-note;
+                    library-name-text <=> root.library-name-text;
+                    library-save => { root.library-save(); }
+                    library-note-edited => { root.library-note-edited(); }
+                    library-apply(name) => { root.library-apply(name); }
+                    library-export(name) => { root.library-export(name); }
+                    library-import => { root.library-import(); }
                     new-voice => {
                         root.scene = 4;
                         root.scene-changed(4);

@@ -18,6 +18,7 @@ mod player;
 mod tasks;
 mod templates;
 mod versions;
+mod voices;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -304,6 +305,10 @@ enum Msg {
         dir: PathBuf,
         outcome: export::BatchExportOutcome,
     },
+    /// 选完要导入的音色目录（里面有 voice.json + 音频）
+    VoiceImportDirPicked {
+        path: Option<String>,
+    },
     /// 批量：系统文件框选完的多篇稿件（取消 = 空表）
     BatchScriptsPicked {
         paths: Vec<PathBuf>,
@@ -551,6 +556,179 @@ fn settings_path() -> PathBuf {
 ///
 /// **逐字段解析**：某一段坏掉（手改错、版本不兼容）只丢那一段，不要连带把 host/port
 /// 也清掉——整份 `from_str::<AppSettings>` 失败会让用户"设置全没了"。
+/// 音色库根目录（库目录 + 索引都在它下面）：与应用设置、导出目录同级。
+fn voices_root() -> PathBuf {
+    documents_dir().join(WORKSHOP_DIR)
+}
+
+/// 音色库列表 → 界面（当前工程正在用的那条打上 ✓）。
+fn refresh_voice_library(ui: &MainWindow) {
+    let in_use = non_empty(ui.get_voice_ref_path().to_string());
+    match voices::load(&voices_root()) {
+        Ok(index) => {
+            let rows: Vec<VoiceLibRow> = index
+                .voices
+                .iter()
+                .map(|v| {
+                    let path = voices::audio_path(&voices_root(), v);
+                    VoiceLibRow {
+                        name: v.name.clone().into(),
+                        note: v.note.clone().into(),
+                        created: relative_time(now_ms(), v.created_at).into(),
+                        current: in_use
+                            .as_deref()
+                            .map(|p| Path::new(p) == path)
+                            .unwrap_or(false),
+                    }
+                })
+                .collect();
+            ui.set_library_status(
+                if rows.is_empty() {
+                    "音色库还是空的".to_string()
+                } else {
+                    format!("{} 个音色", rows.len())
+                }
+                .into(),
+            );
+            ui.set_library_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+        }
+        Err(e) => {
+            // 坏索引不静默变空列表：用户得知道"我的音色还在不在"
+            ui.set_library_rows(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
+            ui.set_library_status(format!("音色库读不出来：{e}").into());
+        }
+    }
+}
+
+/// 音色库（P4）：保存当前参考音 / 应用 / 导出 / 导入。
+fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState>) {
+    // 存入音色库（把当前参考音频复制进库，自包含）
+    let weak = ui.as_weak();
+    let st_save = state.clone();
+    ui.on_library_save(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st_save) {
+            ui.set_status_text("任务进行中：音色库等这轮跑完再改".into());
+            return;
+        }
+        let Some(src) = non_empty(ui.get_voice_ref_path().to_string()) else {
+            ui.set_status_text("先在上面选一段参考音频（或填路径），再存入音色库".into());
+            return;
+        };
+        match voices::add_from_file(
+            &voices_root(),
+            &ui.get_library_name_text(),
+            Path::new(&src),
+            &ui.get_library_note(),
+            now_ms(),
+            file_stem,
+        ) {
+            Ok(entry) => {
+                ui.set_library_name_text("".into());
+                ui.set_library_note("".into());
+                refresh_voice_library(&ui);
+                ui.set_status_text(
+                    format!("已存入音色库：「{}」（原文件删了也能用）", entry.name).into(),
+                );
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+
+    // 备注改了：只有存/导出时才用到，这里只刷新一句提示（不需要落盘）
+    let weak = ui.as_weak();
+    ui.on_library_note_edited(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_status_text("备注会跟着音色一起保存/导出".into());
+    });
+
+    // 应用库里某条：把参考音频换成库里的副本（走既有的"换音色需重录"作废语义）
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let tx = ctx.cmd_tx.clone();
+    ui.on_library_apply(move |name| {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st) {
+            ui.set_status_text("任务进行中：音色等这轮跑完再换".into());
+            return;
+        }
+        let index = match voices::load(&voices_root()) {
+            Ok(i) => i,
+            Err(e) => {
+                ui.set_status_text(e.into());
+                return;
+            }
+        };
+        let Some(entry) = index.get(name.as_str()).cloned() else {
+            ui.set_status_text(format!("音色库里没有「{name}」").into());
+            return;
+        };
+        let path = voices::audio_path(&voices_root(), &entry);
+        if !path.is_file() {
+            ui.set_status_text(
+                format!(
+                    "「{}」的音频不在库里（{}）——重新存一次或从备份导入",
+                    entry.name,
+                    path.display()
+                )
+                .into(),
+            );
+            return;
+        }
+        ui.set_voice_ref_path(path.display().to_string().into());
+        // 与手工改参考音频同一条路：作废工程与成品，提示需要重新合成
+        invalidate_worker_project(&tx, &st);
+        reset_bgm(&ui, &st);
+        st.assembled.borrow_mut().take();
+        ui.set_has_result(false);
+        refresh_voice_labels(&ui);
+        refresh_voice_library(&ui);
+        ui.set_status_text(format!("已切到音色库的「{}」：需要重新合成", entry.name).into());
+    });
+
+    // 导出：写到导出目录下的 voice-lib/<名字>/（目录里是 voice.json + 音频）
+    let weak = ui.as_weak();
+    ui.on_library_export(move |name| {
+        let Some(ui) = weak.upgrade() else { return };
+        let dest = PathBuf::from(ui.get_export_dir().to_string()).join("voice-lib");
+        match voices::export_to(&voices_root(), name.as_str(), &dest, file_stem) {
+            Ok(dir) => {
+                toast(&ui, &format!("已导出 {}", file_label(&dir)));
+                ui.set_status_text(
+                    format!(
+                        "已导出「{name}」到 {}（拷走这个目录就能在别的机器导入）",
+                        dir.display()
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+
+    // 导入：选一个"音色目录"（里面有 voice.json + 音频）
+    let weak = ui.as_weak();
+    let msg = ctx.msg_tx.clone();
+    ui.on_library_import(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_status_text("正在打开目录选择框（选导出的那个音色目录）…".into());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let path = pick_folder_with_prompt("选择要导入的音色目录");
+            let _ = msg.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::VoiceImportDirPicked { path },
+            });
+        });
+    });
+}
+
+/// 「导入音色」这套接线要用的两个 sender（与其它 wire_* 一样按引用传）。
+struct VoiceLibraryCtx {
+    cmd_tx: Sender<Cmd>,
+    msg_tx: Sender<WorkerMsg>,
+}
+
 /// 模板文件：与 settings.json 同目录（用户备份/迁移时一处就够）。
 fn templates_path() -> PathBuf {
     settings_path().with_file_name(templates::TEMPLATES_FILE)
@@ -1347,11 +1525,16 @@ fn parse_picked_paths(success: bool, stdout: &[u8]) -> Vec<PathBuf> {
 }
 
 fn pick_folder_blocking() -> Option<String> {
+    pick_folder_with_prompt("选择模型目录")
+}
+
+/// 系统目录选择框（可自定义提示语）：模型目录、音色导入都用它。
+fn pick_folder_with_prompt(prompt: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
     let out = std::process::Command::new("osascript")
         .args([
             "-e",
-            "POSIX path of (choose folder with prompt \"选择模型目录\")",
+            &format!("POSIX path of (choose folder with prompt \"{prompt}\")"),
         ])
         .output()
         .ok()?;
@@ -2970,6 +3153,15 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_templates(&ui, &cmd_tx, &state);
     wire_versions(&ui, &rows, &cmd_tx, &state);
     wire_voice_panel(&ui, &cmd_tx, &state);
+    wire_voice_library(
+        &ui,
+        &VoiceLibraryCtx {
+            cmd_tx: cmd_tx.clone(),
+            msg_tx: msg_tx_ui.clone(),
+        },
+        &state,
+    );
+    refresh_voice_library(&ui);
     wire_global_settings(&ui, &msg_tx_ui, &cmd_tx, &state);
     wire_sentence_actions(&ui, &rows, &cmd_tx, &player, &state);
     wire_run(&ui, &rows, &cmd_tx, &player, &stop, &state);
@@ -5777,6 +5969,7 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::TaskStage { .. }
         | Msg::ServerHealth { .. }
         | Msg::ModelDirPicked { .. }
+        | Msg::VoiceImportDirPicked { .. }
         | Msg::SeparationInputPicked { .. }
         | Msg::SeparationProgress { .. }
         | Msg::SeparationDone { .. }
@@ -6286,6 +6479,22 @@ fn tick(
                     export::BatchExportOutcome::Failed(e) => format!("批量导出失败：{e}"),
                 };
                 ui.set_status_text(text.into());
+            }
+            Msg::VoiceImportDirPicked { path } => {
+                let Some(dir) = path else {
+                    ui.set_status_text("取消了导入音色".into());
+                    return;
+                };
+                match voices::import_from(&voices_root(), Path::new(&dir), now_ms(), file_stem) {
+                    Ok(entry) => {
+                        refresh_voice_library(ui);
+                        ui.set_status_text(
+                            format!("已导入音色「{}」（自包含：音频已复制进库）", entry.name)
+                                .into(),
+                        );
+                    }
+                    Err(e) => ui.set_status_text(e.into()),
+                }
             }
             Msg::BatchScriptsPicked { paths } => {
                 // 用户在文件框里按了取消（= 没选到任何路径）：这是 no-op，不能把已经
