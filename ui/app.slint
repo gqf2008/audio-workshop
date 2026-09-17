@@ -155,6 +155,8 @@ export component MainWindow inherits Window {
     in property <string> model-dir-info: "";
     // 备份状态行（设置抽屉的「一键备份…」用；与工程版本无关）
     in property <string> backup-info: "";
+    // 备份在飞（含正在弹目录选择框那段）：按钮据此禁用，防连点起两条后台备份
+    in property <bool> backup-running: false;
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
@@ -703,6 +705,7 @@ export component MainWindow inherits Window {
                     check-server => { root.check-server(); }
                     pick-model-dir => { root.pick-model-dir(); }
                     backup-info: root.backup-info;
+                    backup-running: root.backup-running;
                     backup-all => { root.backup-all(); }
                 }
             }

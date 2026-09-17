@@ -192,6 +192,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
     callback pick-model-dir();
     // ── 备份：把工程与自建资产复制成一份自包含目录（M4-P8）──
     in property <string> backup-info: "";
+    in property <bool> backup-running: false;
     callback backup-all();
 
     // 细分隔线：比面板边框轻，只做分组不制造方框
@@ -374,8 +375,8 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     spacing: 10px;
                     PixelButton {
                         width: 120px;
-                        text: "一键备份…";
-                        enabled: !root.busy;
+                        text: root.backup-running ? "备份中…" : "一键备份…";
+                        enabled: !root.busy && !root.backup-running;
                         clicked => { root.backup-all(); }
                     }
                     Rectangle { horizontal-stretch: 1; }

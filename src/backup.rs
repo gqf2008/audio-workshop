@@ -86,8 +86,10 @@ pub fn backup_all(
     if stamp.trim().is_empty() || stamp.contains('/') || stamp.contains('\\') {
         return Err(format!("备份时间戳不合法：{stamp}"));
     }
-    // 目标不能落在源目录里：否则备份会把自己的产物再复制进去（递归自吞）
-    if dest_root.starts_with(workshop_dir) {
+    // 目标不能落在源目录里：否则备份会把自己的产物再复制进去（递归自吞）。
+    // 必须按**真实路径**比，不能看字面前缀：`<外面>/x/../音频作坊/backup` 与
+    // 指向源目录的软链都能绕过纯字符串的 starts_with（复核抓到的阻塞项）。
+    if dest_inside_source(workshop_dir, dest_root)? {
         return Err(format!(
             "备份目标不能放在应用数据目录里面（{}）——请选一个外面/挂载盘上的目录",
             workshop_dir.display()
@@ -148,6 +150,50 @@ pub fn backup_all(
     })?;
     summary.dest = final_dir;
     Ok(summary)
+}
+
+/// 目标是不是落在源目录里面（**按真实路径**比，挡 `..` 与软链绕过）。
+fn dest_inside_source(workshop_dir: &Path, dest_root: &Path) -> Result<bool, String> {
+    Ok(resolve_for_compare(dest_root)?.starts_with(resolve_for_compare(workshop_dir)?))
+}
+
+/// 把路径解析成"真实的绝对路径"，**允许路径本身还不存在**。
+///
+/// `fs::canonicalize` 要求整条路径都存在，而备份目标通常是个还没建出来的目录。
+/// 做法：向上找到最近的、真实存在的祖先做 `canonicalize`（这一步会解开软链），
+/// 再把剩下的段按词法拼回去。剩下的段都还不存在，其中的 `..` 只能在自己的尾段里
+/// 回退、或退到已解析的祖先上——与内核 `create_dir_all` 的实际行为一致。
+fn resolve_for_compare(p: &Path) -> Result<PathBuf, String> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("取当前目录失败（{e}）"))?
+            .join(p)
+    };
+    let mut base = abs;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&base) {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                let seg = seg.as_os_str();
+                if seg == std::ffi::OsStr::new("..") {
+                    out.pop();
+                } else if seg != std::ffi::OsStr::new(".") {
+                    out.push(seg);
+                }
+            }
+            return Ok(out);
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) if parent != base => {
+                tail.push(name.to_os_string());
+                base = parent.to_path_buf();
+            }
+            _ => return Err(format!("路径解析不了：{}", p.display())),
+        }
+    }
 }
 
 /// 递归复制一个条目（文件或目录）。**任何单个文件的失败都只记一条跳过**，不拖垮整份备份。
@@ -375,26 +421,85 @@ mod tests {
         );
     }
 
+    /// 单项失败隔离要有牙：**必须真的造出一个复制不了的条目**，并断言它同时出现在
+    /// `summary.skipped` 与 `manifest.json` 里（只在内存里记、不写清单，这条就该红）。
+    ///
+    /// 用 unix socket 而不是 chmod 000：socket 既不是普通文件也不是目录，复制必然失败，
+    /// 而且与"测试是不是 root"无关（root 能绕过权限位，旧版 chmod 测试在 root 下是空转的）。
+    #[cfg(unix)]
     #[test]
-    fn a_single_unreadable_file_is_skipped_not_fatal() {
+    fn a_non_copyable_entry_is_skipped_and_recorded_in_the_manifest() {
         let root = temp_dir("skip");
         let workshop = root.join("作坊");
         let dest = root.join("备份盘");
         make_workshop(&workshop);
-        // 造一个读不出来的文件（权限 000）
-        let locked = workshop.join("projects/示例工程/locked.txt");
-        std::fs::write(&locked, b"secret").unwrap();
-        let mut perm = std::fs::metadata(&locked).unwrap().permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(&locked, perm).unwrap();
+        let sock = workshop.join("projects/坏条目.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
 
         let s = backup_all(&workshop, &dest, "3000").unwrap();
-        // 只读文件仍然可读（set_readonly 拦的是写），所以这里主要是钉"不因个别失败而中止"：
-        // 备份照常完成、清单可读、其它文件都在
+
+        // ① 如实记一条跳过，且说得出是哪个条目
+        assert_eq!(s.skipped.len(), 1, "要如实记一条跳过：{:?}", s.skipped);
+        assert!(s.skipped[0].contains("坏条目.sock"), "{:?}", s.skipped);
+        // ② 跳过的条目不能出现在备份里（别把抄不动的东西留成空文件）
+        assert!(!s.dest.join("projects/坏条目.sock").exists());
+        // ③ 同一份跳过清单必须落进 manifest，不能只在内存里
+        let m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(s.dest.join("manifest.json")).unwrap()).unwrap();
+        let skipped = m["skipped"]
+            .as_array()
+            .expect("manifest 必须有 skipped 数组");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("坏条目.sock"),
+            "{skipped:?}"
+        );
+        // ④ 单项失败隔离：其它资产照常备份、清单照常写、正式目录照常发布
         assert!(s.dest.join("settings.json").is_file());
         assert!(s.dest.join("manifest.json").is_file());
-        let readable = std::fs::read(s.dest.join("settings.json")).unwrap();
-        assert_eq!(readable, b"{\"port\":1}");
+        assert_eq!(
+            std::fs::read(s.dest.join("settings.json")).unwrap(),
+            b"{\"port\":1}"
+        );
+    }
+
+    /// 目标目录内的判定必须按**真实路径**：字面上不以源目录开头、解析后却落回源目录
+    /// 里面的写法要挡住（否则备份把自己的产物再抄一遍，递归自吞）。
+    #[test]
+    fn refuses_dest_that_lands_inside_the_source_via_dotdot() {
+        let root = temp_dir("dotdot");
+        let workshop = root.join("作坊");
+        let outside = root.join("外面");
+        make_workshop(&workshop);
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // 字面前缀是 <tmp>/外面 —— 完全不像源目录；`..` 一解就回到源目录里面
+        let sneaky = outside
+            .join("..")
+            .join("作坊")
+            .join("projects")
+            .join("backup");
+        let err = backup_all(&workshop, &sneaky, "5000").unwrap_err();
+        assert!(err.contains("不能放在应用数据目录里面"), "{err}");
+    }
+
+    /// 软链绕过：外面有个链接指向源目录，备份目标写在链接下面 —— 也是源目录里面。
+    #[cfg(unix)]
+    #[test]
+    fn refuses_dest_reached_through_a_symlink_into_the_source() {
+        let root = temp_dir("through-link");
+        let workshop = root.join("作坊");
+        let outside = root.join("外面");
+        make_workshop(&workshop);
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = outside.join("捷径");
+        std::os::unix::fs::symlink(&workshop, &link).unwrap();
+
+        let err = backup_all(&workshop, &link.join("backup"), "6000").unwrap_err();
+        assert!(err.contains("不能放在应用数据目录里面"), "{err}");
     }
 
     #[cfg(unix)]

@@ -1774,6 +1774,27 @@ fn export_refusal(ui_busy: bool, batch_in_flight: bool) -> Option<&'static str> 
     None
 }
 
+/// 能不能起一次新备份。三条拒绝理由与 `export_refusal` 同一族（都是"别抄到写了一半的文件"）：
+///   · 已经在备份：连点会起一堆线程，两批同时往同一个目标目录里写；
+///   · 有合成/拼装在跑：备份抄的是**磁盘上的文件**，混音/拼装写到一半就会抄到半套；
+///   · 批量队列在跑：同上（批量每篇也在写 `projects/` 底下的东西）。
+fn backup_refusal(
+    ui_busy: bool,
+    batch_in_flight: bool,
+    backup_running: bool,
+) -> Option<&'static str> {
+    if backup_running {
+        return Some("备份还在进行：等它写完（工程大时要一会儿）");
+    }
+    if batch_in_flight {
+        return Some("批量任务正在跑：等它跑完再备份（否则会抄到写了一半的产物）");
+    }
+    if ui_busy {
+        return Some("合成/拼装正在进行：等它结束再备份（否则会抄到写了一半的产物）");
+    }
+    None
+}
+
 /// 批量导出：扫 projects/ 下有成品的工程，按导出开关复制到导出目录。
 ///
 /// 放后台线程而不是 worker：导出只读磁盘上**已经拼好**的成品（`out/final.wav` 是原子写），
@@ -3471,6 +3492,10 @@ struct UiState {
     batch_skipped_notes: RefCell<Vec<String>>,
     /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
     batch_export_running: std::cell::Cell<bool>,
+    /// 一键备份是否在跑（后台线程，**含正在弹目录选择框那段**）。
+    /// 防连点起一堆线程、两批同时往同一个目标目录里写。这是真相，
+    /// ui 的 `backup-running` 只是它的投影（按钮据此禁用）。
+    backup_running: std::cell::Cell<bool>,
     /// 当前启用的发音词典：库内文件名（None = 不启用）与词条内容（送给 worker 的那份）。
     active_dict_file: RefCell<Option<String>>,
     active_dict: RefCell<std::collections::BTreeMap<String, String>>,
@@ -6613,12 +6638,22 @@ fn tick(
                 Some(p) => ui.set_backup_info(
                     format!("正在备份到 {p} …（工程大时要一会儿，中途别关窗口）").into(),
                 ),
-                None => ui.set_backup_info("已取消备份".into()),
+                None => {
+                    state.backup_running.set(false);
+                    ui.set_backup_running(false);
+                    ui.set_backup_info("已取消备份".into());
+                }
             },
-            Msg::BackupDone { result } => match result {
-                Ok(note) => ui.set_backup_info(note.into()),
-                Err(error) => ui.set_backup_info(format!("备份失败：{error}").into()),
-            },
+            Msg::BackupDone { result } => {
+                // 终态一定要把在飞标志放掉：它同时是按钮的禁用条件，
+                // 忘了放就等于把「一键备份…」永久锁死
+                state.backup_running.set(false);
+                ui.set_backup_running(false);
+                match result {
+                    Ok(note) => ui.set_backup_info(note.into()),
+                    Err(error) => ui.set_backup_info(format!("备份失败：{error}").into()),
+                }
+            }
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());
                 ui.set_server_ok(ok);
@@ -7443,13 +7478,20 @@ fn wire_global_settings(
     });
 
     let weak = ui.as_weak();
+    let st = state.clone();
     let msg = msg_tx.clone();
     ui.on_backup_all(move || {
         let Some(ui) = weak.upgrade() else { return };
-        // 备份与合成/导出共用同一条"别在忙的时候动文件"的判据
-        if ui.get_busy() || ui.get_running() {
+        if let Some(refusal) =
+            backup_refusal(ui.get_busy(), batch_in_flight(&st), st.backup_running.get())
+        {
+            ui.set_backup_info(refusal.into());
             return;
         }
+        // 在飞标志在**点下去那一刻**就要置位：目录选择框会把控制权交回事件循环，
+        // 不置位的话连点两下就是两条后台线程（两条都去弹选择框、都往同一目标写）
+        st.backup_running.set(true);
+        ui.set_backup_running(true);
         ui.set_backup_info("正在打开系统目录选择框…".into());
         spawn_backup(msg.clone(), workshop_dir());
     });
@@ -9798,6 +9840,28 @@ mod tests {
                 names[i]
             );
         }
+    }
+
+    /// 备份的起跑守卫：连点、以及和别的写盘动作撞车，都要被挡住（复核的阻塞项 2）。
+    #[test]
+    fn backup_refusal_blocks_double_click_and_concurrent_writers() {
+        assert!(
+            backup_refusal(false, false, false).is_none(),
+            "空闲时该放行"
+        );
+        let again = backup_refusal(false, false, true).expect("已经在备份时必须拒绝");
+        assert!(again.contains("备份还在进行"), "{again}");
+        assert!(
+            backup_refusal(true, false, false).is_some(),
+            "合成/拼装在跑时不能备份（会抄到写了一半的产物）"
+        );
+        assert!(
+            backup_refusal(false, true, false).is_some(),
+            "批量在跑时不能备份（同上）"
+        );
+        // 已经在备份时，别的理由不该抢答——否则用户看到的是"合成中"而不是"备份中"
+        let both = backup_refusal(true, true, true).unwrap();
+        assert!(both.contains("备份还在进行"), "{both}");
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。
