@@ -17,8 +17,8 @@ pub mod song;
 pub mod text_layer;
 
 pub use audio_client::{
-    memory_shortfall, memory_shortfall_note, Client, ClientError, MemoryShortfall,
-    DEFAULT_ASR_MODEL,
+    memory_shortfall, memory_shortfall_note, parse_insufficient_memory, Client, ClientError,
+    InsufficientMemory, MemoryShortfall, DEFAULT_ASR_MODEL,
 };
 pub use bgm::{
     assemble_bgm, bgm_artifacts_from_disk, bgm_only_artifacts, generate_segments,

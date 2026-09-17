@@ -41,7 +41,8 @@ impl ClientError {
     /// 唯一识别入口：只认 JSON 里 `error.type == "insufficient_memory"`，
     /// 不从人类可读 message 里猜数字或关键词。
     pub fn is_insufficient_memory(&self) -> bool {
-        matches!(self, ClientError::Server(_, body) if memory_shortfall(body).is_some())
+        // 委托给唯一的结构化解析器：识别口径只能有一处
+        self.insufficient_memory().is_some()
     }
 }
 
@@ -59,17 +60,13 @@ pub struct MemoryShortfall {
 /// 非 JSON、空 body、别的 `error.type` 都返回 `None`；调用方不得把任意 503
 /// 都说成内存不足。抽出纯函数是为了让识别与文案只有一处，供所有 Tab 共用。
 pub fn memory_shortfall(body: &str) -> Option<MemoryShortfall> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let error = value.get("error")?;
-    if error.get("type").and_then(Value::as_str) != Some("insufficient_memory") {
-        return None;
-    }
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("服务端没有提供内存不足的详细说明")
-        .to_string();
-    Some(MemoryShortfall { message })
+    // **唯一解析器是 `parse_insufficient_memory`**：这里只做投影，不再自己 parse 一次。
+    // 两个并行分支一度各写了一份"只认 error.type"的解析（本仓复核抓过多次同类漂移），
+    // 合并时必须收敛到一处，否则识别口径会随改动分叉。
+    let parsed = parse_insufficient_memory(body)?;
+    Some(MemoryShortfall {
+        message: parsed.message,
+    })
 }
 
 /// 内存不足的唯一用户文案入口。
@@ -84,6 +81,110 @@ pub fn memory_shortfall_note(body: &str) -> Option<String> {
             shortfall.message
         )
     })
+}
+
+/// 服务 503 拒绝加载模型时给出的**内存不足**信息（数字就在 503 的 body 里）。
+///
+/// 真实样例（本机 16 GiB，qwen3-asr 装不下）：
+/// ```text
+/// {"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB
+///  headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsufficientMemory {
+    /// 服务端原文（保留模型名、估算、余量、可用内存；缺字段时的兜底也在这里）
+    pub message: String,
+    /// 装不下的那个模型 id（服务用单引号包着）
+    pub model: Option<String>,
+    /// 模型自身的估算占用（MiB）
+    pub estimated_mib: Option<u64>,
+    /// 服务要求预留的余量（MiB）
+    pub headroom_mib: Option<u64>,
+    /// 当时服务的可用主机内存（MiB）
+    pub available_mib: Option<u64>,
+}
+
+impl InsufficientMemory {
+    /// 合计需要多少（估算 + 余量）。缺任一项就是 None —— 不拿单项冒充合计。
+    pub fn required_mib(&self) -> Option<u64> {
+        self.estimated_mib?.checked_add(self.headroom_mib?)
+    }
+}
+
+impl ClientError {
+    /// 服务因**内存不足**拒绝加载模型时的结构化信息；其它错误（含模型忙碌的 503）为 None。
+    ///
+    /// 只看 `type` 字段：那是服务给的稳定契约，不靠匹配人读的 message 文案。
+    pub fn insufficient_memory(&self) -> Option<InsufficientMemory> {
+        match self {
+            ClientError::Server(503, body) => parse_insufficient_memory(body),
+            _ => None,
+        }
+    }
+}
+
+/// 解析服务的错误体；不是"内存不足"就返回 None。
+///
+/// 判定只认 `error.type == "insufficient_memory"`（稳定契约）。数字解析失败只让对应字段
+/// 为 `None`，**不影响**判定本身——调用方仍能给出"这个模型装不下 + 换个更小的"这条可执行动作。
+pub fn parse_insufficient_memory(body: &str) -> Option<InsufficientMemory> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let err = v.get("error")?;
+    if err.get("type").and_then(Value::as_str) != Some("insufficient_memory") {
+        return None;
+    }
+    let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
+    let t: Vec<&str> = msg.split_whitespace().collect();
+    Some(InsufficientMemory {
+        message: if msg.is_empty() {
+            "服务端没有提供内存不足的详细说明".to_string()
+        } else {
+            msg.to_string()
+        },
+        // `cannot load model 'qwen3-asr': ...`
+        model: msg
+            .split_once("model '")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(id, _)| id.to_string())
+            .filter(|id| !id.is_empty()),
+        // `estimated 3.31 GiB + ...`
+        estimated_mib: word_at(&t, "estimated").and_then(|i| size_at(&t, i + 1)),
+        // `+ 1024 MiB headroom exceeds ...` —— 数字在 "headroom" 前面
+        headroom_mib: word_at(&t, "headroom")
+            .and_then(|i| i.checked_sub(2))
+            .and_then(|i| size_at(&t, i)),
+        // `... available host memory (3.84 GiB)`
+        available_mib: word_at(&t, "memory").and_then(|i| size_at(&t, i + 1)),
+    })
+}
+
+/// 词在分词里的下标（要求整词相等，避免 "memory" 命中别的词）。
+fn word_at(tokens: &[&str], word: &str) -> Option<usize> {
+    tokens
+        .iter()
+        .position(|t| t.trim_matches(|c: char| !c.is_alphanumeric()) == word)
+}
+
+/// 读 `tokens[i]`（数字，允许带 `(` 之类的前缀）与 `tokens[i+1]`（单位）为 MiB。
+fn size_at(tokens: &[&str], i: usize) -> Option<u64> {
+    let raw = tokens
+        .get(i)?
+        .trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+    let value: f64 = raw.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    // 单位可能被标点包着（如 `(3.84 GiB)` 里的 `GiB)`）
+    let unit = tokens
+        .get(i + 1)?
+        .trim_matches(|c: char| !c.is_ascii_alphabetic());
+    let k = match unit {
+        "GiB" => 1024.0,
+        "MiB" => 1.0,
+        "KiB" => 1.0 / 1024.0,
+        _ => return None,
+    };
+    Some((value * k).round() as u64)
 }
 
 impl std::fmt::Display for ClientError {
@@ -346,6 +447,53 @@ mod tests {
     #[test]
     fn base64_rejects_invalid() {
         assert!(decode_base64("****").is_err());
+    }
+
+    /// 真机 503 body（本机 16 GiB / qwen3-asr 装不下）必须能解析出模型名与三个数字。
+    #[test]
+    fn parses_real_insufficient_memory_body() {
+        let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+        let m = parse_insufficient_memory(body).expect("应识别为内存不足");
+        assert_eq!(m.model.as_deref(), Some("qwen3-asr"));
+        assert_eq!(m.estimated_mib, Some(3389)); // 3.31 GiB
+        assert_eq!(m.headroom_mib, Some(1024));
+        assert_eq!(m.available_mib, Some(3932)); // 3.84 GiB
+        assert_eq!(m.required_mib(), Some(4413));
+        // ClientError 侧同一个入口
+        let e = ClientError::Server(503, body.to_string());
+        assert_eq!(
+            e.insufficient_memory().unwrap().model.as_deref(),
+            Some("qwen3-asr")
+        );
+    }
+
+    /// 模型忙碌也是 503 —— 不能因为它是 503 就当成"装不下"。
+    #[test]
+    fn busy_503_is_not_reported_as_insufficient_memory() {
+        let busy = r#"{"error":{"message":"model 'qwen3-asr' is busy","type":"model_busy"}}"#;
+        assert!(parse_insufficient_memory(busy).is_none());
+        assert!(ClientError::Server(503, busy.to_string())
+            .insufficient_memory()
+            .is_none());
+        // 500（非 503）即使 body 自称内存不足也不算：状态码是唯一判据
+        assert!(ClientError::Server(
+            500,
+            r#"{"error":{"type":"insufficient_memory"}}"#.to_string()
+        )
+        .insufficient_memory()
+        .is_none());
+    }
+
+    /// 判定靠 type，不靠数字：message 换了措辞/单位不认识时，模型名与能认出的项仍然要出来。
+    #[test]
+    fn type_decides_while_broken_numbers_stay_none() {
+        let odd = r#"{"error":{"message":"cannot load model 'audio8-asr': not enough room","type":"insufficient_memory"}}"#;
+        let m = parse_insufficient_memory(odd).expect("type 决定判定");
+        assert_eq!(m.model.as_deref(), Some("audio8-asr"));
+        assert_eq!(m.estimated_mib, None);
+        assert_eq!(m.required_mib(), None, "缺项时不得把单项当合计");
+        assert!(parse_insufficient_memory("not json").is_none());
+        assert!(parse_insufficient_memory(r#"{"error":{"message":"x"}}"#).is_none());
     }
 
     /// 重试判定必须看状态码，不看消息文本

@@ -259,6 +259,11 @@ export component MainWindow inherits Window {
     callback speed-changed(float);
     callback gap-edited();
     callback dict-picked(int);
+    /// 质检回读（ASR）模型：候选由 Rust 侧从服务清单算好，Slint 只投影
+    in property <[string]> asr-model-names: [];
+    in-out property <int> asr-model-index: 0;
+    in property <string> asr-model-note: "";
+    callback asr-model-picked(int);
     callback dict-import();
     callback dict-export();
     callback version-save();
@@ -422,6 +427,10 @@ export component MainWindow inherits Window {
                     dict-index <=> root.dict-index;
                     dict-status: root.dict-status;
                     dict-picked(i) => { root.dict-picked(i); }
+                    asr-model-names: root.asr-model-names;
+                    asr-model-index <=> root.asr-model-index;
+                    asr-model-note: root.asr-model-note;
+                    asr-model-picked(i) => { root.asr-model-picked(i); }
                     dict-import => { root.dict-import(); }
                     dict-export => { root.dict-export(); }
                     template-names: root.template-names;

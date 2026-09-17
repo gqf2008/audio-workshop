@@ -173,6 +173,9 @@ enum Cmd {
         revision: u64,
         task_id: u32,
         dir: PathBuf,
+        /// 回读用的 ASR 模型 id。由 UI 侧用 `effective_asr_model()` 算好传进来——
+        /// worker 自己再读一次设置就有两个真相源，报告与实际请求会漂移。
+        model: String,
     },
     /// 歌曲彩蛋生成（独立于配音工程内容，只复用工程目录）。
     RunSong {
@@ -388,6 +391,8 @@ enum Msg {
         task_id: u32,
         done: usize,
         total: usize,
+        /// 本次实际在用的回读模型：进度文案念它，UI 侧不再自己算一份
+        model: String,
     },
     EvalDone {
         task_id: u32,
@@ -407,6 +412,8 @@ enum Msg {
 /// 质检汇总：平均可懂度 + 最差几句（够用户直接去重录那几句）。
 #[derive(Clone, Debug)]
 struct EvalSummary {
+    /// **本次实际用的**回读模型（与发给服务的 model 同一个值，报告/状态行都念它）
+    model: String,
     /// 平均可懂度百分比（只算转写成功的句子）
     percent: f64,
     scored: usize,
@@ -484,6 +491,13 @@ struct AppSettings {
     /// 缺省 = `src/update.rs::DEFAULT_MANIFEST_URL`（GitHub 最新 Release API）。
     #[serde(default)]
     update_url: Option<String>,
+    /// 质检回读（ASR）用哪个模型：在服务清单 `task == "asr"` 的模型里选。
+    ///
+    /// 缺省 = `aw_core::DEFAULT_ASR_MODEL`（qwen3-asr，M0 定标同款）。
+    /// **唯一入口是 `effective_asr_model()`**：worker 真的拿它去请求、界面回显、
+    /// 质检报告落盘，三处必须是同一份推导（两份实现必然漂移）。
+    #[serde(default)]
+    asr_model: Option<String>,
 }
 
 /// BGM 的默认描述：**与 ui/app.slint 里 `bgm-prompt` 的默认值必须一致**
@@ -1135,7 +1149,12 @@ fn refresh_template_names(ui: &MainWindow, keep: Option<&str>) {
 }
 
 fn load_settings() -> AppSettings {
-    let Some(raw) = std::fs::read_to_string(settings_path()).ok() else {
+    load_settings_at(&settings_path())
+}
+
+/// 从指定路径读设置（`load_settings` 的唯一实现；路径可注入才测得了"落盘后能读回"）。
+fn load_settings_at(path: &Path) -> AppSettings {
+    let Some(raw) = std::fs::read_to_string(path).ok() else {
         return AppSettings::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -1148,6 +1167,7 @@ fn load_settings() -> AppSettings {
         dictionary: json_field(&v, "dictionary"),
         bgm: json_field(&v, "bgm").unwrap_or_default(),
         update_url: json_field(&v, "update_url"),
+        asr_model: json_field(&v, "asr_model"),
     }
 }
 
@@ -1158,7 +1178,11 @@ fn json_field<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str) 
 }
 
 fn save_settings(s: &AppSettings) -> std::io::Result<()> {
-    let path = settings_path();
+    save_settings_at(&settings_path(), s)
+}
+
+/// 写到指定路径（`save_settings` 的唯一实现；路径可注入，理由同上）。
+fn save_settings_at(path: &Path, s: &AppSettings) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1281,6 +1305,286 @@ fn read_server_config() -> Option<ServerConfig> {
     std::fs::read_to_string(config_path())
         .ok()
         .and_then(|raw| serde_json::from_str::<ServerConfig>(&raw).ok())
+}
+
+// ===========================================================================
+// 质检回读（ASR）模型：候选来自服务清单，选择落 settings.json
+//
+// 本机 16 GiB 时 `qwen3-asr`（估 3.31 GiB + 1 GiB 余量）装不下，服务直接 503，
+// 而应用把回读模型写死成它 —— 质检整条功能不可用。这里让它可选，并且**动态**列
+// 清单里 `task == "asr"` 的模型（不硬编名字：清单加一个就多一项）。
+// ===========================================================================
+
+/// 清单里所有 `task == "asr"` 的模型 id（保持清单顺序，跳过空 id）。
+fn asr_models_from(cfg: Option<&ServerConfig>) -> Vec<String> {
+    cfg.map(|c| {
+        c.models
+            .iter()
+            .filter(|m| m.task == "asr" && !m.id.trim().is_empty())
+            .map(|m| m.id.clone())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// 本机清单里的 ASR 模型（读不到清单 = 空列表，不算错误）。
+fn asr_models() -> Vec<String> {
+    asr_models_from(read_server_config().as_ref())
+}
+
+/// 当前生效的质检回读模型：设置 > 默认。**这是唯一入口**。
+///
+/// 用户选的 id 若已不在当前清单里也**照用不改**：静默换成别的模型会改变质检口径
+/// （词级/说话人能力都不同），换模型只能由用户点。服务拒绝就如实报错。
+fn effective_asr_model(s: &AppSettings) -> String {
+    s.asr_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(aw_core::DEFAULT_ASR_MODEL)
+        .to_string()
+}
+
+/// 下拉要显示什么 + 每个下标对应哪个 id + 当前选中下标。
+///
+/// 三样一起返回，是因为它们必须来自**同一份推导**：分别算就会漂移成"显示的是 A、
+/// 选出来的却是 B"。当前模型不在清单里时插到第 0 项并标注，保证下拉永远不会
+/// 因为清单变化而静默改掉用户的生效值。
+fn asr_picker_view(models: &[String], current: &str) -> (Vec<String>, Vec<String>, i32) {
+    let mut ids: Vec<String> = models.to_vec();
+    let mut labels: Vec<String> = models.to_vec();
+    if !ids.iter().any(|m| m == current) {
+        ids.insert(0, current.to_string());
+        labels.insert(0, format!("{current}（不在当前清单）"));
+    }
+    let index = ids.iter().position(|m| m == current).unwrap_or(0) as i32;
+    (ids, labels, index)
+}
+
+/// 一个 ASR 候选在磁盘上的权重文件大小（读不到 = None，不猜）。
+fn asr_candidate_weights(cfg: Option<&ServerConfig>) -> Vec<(String, Option<u64>)> {
+    cfg.map(|c| {
+        c.models
+            .iter()
+            .filter(|m| m.task == "asr" && !m.id.trim().is_empty())
+            .map(|m| (m.id.clone(), file_size_of(&m.path)))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// 单个路径的字节数：不存在 / 是目录 / 读不了都返回 None。
+fn file_size_of(path: &str) -> Option<u64> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let md = std::fs::metadata(path).ok()?;
+    md.is_file().then_some(md.len())
+}
+
+/// MiB → 人读（≥1024 MiB 用 GiB）。
+fn humans_mib(mib: u64) -> String {
+    if mib >= 1024 {
+        format!("{:.2} GiB", mib as f64 / 1024.0)
+    } else {
+        format!("{mib} MiB")
+    }
+}
+
+/// 比当前模型更小的 ASR 候选，按磁盘权重升序，最多 3 个。
+///
+/// 当前模型的权重读不到时退化成"清单里其它 ASR 模型"——宁可不排序，也不假装知道谁更小。
+/// 数字标的是**权重文件**大小，不是服务的内存估算，文案里说清楚这一点。
+fn smaller_asr_candidates(current: &str, candidates: &[(String, Option<u64>)]) -> Vec<String> {
+    let cur_size = candidates
+        .iter()
+        .find(|(id, _)| id == current)
+        .and_then(|(_, size)| *size);
+    let mut rest: Vec<&(String, Option<u64>)> =
+        candidates.iter().filter(|(id, _)| id != current).collect();
+    if let Some(cur) = cur_size {
+        rest.retain(|(_, size)| matches!(size, Some(n) if *n < cur));
+    }
+    // 知道的在前（按大小升序），不知道的排后面：不排序 = 不假装知道
+    rest.sort_by_key(|(_, size)| size.map(|n| (0u8, n)).unwrap_or((1, 0)));
+    rest.into_iter()
+        .take(3)
+        .map(|(id, size)| match size {
+            Some(n) => format!("{id}（权重约 {}）", backup::human_bytes(*n)),
+            None => id.clone(),
+        })
+        .collect()
+}
+
+/// 内存不足时的**可执行**提示：哪个模型装不下（含服务给的数字）、当时可用多少、
+/// 本机还有哪些更小的可选。只说"失败"等于把用户扔在原地。
+fn memory_shortfall_hint(
+    model: &str,
+    mem: Option<&aw_core::InsufficientMemory>,
+    candidates: &[(String, Option<u64>)],
+) -> String {
+    let mut out = match mem {
+        Some(m) => {
+            // 服务报的是它眼里的模型名；与请求名不一致时两个都写出来
+            let name = match m.model.as_deref() {
+                Some(n) if n != model => format!("{n}（请求的是 {model}）"),
+                _ => model.to_string(),
+            };
+            let need = match (m.required_mib(), m.estimated_mib, m.headroom_mib) {
+                (Some(req), Some(est), Some(head)) => format!(
+                    "需要约 {}（模型 {} + 余量 {}）",
+                    humans_mib(req),
+                    humans_mib(est),
+                    humans_mib(head)
+                ),
+                _ => "服务没给出可解析的占用估算".to_string(),
+            };
+            let avail = match m.available_mib {
+                Some(a) => format!("，当时可用 {}", humans_mib(a)),
+                None => String::new(),
+            };
+            format!("质检未开始：回读模型 {name} 装不下：{need}{avail}。")
+        }
+        None => format!("质检未开始：回读模型 {model} 装不下（服务因内存不足拒绝加载）。"),
+    };
+    let smaller = smaller_asr_candidates(model, candidates);
+    if smaller.is_empty() {
+        out.push_str(
+            "本机清单里没有更小的 ASR 模型可选：先腾出内存，或给清单加一个更小的 ASR 模型。",
+        );
+    } else {
+        out.push_str(&format!(
+            "本机更小的 ASR 模型可选：{}——在「高级 → 质检回读模型」里改选后重跑。",
+            smaller.join("、")
+        ));
+    }
+    // 换 ASR 会改变质检口径，所以只提示、不代劳
+    out.push_str(
+        "换回读模型会改变质检口径（audio8-asr / fun-asr 没有词级时间戳与说话人分离），需你确认，本应用不会自动换。",
+    );
+    out
+}
+
+/// 单句 ASR 失败之后该怎么办。
+#[derive(Debug, PartialEq, Eq)]
+enum EvalAsrFailure {
+    /// 整轮都不可能成功（内存不足）：带着可执行提示立刻收尾
+    Fatal(String),
+    /// 只是这一句没测到：记数、继续下一句
+    Counted,
+}
+
+/// **唯一判据**：worker 按它决定"收尾"还是"继续"。
+///
+/// 抽出来是为了能直接喂一个真实的 503 body 做用例——真去起服务/等退避才判得出来的话，
+/// 这条行为就没有能红的回归（也不该为了测试去 set_var 改进程环境）。
+fn classify_asr_failure(
+    model: &str,
+    err: &aw_core::ClientError,
+    candidates: &[(String, Option<u64>)],
+) -> EvalAsrFailure {
+    match err.insufficient_memory() {
+        Some(mem) => EvalAsrFailure::Fatal(memory_shortfall_hint(model, Some(&mem), candidates)),
+        None => EvalAsrFailure::Counted,
+    }
+}
+
+/// 回读下拉右边那句说明。只描述"候选从哪来 / 当前选的还在不在 / 换它会变什么"，
+/// 不列举任何写死的模型名（候选是清单给的，写死就又多一份真相）。
+fn asr_model_note(models: &[String], current: &str, in_manifest: bool) -> String {
+    let mut note = if models.is_empty() {
+        "没读到服务清单里 task=asr 的模型：检查 server.json 与 audiocpp_server".to_string()
+    } else {
+        format!("候选来自服务清单（{} 个 ASR 模型）", models.len())
+    };
+    if !in_manifest {
+        note.push_str(&format!("·当前选的 {current} 不在清单里，服务可能加载不了"));
+    }
+    note.push_str("·换模型会改变质检口径（audio8-asr / fun-asr 无词级时间戳与说话人分离）");
+    note
+}
+
+/// 把选中的回读模型落进 settings.json（失败也不阻断，只提示）。
+///
+/// 返回真正写下去的值，便于调用方用它回显——回显若另算一份就会与落盘值漂移。
+fn persist_asr_model(model: &str) -> Result<String, String> {
+    persist_asr_model_at(settings(), &settings_path(), model)
+}
+
+/// `persist_asr_model` 的唯一实现。settings 与路径都可注入：单测不得写用户真实的
+/// settings.json（`LESSON_单测不得写用户真实运行数据须拆出注入缝`）。
+fn persist_asr_model_at(
+    store: &std::sync::Mutex<AppSettings>,
+    path: &Path,
+    model: &str,
+) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("回读模型不能为空".into());
+    }
+    let snapshot = {
+        let mut guard = store.lock().map_err(|_| "设置锁不可用".to_string())?;
+        guard.asr_model = Some(model.to_string());
+        guard.clone()
+    };
+    // 先改内存再落盘是既有约定（失败时至少本次会话生效）；落盘失败要如实回报
+    save_settings_at(path, &snapshot).map_err(|e| e.to_string())?;
+    Ok(model.to_string())
+}
+
+/// 把回读下拉刷成"清单 + 当前生效值"的投影（候选、选中项、说明来自同一份推导）。
+fn refresh_asr_models(ui: &MainWindow) {
+    let models = asr_models();
+    let current = effective_asr_model(&settings_snapshot());
+    let (_, labels, index) = asr_picker_view(&models, &current);
+    let in_manifest = models.contains(&current);
+    let labels: Vec<SharedString> = labels.into_iter().map(SharedString::from).collect();
+    ui.set_asr_model_names(ModelRc::from(Rc::new(VecModel::from(labels))));
+    ui.set_asr_model_index(index);
+    ui.set_asr_model_note(asr_model_note(&models, &current, in_manifest).into());
+}
+
+/// 质检回读模型的下拉：候选来自服务清单，切换落 settings.json。
+///
+/// 归属：回读模型只影响配音页的质检，所以放在本页「高级」里，不进全局抽屉
+/// （`LESSON_全局容器只放全局项单Tab独有的放本页`）。
+fn wire_asr_model(ui: &MainWindow, state: &Rc<UiState>) {
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_asr_model_picked(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        // 质检在跑时不让换：worker 手里那条命令已经带着当时的模型名，
+        // 中途改设置只会造成"界面显示 A、这次实际用 B"。
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
+            ui.set_status_text("任务进行中：等这轮跑完再换回读模型".into());
+            refresh_asr_models(&ui);
+            return;
+        }
+        let current = effective_asr_model(&settings_snapshot());
+        // 与刷新时同一份推导：下拉显示的第 i 项就是这里取出的第 i 项
+        let (ids, _, _) = asr_picker_view(&asr_models(), &current);
+        let picked = ids.get(i.max(0) as usize).cloned();
+        if let Some(id) = picked.filter(|id| *id != current) {
+            match persist_asr_model(&id) {
+                Ok(saved) => {
+                    // 如实说清：盘上那份分数是**上一个模型**测的。本批不给分数打模型标记，
+                    // 所以不能假装它还是当前结论——但也不擅自清分（见 docs 的已知边界）。
+                    let note = if st.eval_scores.borrow().is_empty() {
+                        format!("回读模型已改为 {saved}（下次质检生效）")
+                    } else {
+                        format!(
+                            "回读模型已改为 {saved}：现有分数是上一个模型测的，建议重新质检一次再看结论"
+                        )
+                    };
+                    ui.set_status_text(note.into());
+                }
+                Err(e) => ui.set_status_text(
+                    format!("回读模型没能保存（{e}）：重启后会回到上次的选择").into(),
+                ),
+            }
+        }
+        refresh_asr_models(&ui);
+    });
 }
 
 /// 服务地址解析（纯函数，便于单测三档优先级）。
@@ -3131,6 +3435,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision: _revision,
                 task_id,
                 dir,
+                model,
             } => {
                 if task_take_started(&ctx, task_id) {
                     let _ = ctx.tx.send(WorkerMsg {
@@ -3199,6 +3504,8 @@ fn worker_loop(ctx: WorkerCtx) {
                 let mut asr_failed = 0usize;
                 let mut asr_error: Option<String> = None;
                 let mut stopped = false;
+                // 内存不足这类"整轮都不可能成功"的错误：记下来，跳出循环后带着可执行提示收尾
+                let mut fatal: Option<String> = None;
                 for (n, idx) in done.iter().enumerate() {
                     // 协作式停止：一句转写完再停（ASR 调用本身中断不了）
                     if ctx.eval_stop.load(Ordering::Relaxed) {
@@ -3206,7 +3513,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         break;
                     }
                     let wav = dir.join(format!("sentences/{idx:03}.wav"));
-                    match client.asr(&wav) {
+                    match client.asr_with(&model, &wav) {
                         Ok(hypothesis) => {
                             // clone 一份参考文本：下面还要 mut 借 project.sentences 写分数
                             let reference = project
@@ -3245,14 +3552,29 @@ fn worker_loop(ctx: WorkerCtx) {
                             }
                         }
                         Err(e) => {
-                            // 单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分。
-                            // 这句的旧分数（如果有）**保留**——它描述的是磁盘上那段音频，
-                            // 而这次只是没测到；保留的分数要一起回给 UI，否则 UI 与磁盘不一致。
-                            asr_failed += 1;
-                            // 保留第一条服务端原文（含 OOM 三个动作）；后续同一
-                            // 错误不再重复堆积，摘要只展示一份可执行说明。
-                            if asr_error.is_none() {
-                                asr_error = Some(e.to_string());
+                            // 内存不足不是"这一句没测到"：模型根本加载不了，后面每一句都会
+                            // 同样失败，继续跑只会让用户白等。判据在 `classify_asr_failure`
+                            // （识别口径与用例同一份），这里只执行结论。
+                            match classify_asr_failure(
+                                &model,
+                                &e,
+                                &asr_candidate_weights(read_server_config().as_ref()),
+                            ) {
+                                EvalAsrFailure::Fatal(error) => {
+                                    fatal = Some(error);
+                                    break;
+                                }
+                                // 其余单句转写失败不致命：记数并在汇总里如实报出来，不混进平均分。
+                                // 这句的旧分数（如果有）**保留**——它描述的是磁盘上那段音频，
+                                // 而这次只是没测到；保留的分数要一起回给 UI，否则 UI 与磁盘不一致。
+                                EvalAsrFailure::Counted => {
+                                    asr_failed += 1;
+                                    // 保留第一条服务端原文（含 OOM 三个动作）；后续同一
+                                    // 错误不再重复堆积，摘要只展示一份可执行说明。
+                                    if asr_error.is_none() {
+                                        asr_error = Some(e.to_string());
+                                    }
+                                }
                             }
                         }
                     }
@@ -3262,8 +3584,16 @@ fn worker_loop(ctx: WorkerCtx) {
                             task_id,
                             done: n + 1,
                             total,
+                            model: model.clone(),
                         },
                     });
+                }
+                if let Some(error) = fatal {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision: 0,
+                        msg: Msg::EvalFailed { task_id, error },
+                    });
+                    continue;
                 }
                 if stopped {
                     let _ = ctx.tx.send(WorkerMsg {
@@ -3295,7 +3625,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     .unwrap_or_else(|| "未命名工程".to_string());
                 let report = qa_report_markdown(
                     &project_name,
-                    "qwen3-asr",
+                    &model,
                     &rows,
                     if scored == 0 {
                         0.0
@@ -3340,6 +3670,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     msg: Msg::EvalDone {
                         task_id,
                         summary: EvalSummary {
+                            model: model.clone(),
                             percent,
                             scored,
                             asr_failed,
@@ -4166,6 +4497,8 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_versions(&ui, &rows, &cmd_tx, &state);
     wire_dictionary(&ui, &rows, &cmd_tx, &msg_tx_ui, &state);
     load_active_dictionary(&ui, &state);
+    wire_asr_model(&ui, &state);
+    refresh_asr_models(&ui);
     wire_voice_panel(&ui, &cmd_tx, &state);
     wire_voice_library(
         &ui,
@@ -5742,6 +6075,9 @@ fn eval_summary_note(summary: &EvalSummary) -> String {
     if let Some(path) = &summary.report_path {
         note.push_str(&format!("·报告 {}", file_label(path)));
     }
+    // 回读模型念出来：报告的"回读模型"与状态行这一点必须是同一个值，否则用户
+    // 换过模型之后两边说法会不一致（而且报告是要存档的，事后更没法核对）。
+    note.push_str(&format!("·回读 {}", summary.model));
     note
 }
 
@@ -7875,9 +8211,10 @@ fn tick(
                 task_id,
                 done,
                 total,
+                model,
             } => {
                 if state.eval_task.get() == Some(task_id) {
-                    let note = format!("质检中：第 {done}/{total} 句");
+                    let note = format!("质检中：第 {done}/{total} 句 · 回读 {model}");
                     ui.set_status_text(note.clone().into());
                     progress_task(
                         ui,
@@ -8512,6 +8849,8 @@ fn wire_global_settings(
             dictionary: prev.dictionary,
             // 「更新」的清单地址也不在这里改（有自己的落盘点 save_update_url），原样带上
             update_url: prev.update_url,
+            // 质检回读模型也不在这里改（自己的落盘点 persist_asr_model），原样带上
+            asr_model: prev.asr_model,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -9102,6 +9441,9 @@ fn wire_quality_check(
         let stem = file_stem(&ui.get_project_name());
         let dir = project_dir(&stem);
         stop_flag.store(false, Ordering::Relaxed);
+        // 这里就把生效模型定下来发给 worker：UI 回显、报告落盘、真实请求三处同一个值，
+        // 不给"两处各算一份"留机会（运行中改设置也不会让它们漂移）。
+        let model = effective_asr_model(&settings_snapshot());
         let id = enqueue_task(
             &ui,
             &st,
@@ -9110,8 +9452,10 @@ fn wire_quality_check(
             "质检 · ASR 回读",
         );
         let note: String = match queue_note(&st, id) {
-            Some(q) => format!("{q} · 轮到它时自动开始质检"),
-            None => "质检中：正在逐句 ASR 回读（首次会加载 ASR 模型，约 8s）…".to_string(),
+            Some(q) => format!("{q} · 轮到它时自动开始质检（回读 {model}）"),
+            None => {
+                format!("质检中：用 {model} 逐句 ASR 回读（首次会加载该模型，约 8s）…")
+            }
         };
         ui.set_status_text(note.into());
         if tx
@@ -9119,6 +9463,7 @@ fn wire_quality_check(
                 revision: st.project_revision.get(),
                 task_id: id,
                 dir,
+                model,
             })
             .is_err()
         {
@@ -9674,12 +10019,8 @@ mod tests {
 
         // 只覆盖端口 → host 回落清单
         let over_port = AppSettings {
-            host: None,
             port: Some(9999),
-            model_dir: None,
-            dictionary: None,
-            bgm: Default::default(),
-            update_url: None,
+            ..Default::default()
         };
         assert_eq!(
             resolve_base(&over_port, &cfg, None).0,
@@ -9689,11 +10030,7 @@ mod tests {
         // 只覆盖 host → 端口回落清单
         let over_host = AppSettings {
             host: Some("10.0.0.1".into()),
-            port: None,
-            model_dir: None,
-            dictionary: None,
-            bgm: Default::default(),
-            update_url: None,
+            ..Default::default()
         };
         assert_eq!(
             resolve_base(&over_host, &cfg, None).0,
@@ -11876,6 +12213,7 @@ mod tests {
     #[test]
     fn eval_summary_note_handles_all_failed_and_all_clean() {
         let all_failed = EvalSummary {
+            model: "qwen3-asr".into(),
             percent: 0.0,
             scored: 0,
             asr_failed: 5,
@@ -11892,6 +12230,7 @@ mod tests {
         assert!(!note.contains("全部一致"), "全失败不是全部一致：{note}");
 
         let clean = EvalSummary {
+            model: "qwen3-asr".into(),
             percent: 100.0,
             scored: 3,
             asr_failed: 0,
@@ -11906,6 +12245,7 @@ mod tests {
         assert!(note.contains("全部一致"), "{note}");
 
         let with_worst = EvalSummary {
+            model: "audio8-asr".into(),
             percent: 96.4,
             scored: 57,
             asr_failed: 2,
@@ -11926,8 +12266,19 @@ mod tests {
             note.contains("第 12 句") && note.contains("92.3%") && note.contains("应为"),
             "最差句要给序号、分数与差异片段：{note}"
         );
+        // 状态行念的必须是**这次实际用的**模型：非默认名要出现，且不能出现默认名
+        assert!(note.contains("回读 audio8-asr"), "要念出实际模型：{note}");
+        assert!(
+            !note.contains("qwen3-asr"),
+            "状态行不能写死默认模型名：{note}"
+        );
+        assert!(
+            eval_summary_note(&clean).contains("回读 qwen3-asr"),
+            "默认模型也要念出来"
+        );
 
         let oom = EvalSummary {
+            model: "qwen3-asr".into(),
             percent: 0.0,
             scored: 0,
             asr_failed: 1,
@@ -12204,6 +12555,7 @@ mod tests {
     #[test]
     fn eval_summary_note_reports_persist_warning() {
         let summary = EvalSummary {
+            model: "audio8-asr".into(),
             percent: 96.4,
             scored: 57,
             asr_failed: 0,
@@ -12292,9 +12644,14 @@ mod tests {
                 snippet: "…【应为 例，读到 力】…".into(),
             },
         ];
-        let md = qa_report_markdown("示例工程", "qwen3-asr", &rows, 96.4, 2, 0);
+        // 故意用**非默认**名：写死 qwen3-asr 的实现会在这里红
+        let md = qa_report_markdown("示例工程", "fun-asr", &rows, 96.4, 2, 0);
         assert!(md.contains("# 质检报告 · 示例工程"), "{md}");
-        assert!(md.contains("qwen3-asr"), "要写明回读模型：{md}");
+        assert!(
+            md.contains("回读模型：fun-asr"),
+            "要写明实际用的回读模型：{md}"
+        );
+        assert!(!md.contains("qwen3-asr"), "报告不能写死默认模型名：{md}");
         assert!(md.contains("平均可懂度：96.4%"), "{md}");
         assert!(
             md.contains("| 1 | 100.0% | 第一句测试。"),
@@ -12312,7 +12669,8 @@ mod tests {
     /// 一句都没评上分时，报告不能写"平均 0%"（与摘要同一口径）。
     #[test]
     fn qa_report_markdown_says_when_nothing_scored() {
-        let md = qa_report_markdown("示例工程", "qwen3-asr", &[], 0.0, 0, 5);
+        let md = qa_report_markdown("示例工程", "audio8-asr", &[], 0.0, 0, 5);
+        assert!(md.contains("回读模型：audio8-asr"), "{md}");
         assert!(md.contains("未能评分"), "{md}");
         assert!(!md.contains("平均可懂度：0.0%"), "{md}");
         assert!(md.contains("转写失败 5"), "{md}");
@@ -12328,7 +12686,7 @@ mod tests {
     /// 合成准备故意直接用 aw-core（与 app 同一条链路）：走 `Cmd::Run` 会落到用户的
     /// `~/Documents/音频作坊/projects/<工程名>` 下，测试不该往用户真实数据目录里写东西。
     #[test]
-    #[ignore = "需要本机 audiocpp_server + audio8-tts + qwen3-asr"]
+    #[ignore = "需要本机 audiocpp_server + audio8-tts + audio8-asr"]
     fn worker_eval_writes_report_end_to_end() {
         let dir = std::env::temp_dir().join(format!("aw-worker-eval-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -12369,10 +12727,12 @@ mod tests {
             })
         });
         cmd_tx
+            // 故意用一个**非默认**的回读模型：报告与状态行必须念这个，而不是写死的 qwen3-asr
             .send(Cmd::RunEval {
                 revision: 0,
                 task_id: 7,
                 dir: dir.clone(),
+                model: "audio8-asr".into(),
             })
             .unwrap();
 
@@ -12397,6 +12757,11 @@ mod tests {
         let md = std::fs::read_to_string(&path).expect("报告应已落盘");
         assert!(md.contains("# 质检报告"), "{md}");
         assert!(md.contains("第一句测试。"), "报告里要有逐句参考文本：{md}");
+        assert!(
+            md.contains("回读模型：audio8-asr"),
+            "报告要写实际用的模型：{md}"
+        );
+        assert!(!md.contains("qwen3-asr"), "报告不能写死默认模型名：{md}");
         eprintln!("报告：{}\n{md}", path.display());
 
         // 工程里的分数也落了盘（跨会话留存那条）
@@ -12407,11 +12772,72 @@ mod tests {
         );
     }
 
+    /// 16kHz / 单声道 / 16bit / 0.1s 静音：手搓一个最小合法 wav
+    /// （主 crate 没有 hound 依赖，这里只为了给真机探针一个能读的输入）。
+    fn tiny_silent_wav() -> Vec<u8> {
+        let frames: u32 = 1600;
+        let data_len = frames * 2;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&16_000u32.to_le_bytes());
+        out.extend_from_slice(&32_000u32.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        out
+    }
+
+    /// 真机（默认 ignored）：把**活的** 503 喂给真实的失败判据，看提示能不能照着做。
+    ///
+    /// 内存宽裕时 `qwen3-asr` 也装得上 —— 那本次就没触发，如实打印并返回，
+    /// 不假装验证过（`RULE_可达性.md` 第 3 条：条件不满足走 detect-and-return）。
+    #[test]
+    #[ignore = "需要本机 audiocpp_server；内存紧时才会真实触发 insufficient_memory"]
+    fn live_memory_shortfall_becomes_an_actionable_hint() {
+        let base = std::env::var("AW_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+        let client = Client::new(&base);
+        assert!(client.healthy(), "服务不可用：{base}");
+        let wav = std::env::temp_dir().join(format!("aw-oom-probe-{}.wav", std::process::id()));
+        std::fs::write(&wav, tiny_silent_wav()).unwrap();
+
+        let candidates = asr_candidate_weights(read_server_config().as_ref());
+        match client.asr_with("qwen3-asr", &wav) {
+            Ok(text) => eprintln!("本次没触发：qwen3-asr 装得下（回读={text:?}），跳过降档验证"),
+            Err(e) => match classify_asr_failure("qwen3-asr", &e, &candidates) {
+                EvalAsrFailure::Fatal(msg) => {
+                    eprintln!("原始 503：{e}");
+                    eprintln!("组装出的提示：{msg}");
+                    assert!(msg.contains("qwen3-asr"), "{msg}");
+                    assert!(
+                        msg.contains("GiB") || msg.contains("MiB"),
+                        "要带需要/可用数字：{msg}"
+                    );
+                    assert!(
+                        msg.contains("audio8-asr") || msg.contains("fun-asr"),
+                        "要点名更小的候选：{msg}"
+                    );
+                    assert!(msg.contains("不会自动换"), "要写明不自动换：{msg}");
+                }
+                EvalAsrFailure::Counted => {
+                    eprintln!("本次没触发内存不足（判成单句失败），服务回的是：{e}")
+                }
+            },
+        }
+    }
+
     /// 一句都没评上分时**也要**把"落盘告警/报告路径"带出来——旧写法在 scored==0 分支提前 return，
     /// 把报告路径和"报告没写进去"的告警一起吞了（复核指出）。
     #[test]
     fn eval_summary_note_keeps_warnings_when_nothing_scored() {
         let summary = EvalSummary {
+            model: "audio8-asr".into(),
             percent: 0.0,
             scored: 0,
             asr_failed: 5,
@@ -13063,6 +13489,322 @@ mod tests {
 
         s.bgm.prompt = "改过了".into();
         assert_ne!(s.bgm.prompt, DEFAULT_BGM_PROMPT);
+    }
+
+    /// 质检回读的候选**来自服务清单**，不是硬编的三个名字：清单加一个 task=asr
+    /// 的模型，下拉里就要多一个（本用例故意放第 4 个，钉住"不是写死的三个"）。
+    #[test]
+    fn asr_models_come_from_the_manifest_not_a_hardcoded_list() {
+        let m = |id: &str, task: &str, path: &str| ServerModel {
+            id: id.into(),
+            task: task.into(),
+            family: "f".into(),
+            path: path.into(),
+            url: String::new(),
+            sha256: String::new(),
+            size: None,
+        };
+        let cfg = ServerConfig {
+            host: None,
+            port: None,
+            models: vec![
+                m("audio8-tts", "tts", "/models/tts/x.gguf"),
+                m("qwen3-asr", "asr", "/models/asr/q.gguf"),
+                m("audio8-asr", "asr", "/models/asr/a.gguf"),
+                m("sortformer-diar", "diar", "/models/diar/s.gguf"),
+                m("fun-asr", "asr", "/models/asr/f.gguf"),
+                m("whisper-tiny", "asr", "/models/asr/w.gguf"),
+            ],
+        };
+        assert_eq!(
+            asr_models_from(Some(&cfg)),
+            vec!["qwen3-asr", "audio8-asr", "fun-asr", "whisper-tiny"],
+            "只收 task==asr，且保持清单顺序"
+        );
+        assert!(asr_models_from(None).is_empty(), "没有清单 = 没有候选");
+    }
+
+    /// 生效模型 = 设置 > 默认；空串/空白不算选择（回退默认而不是拿空串去请求）。
+    #[test]
+    fn effective_asr_model_defaults_then_honours_the_choice() {
+        let none = AppSettings::default();
+        assert_eq!(effective_asr_model(&none), "qwen3-asr");
+        let blank = AppSettings {
+            asr_model: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_asr_model(&blank), "qwen3-asr", "空白不算选择");
+        let picked = AppSettings {
+            asr_model: Some("  audio8-asr  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_asr_model(&picked), "audio8-asr", "去掉两侧空白");
+        // 清单里没有也照用：换模型会改质检口径，不能静默替换
+        let gone = AppSettings {
+            asr_model: Some("removed-asr".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_asr_model(&gone), "removed-asr");
+    }
+
+    /// 下拉的显示名、下标、id 必须来自同一份推导：当前模型不在清单里时也要留在
+    /// 第 0 项（否则清单一变，用户没动过下拉，生效模型却被静默换掉）。
+    #[test]
+    fn asr_picker_view_keeps_the_current_model_visible() {
+        let models: Vec<String> = ["qwen3-asr", "audio8-asr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let (ids, labels, index) = asr_picker_view(&models, "audio8-asr");
+        assert_eq!(index, 1);
+        assert_eq!(labels[index as usize], "audio8-asr");
+        assert_eq!(
+            ids[index as usize], "audio8-asr",
+            "下标取回的 id 必须就是显示的那个"
+        );
+
+        let (ids, labels, index) = asr_picker_view(&models, "gone-asr");
+        assert_eq!(index, 0);
+        assert_eq!(ids[0], "gone-asr", "不在清单里也照用它");
+        assert!(labels[0].contains("不在当前清单"), "{}", labels[0]);
+        assert_eq!(labels.len(), 3);
+
+        // 选第 2 项（清单第 2 个）拿到的就是它自己的 id——显示与取值同源
+        let (ids, labels, _) = asr_picker_view(&models, "qwen3-asr");
+        assert_eq!(
+            (ids[1].as_str(), labels[1].as_str()),
+            ("audio8-asr", "audio8-asr")
+        );
+    }
+
+    /// 报告与 ASR 请求都必须用**本次实际用的模型**，不能退回写死的字面量。
+    ///
+    /// 用源码级守卫而不是只测纯函数：`qa_report_markdown` 的入参谁都能传对，
+    /// 真正会漂移的是**调用点**（"回显与真实行为不同源"这类问题被复核抓到过多次）；
+    /// 而真机 e2e 是 `#[ignore]` 的，跑不到就等于没保护。
+    #[test]
+    fn report_and_request_read_the_run_model_not_a_literal() {
+        let src = include_str!("main.rs");
+        // 这个"针"必须拼出来：直接写完整字面量的话，它会命中**本用例自己的源码**，
+        // 断言恒真、改坏也不红（第一次写就踩了这个坑，阳性对照抓出来的）。
+        let request = format!("client.asr_with({}, &wav)", "&model");
+        assert!(
+            src.contains(&request),
+            "ASR 请求必须用这次选中的模型，不能退回 client.asr()"
+        );
+        assert!(
+            src.contains(
+                "qa_report_markdown(\n                    &project_name,\n                    &model,"
+            ),
+            "报告必须用本次实际用的模型"
+        );
+        // 报告调用点里不能再出现写死的默认模型名（正是这条被复核驳回的形态）
+        assert!(
+            !src.contains("\"qwen3-asr\",\n                    &rows"),
+            "报告路径不得写死模型名"
+        );
+    }
+
+    /// 下拉旁的说明：候选数来自清单、当前值不在清单要明说、换模型口径会变要明说。
+    #[test]
+    fn asr_model_note_is_honest_about_where_candidates_come_from() {
+        let models: Vec<String> = ["qwen3-asr", "audio8-asr", "fun-asr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let note = asr_model_note(&models, "qwen3-asr", true);
+        assert!(note.contains("3 个 ASR 模型"), "候选数要来自清单：{note}");
+        assert!(note.contains("说话人分离"), "要如实说明能力差异：{note}");
+        assert!(!note.contains("不在清单里"), "在清单里就不该这么写：{note}");
+
+        let note = asr_model_note(&models, "gone-asr", false);
+        assert!(
+            note.contains("gone-asr") && note.contains("不在清单里"),
+            "当前值不在清单时要说清（照用不换，但服务可能加载不了）：{note}"
+        );
+
+        let note = asr_model_note(&[], "qwen3-asr", false);
+        assert!(note.contains("没读到服务清单"), "清单读不到要说清：{note}");
+    }
+
+    /// 内存不足 → 整轮立刻收尾（带可执行提示）；其它 ASR 失败 → 只记这一句。
+    ///
+    /// 直接喂真机 503 body，不起服务、不进退避等待：worker 执行的是这条判据的结论。
+    #[test]
+    fn memory_shortfall_is_fatal_while_other_asr_errors_are_counted() {
+        let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
+        let candidates = vec![
+            ("qwen3-asr".to_string(), Some(3_400_000_000u64)),
+            ("audio8-asr".to_string(), Some(459_000_000)),
+        ];
+        let err = aw_core::ClientError::Server(503, body.to_string());
+        match classify_asr_failure("qwen3-asr", &err, &candidates) {
+            EvalAsrFailure::Fatal(msg) => {
+                assert!(msg.contains("qwen3-asr"), "{msg}");
+                assert!(
+                    msg.contains("3.84 GiB") && msg.contains("4.31 GiB"),
+                    "{msg}"
+                );
+                assert!(msg.contains("audio8-asr"), "{msg}");
+            }
+            other => panic!("内存不足必须整轮收尾，实得 {other:?}"),
+        }
+
+        // 模型忙碌也是 503 —— 那是"这一句没测到"，不能当成装不下
+        let busy = r#"{"error":{"message":"model 'qwen3-asr' is busy","type":"model_busy"}}"#;
+        assert_eq!(
+            classify_asr_failure(
+                "qwen3-asr",
+                &aw_core::ClientError::Server(503, busy.to_string()),
+                &candidates
+            ),
+            EvalAsrFailure::Counted
+        );
+        // 传输层失败（服务没起来）同样只记一句：换模型也救不了
+        assert_eq!(
+            classify_asr_failure(
+                "qwen3-asr",
+                &aw_core::ClientError::Http("连接被拒绝".into()),
+                &candidates
+            ),
+            EvalAsrFailure::Counted
+        );
+    }
+
+    /// 内存不足的提示必须**可执行**：模型名 + 需要/可用数字 + 更小的候选 + 不自动换。
+    #[test]
+    fn memory_shortfall_hint_names_the_model_numbers_and_smaller_candidates() {
+        // 真机 503 body 解析出来的数字
+        let mem = aw_core::InsufficientMemory {
+            message: "cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)".into(),
+            model: Some("qwen3-asr".into()),
+            estimated_mib: Some(3389),
+            headroom_mib: Some(1024),
+            available_mib: Some(3932),
+        };
+        let candidates = vec![
+            ("qwen3-asr".to_string(), Some(3_400_000_000u64)),
+            ("audio8-asr".to_string(), Some(459_000_000)),
+            ("fun-asr".to_string(), Some(1_200_000_000)),
+        ];
+        let hint = memory_shortfall_hint("qwen3-asr", Some(&mem), &candidates);
+        assert!(hint.contains("qwen3-asr"), "要说清是哪个模型：{hint}");
+        assert!(
+            hint.contains("4.31 GiB"),
+            "要说需要多少（估算+余量）：{hint}"
+        );
+        assert!(
+            hint.contains("3.31 GiB") && hint.contains("1.00 GiB"),
+            "拆开也要给：{hint}"
+        );
+        assert!(hint.contains("3.84 GiB"), "要说当时可用多少：{hint}");
+        assert!(
+            hint.contains("audio8-asr") && hint.contains("fun-asr"),
+            "要列出更小的候选：{hint}"
+        );
+        assert!(
+            !hint.contains("qwen3-asr（权重"),
+            "当前模型不该出现在降档候选里：{hint}"
+        );
+        assert!(hint.contains("不会自动换"), "必须写明不自动换：{hint}");
+        assert!(hint.contains("质检回读模型"), "要指出去哪儿改：{hint}");
+        // 没有更小的可选时不能留空话
+        let hint = memory_shortfall_hint("qwen3-asr", Some(&mem), &candidates[..1]);
+        assert!(hint.contains("没有更小的 ASR 模型可选"), "{hint}");
+        // 数字解析不出来也要给出动作，而不是只报错
+        let no_numbers = aw_core::InsufficientMemory {
+            message: "cannot load model 'qwen3-asr'（这条没有可解析的数字）".into(),
+            model: Some("qwen3-asr".into()),
+            estimated_mib: None,
+            headroom_mib: None,
+            available_mib: None,
+        };
+        let hint = memory_shortfall_hint("qwen3-asr", Some(&no_numbers), &candidates);
+        assert!(hint.contains("没给出可解析"), "{hint}");
+        assert!(hint.contains("audio8-asr"), "数字缺失也要给候选：{hint}");
+    }
+
+    /// 候选按磁盘权重升序、剔除当前模型；权重读不到的排在后面（不假装知道谁更小）。
+    #[test]
+    fn smaller_asr_candidates_orders_by_weight_and_drops_the_current() {
+        let c = |id: &str, size: Option<u64>| (id.to_string(), size);
+        let candidates = vec![
+            c("qwen3-asr", Some(3_400_000_000)),
+            c("fun-asr", Some(1_200_000_000)),
+            c("mystery-asr", None),
+            c("audio8-asr", Some(459_000_000)),
+            c("bigger-asr", Some(9_000_000_000)),
+        ];
+        let got = smaller_asr_candidates("qwen3-asr", &candidates);
+        assert_eq!(got.len(), 2, "更大/权重未知/当前的都要剔掉：{got:?}");
+        assert!(got[0].starts_with("audio8-asr"), "小的排前面：{got:?}");
+        assert!(got[1].starts_with("fun-asr"), "{got:?}");
+        assert!(
+            got[0].contains("437.7MB") && got[1].contains("1144.4MB"),
+            "要给出权重数字（bytes→MB，1024 进制）：{got:?}"
+        );
+        assert!(
+            !got.iter().any(|g| g.contains("9000")),
+            "比当前更大的不当降档候选：{got:?}"
+        );
+
+        // 当前模型的权重读不到 → 不筛大小（不假装知道谁更小），但不能把"权重未知"的
+        // 候选排到"知道更小"的前面去
+        let unknown_current = smaller_asr_candidates("mystery-asr", &candidates);
+        assert_eq!(
+            unknown_current.len(),
+            3,
+            "不知道当前多大就不按大小筛（只受最多 3 条的上限约束）：{unknown_current:?}"
+        );
+        assert!(
+            unknown_current.last().unwrap().starts_with("qwen3-asr"),
+            "有数字的在前（即便比当前大也不装懂）：{unknown_current:?}"
+        );
+    }
+
+    /// 选择要真的落盘、重启读回；拒绝写入时不得改动盘上已有的值。
+    #[test]
+    fn asr_model_choice_survives_a_settings_roundtrip() {
+        let dir = temp_dir("asr-model-settings");
+        let path = dir.join("settings.json");
+        let store = std::sync::Mutex::new(AppSettings::default());
+        assert_eq!(
+            effective_asr_model(&store.lock().unwrap()),
+            "qwen3-asr",
+            "没选过 = 默认"
+        );
+
+        assert_eq!(
+            persist_asr_model_at(&store, &path, " audio8-asr ").unwrap(),
+            "audio8-asr"
+        );
+        let back = load_settings_at(&path);
+        assert_eq!(back.asr_model.as_deref(), Some("audio8-asr"), "重启读回");
+        assert_eq!(effective_asr_model(&back), "audio8-asr");
+
+        assert_eq!(
+            persist_asr_model_at(&store, &path, "fun-asr").unwrap(),
+            "fun-asr"
+        );
+        assert_eq!(
+            load_settings_at(&path).asr_model.as_deref(),
+            Some("fun-asr")
+        );
+
+        assert!(persist_asr_model_at(&store, &path, "   ").is_err());
+        assert_eq!(
+            load_settings_at(&path).asr_model.as_deref(),
+            Some("fun-asr"),
+            "拒绝写入时盘上的值不能被改掉"
+        );
+
+        // 老版本文件（没有这一段）读得回来，且回落默认
+        let legacy_path = dir.join("legacy.json");
+        std::fs::write(&legacy_path, "{\"host\":\"127.0.0.1\",\"port\":8080}").unwrap();
+        let legacy = load_settings_at(&legacy_path);
+        assert_eq!(legacy.asr_model, None);
+        assert_eq!(effective_asr_model(&legacy), "qwen3-asr");
     }
 
     /// "这套 BGM 结果还算不算当前"：`has_result && !stale`。
