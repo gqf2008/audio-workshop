@@ -119,8 +119,29 @@ pub fn list(project_dir: &Path) -> (Vec<VersionRow>, usize) {
     (rows.into_iter().map(|(r, _)| r).collect(), broken)
 }
 
+/// 版本 id 是否合法：只接我们自己生成的形式（`<毫秒>` 或 `<毫秒>-<序号>`）。
+///
+/// 界面回传的 id 本来就来自 `list()`，但**不校验就等于把路径拼接交给调用方**——
+/// `../..` 这类 id 能读到工程目录之外的文件。宁可多一道判断。
+fn is_valid_id(id: &str) -> bool {
+    let mut parts = id.split('-');
+    let Some(ms) = parts.next() else {
+        return false;
+    };
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && parts.next().is_none(),
+    }
+}
+
 /// 读一份版本（用于对比 / 回滚）。
 pub fn load(project_dir: &Path, id: &str) -> Result<Version, String> {
+    if !is_valid_id(id) {
+        return Err(format!("版本 id 不合法：{id}"));
+    }
     let path = versions_dir(project_dir).join(format!("{id}.json"));
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("版本读不出来：{}（{e}）", path.display()))?;
@@ -351,6 +372,36 @@ mod tests {
         let (rows, broken) = list(&dir);
         assert_eq!(rows.len(), 1);
         assert_eq!(broken, 1, "坏文件要计数并报出来");
+    }
+
+    /// 版本 id 不合法（路径穿越、绝对路径、空）一律拒绝：不能把工程目录之外的
+    /// 文件当版本读进来。
+    #[test]
+    fn rejects_path_traversal_ids() {
+        let dir = temp_dir("bad-id");
+        let outside = dir
+            .parent()
+            .unwrap()
+            .join(format!("aw-versions-outside-{}.json", std::process::id()));
+        std::fs::write(
+            &outside,
+            "{\"label\":\"外面的\",\"created_at\":1,\"project\":{}}".as_bytes(),
+        )
+        .unwrap();
+        for bad in [
+            "../x",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "",
+            "abc",
+            "1-2-3",
+        ] {
+            assert!(load(&dir, bad).is_err(), "非法 id 必须拒绝：{bad}");
+        }
+        // 合法形式（我们自己生成的）能过
+        let id = save(&dir, "好的", &project("第一句。"), 42).unwrap();
+        assert!(load(&dir, &id).is_ok());
+        let _ = std::fs::remove_file(&outside);
     }
 
     #[test]

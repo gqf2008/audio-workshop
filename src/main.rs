@@ -2731,10 +2731,8 @@ fn new_project_from_inputs(
         },
     );
     project.auto_normalize = auto_normalize;
-    // 参考音的内容哈希：能算就算（算不出来时留 None = 下次保守重录）
-    if let Some(path) = voice_ref.as_deref() {
-        project.voice_ref_hash = sha256_file(Path::new(path)).ok();
-    }
+    // 参考音哈希**不在这里算**：`load_resumable` 已经算过一份（算两遍纯属浪费），
+    // 版本留档那边由 `project_from_ui` 自己补。这里只管"按输入造工程"。
     project
 }
 
@@ -4513,13 +4511,19 @@ fn wire_task_center(
 /// 与 worker 造新工程共用 `new_project_from_inputs`，所以留档下来的东西就是"点开始合成
 /// 会用的那一份"，不是另建一个近似对象。
 fn project_from_ui(ui: &MainWindow) -> Project {
-    new_project_from_inputs(
+    let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+    let mut project = new_project_from_inputs(
         &ui.get_script_text(),
         &current_model_name(ui).unwrap_or_default(),
-        non_empty(ui.get_voice_ref_path().to_string()),
+        voice_ref.clone(),
         gap_ms_from_ui(ui),
         ui.get_auto_normalize(),
-    )
+    );
+    // 留档也要忠实：把参考音的内容哈希一起记下来（算不出来就留 None = 下次保守重录）
+    if let Some(path) = voice_ref.as_deref() {
+        project.voice_ref_hash = sha256_file(Path::new(path)).ok();
+    }
+    project
 }
 
 /// 时间戳 → 人话（版本列表用；不引日期库，按"多久以前"说）。
