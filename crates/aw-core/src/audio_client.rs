@@ -46,10 +46,13 @@ impl ClientError {
     }
 }
 
-/// 服务端结构化内存不足错误的最小投影。
+/// 服务端结构化内存不足错误的**用户文案投影**。
 ///
-/// `message` 是服务端原文，保留模型名、估算内存、余量和当前可用内存，
-/// 不在这里重新解析数字（那会让服务端改文案时应用跟着漂移）。
+/// `message` 是服务端原文（含模型名、估算内存、余量、可用内存这些数字，但**只作为文本**）。
+/// 面向用户的提示一律用这段原文，不拿解析出来的数字重新拼一遍——服务端改文案时应用不该跟着漂移。
+/// （数字要用于"降档候选"这类判断时，走 `InsufficientMemory` 的字段，见下。）
+///
+/// 实现上这里**委托** `parse_insufficient_memory`（唯一解析器），不再自己 parse 一次 JSON。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryShortfall {
     pub message: String,
