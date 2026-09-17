@@ -37,14 +37,29 @@ pub(crate) fn resolve_for_compare(p: &Path, base: &Path) -> Result<PathBuf, Stri
             }
             return Ok(out);
         }
-        match (base.parent(), base.file_name()) {
-            (Some(parent), Some(name)) if parent != base => {
-                tail.push(name.to_os_string());
-                base = parent.to_path_buf();
+        match split_last(&base) {
+            Some((parent, name)) if parent != base => {
+                tail.push(name);
+                base = parent;
             }
             _ => return Err(format!("路径解析不了：{}", p.display())),
         }
     }
+}
+
+/// 把路径拆成「父目录 + 最后一段」。
+///
+/// **不能用 `parent()` / `file_name()`**：最后一段是 `..`（或 `.`）时 `file_name()` 返回
+/// `None`，于是整个回退循环走到 `_ =>` 直接报"路径解析不了"——`…/models/x/..` 这种
+/// 结尾是 `..` 的路径实测踩过：判定变成静默 false（"在里面"被当成"不在里面"）。
+fn split_last(p: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
+    let mut comps: Vec<std::path::Component> = p.components().collect();
+    let last = comps.pop()?;
+    let mut parent = PathBuf::new();
+    for c in comps {
+        parent.push(c.as_os_str());
+    }
+    Some((parent, last.as_os_str().to_os_string()))
 }
 
 #[cfg(test)]
@@ -62,6 +77,37 @@ mod tests {
         let b = resolve_for_compare(&tmp.join("sub"), &tmp).unwrap();
         assert_eq!(a, b);
         assert!(b.starts_with(resolve_for_compare(&tmp, &tmp).unwrap()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 尾段是 `..` 也要能解析。
+    ///
+    /// 反例（修之前）：回退循环用 `parent()` / `file_name()` 往上走，而 `..` 作为最后一段时
+    /// `file_name()` 是 `None` → 整条路径直接报"解析不了"。调用方拿到 Err 只能当作
+    /// "不在里面"，于是"目标落在源目录里"这种判定变成**静默 false**。
+    #[test]
+    fn trailing_parent_dir_component_still_resolves() {
+        let tmp = std::env::temp_dir().join(format!("aw-paths-dotdot-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("models/in")).unwrap();
+
+        let ends_with_dotdot = tmp.join("models").join("in").join("..");
+        assert_eq!(
+            resolve_for_compare(&ends_with_dotdot, &tmp).unwrap(),
+            resolve_for_compare(&tmp.join("models"), &tmp).unwrap(),
+            "`…/models/in/..` 必须解析成 `…/models`"
+        );
+
+        // 中间段不存在 + 尾段是 `..`：仍要按词法回退到已解析的祖先
+        let mixed = tmp.join("models").join("nope").join("..").join("in");
+        assert_eq!(
+            resolve_for_compare(&mixed, &tmp).unwrap(),
+            resolve_for_compare(&tmp.join("models/in"), &tmp).unwrap()
+        );
+
+        // 全是不存在的段：回退到最近存在的祖先即可，不能报错
+        let ghost = tmp.join("ghost").join("..").join("deep");
+        assert!(resolve_for_compare(&ghost, &tmp).is_ok());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

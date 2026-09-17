@@ -582,11 +582,26 @@ fn scan_model_dir_with_limit(dir: &Path, limit: usize) -> (bool, usize) {
 }
 
 /// 模型目录里有多少个清单模型的权重文件（用来判断模型盘挂上没）。
+///
+/// 包含判定走 `crate::paths::resolve_for_compare`（**真实路径**，会消解 `..` 与软链）：
+/// 清单里写 `/models/x/../in/y.gguf`、或模型目录本身是软链时，词法的 `Path::starts_with`
+/// 会漏报/误报——这正是本仓踩过两次的坑（见
+/// `LESSON_路径包含判定必须按真实路径而非字面前缀.md`）。既然已有唯一入口就别再各来一份。
+///
+/// 单条路径解析不了（理论上不会）就当作"不在里面"，不把整次统计打断。
 fn models_under_dir(cfg: &Option<ServerConfig>, dir: &Path) -> usize {
     let Some(cfg) = cfg else { return 0 };
+    let Ok(base) = crate::paths::resolve_for_compare(dir, dir) else {
+        return 0;
+    };
     cfg.models
         .iter()
-        .filter(|m| !m.path.is_empty() && Path::new(&m.path).starts_with(dir))
+        .filter(|m| !m.path.is_empty())
+        .filter(|m| {
+            crate::paths::resolve_for_compare(Path::new(&m.path), &base)
+                .map(|p| p.starts_with(&base))
+                .unwrap_or(false)
+        })
         .count()
 }
 
@@ -9248,6 +9263,90 @@ mod tests {
         );
         assert_eq!(models_under_dir(&cfg, Path::new("/elsewhere")), 1);
         assert_eq!(models_under_dir(&None, Path::new("/models")), 0);
+    }
+
+    /// `..` 与软链都要按**真实路径**算（LESSON：路径包含判定必须按真实路径）：
+    /// 词法比较会把 `/models/x/../in/y.gguf` 判成"不在 /models 里"、把"经软链指向模型目录"
+    /// 的路径也判成不在——模型盘明明挂了却显示没挂。
+    #[test]
+    fn models_under_dir_resolves_dotdot_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("aw-mud-{}", std::process::id()));
+        let models = root.join("models");
+        std::fs::create_dir_all(models.join("in")).unwrap();
+        let model = |id: &str, path: String| ServerModel {
+            id: id.into(),
+            task: "tts".into(),
+            family: "f".into(),
+            path,
+            url: String::new(),
+            sha256: String::new(),
+            size: None,
+        };
+
+        let cfg_with = |id: &str, path: String| {
+            Some(ServerConfig {
+                host: None,
+                port: None,
+                models: vec![model(id, path)],
+            })
+        };
+
+        // ① `..` **逃出去**：字面上以 `<root>/models` 开头，真实路径在 `<root>/outside` 里
+        //    —— 词法比较会误报成"模型盘上有这个模型"。
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let escape = models
+            .join("x")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("y.gguf")
+            .display()
+            .to_string();
+        assert_eq!(
+            models_under_dir(&cfg_with("escape", escape), &models),
+            0,
+            "`..` 逃出模型目录的不能算在里面（词法前缀会误报）"
+        );
+
+        // ② `..` 只是绕一下、真实路径仍在模型目录里 → 要算
+        let dotdot = models
+            .join("x")
+            .join("..")
+            .join("in")
+            .join("y.gguf")
+            .display()
+            .to_string();
+        assert_eq!(
+            models_under_dir(&cfg_with("dotdot", dotdot), &models),
+            1,
+            "`..` 要按真实路径消解"
+        );
+
+        // 软链：`link` 指向 models，挂在 link 下面的权重也算在 models 里
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&models, &link).unwrap();
+            // ③ 经软链指向模型目录 → 真实在模型目录里，字面上不在
+            let viasymlink = link.join("in").join("z.gguf").display().to_string();
+            assert_eq!(
+                models_under_dir(&cfg_with("viasymlink", viasymlink), &models),
+                1,
+                "经软链指向模型目录的路径也要算在里面"
+            );
+
+            // ④ 反过来：字面上在模型目录里，但中间那段是个指向外面的软链 → 不算
+            let out_link = models.join("捷径");
+            std::os::unix::fs::symlink(root.join("outside"), &out_link).unwrap();
+            let sneaky = out_link.join("w.gguf").display().to_string();
+            assert_eq!(
+                models_under_dir(&cfg_with("sneaky", sneaky), &models),
+                0,
+                "模型目录里被软链引到外面的路径不能算（词法前缀会误报）"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // 下载落盘位置现在由 `model_sources::plan_rows` 统一算（内置清单的上游布局优先，
