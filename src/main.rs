@@ -1405,6 +1405,10 @@ fn config_path() -> PathBuf {
 struct ServerConfig {
     host: Option<String>,
     port: Option<u16>,
+    /// 服务内存守卫要求的余量（MiB）；0 = 服务侧关掉了守卫。
+    /// 缺省时按 `model_sources::DEFAULT_HEADROOM_BYTES`（schema 的默认 1024 MiB）。
+    #[serde(default)]
+    min_free_memory_mb: Option<u32>,
     models: Vec<ServerModel>,
 }
 
@@ -2534,6 +2538,55 @@ fn download_plan() -> Vec<model_sources::Row> {
     model_sources::plan_rows(&server, model_sources::catalog(), &model_dir())
 }
 
+/// 推荐用的「本机尺度」：物理内存（平台探测）+ 服务守卫要求的余量（`server.json`
+/// 的 `min_free_memory_mb`，缺省 1024 MiB —— 与 `config/models.schema.yaml` 的默认一致）。
+///
+/// **唯一一处**组装它：界面文案与真实判据都从这份值算，免得"回显一套、行为另一套"。
+fn machine_budget() -> model_sources::MachineBudget {
+    let headroom = read_server_config()
+        .and_then(|cfg| cfg.min_free_memory_mb)
+        .map_or(model_sources::DEFAULT_HEADROOM_BYTES, |mb| {
+            u64::from(mb) * 1024 * 1024
+        });
+    model_sources::MachineBudget::detect(headroom)
+}
+
+/// 档位列表文案（`q8_0 1.07 GiB · f16 1.75 GiB`）。
+///
+/// 多档时补一句「下载按钮取的是哪一档」：按钮下的是与清单 `path` 对应的**那一档**，
+/// 不写清楚就会出现"界面推荐 f16、按钮却在下 q8_0"的错位。
+fn tier_line(tiers: &[model_sources::Tier]) -> String {
+    if tiers.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = tiers
+        .iter()
+        .map(|tier| {
+            let label = if tier.precision.trim().is_empty() {
+                tier.format.as_str()
+            } else {
+                tier.precision.as_str()
+            };
+            match tier.download_bytes {
+                Some(bytes) => format!("{label} {}", model_sources::human_bytes(bytes)),
+                None => format!("{label} 体积未知"),
+            }
+        })
+        .collect();
+    let mut line = format!("档位：{}", parts.join(" · "));
+    if tiers.len() > 1 {
+        if let Some(entry) = tiers.iter().find(|tier| tier.is_entry) {
+            let label = if entry.precision.trim().is_empty() {
+                entry.format.as_str()
+            } else {
+                entry.precision.as_str()
+            };
+            line.push_str(&format!("（下载按钮取 {label}）"));
+        }
+    }
+    line
+}
+
 /// 从规划里取一条真的能点的入口（点击时用；没有入口的模型这里返回 None）。
 fn download_entry_for(key: &str) -> Option<DownloadableModel> {
     download_plan()
@@ -2566,7 +2619,15 @@ fn short_bytes(n: u64) -> String {
 }
 
 /// 一条下载任务 → 界面行。没有队列快照时按磁盘上有没有正式文件给出"未下载/已就位"。
-fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) -> DownloadRow {
+///
+/// `tiers` / `advice` 由 `model_sources` 算好（纯函数 + 注入的本机尺度），
+/// 这里只做投影 —— 界面不拼判据。
+fn download_row_for(
+    m: &DownloadableModel,
+    latest: Option<&download::Snapshot>,
+    tiers: &[model_sources::Tier],
+    advice: &model_sources::Advice,
+) -> DownloadRow {
     let (state_text, base, progress, active) = match latest {
         Some(snap) => {
             let downloading = matches!(
@@ -2625,6 +2686,8 @@ fn download_row_for(m: &DownloadableModel, latest: Option<&download::Snapshot>) 
         label: m.id.clone().into(),
         state: state_text.into(),
         detail: detail.into(),
+        tiers: tier_line(tiers).into(),
+        advice: advice.note.clone().into(),
         progress,
         active,
         actionable: true,
@@ -2639,6 +2702,9 @@ fn no_source_row_for(id: &str, reason: &str) -> DownloadRow {
         label: id.into(),
         state: "没有下载源".into(),
         detail: reason.into(),
+        // 没有下载入口就谈不上"有哪几档"，两栏留空（不摆一个选不了的档位）
+        tiers: "".into(),
+        advice: "".into(),
         progress: 0.0,
         active: false,
         actionable: false,
@@ -2648,11 +2714,15 @@ fn no_source_row_for(id: &str, reason: &str) -> DownloadRow {
 /// 重建"可下载模型"列表：清单元数据 + 队列里每条的最新快照。
 fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
     let snapshots = state.downloads.borrow();
+    let budget = machine_budget();
+    let catalog = model_sources::catalog();
     let rows: Vec<DownloadRow> = download_plan()
         .into_iter()
         .map(|row| {
             // 先解构：`action` 会被 move，拆成三个局部变量后两个分支都不带部分移动
             let model_sources::Row { id, action, reason } = row;
+            // 档位与本机推荐：同一个纯函数给"仅有的这几个"行算，不在这里另写判据
+            let (tiers, advice) = model_sources::tiers_and_advice(catalog, &id, &budget);
             match action {
                 Some(action) => {
                     let model = DownloadableModel {
@@ -2665,7 +2735,7 @@ fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
                         conflict: action.conflict,
                     };
                     let latest = snapshots.iter().rev().find(|s| s.label == model.id);
-                    download_row_for(&model, latest)
+                    download_row_for(&model, latest, &tiers, &advice)
                 }
                 None => no_source_row_for(&id, &reason),
             }
@@ -4801,6 +4871,8 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     label: "audio8-tts".into(),
                     state: "下载中".into(),
                     detail: "来源：内置下载清单 · 已下载 412 MB / 2.1 GB · 从 412 MB 字节断点续传".into(),
+                    tiers: "".into(),
+                    advice: "".into(),
                     progress: 0.19,
                     active: true,
                     actionable: true,
@@ -4810,6 +4882,8 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     label: "indextts2".into(),
                     state: "排队".into(),
                     detail: "来源：server.json（服务清单） · /Users/me/models/indextts2".into(),
+                    tiers: "档位：q8_0 3.26 GiB · f16 4.24 GiB · orig 7.34 GiB（下载按钮取 q8_0）".into(),
+                    advice: "本机推荐 f16：估算占用 6.48 GiB + 余量 1.00 GiB ≤ 物理内存 16.00 GiB 的一半 8.00 GiB".into(),
                     progress: 0.0,
                     active: true,
                     actionable: true,
@@ -4819,6 +4893,8 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     label: "yue2".into(),
                     state: "已完成".into(),
                     detail: "来源：内置下载清单 · 下载完成 · /Users/me/models/yue2.gguf".into(),
+                    tiers: "".into(),
+                    advice: "".into(),
                     progress: 1.0,
                     active: false,
                     actionable: true,
@@ -4828,6 +4904,8 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     label: "ace-step".into(),
                     state: "失败".into(),
                     detail: "来源：内置下载清单 · 网络错误：服务器返回 HTTP 404 · /Users/me/models/ace.gguf".into(),
+                    tiers: "档位：q8_0 5.76 GiB · bf16 9.40 GiB（下载按钮取 q8_0）".into(),
+                    advice: "本机装不下任何一档：最小档 q8_0 要估算占用 8.77 GiB + 余量 1.00 GiB = 9.77 GiB > 物理内存 16.00 GiB 的一半 8.00 GiB".into(),
                     progress: 0.0,
                     active: false,
                     actionable: true,
@@ -4837,6 +4915,8 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     label: "qwen3-asr".into(),
                     state: "未下载".into(),
                     detail: "来源：内置下载清单 · /Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf · ⚠ 落点与 server.json 对不上：清单 path 是 /Volumes/DataExt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf，本次会下到 /Users/me/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf —— 下完服务仍可能加载不到".into(),
+                    tiers: "档位：q8_0 1.07 GiB · f16 1.75 GiB（下载按钮取 q8_0）".into(),
+                    advice: "本机推荐 f16：估算占用 3.27 GiB + 余量 1.00 GiB ≤ 物理内存 16.00 GiB 的一半 8.00 GiB".into(),
                     progress: 0.0,
                     active: false,
                     actionable: true,
@@ -4846,6 +4926,8 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                     label: "yue2".into(),
                     state: "没有下载源".into(),
                     detail: "上游 model_specs 里没有 family=yue2 的 spec —— 暂无下载源，不猜地址".into(),
+                    tiers: "".into(),
+                    advice: "".into(),
                     progress: 0.0,
                     active: false,
                     actionable: false,
@@ -4886,6 +4968,15 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             eprintln!(
                 "AW_UI_STATE=model-sources：{ready} 个有下载入口 / {missing} 个没有下载源 / {conflicts} 条带「落点与 server.json 对不上」"
             );
+            let budget = machine_budget();
+            eprintln!(
+                "AW_UI_STATE=model-sources：物理内存 = {}（服务余量 = {}）",
+                budget
+                    .physical_memory
+                    .map(model_sources::human_bytes)
+                    .unwrap_or_else(|| "拿不到".into()),
+                model_sources::human_bytes(budget.headroom_bytes)
+            );
             for r in &plan {
                 match &r.action {
                     Some(a) => {
@@ -4901,6 +4992,15 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                         )
                     }
                     None => eprintln!("  {} → 没有下载源：{}", r.id, r.reason),
+                }
+                // 档位与本机推荐（同一份纯函数算出来的，界面渲染的就是这两行）
+                let (tiers, advice) =
+                    model_sources::tiers_and_advice(model_sources::catalog(), &r.id, &budget);
+                if !tiers.is_empty() {
+                    eprintln!("      {}", tier_line(&tiers));
+                }
+                if !advice.note.is_empty() {
+                    eprintln!("      {}", advice.note);
                 }
             }
             refresh_download_rows(ui, ui_state);
@@ -10479,6 +10579,7 @@ mod tests {
         ServerConfig {
             host: None,
             port: None,
+            min_free_memory_mb: None,
             models: paths
                 .iter()
                 .enumerate()
@@ -10663,6 +10764,7 @@ mod tests {
         let cfg = Some(ServerConfig {
             host: None,
             port: None,
+            min_free_memory_mb: None,
             models: vec![
                 model("in", "/models/in/x.gguf"),
                 model("sibling", "/models-2/s/x.gguf"),
@@ -11091,6 +11193,7 @@ mod tests {
             Some(ServerConfig {
                 host: None,
                 port: None,
+                min_free_memory_mb: None,
                 models: vec![model(id, path)],
             })
         };
@@ -11337,6 +11440,7 @@ mod tests {
         let cfg = Some(ServerConfig {
             host: Some("manifest-host".into()),
             port: Some(1111),
+            min_free_memory_mb: None,
             models: vec![],
         });
 
@@ -15038,6 +15142,7 @@ mod tests {
         let cfg = ServerConfig {
             host: None,
             port: None,
+            min_free_memory_mb: None,
             models: vec![
                 m("audio8-tts", "tts", "/models/tts/x.gguf"),
                 m("qwen3-asr", "asr", "/models/asr/q.gguf"),

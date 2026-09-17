@@ -90,6 +90,10 @@ export struct DownloadRow {
     label: string,        // 展示名（同 id，给未来留别名位）
     state: string,        // 未下载 / 排队 / 下载中 / 校验中 / 已完成 / 失败 / 已取消 / 已就位 / 没有下载源
     detail: string,       // 权重来源 + 进度或失败原因（已下载 X / Y）+ 落点提醒
+    tiers: string,        // 「有哪几档」：q8_0 1.07 GiB · f16 1.75 GiB（下载按钮取 q8_0）；
+                          // 单档或没有档位时为空串（不摆一个没得选的档位）
+    advice: string,       // 「本机推荐哪一档 + 为什么」；Rust 侧用服务的内存守卫口径算好，
+                          // Slint 只显示 —— 不许在这里拼可用性/推荐判据
     progress: float,      // 0..1（总长未知时为 0）
     active: bool,         // 排队/下载中/校验中 → 按钮显示「取消」，否则回到「下载 / 重下」
     actionable: bool,     // **Rust 侧判定的投影**：false = 没有下载入口，按钮不可点。

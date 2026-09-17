@@ -20,6 +20,14 @@
 //! 服务清单里**显式给了 `url` 的以服务为准**（服务侧可以覆盖内置清单，例如内网镜像）；
 //! 服务没给才查内置清单。
 //!
+//! ## 档位与「本机推荐」
+//! 内置清单里每个 family 都带全部可下载包（`packages[]`）。本模块把**与入口同一个目录**
+//! 的单文件包当作"这个模型的档位"（同一变体的 q8_0 / f16 / orig …），并按**服务的内存守卫
+//! 口径**给出"本机推荐哪一档"：调档只看下载体积会把运行时那部分漏掉（`qwen3-asr` 0.6B
+//! q8_0 权重 1.07 GiB、服务估的是 3.31 GiB），公式与 X 的理由见 `footprint_estimate` 与
+//! `BUDGET_PERCENT_OF_PHYSICAL` 的注释。**只列 + 推荐 + 说明**：不自动改服务清单、
+//! 不自动替用户下推荐档。
+//!
 //! ## 落点
 //! 目标一律是 `<模型目录>/<相对落点>`，相对落点优先取内置清单的 `local_paths[0]`
 //! （那是上游 `target_directory + strip_prefix` 的布局，与 `server.json` 的 `path`
@@ -55,10 +63,34 @@ pub struct CatalogModel {
     /// 选中的那条包（`status == "downloadable"` 时必有）。
     #[serde(default)]
     pub entry: Option<Package>,
+    /// 这个 family 的全部包 —— 界面从这里筛出"与入口同一个目录"的档位。
+    #[serde(default)]
+    pub packages: Vec<Package>,
+    /// `session_options` 里辅助权重的体积合计（服务估算占用时要一起算）。
+    #[serde(default)]
+    pub aux_bytes: u64,
+    /// 辅助权重里**没能核实体积**的键名（非空 = 估算偏低，界面必须如实说）。
+    #[serde(default)]
+    pub aux_unresolved: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Package {
+    /// 上游包 id（判断"哪一档是下载按钮会下的那条"用）。
+    #[serde(default)]
+    pub id: String,
+    /// 档位标签：`q8_0` / `f16` / `orig` / `native`。
+    #[serde(default)]
+    pub precision: String,
+    /// 权重格式：`gguf` / `safetensors`（没有 precision 时的兜底标签）。
+    #[serde(default)]
+    pub format: String,
+    /// 整包体积（生成时 HTTP HEAD 取到；**任一文件未知就是 `None`**，不许拿已知项推算）。
+    #[serde(default)]
+    pub bytes: Option<u64>,
+    /// 这个包是不是真的能下（认识 `kind` + 有 repo + 非 gated + 每个文件都有 URL）。
+    #[serde(default)]
+    pub downloadable: bool,
     /// 相对「模型目录」的落点（上游 `target_directory` + `strip_prefix` 之后的文件路径）。
     #[serde(default)]
     pub local_paths: Vec<String>,
@@ -71,6 +103,8 @@ pub struct Package {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+/// 文件级 `bytes` 也在清单里（生成脚本离线沿用它），但**应用只读包级 `bytes`**——本模块
+/// 的约定是只声明"应用真的会读"的字段，serde 忽略其余。
 pub struct PackageFile {
     pub url: Option<String>,
 }
@@ -85,6 +119,384 @@ pub fn catalog() -> Result<&'static Catalog, &'static str> {
         Ok(c) => Ok(c),
         Err(e) => Err(e.as_str()),
     }
+}
+
+// ===========================================================================
+// 档位体积 + 「本机推荐哪一档」
+// ===========================================================================
+
+/// 服务内存守卫的运行时开销 —— 抄自上游 `app/server/model_memory.cpp` 的
+/// `estimate_model_memory_bytes()`：
+///
+/// ```text
+/// estimate = weights × 1.5 + 128 MiB
+/// ```
+///
+/// **抄同一把尺**是因为"推荐哪一档装得下"问的就是服务那句话：只看下载体积会把运行时的
+/// KV / 激活图 / GPU 缓冲全漏掉（实测 `qwen3-asr` 0.6B q8_0 权重 1.07 GiB、服务估的是
+/// 3.31 GiB，差 3 倍）。跨进程复制一份公式就有漂移风险，所以用三个**真机 503 原文**里的
+/// 数字钉住它（`footprint_estimate_reproduces_the_three_real_503_numbers`）——上游改了系数
+/// 这里不会自动知道，所以界面上说的始终是"估算"，最终能不能加载由服务的守卫决定。
+const RUNTIME_OVERHEAD_PERCENT: u64 = 50;
+const FIXED_OVERHEAD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// `server.json` 没写 `min_free_memory_mb` 时的余量（schema 的默认就是 1024 MiB）。
+pub const DEFAULT_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 推荐时只把物理内存的**这一半**算作"这一档可以花的预算"。
+///
+/// 取 50% 的理由：服务的守卫比的是**当时可用**内存（macOS 上 free+inactive+purgeable），
+/// 而这里只知道**物理**内存总量；可用永远小于物理，而且在真机上差得很远 —— 同一台 16 GiB
+/// 的机器上，并行编译时服务只拿到 1.0–3.9 GiB 可用（物理的 6%–24%）。所以推荐只能是
+/// "这台机器适合哪一档"的**规划口径**：一半留给系统、桌面、引擎常驻的其它模型与文件缓存。
+/// 它是**天花板不是承诺**：真正能不能加载由服务守卫决定，文案里不许写"保证装得下"。
+pub const BUDGET_PERCENT_OF_PHYSICAL: u64 = 50;
+
+/// 服务口径的加载占用估算（`weights × 1.5 + 128 MiB`；整数运算与上游的
+/// `floor(weights * 1.5)` 等价）。
+pub fn footprint_estimate(weights_bytes: u64) -> u64 {
+    weights_bytes + weights_bytes * RUNTIME_OVERHEAD_PERCENT / 100 + FIXED_OVERHEAD_BYTES
+}
+
+/// 体积文案：`GiB` / `MiB`。与服务 503 里报的 `GiB` 同一口径，用户可以逐字对照；
+/// 进度行的 `short_bytes` 只求短，是另一回事。
+pub fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.2} GiB", value / GIB)
+    } else {
+        format!("{:.0} MiB", value / MIB)
+    }
+}
+
+/// 推荐要用的"本机尺度"。两个输入都来自真实来源（物理内存来自平台探测、`headroom`
+/// 来自 `server.json` 的 `min_free_memory_mb`），做成结构体是为了在单测里**注入** ——
+/// 一台机器只有一个物理内存值，不注入就写不出能红的用例。
+#[derive(Debug, Clone, Copy)]
+pub struct MachineBudget {
+    pub physical_memory: Option<u64>,
+    pub headroom_bytes: u64,
+}
+
+impl MachineBudget {
+    /// 物理内存走平台探测；`headroom_bytes` 由调用方从服务清单取。
+    pub fn detect(headroom_bytes: u64) -> Self {
+        Self {
+            physical_memory: physical_memory_bytes(),
+            headroom_bytes,
+        }
+    }
+
+    /// 这一档可以花的预算（物理内存的一半；拿不到物理内存时 `None`）。
+    fn per_model_budget(&self) -> Option<u64> {
+        self.physical_memory
+            .map(|total| total / 100 * BUDGET_PERCENT_OF_PHYSICAL)
+    }
+}
+
+/// 同落点目录里的一个可下载档位（同一变体的 q8_0 / f16 / orig …）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier {
+    pub precision: String,
+    pub format: String,
+    /// 下载体积（HTTP HEAD 取到的原始字节）；清单里没取到 → `None`
+    pub download_bytes: Option<u64>,
+    /// 服务口径的加载占用 = `(下载体积 + 辅助权重) × 1.5 + 128 MiB`
+    pub footprint_bytes: Option<u64>,
+    /// 是不是「下载」按钮实际会下的那一档（与清单 `path` 对应的那一条）
+    pub is_entry: bool,
+}
+
+/// 「本机推荐哪一档」+ 理由。`tier = None` = 没有可推荐的档（只有一档 / 体积未知 /
+/// 内存未知 / 全都装不下），此时 `note` 必须说清是哪种。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Advice {
+    pub tier: Option<String>,
+    pub note: String,
+}
+
+/// 档位在界面上的短标签：优先 `precision`（q8_0 / f16 / orig），没有就用 `format`。
+fn label_of(tier: &Tier) -> String {
+    if !tier.precision.trim().is_empty() {
+        tier.precision.clone()
+    } else if !tier.format.trim().is_empty() {
+        tier.format.clone()
+    } else {
+        "（未标精度）".to_string()
+    }
+}
+
+/// `(档位, 本机尺度) → 推荐` 的**唯一判据**（纯函数）。
+///
+/// 规则：`占用估算 + 服务的余量 ≤ 物理内存的一半` 里**最大的那一档**。
+/// - 为什么取最大的：档位越大质量越好，装得下就没理由让用户退而求其次；
+///   "越小越稳"会让 64 GiB 的机器也去下最小档，白白浪费机器。
+/// - 为什么用**物理**内存而不是当时可用内存：可用每秒钟都在变（同一台机器实测
+///   1.0→3.9 GiB），一个会跳的推荐等于没推荐；物理内存是稳定的机器属性。
+pub fn recommend_tier(tiers: &[Tier], budget: &MachineBudget) -> Advice {
+    if tiers.is_empty() {
+        return Advice::default();
+    }
+    let Some(per_model) = budget.per_model_budget() else {
+        return Advice {
+            tier: None,
+            note: "拿不到本机物理内存，不猜推荐".into(),
+        };
+    };
+    let physical = budget.physical_memory.unwrap_or_default();
+    let known: Vec<&Tier> = tiers
+        .iter()
+        .filter(|tier| tier.footprint_bytes.is_some())
+        .collect();
+    let unknown = tiers.len() - known.len();
+    let with_caveat = |mut note: String| {
+        if unknown > 0 {
+            note.push_str(&format!("（另有 {unknown} 档体积未知，未参与比较）"));
+        }
+        note
+    };
+    if known.is_empty() {
+        return Advice {
+            tier: None,
+            note: "档位体积未知（生成清单时没取到），无法判断哪一档装得下".into(),
+        };
+    }
+    let required = |tier: &Tier| tier.footprint_bytes.unwrap_or_default() + budget.headroom_bytes;
+    if tiers.len() == 1 {
+        let only = &tiers[0];
+        let fits = required(only) <= per_model;
+        let (sign, verdict) = if fits {
+            ("≤", "装得下")
+        } else {
+            (">", "装不下")
+        };
+        return Advice {
+            tier: None,
+            note: format!(
+                "只有一档 {}：估算占用 {} + 余量 {} {} 物理内存 {} 的一半 {} —— {verdict}",
+                label_of(only),
+                human_bytes(only.footprint_bytes.unwrap_or_default()),
+                human_bytes(budget.headroom_bytes),
+                sign,
+                human_bytes(physical),
+                human_bytes(per_model),
+            ),
+        };
+    }
+    let mut fits: Vec<&Tier> = known
+        .iter()
+        .copied()
+        .filter(|tier| required(tier) <= per_model)
+        .collect();
+    fits.sort_by_key(|tier| {
+        (
+            tier.footprint_bytes.unwrap_or_default(),
+            tier.precision.clone(),
+        )
+    });
+    match fits.last() {
+        Some(best) => {
+            let mut note = format!(
+                "本机推荐 {}：估算占用 {} + 余量 {} ≤ 物理内存 {} 的一半 {}",
+                label_of(best),
+                human_bytes(best.footprint_bytes.unwrap_or_default()),
+                human_bytes(budget.headroom_bytes),
+                human_bytes(physical),
+                human_bytes(per_model),
+            );
+            if !best.is_entry {
+                if let Some(entry) = tiers.iter().find(|tier| tier.is_entry) {
+                    note.push_str(&format!(
+                        "；下载按钮取的是 {}（与清单 path 对应的那一档）",
+                        label_of(entry)
+                    ));
+                }
+            }
+            Advice {
+                tier: Some(best.precision.clone()),
+                note: with_caveat(note),
+            }
+        }
+        None => {
+            let smallest = known
+                .iter()
+                .copied()
+                .min_by_key(|tier| tier.footprint_bytes.unwrap_or_default())
+                .unwrap_or(&tiers[0]);
+            Advice {
+                tier: None,
+                note: with_caveat(format!(
+                    "本机装不下任何一档：最小档 {} 要估算占用 {} + 余量 {} = {} > 物理内存 {} 的一半 {}",
+                    label_of(smallest),
+                    human_bytes(smallest.footprint_bytes.unwrap_or_default()),
+                    human_bytes(budget.headroom_bytes),
+                    human_bytes(required(smallest)),
+                    human_bytes(physical),
+                    human_bytes(per_model),
+                )),
+            }
+        }
+    }
+}
+
+/// 一个模型的档位 = **与入口同一个目录**里的可下载单文件包。
+///
+/// 为什么不按 `target_directory` 或 family 分组：
+/// - `target_directory` 太粗：`ace-step` 的 turbo / base / xl 是**不同变体**，都挂在
+///   `ACE-Step1.5-GGUF` 下，混在一起会把"另一个模型"当成"另一档"；
+/// - family 更粗：`qwen3_asr` 同时管 0.6B 与 1.7B，`index_tts2` 同时管 2.0 与 2.5。
+///
+/// 只收**单文件**包：多文件包（safetensors 等）下载器还不支持，列出来等于给一个点不了的入口。
+fn tiers_of(model: &CatalogModel) -> Vec<Tier> {
+    let Some(entry) = model.entry.as_ref() else {
+        return Vec::new();
+    };
+    let Some(entry_path) = entry.local_paths.first() else {
+        return Vec::new();
+    };
+    let dir = parent_dir(entry_path);
+    let aux = model.aux_bytes;
+    let mut tiers: Vec<Tier> = model
+        .packages
+        .iter()
+        .filter(|package| {
+            package.downloadable
+                && package.files.len() == 1
+                && package
+                    .local_paths
+                    .first()
+                    .is_some_and(|rel| parent_dir(rel) == dir)
+        })
+        .map(|package| Tier {
+            precision: package.precision.clone(),
+            format: package.format.clone(),
+            download_bytes: package.bytes,
+            footprint_bytes: package
+                .bytes
+                .map(|weights| footprint_estimate(weights + aux)),
+            is_entry: package.id == entry.id,
+        })
+        .collect();
+    // 稳定顺序：体积升序（未知排最后），同体积按 precision —— 界面顺序必须可复现
+    tiers.sort_by_key(|tier| {
+        (
+            tier.footprint_bytes.unwrap_or(u64::MAX),
+            tier.precision.clone(),
+        )
+    });
+    tiers
+}
+
+/// 相对落点里"文件所在的那一层目录"（清单里的路径一律 `/` 分隔，与平台无关）。
+fn parent_dir(rel: &str) -> &str {
+    rel.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+}
+
+/// 一个模型的档位 + 本机推荐（`plan_rows` 之外单独取：推荐要看**同目录**的其它档）。
+///
+/// `catalog` 传 `Result` 而不是 `Option`：内置清单**读不出来**是"说不清"，与"这个模型
+/// 没有档位"是两回事（前者界面要说清，后者不显示）。
+pub fn tiers_and_advice(
+    catalog: Result<&Catalog, &str>,
+    model_id: &str,
+    budget: &MachineBudget,
+) -> (Vec<Tier>, Advice) {
+    let model = catalog
+        .ok()
+        .and_then(|catalog| catalog.models.iter().find(|m| m.id == model_id));
+    let Some(model) = model else {
+        return (Vec::new(), Advice::default());
+    };
+    let tiers = tiers_of(model);
+    let mut advice = recommend_tier(&tiers, budget);
+    if !model.aux_unresolved.is_empty() && !advice.note.is_empty() {
+        advice.note.push_str(&format!(
+            "（另有 {} 项辅助权重没能核实体积，估算偏低）",
+            model.aux_unresolved.len()
+        ));
+    }
+    (tiers, advice)
+}
+
+// ---------------------------------------------------------------------------
+// 本机物理内存
+// ---------------------------------------------------------------------------
+
+/// 本机物理内存（字节）。拿不到就是 `None` —— 推荐必须能区分"内存未知"，
+/// 不许拿 0 兜底（0 会让每一档都判成装不下，等于凭空编一个结论）。
+pub fn physical_memory_bytes() -> Option<u64> {
+    physical_memory_with(&platform_memory_probe)
+}
+
+/// 探测缝：`probe` 给平台的原始输出，解析是纯函数（三种格式在任一平台上都可测）。
+fn physical_memory_with(probe: &dyn Fn() -> Option<String>) -> Option<u64> {
+    parse_physical_memory(&probe()?)
+}
+
+/// 解析平台探测输出里的物理内存字节数。三种格式都认：
+///
+/// - macOS `sysctl -n hw.memsize` → `17179869184`
+/// - Windows PowerShell `(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory` → `17179869184`
+/// - Linux `/proc/meminfo` → `MemTotal:       16384000 kB`
+pub fn parse_physical_memory(raw: &str) -> Option<u64> {
+    for line in raw.lines() {
+        // PowerShell 的 stdout 可能带 BOM
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return kib.checked_mul(1024).filter(|total| *total > 0);
+        }
+        if let Ok(bytes) = line.parse::<u64>() {
+            return (bytes > 0).then_some(bytes);
+        }
+    }
+    None
+}
+
+/// 平台探测：macOS `sysctl` / Linux `/proc/meminfo` / Windows PowerShell。
+///
+/// 命令与解析都留在本模块，别处只消费 `physical_memory_bytes()`（"这份机器尺度从哪来"
+/// 只有一处，免得回显与实际各算一份）。
+#[cfg(target_os = "macos")]
+fn platform_memory_probe() -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_memory_probe() -> Option<String> {
+    std::fs::read_to_string("/proc/meminfo").ok()
+}
+
+#[cfg(windows)]
+fn platform_memory_probe() -> Option<String> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+        ])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// 其它平台：不猜（`None` → 界面说"拿不到本机物理内存"）。
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn platform_memory_probe() -> Option<String> {
+    None
 }
 
 /// 服务清单里一条模型（只取下载相关的字段，不依赖 `main.rs` 的 `ServerModel`）。
@@ -386,22 +798,82 @@ mod tests {
     }
 
     fn cat_model(id: &str, status: &str, note: &str, pkg: Option<Package>) -> CatalogModel {
+        let packages: Vec<Package> = pkg.iter().cloned().collect();
         CatalogModel {
             id: id.into(),
             spec: "f.json".into(),
             status: status.into(),
             note: note.into(),
             entry: pkg,
+            packages,
+            aux_bytes: 0,
+            aux_unresolved: Vec::new(),
         }
     }
 
     fn pkg(local: &str, url: &str) -> Package {
         Package {
+            id: format!("pkg-{local}"),
+            precision: "q8_0".into(),
+            format: "gguf".into(),
+            bytes: None,
+            downloadable: true,
             local_paths: vec![local.into()],
             gated: false,
             files: vec![PackageFile {
                 url: Some(url.into()),
             }],
+        }
+    }
+
+    /// 造一个"有档位"的模型：`(precision, 体积, 是不是下载按钮那一档)`，同目录。
+    fn model_with_tiers(
+        dir: &str,
+        tiers: &[(&str, Option<u64>, bool)],
+        aux_bytes: u64,
+    ) -> CatalogModel {
+        let packages: Vec<Package> = tiers
+            .iter()
+            .map(|(precision, bytes, _)| Package {
+                id: format!("{dir}::{precision}"),
+                precision: (*precision).into(),
+                format: "gguf".into(),
+                bytes: *bytes,
+                downloadable: true,
+                local_paths: vec![format!("{dir}/{precision}.gguf")],
+                gated: false,
+                files: vec![PackageFile {
+                    url: Some(format!("https://example.com/{dir}/{precision}.gguf")),
+                }],
+            })
+            .collect();
+        let entry = tiers
+            .iter()
+            .find(|(_, _, is_entry)| *is_entry)
+            .or_else(|| tiers.first())
+            .and_then(|(precision, _, _)| {
+                packages
+                    .iter()
+                    .find(|package| package.precision == *precision)
+                    .cloned()
+            });
+        CatalogModel {
+            id: "m".into(),
+            spec: "f.json".into(),
+            status: "downloadable".into(),
+            note: String::new(),
+            entry,
+            packages,
+            aux_bytes,
+            aux_unresolved: Vec::new(),
+        }
+    }
+
+    fn budget(physical_gib: f64, headroom_gib: f64) -> MachineBudget {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        MachineBudget {
+            physical_memory: Some((physical_gib * GIB) as u64),
+            headroom_bytes: (headroom_gib * GIB) as u64,
         }
     }
 
@@ -901,6 +1373,298 @@ mod tests {
                 "yue2",
             ],
             "5 个如实标没有源"
+        );
+    }
+
+    // ---- 档位体积 + 推荐 -------------------------------------------------
+
+    /// 估算公式必须与服务**自己报的数字**逐位吻合：三个 `estimated N GiB` 来自真机
+    /// `insufficient_memory` 的 503 原文，权重是实测的文件大小。
+    ///
+    /// 阳性对照：把 `RUNTIME_OVERHEAD_PERCENT` 改成 100（或删掉 `FIXED_OVERHEAD_BYTES`）
+    /// → 本条红。
+    #[test]
+    fn footprint_estimate_reproduces_the_three_real_503_numbers() {
+        // qwen3-asr 0.6B q8_0 + forced aligner 0.6B q8_0（合计 2282478660 B）
+        // → 服务报 "estimated 3.31 GiB"
+        assert_eq!(footprint_estimate(2282478660), 3557935718);
+        assert_eq!(human_bytes(3557935718), "3.31 GiB");
+        // index-tts2 2.5 q8_0（3502955328 B）→ 服务报 "estimated 5.02 GiB"
+        assert_eq!(footprint_estimate(3502955328), 5388650720);
+        assert_eq!(human_bytes(5388650720), "5.02 GiB");
+        // stable-audio-small-music 目录树（1683577736 B）→ 服务报 "estimated 2.48 GiB"
+        assert_eq!(footprint_estimate(1683577736), 2659584332);
+        assert_eq!(human_bytes(2659584332), "2.48 GiB");
+    }
+
+    /// 多档：推荐"预算内最大的那一档"。
+    ///
+    /// 用 index-tts2 的真实三档（3.26 / 4.24 / 7.34 GiB 权重）：
+    /// 16 GiB 机器预算 8 GiB → 推荐 f16（7.48 GiB 需求）；orig 要 12.14 GiB，排除。
+    /// 阳性对照：把 `BUDGET_PERCENT_OF_PHYSICAL` 改成 100 → 会推荐 orig，本条红。
+    #[test]
+    fn recommend_tier_picks_the_largest_that_fits() {
+        let model = model_with_tiers(
+            "IndexTTS2.5-GGUF",
+            &[
+                ("q8_0", Some(3502955328), true),
+                ("f16", Some(4547355072), false),
+                ("orig", Some(7885093440), false),
+            ],
+            0,
+        );
+        let tiers = tiers_of(&model);
+        assert_eq!(tiers.len(), 3, "三档都在同一个目录里");
+        assert!(tiers[0].is_entry, "入口是 q8_0（清单 path 指向它）");
+        assert_eq!(tiers[0].footprint_bytes, Some(5388650720));
+
+        let advice = recommend_tier(&tiers, &budget(16.0, 1.0));
+        assert_eq!(advice.tier.as_deref(), Some("f16"), "{}", advice.note);
+        assert!(advice.note.contains("本机推荐 f16"), "{}", advice.note);
+        // 推荐的**不是**入口那一档（入口是 q8_0）→ 必须点明按钮下的是哪一档
+        assert!(
+            advice.note.contains("下载按钮取的是 q8_0"),
+            "{}",
+            advice.note
+        );
+
+        // 32 GiB 的机器：预算 16 GiB，最大的 orig（12.14 GiB）也装得下
+        assert_eq!(
+            recommend_tier(&tiers, &budget(32.0, 1.0)).tier.as_deref(),
+            Some("orig")
+        );
+    }
+
+    /// 推荐的**就是**入口那一档时，别再补一句"下载按钮取的是…"（没有错位就不用解释）。
+    #[test]
+    fn advice_stays_quiet_about_the_button_when_it_matches_the_recommendation() {
+        let model = model_with_tiers(
+            "IndexTTS2.5-GGUF",
+            &[
+                ("q8_0", Some(3502955328), true),
+                ("orig", Some(7885093440), false),
+            ],
+            0,
+        );
+        // 13 GiB 机器：预算 6.5 GiB → 只有 q8_0（6.02 GiB）装得下，而它就是入口
+        let advice = recommend_tier(&tiers_of(&model), &budget(13.0, 1.0));
+        assert_eq!(advice.tier.as_deref(), Some("q8_0"), "{}", advice.note);
+        assert!(!advice.note.contains("下载按钮"), "{}", advice.note);
+    }
+
+    /// 全都装不下：`tier` 必须是 `None`（界面不显示推荐档），理由里给出数字。
+    ///
+    /// 阳性对照：把 `per_model_budget` 改成不除（`physical_memory` 直接用）→ 本条红。
+    #[test]
+    fn recommend_tier_refuses_when_nothing_fits() {
+        let model = model_with_tiers(
+            "IndexTTS2.5-GGUF",
+            &[
+                ("q8_0", Some(3502955328), true),
+                ("f16", Some(4547355072), false),
+            ],
+            0,
+        );
+        // 8 GiB 机器：预算 4 GiB，最小档也要 6.02 GiB
+        let advice = recommend_tier(&tiers_of(&model), &budget(8.0, 1.0));
+        assert_eq!(advice.tier, None);
+        assert!(advice.note.contains("装不下任何一档"), "{}", advice.note);
+        assert!(advice.note.contains("q8_0"), "{}", advice.note);
+        assert!(advice.note.contains("6.02 GiB"), "{}", advice.note);
+    }
+
+    /// 体积未知：不许瞎推荐，也不许把未知档当成"装得下"。
+    #[test]
+    fn recommend_tier_reports_unknown_sizes_instead_of_guessing() {
+        let model = model_with_tiers(
+            "X-GGUF",
+            &[("q8_0", Some(3000000000), true), ("f16", None, false)],
+            0,
+        );
+        let tiers = tiers_of(&model);
+        assert_eq!(tiers[1].footprint_bytes, None);
+        let advice = recommend_tier(&tiers, &budget(16.0, 1.0));
+        assert_eq!(advice.tier.as_deref(), Some("q8_0"));
+        assert!(advice.note.contains("另有 1 档体积未知"), "{}", advice.note);
+        assert!(advice.note.contains("未参与比较"), "{}", advice.note);
+
+        // 全未知 → 连结论都不给
+        let all_unknown =
+            model_with_tiers("Y-GGUF", &[("q8_0", None, true), ("f16", None, false)], 0);
+        let advice = recommend_tier(&tiers_of(&all_unknown), &budget(16.0, 1.0));
+        assert_eq!(advice.tier, None);
+        assert!(advice.note.contains("体积未知"), "{}", advice.note);
+    }
+
+    /// 内存未知：不猜（`tier` 为 None，理由说清是"拿不到物理内存"）。
+    ///
+    /// 阳性对照：把 `physical_memory` 的 `None` 当成 0 兜底 → 会退化成"全都装不下"，本条红。
+    #[test]
+    fn recommend_tier_reports_unknown_memory_instead_of_guessing() {
+        let model = model_with_tiers("X-GGUF", &[("q8_0", Some(1000), true)], 0);
+        let advice = recommend_tier(
+            &tiers_of(&model),
+            &MachineBudget {
+                physical_memory: None,
+                headroom_bytes: DEFAULT_HEADROOM_BYTES,
+            },
+        );
+        assert_eq!(advice.tier, None);
+        assert!(
+            advice.note.contains("拿不到本机物理内存"),
+            "{}",
+            advice.note
+        );
+        assert!(
+            !advice.note.contains("装不下"),
+            "别把未知说成装不下：{}",
+            advice.note
+        );
+    }
+
+    /// 只有一档：没有可比较的档，所以不给"推荐"，但要说清这一档装不装得下。
+    #[test]
+    fn recommend_tier_describes_a_single_tier_without_recommending() {
+        let model = model_with_tiers("X-GGUF", &[("q8_0", Some(1000000000), true)], 0);
+        let tiers = tiers_of(&model);
+        assert_eq!(tiers.len(), 1);
+        let fits = recommend_tier(&tiers, &budget(16.0, 1.0));
+        assert_eq!(fits.tier, None, "只有一档就没有'推荐哪一档'");
+        assert!(fits.note.contains("只有一档 q8_0"), "{}", fits.note);
+        assert!(fits.note.contains("装得下"), "{}", fits.note);
+
+        let too_small = recommend_tier(&tiers, &budget(1.0, 1.0));
+        assert!(too_small.note.contains("装不下"), "{}", too_small.note);
+    }
+
+    /// 档位只收**同目录**里的**单文件**包：
+    /// 别的目录 = 别的变体（ace-step 的 turbo / base / xl），多文件包 = 下载器还不支持。
+    ///
+    /// 阳性对照：去掉 `parent_dir(rel) == dir` 这一条 → 会把别的变体算成"另一档"，本条红。
+    #[test]
+    fn tiers_are_only_the_same_directory_single_file_packages() {
+        let mut model = model_with_tiers(
+            "Wanted-GGUF",
+            &[("q8_0", Some(100), true), ("f16", Some(200), false)],
+            0,
+        );
+        // 另一个变体：同 target_directory、不同子目录（ace-step 的真实形状）
+        let mut other = pkg("Other-GGUF/x.gguf", "https://example.com/other.gguf");
+        other.precision = "q8_0".into();
+        other.bytes = Some(999);
+        model.packages.push(other);
+        // 多文件包：下载器不支持，不许列成"可下的档"
+        let mut multi = pkg("Wanted-GGUF/a.json", "https://example.com/a.json");
+        multi.local_paths = vec![
+            "Wanted-GGUF/a.json".into(),
+            "Wanted-GGUF/b.safetensors".into(),
+        ];
+        multi.files = vec![
+            PackageFile {
+                url: Some("https://example.com/a.json".into()),
+            },
+            PackageFile {
+                url: Some("https://example.com/b.safetensors".into()),
+            },
+        ];
+        model.packages.push(multi);
+
+        let tiers = tiers_of(&model);
+        assert_eq!(tiers.len(), 2, "只该有同目录的两个单文件档：{tiers:?}");
+        assert_eq!(
+            tiers
+                .iter()
+                .map(|t| t.precision.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q8_0", "f16"]
+        );
+    }
+
+    /// 辅助权重（如 qwen3-asr 的 forced aligner）必须算进占用估算，否则推荐会偏乐观。
+    #[test]
+    fn aux_weights_are_part_of_the_footprint() {
+        let bare = model_with_tiers("X-GGUF", &[("q8_0", Some(1000000000), true)], 0);
+        let with_aux = model_with_tiers("X-GGUF", &[("q8_0", Some(1000000000), true)], 500000000);
+        assert_eq!(
+            tiers_of(&bare)[0].footprint_bytes,
+            Some(footprint_estimate(1000000000))
+        );
+        assert_eq!(
+            tiers_of(&with_aux)[0].footprint_bytes,
+            Some(footprint_estimate(1500000000))
+        );
+    }
+
+    /// 没能核实的辅助权重会让估算**偏低**，界面必须如实说（不许悄悄乐观）。
+    #[test]
+    fn advice_carries_the_unresolved_aux_caveat() {
+        let mut model = model_with_tiers("X-GGUF", &[("q8_0", Some(3000000000), true)], 0);
+        model.aux_unresolved = vec!["x.vad_model_path".into()];
+        let catalog = Catalog {
+            models: vec![model],
+        };
+        let (_tiers, advice) = tiers_and_advice(Ok(&catalog), "m", &budget(16.0, 1.0));
+        assert!(
+            advice.note.contains("1 项辅助权重没能核实体积"),
+            "{}",
+            advice.note
+        );
+    }
+
+    /// 清单里没有这个模型（或清单读不出来）→ 没有档位、也没有推荐文案。
+    #[test]
+    fn tiers_and_advice_is_empty_without_a_catalog_entry() {
+        let catalog = Catalog { models: vec![] };
+        let (tiers, advice) = tiers_and_advice(Ok(&catalog), "m", &budget(16.0, 1.0));
+        assert!(tiers.is_empty());
+        assert_eq!(advice, Advice::default());
+        let (tiers, advice) = tiers_and_advice(Err("坏了"), "m", &budget(16.0, 1.0));
+        assert!(tiers.is_empty());
+        assert_eq!(advice, Advice::default());
+    }
+
+    /// 物理内存探测：三种平台的输出都要认（在任一平台上都可测）。
+    ///
+    /// 阳性对照：把 Linux 那支的 `* 1024` 去掉 → 第一条断言红（16 GB 变成 16 MB，推荐全乱）。
+    #[test]
+    fn physical_memory_parsing_covers_all_three_platforms() {
+        // macOS `sysctl -n hw.memsize`
+        assert_eq!(parse_physical_memory("17179869184\n"), Some(17179869184));
+        // Windows PowerShell（可能带 BOM）
+        assert_eq!(
+            parse_physical_memory("\u{feff}17179869184\r\n"),
+            Some(17179869184)
+        );
+        // Linux /proc/meminfo：kB → 字节
+        assert_eq!(
+            parse_physical_memory("MemTotal:       16777216 kB\nMemFree:  1 kB\n"),
+            Some(17179869184)
+        );
+        // 认不出来 / 0 / 空 → None（不许拿 0 当"内存"）
+        assert_eq!(parse_physical_memory(""), None);
+        assert_eq!(parse_physical_memory("MemTotal:       0 kB\n"), None);
+        assert_eq!(parse_physical_memory("not a number\n"), None);
+    }
+
+    /// 探测缝：命令起不来 / 输出读不到 → `None`（界面说"拿不到"，不是"内存是 0"）。
+    #[test]
+    fn physical_memory_with_reports_none_when_the_probe_fails() {
+        assert_eq!(physical_memory_with(&|| None), None);
+        assert_eq!(physical_memory_with(&|| Some(String::new())), None);
+        assert_eq!(
+            physical_memory_with(&|| Some("17179869184".to_string())),
+            Some(17179869184)
+        );
+    }
+
+    /// 真机自检：这台机器上必须**真的拿到**物理内存（探测链没断）。
+    #[test]
+    fn physical_memory_is_available_on_this_machine() {
+        let total = physical_memory_bytes().expect("本机应能探测物理内存");
+        assert!(
+            total >= 2 * 1024 * 1024 * 1024,
+            "物理内存 {} 字节小得可疑，探测可能解析错了",
+            total
         );
     }
 }

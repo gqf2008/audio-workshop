@@ -446,6 +446,22 @@ export component WorkbenchDrawer inherits VerticalLayout {
                                 wrap: word-wrap;
                                 overflow: elide;
                             }
+                            // 有哪几档（多档模型才有）
+                            if d.tiers != "" : Text {
+                                text: d.tiers;
+                                color: PixelTheme.text;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                            }
+                            // 本机推荐哪一档 + 为什么（Rust 侧算好的纯函数结论）
+                            if d.advice != "" : Text {
+                                text: d.advice;
+                                color: PixelTheme.accent;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                            }
                         }
                     }
                 }
