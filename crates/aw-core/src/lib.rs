@@ -17,7 +17,8 @@ pub mod song;
 pub mod text_layer;
 
 pub use audio_client::{
-    Client, ClientError, VoiceClone, DEFAULT_ASR_MODEL, MISSING_REFERENCE_TEXT,
+    Client, ClientError, VoiceClone, DEFAULT_ASR_MODEL, MISSING_REFERENCE_PATH,
+    MISSING_REFERENCE_TEXT,
 };
 pub use bgm::{
     assemble_bgm, bgm_artifacts_from_disk, bgm_only_artifacts, generate_segments,

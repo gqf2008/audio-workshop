@@ -219,7 +219,9 @@ export component VoicePanel inherits Rectangle {
                 }
                 PixelTextInput {
                     horizontal-stretch: 1;
-                    enabled: !root.busy;
+                    // 转写中禁编辑：否则落地的转写结果会**覆盖用户此刻打进去的字**
+                    // （复核指出；按钮早就按 !transcribing 灰掉了，输入框漏了这一条）
+                    enabled: !root.busy && !root.transcribing;
                     text <=> root.reference-text;
                     placeholder: "这段参考音频里实际念的内容（服务端要求与音频成对）";
                     edited => { root.reference-text-edited(); }

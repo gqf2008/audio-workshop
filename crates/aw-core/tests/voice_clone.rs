@@ -76,6 +76,16 @@ fn clone_without_reference_text_is_refused_before_any_request() {
     let c = VoiceClone::new("/tmp/ref.wav", " 你好 ").unwrap();
     assert_eq!(c.reference_text(), " 你好 ");
     assert_eq!(c.path(), "/tmp/ref.wav");
+
+    // 路径也要校验：只校文本的话"空路径 + 有文本"会过，然后发出 voice_ref: ""
+    // —— 与这个类型自称的"成对"不一致（复核指出；UI 走不到，但类型不变式该自己守）
+    for blank in ["", "   ", "\t"] {
+        let err = VoiceClone::new(blank, "有文本").unwrap_err();
+        assert!(
+            err.to_string().contains("参考音频路径"),
+            "空路径要报「没给路径」：{err}"
+        );
+    }
 }
 
 #[test]

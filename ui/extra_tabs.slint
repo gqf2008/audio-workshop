@@ -102,7 +102,8 @@ export component VoiceDesignTab inherits Rectangle {
                             spacing: 12px;
                             PixelTextInput {
                                 horizontal-stretch: 1;
-                                enabled: !root.busy;
+                                // 与配音页同一条：转写中禁编辑，否则结果会覆盖用户正在打的字
+                                enabled: !root.busy && !root.transcribing;
                                 text <=> root.reference-text;
                                 placeholder: "这段参考音频里实际念的内容（与音频成对，必填）";
                                 edited => { root.reference-text-edited(); }

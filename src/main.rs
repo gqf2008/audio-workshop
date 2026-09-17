@@ -831,7 +831,9 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
             ui.set_status_text(format!("已经在用「{}」", entry.name).into());
             return;
         }
-        ui.set_voice_ref_path(path.display().to_string().into());
+        // 走唯一入口：换到另一段音频 ⇒ 上一段名下的转写一起清（否则会拿它的文本
+        // 当条件去克隆新音频，服务端不报错但声音已经不是用户要的那个）
+        set_voice_ref(&ui, path.to_string_lossy().as_ref());
         // 与手工改参考音频同一条路：作废工程与成品，提示需要重新合成
         invalidate_worker_project(&tx, &st);
         reset_bgm(&ui, &st);
@@ -3883,6 +3885,37 @@ fn new_project_from_inputs(
     project
 }
 
+/// 参考文本只属于**当前这一段**参考音；路径一换，它就作废。
+///
+/// 返回 true = 文本仍然有效（还是同一段音频），不用清。
+///
+/// 为什么"必须清"不是洁癖（复核真机复现的静默缺陷）：文本非空 ⇒
+/// `reference_text_missing`（本文件下方）拦不住；而 `settings_allow_reuse` 见
+/// `voice_ref` 变了会**重录** ⇒ 于是**拿 A 音频的转写去条件 B 音频**。
+/// 服务端不报错（正确文本 273241B / 完全无关文本 289628B —— 产物已经变了），
+/// 用户只会觉得"换了音频但音色怪怪的"。
+fn keeps_reference_text(old_path: &str, new_path: &str) -> bool {
+    let old = old_path.trim();
+    !old.is_empty() && old == new_path.trim()
+}
+
+/// 清掉参考文本与它的状态行。**唯一入口**：清除参考音、换参考音、手改路径都走它。
+fn clear_reference_text(ui: &MainWindow) {
+    ui.set_voice_ref_text("".into());
+    ui.set_voice_ref_text_status("".into());
+}
+
+/// 换参考音频：写路径，并**在路径真的变了的时候**把名下的文本一起清掉。
+///
+/// 这是全文件**唯一一处**写 `voice-ref-path` 的地方 —— 源码级守卫
+/// `reference_path_writes_go_through_this_helper` 钉住了这点，谁再绕过它就红。
+fn set_voice_ref(ui: &MainWindow, path: &str) {
+    if !keeps_reference_text(&ui.get_voice_ref_path(), path) {
+        clear_reference_text(ui);
+    }
+    ui.set_voice_ref_path(path.into());
+}
+
 /// 界面上的音色输入：**唯一入口**。
 ///
 /// 返回 `(参考音频路径, 参考音频的文本)`，并在这里统一执行"没有参考音就不带孤立文本"
@@ -4529,9 +4562,10 @@ fn restore_project(
         // 不保留默认 index，否则“开始合成”会把缺失模型静默换成另一音色。
         ui.set_voice_index(-1);
     }
-    ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
     // 参考文本与参考音一起回灌：只回灌路径的话，重开应用后克隆音色会因为"没文本"
-    // 被前置拦截挡住，用户得凭空重填一次（其实工程里存着）
+    // 被前置拦截挡住，用户得凭空重填一次（其实工程里存着）。顺序不能反——
+    // `set_voice_ref` 会因为"换了段音频"先把文本清掉。
+    set_voice_ref(ui, &project.voice_ref.clone().unwrap_or_default());
     ui.set_voice_ref_text(project.voice_ref_text.clone().unwrap_or_default().into());
     refresh_voice_labels(ui);
     // 工程里记着的两个输入回灌界面：兜底开关（决定怎么念）与句间停顿（决定拼装）
@@ -6295,7 +6329,7 @@ fn wire_versions(
                 ui.set_script_text(script.clone().into());
                 // 句子行重算（与改稿同一条路径）：这里只有 ui，行模型由 wire_versions 传入
                 rebuild(&ui, &rows, &script);
-                ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+                set_voice_ref(&ui, &project.voice_ref.clone().unwrap_or_default());
                 ui.set_voice_ref_text(project.voice_ref_text.clone().unwrap_or_default().into());
                 if !restore_voice_index(&ui, &project.model) {
                     ui.set_voice_index(-1);
@@ -6360,7 +6394,7 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
         let effect = templates::apply_effect(&project_inputs_from_ui(&ui), &t);
 
         // 先套用输入（模型索引按名字找回，找不到就把索引清 -1，别静默换成别的引擎）
-        ui.set_voice_ref_path(t.voice_ref.clone().unwrap_or_default().into());
+        set_voice_ref(&ui, &t.voice_ref.clone().unwrap_or_default());
         ui.set_voice_ref_text(t.voice_ref_text.clone().unwrap_or_default().into());
         if !restore_voice_index(&ui, &t.model) {
             ui.set_voice_index(-1);
@@ -6512,6 +6546,10 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
             ui.set_status_text("任务进行中：参考音暂不可改".into());
             return;
         }
+        // 路径字段是 in-out 绑定，回调触发时 Slint 已经把它改成新值了 ——
+        // 拿不到旧值做比较，所以**任何编辑都让文本作废**：
+        // 文本属于原来那段音频，留着就会静默拿它去条件新音频（见 `keeps_reference_text`）。
+        clear_reference_text(&ui);
         invalidate_worker_project(&tx2, &state2);
         reset_bgm(&ui, &state2);
         ui.set_has_result(false);
@@ -6588,11 +6626,8 @@ fn wire_voice_panel(
         if ui.get_running() || ui.get_busy() || ui.get_voice_ref_path().is_empty() {
             return;
         }
-        ui.set_voice_ref_path("".into());
-        // 参考音清掉了，它的文本也一起清：留着孤立的文本会让"下一次选回同一段音频"
-        // 静默沿用上一份转写（用户以为重新转写过）
-        ui.set_voice_ref_text("".into());
-        ui.set_voice_ref_text_status("".into());
+        // 清空路径 ⇒ helper 判定"不是同一段音频" ⇒ 文本与状态行一起清
+        set_voice_ref(&ui, "");
         invalidate_worker_project(&tx, &st);
         reset_bgm(&ui, &st);
         ui.set_has_result(false);
@@ -7721,9 +7756,13 @@ fn tick(
                             .into(),
                         );
                         // 文本变了 ⇒ 旧成品/旧工程不可复用（与手改参考文本同一条路）。
+                        // 三件事与 `on_voice_ref_text_changed` **逐条对齐**：少了 BGM 与
+                        // has_result，"试听全篇/导出"会亮着、点了才说"工程已变更"（复核指出）。
                         // 必须在这里作废 worker 那份内存工程：否则下一次「重新合成某句」
                         // 会拿旧文本去合成，用户改了文本却听不出变化。
                         invalidate_worker_project(cmd_tx, state);
+                        reset_bgm(ui, state);
+                        ui.set_has_result(false);
                         refresh_voice_labels(ui);
                         ui.set_status_text("参考音频已转写：核对文本后开始合成".into());
                     }
@@ -9933,6 +9972,59 @@ mod tests {
             &empty_dict(),
         );
         assert_eq!(with_ref.voice_ref_text.as_deref(), Some("实际念的内容"));
+    }
+
+    /// 参考文本只在"还是同一段音频"时保留。
+    #[test]
+    fn reference_text_only_survives_when_the_path_is_unchanged() {
+        assert!(
+            keeps_reference_text("/x/a.wav", "/x/a.wav"),
+            "同一段音频要保留（否则用户点一下输入框就丢转写）"
+        );
+        assert!(
+            keeps_reference_text("  /x/a.wav ", "/x/a.wav"),
+            "只差首尾空白算同一段"
+        );
+        assert!(
+            !keeps_reference_text("/x/a.wav", "/x/b.wav"),
+            "换到别的音频必须清（否则拿 A 的转写去条件 B）"
+        );
+        assert!(!keeps_reference_text("/x/a.wav", ""), "清空必须清");
+        assert!(
+            !keeps_reference_text("", "/x/a.wav"),
+            "从空变成有：本来也没有文本可留"
+        );
+    }
+
+    /// 换参考音频的每条路径都必须把参考文本一起清 —— 否则**静默**拿上一段的转写当条件。
+    ///
+    /// 这条是**源码级守卫**（第四轮复核真机抓到的）：音色库「应用」与手改路径只换
+    /// `voice-ref-path`、不清 `voice-ref-text` ⇒ 文本非空时 `reference_text_missing`
+    /// 拦不住，而 `settings_allow_reuse` 见 `voice_ref` 变了又去重录 ⇒ 拿 A 音频的转写
+    /// 去条件 B 音频。服务端**不报错**、产物已经变了（复核真机：正确文本 273241B /
+    /// 完全无关文本 289628B，sha 也不同）。
+    ///
+    /// 加锁方式：把"写 `voice-ref-path`"收敛成唯一一处 `set_voice_ref`（它内部按
+    /// `keeps_reference_text` 决定要不要清文本）。谁再直接写这个属性，这条立刻红。
+    #[test]
+    fn reference_path_writes_go_through_the_helper_that_clears_the_text() {
+        let src = include_str!("main.rs");
+        // 拼接构造 needle：否则这条用例自己的源码就会被算成一次命中
+        let needle = concat!("ui.set_voice_ref_", "path(");
+        let writes = src.matches(needle).count();
+        assert_eq!(
+            writes, 1,
+            "写 voice-ref-path 只允许在 set_voice_ref 里一处（现在 {writes} 处）：\
+             多出来的地方必须改走 set_voice_ref，否则换音频会留着上一段的参考文本"
+        );
+
+        // 反向也要钉住：helper 本身必须真的清（不能只留个名字）
+        let at = src.find("fn set_voice_ref(").expect("set_voice_ref 必须在");
+        let body = &src[at..(at + 400).min(src.len())];
+        assert!(
+            body.contains("clear_reference_text(") && body.contains("keeps_reference_text("),
+            "set_voice_ref 必须按 keeps_reference_text 判断、并真的清文本：{body}"
+        );
     }
 
     fn save_done_project(dir: &Path, project: &mut Project) {

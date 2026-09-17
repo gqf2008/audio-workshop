@@ -54,6 +54,15 @@ impl std::fmt::Display for ClientError {
 /// 服务端原文 `Audio8 TTS prepare with inline reference audio requires reference_text option`
 /// 用户看不懂，而且是在**每一句**上重复撞出来的（N 句 = N 条一样的 500）。
 /// 这里一次说清"缺什么 / 去哪填 / 怎么免手填"。
+/// 调用了克隆但没给参考音频路径时的**前置拦截**文案。
+///
+/// 正常 UI 走不到（路径为空就是内置音色、不会走 `VoiceClone`），但 `VoiceClone::new`
+/// 是公开入口，类型自己的不变式该自己守。
+pub const MISSING_REFERENCE_PATH: &str = concat!(
+    "调用了参考音频克隆，但没有给参考音频路径。",
+    "内置音色不需要参考音；要克隆就先在「参考音频」里填一段干净的 5–30 秒人声。",
+);
+
 pub const MISSING_REFERENCE_TEXT: &str = concat!(
     "参考音频已选，但缺少它的文本（reference_text）。",
     "克隆音色时服务端要求音频与文本成对：请在「参考音频的文本」里填这段音频实际念的内容，",
@@ -75,11 +84,18 @@ pub struct VoiceClone<'a> {
 }
 
 impl<'a> VoiceClone<'a> {
-    /// 唯一构造入口：文本空白即 `Err`（不是 `None`，也不是"悄悄发个空串"）。
+    /// 唯一构造入口：路径或文本为空白即 `Err`（不是 `None`，也不是"悄悄发个空串"）。
     ///
     /// 空串发过去服务端照样报错，只是换了个看不懂的说法；在**发起前**拦住，
     /// 用户拿到的是一次可执行的提示，而不是 N 句 `error:`。
+    ///
+    /// 路径也要校验：只校文本的话，"空路径 + 有文本"会通过，然后发出
+    /// `voice_ref: ""` —— 与这个类型自称的"成对"不一致（复核指出；
+    /// 当前 UI 走不到，但类型不变式不该依赖 UI 恰好拦得住）。
     pub fn new(path: &'a str, reference_text: &'a str) -> Result<Self, ClientError> {
+        if path.trim().is_empty() {
+            return Err(ClientError::Local(MISSING_REFERENCE_PATH.into()));
+        }
         if reference_text.trim().is_empty() {
             return Err(ClientError::Local(MISSING_REFERENCE_TEXT.into()));
         }
