@@ -11,6 +11,7 @@
 //!   projects/<工程名>/out/final.wav|srt 成品
 //!   <工程名>.wav / <工程名>.srt          导出（复制自 out/）
 
+mod backup;
 mod batch;
 mod cancel;
 mod dictionaries;
@@ -284,6 +285,15 @@ enum Msg {
     /// 全局设置里「选择模型目录」的结果
     ModelDirPicked {
         path: Option<String>,
+    },
+    /// 一键备份：目标目录选择结果（`None` = 用户取消）
+    BackupDirPicked {
+        path: Option<String>,
+    },
+    /// 一键备份终态：`Ok(note)` 是给状态行的那句话，`Err` 是**可执行**的失败原因。
+    /// 后台线程发回、与工程版本无关（用户点按钮那一刻和稿件版本没关系）。
+    BackupDone {
+        result: Result<String, String>,
     },
     /// 人声分离进度 / 终态（都带 task_id 以便与当前任务对齐）
     SeparationProgress {
@@ -1588,6 +1598,30 @@ fn spawn_folder_pick(msg_tx: Sender<WorkerMsg>, revision: u64) {
         let _ = msg_tx.send(WorkerMsg {
             revision,
             msg: Msg::ModelDirPicked { path },
+        });
+    });
+}
+
+/// 一键备份：**一条后台线程走完"选目录 → 复制"两步**。
+///
+/// 目录选择框是阻塞式的（与其它选择器同款），备份本身也是长 IO——两步都必须在后台，
+/// 否则点下去界面就冻住了。中间先回一条 `BackupDirPicked`，让状态行能立刻显示
+/// "正在备份到 <路径>"，而不是让人对着"正在打开目录选择框…"猜有没有开始。
+fn spawn_backup(msg_tx: Sender<WorkerMsg>, workshop_dir: PathBuf) {
+    std::thread::spawn(move || {
+        let picked = pick_folder_with_prompt("选择备份目标目录");
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::BackupDirPicked {
+                path: picked.clone(),
+            },
+        });
+        let Some(root) = picked else { return };
+        let result = backup::backup_all(&workshop_dir, Path::new(&root), &backup::stamp_now())
+            .map(|s| s.note());
+        let _ = msg_tx.send(WorkerMsg {
+            revision: 0,
+            msg: Msg::BackupDone { result },
         });
     });
 }
@@ -3080,9 +3114,17 @@ fn make_client() -> Result<Client, String> {
     Ok(Client::new(base))
 }
 
+/// 应用数据目录：~/Documents/音频作坊/
+///
+/// 工程、设置、模板、词典库、音色库都在这一层——也就是一键备份要打包的全部内容
+/// （见 `src/backup.rs` 的 `ITEMS`，两边必须同源）。
+fn workshop_dir() -> PathBuf {
+    documents_dir().join(WORKSHOP_DIR)
+}
+
 /// 工程目录：~/Documents/音频作坊/projects/<stem>/
 fn projects_root() -> PathBuf {
-    documents_dir().join(WORKSHOP_DIR).join("projects")
+    workshop_dir().join("projects")
 }
 
 fn project_dir(stem: &str) -> PathBuf {
@@ -6363,6 +6405,10 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::TaskStage { .. }
         | Msg::ServerHealth { .. }
         | Msg::ModelDirPicked { .. }
+        // 备份：目录选择结果来自对话框，终态来自长 IO，两者都与工程版本无关；
+        // 不在名单里就会出现"备份好了但状态行还停在正在备份"（期间改一次稿就永远停住）
+        | Msg::BackupDirPicked { .. }
+        | Msg::BackupDone { .. }
         | Msg::VoiceImportDirPicked { .. }
         | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
@@ -6562,6 +6608,16 @@ fn tick(
                 None => {
                     ui.set_status_text("取消了选择模型目录".into());
                 }
+            },
+            Msg::BackupDirPicked { path } => match path {
+                Some(p) => ui.set_backup_info(
+                    format!("正在备份到 {p} …（工程大时要一会儿，中途别关窗口）").into(),
+                ),
+                None => ui.set_backup_info("已取消备份".into()),
+            },
+            Msg::BackupDone { result } => match result {
+                Ok(note) => ui.set_backup_info(note.into()),
+                Err(error) => ui.set_backup_info(format!("备份失败：{error}").into()),
             },
             Msg::ServerHealth { ok, detail } => {
                 ui.set_server_status(detail.into());
@@ -7384,6 +7440,18 @@ fn wire_global_settings(
         }
         ui.set_status_text("正在打开系统目录选择框…".into());
         spawn_folder_pick(msg.clone(), st.project_revision.get());
+    });
+
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    ui.on_backup_all(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        // 备份与合成/导出共用同一条"别在忙的时候动文件"的判据
+        if ui.get_busy() || ui.get_running() {
+            return;
+        }
+        ui.set_backup_info("正在打开系统目录选择框…".into());
+        spawn_backup(msg.clone(), workshop_dir());
     });
 
     let weak = ui.as_weak();
@@ -9701,6 +9769,35 @@ mod tests {
             should_handle_message(&stale_sentence, 0),
             "revision 对得上就该处理"
         );
+    }
+
+    /// 备份的两条消息同样不过滤：目录选择来自对话框，终态来自长 IO，两者都与稿件
+    /// 版本无关。之前复核已经两次抓到"忘了加名单"，所以这里也钉一条。
+    #[test]
+    fn backup_messages_survive_revision_changes() {
+        let msgs = vec![
+            Msg::BackupDirPicked {
+                path: Some("/tmp/备份盘".into()),
+            },
+            Msg::BackupDone {
+                result: Ok(
+                    "已备份 6 个文件（1.2KB）到 /tmp/备份盘/音频作坊备份-20260917-143012".into(),
+                ),
+            },
+            // 失败路径也不能被当成"过期消息"丢掉，否则状态行停在正在备份
+            Msg::BackupDone {
+                result: Err("备份目标不能放在应用数据目录里面".into()),
+            },
+        ];
+        let names = ["BackupDirPicked", "BackupDone(Ok)", "BackupDone(Err)"];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
     }
 
     /// 任务中心点「停止」的分派判定：**错误的 task_id 不会停当前任务**。

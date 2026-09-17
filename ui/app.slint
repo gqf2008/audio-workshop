@@ -153,6 +153,8 @@ export component MainWindow inherits Window {
     in property <bool> server-locked: false;
     in-out property <string> model-dir: "";
     in property <string> model-dir-info: "";
+    // 备份状态行（设置抽屉的「一键备份…」用；与工程版本无关）
+    in property <string> backup-info: "";
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
@@ -281,6 +283,7 @@ export component MainWindow inherits Window {
     callback rescan-models();
     callback check-server();
     callback pick-model-dir();
+    callback backup-all();
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
@@ -699,6 +702,8 @@ export component MainWindow inherits Window {
                     rescan-models => { root.rescan-models(); }
                     check-server => { root.check-server(); }
                     pick-model-dir => { root.pick-model-dir(); }
+                    backup-info: root.backup-info;
+                    backup-all => { root.backup-all(); }
                 }
             }
         }
