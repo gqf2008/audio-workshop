@@ -545,6 +545,10 @@ export component DubWorkbench inherits Rectangle {
     // ── 音色区（页内展开，与「高级」同款；换音色 ≠ 换模型）──
     in property <string> engine-label: "";
     in-out property <string> voice-ref-path: "";
+    /// 参考音频的文本：服务端要求与参考音频成对（缺它每句都 500）；改它 = 换音色
+    in-out property <string> voice-ref-text: "";
+    in property <string> voice-ref-text-status: "";
+    in property <bool> voice-ref-text-busy: false;
     in property <[string]> voice-names: [];
     in-out property <int> voice-index: 0;
     callback engine-changed();
@@ -601,6 +605,8 @@ export component DubWorkbench inherits Rectangle {
     callback new-voice();
     callback clear-reference();
     callback voice-ref-changed();
+    callback voice-ref-text-changed();
+    callback transcribe-reference();
     callback script-edited();
     callback use-sample();
     callback clear-script();
@@ -721,6 +727,11 @@ export component DubWorkbench inherits Rectangle {
                             voice-label: root.voice-label;
                             engine-label: root.engine-label;
                             reference-path <=> root.voice-ref-path;
+                            reference-text <=> root.voice-ref-text;
+                            reference-text-status: root.voice-ref-text-status;
+                            transcribing: root.voice-ref-text-busy;
+                            reference-text-edited => { root.voice-ref-text-changed(); }
+                            transcribe-reference => { root.transcribe-reference(); }
                             // 批量在跑时也把音色区锁住：批量的 voice_ref 在提交那一刻就定格了
                             busy: root.running || root.busy || root.batch-running;
                             reference-exists: root.reference-exists;

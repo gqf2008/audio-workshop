@@ -3,7 +3,7 @@
 //
 // 诚实原则（见 docs/ui/redesign-v1/competitive-analysis.md「不采用清单」）：
 //   后端没有的能力一律显示“未接入 + 缺什么”，不放假按钮、不装成已完成。
-//   · 参考音频克隆：真实可用（配音链路 voice_ref → index-tts2）
+//   · 参考音频克隆：真实可用（配音链路 voice_ref + reference_text → audio8-tts / index-tts2）
 //   · 文本描述生成音色：后端未接入（audio.cpp 无 voice design 任务）
 //   · 人声分离 / 音乐制作：本分支未接入
 // ============================================================================
@@ -14,11 +14,17 @@ import { PixelBadge, PixelButton, PixelTextArea, PixelTextInput, PixelTheme } fr
 // ---------------------------------------------------------------------------
 export component VoiceDesignTab inherits Rectangle {
     in-out property <string> reference-path: "";
+    /// 参考音频的文本：服务端要求与参考音频成对下发（只给路径会 500）
+    in-out property <string> reference-text: "";
+    in property <string> reference-text-status: "";
+    in property <bool> transcribing: false;
     in property <bool> busy: false;
 
     callback edited();
     callback clear-reference();
     callback use-in-dubbing();
+    callback reference-text-edited();
+    callback transcribe-reference();
 
     HorizontalLayout {
         horizontal-stretch: 1;
@@ -92,8 +98,31 @@ export component VoiceDesignTab inherits Rectangle {
                             placeholder: "参考音频路径，如 ~/Documents/ref.wav";
                             edited => { root.edited(); }
                         }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            PixelTextInput {
+                                horizontal-stretch: 1;
+                                enabled: !root.busy;
+                                text <=> root.reference-text;
+                                placeholder: "这段参考音频里实际念的内容（与音频成对，必填）";
+                                edited => { root.reference-text-edited(); }
+                            }
+                            PixelButton {
+                                width: 110px;
+                                text: root.transcribing ? "转写中…" : "自动转写";
+                                Tooltip { text: @markdown("让本机 ASR 听一遍参考音频、把内容填进左边的框。\n填完**请自己核对**——转写错字会让克隆音色跑偏。"); }
+                                enabled: !root.busy && !root.transcribing && root.reference-path != "";
+                                clicked => { root.transcribe-reference(); }
+                            }
+                        }
+                        if root.reference-text-status != "" : Text {
+                            text: root.reference-text-status;
+                            color: root.reference-text == "" ? PixelTheme.danger : PixelTheme.dim;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
                         Text {
-                            text: "本版直接填路径（还没接系统文件框）。改完路径会把旧的合成结果标为旧版本，需重新生成。";
+                            text: "本版直接填路径（还没接系统文件框）。改完路径或文本都会把旧的合成结果标为旧版本，需重新生成。";
                             color: PixelTheme.dim;
                             font-size: 11px;
                             wrap: word-wrap;

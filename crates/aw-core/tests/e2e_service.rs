@@ -198,3 +198,57 @@ fn bgm_pipeline_end_to_end() {
         mixed_path.display()
     );
 }
+
+/// 音色克隆真机：`voice_ref` **必须**与 `reference_text` 成对下发。
+///
+/// 锚定的是那个"招牌功能 100% 跑不通"的缺陷：修复前 `synth` 只发 `voice_ref`，
+/// audio8-tts 直接 500 —— 用户按 README 做克隆，每一句都失败。
+/// 这里用真服务跑两个对照：
+///   ① 只给音频（`synth` 现在**不可能**这么调，改用裸 HTTP 复刻旧行为）→ 期望失败；
+///   ② 成对给（走 `Client::synth`）→ 期望 200，且产物与内置音色**不同**。
+#[test]
+#[ignore = "需要本机 audiocpp_server + audio8-tts；用 -- --ignored 显式跑"]
+fn voice_clone_reference_text_end_to_end() {
+    let base = env_or("AW_SERVER", "http://127.0.0.1:8080");
+    let model = env_or("AW_TTS_MODEL", "audio8-tts");
+    let client = Client::new(&base);
+    assert!(client.healthy(), "服务不可用: {base}/health");
+
+    // 参考音频：优先用环境变量，其次用示例工程拆出来的人声轨
+    let reference = std::env::var("AW_VOICE_REF").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/Documents/音频作坊/projects/示例工程 · 频道口播/stems/示例工程 · 频道口播_vocals.wav")
+    });
+    assert!(
+        std::path::Path::new(&reference).is_file(),
+        "参考音频不存在：{reference}（用 AW_VOICE_REF 指定）"
+    );
+    let reference_text = env_or(
+        "AW_VOICE_REF_TEXT",
+        "这是一段用来验证人生分离链路是否跑得通的测试音频。",
+    );
+    let text = "这是一句克隆音色的真机验证。";
+
+    // ① 内置音色（不带两个字段）：拿到基准产物
+    let builtin = client
+        .synth(&model, text, Some(831001), None, None)
+        .unwrap_or_else(|e| panic!("内置音色合成失败（{model}）：{e}"));
+
+    // ② 成对克隆：走真正的代码路径
+    let clone = aw_core::VoiceClone::new(&reference, &reference_text).expect("参考文本非空");
+    let cloned = client
+        .synth(&model, text, Some(831001), Some(clone), None)
+        .unwrap_or_else(|e| panic!("克隆合成失败（{model} + reference_text）：{e}"));
+
+    eprintln!(
+        "  内置音色: {} 字节\n  克隆音色: {} 字节（参考音 {}）",
+        builtin.len(),
+        cloned.len(),
+        reference
+    );
+    assert!(!cloned.is_empty(), "克隆产物不能为空");
+    assert_ne!(
+        builtin, cloned,
+        "给了参考音+参考文本后产物必须与内置音色不同（否则说明 reference_text 没生效）"
+    );
+}

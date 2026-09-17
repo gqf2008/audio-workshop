@@ -90,6 +90,9 @@ enum Cmd {
         script: String,
         model: String,
         voice_ref: Option<String>,
+        /// 参考音频里实际念的内容。克隆音色**必须**与 `voice_ref` 成对下发，
+        /// 所以它和路径一样是"这次发什么请求"的一部分（见 `aw_core::VoiceClone`）。
+        voice_ref_text: Option<String>,
         project_name: String,
         /// 句间静音（毫秒）：只影响拼装出来的时间轴，不影响逐句音频
         gap_ms: u64,
@@ -109,6 +112,8 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
+        /// 与单篇同一份语义：批量里每篇都用同一个克隆音色
+        voice_ref_text: Option<String>,
         /// 与单篇同一套：句间静音 + 文本兜底开关 + 发音词典（批量产物也受它们影响）
         gap_ms: u64,
         auto_normalize: bool,
@@ -144,6 +149,8 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
+        /// 试听也必须成对：否则克隆音色的试听永远 500，用户按试听选音色会被误导
+        voice_ref_text: Option<String>,
         text: String,
     },
     /// 人声分离（本地 htdemucs）：两轨写到 out_dir。
@@ -356,6 +363,15 @@ enum Msg {
     VoicePreviewFailed {
         label: String,
         error: String,
+    },
+    /// 参考音频的**自动转写**结果（后台线程发回，与工程版本无关）。
+    ///
+    /// 只回结果、不直接写界面：转写是"帮用户填"，不是"替用户决定"——
+    /// 调用方要把文本回显出来让人核对（ASR 错一个字，克隆出的音色就跑偏）。
+    ReferenceTranscribed {
+        /// 转写用的 ASR 模型（成功时一并回显，失败原因里也要带）
+        model: String,
+        result: Result<String, String>,
     },
     /// 歌曲终态：带 task_id 与分离同理——歌曲可以排在别的任务后面，跨改稿时
     /// 用 revision 过滤会把终态丢掉、任务永远停在"运行中"。
@@ -1066,6 +1082,7 @@ fn template_from_inputs(
     name: &str,
     model: &str,
     voice_ref: Option<String>,
+    voice_ref_text: Option<String>,
     speed: f32,
     gap_ms: u64,
     auto_normalize: bool,
@@ -1078,6 +1095,8 @@ fn template_from_inputs(
         name: name.to_string(),
         model: model.to_string(),
         voice_ref,
+        // 模板必须自带参考文本：只存路径的话，应用回来的克隆音色缺文本、跑不起来
+        voice_ref_text,
         speed,
         gap_ms,
         auto_normalize,
@@ -1087,9 +1106,11 @@ fn template_from_inputs(
 /// 当前工程的输入（用来和模板比对，算出"应用后要作废什么"）。
 fn project_inputs_from_ui(ui: &MainWindow) -> templates::ProjectInputs {
     let model = current_model_name(ui).unwrap_or_default();
+    let (voice_ref, voice_ref_text) = voice_input_from_ui(ui);
     templates::ProjectInputs {
         model,
-        voice_ref: non_empty(ui.get_voice_ref_path().to_string()),
+        voice_ref_text,
+        voice_ref,
         gap_ms: gap_ms_from_ui(ui),
         auto_normalize: ui.get_auto_normalize(),
     }
@@ -2557,19 +2578,39 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision,
                 model,
                 voice_ref,
+                voice_ref_text,
                 text,
             } => {
                 let msg = match make_client() {
                     Ok(client) => {
                         // instruction 与配音链路一致（aw_core 合成恒定传 DEFAULT_INSTRUCTION）：
                         // 试听听到的语气必须等于成品，否则用户按试听选音色会被误导。
-                        match client.synth(
-                            &model,
-                            &text,
-                            Some(BASE_SEED),
-                            voice_ref.as_deref(),
-                            Some(aw_core::DEFAULT_INSTRUCTION),
-                        ) {
+                        //
+                        // 克隆同理**必须成对**：只发 voice_ref 的话试听永远 500，
+                        // 用户以为自己选的音色不行，其实是少发了 reference_text。
+                        let outcome = match voice_ref.as_deref() {
+                            Some(path) => match aw_core::VoiceClone::new(
+                                path,
+                                voice_ref_text.as_deref().unwrap_or_default(),
+                            ) {
+                                Ok(clone) => client.synth(
+                                    &model,
+                                    &text,
+                                    Some(BASE_SEED),
+                                    Some(clone),
+                                    Some(aw_core::DEFAULT_INSTRUCTION),
+                                ),
+                                Err(e) => Err(e),
+                            },
+                            None => client.synth(
+                                &model,
+                                &text,
+                                Some(BASE_SEED),
+                                None,
+                                Some(aw_core::DEFAULT_INSTRUCTION),
+                            ),
+                        };
+                        match outcome {
                             Ok(wav) => Msg::VoicePreview {
                                 wav,
                                 label: model.clone(),
@@ -2593,6 +2634,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 script,
                 model,
                 voice_ref,
+                voice_ref_text,
                 project_name,
                 gap_ms,
                 auto_normalize,
@@ -2616,6 +2658,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     &script,
                     &model,
                     voice_ref,
+                    voice_ref_text,
                     gap_ms,
                     auto_normalize,
                     &dict,
@@ -2688,6 +2731,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 revision,
                 model,
                 voice_ref,
+                voice_ref_text,
                 gap_ms,
                 auto_normalize,
                 dict,
@@ -2741,6 +2785,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         &item.script,
                         &model,
                         voice_ref.clone(),
+                        voice_ref_text.clone(),
                         gap_ms,
                         auto_normalize,
                         &dict,
@@ -3649,13 +3694,18 @@ fn voice_ref_matches(
     saved: &Project,
     voice_ref: &Option<String>,
     voice_ref_hash: &Option<String>,
+    voice_ref_text: &Option<String>,
 ) -> bool {
     saved.voice_ref.as_ref() == voice_ref.as_ref()
         && saved.voice_ref_hash.as_ref() == voice_ref_hash.as_ref()
+        // 参考文本也是音色的一部分：同一段音频换个转写文本 = 另一个声音。
+        // 少了这一条，"让用户确认/修正 ASR 转写"就成了空转——改完文本点开始合成，
+        // 句子全是 done 直接被复用，用户听到的还是旧转写合成的声音。
+        && saved.voice_ref_text.as_ref() == voice_ref_text.as_ref()
 }
 
-/// "旧工程的音频能不能给这份新设置复用"的判据：**模型 / 兜底开关 / 参考音（含内容哈希）
-/// 全一致**。停顿（gap_ms）只影响拼装，不算在内。
+/// "旧工程的音频能不能给这份新设置复用"的判据：**模型 / 兜底开关 / 参考音
+/// （路径 + 内容哈希 + 参考文本）全一致**。停顿（gap_ms）只影响拼装，不算在内。
 ///
 /// worker 的 `load_resumable`（续作/改稿继承）与版本回滚的"按文本继承"**共用这一条**：
 /// 两处各写一遍的话，回滚就可能把 B 模型合成的音频标成"版本显示 A"的已合成
@@ -3665,6 +3715,7 @@ fn settings_allow_reuse(
     model: &str,
     voice_ref: &Option<String>,
     voice_ref_hash: &Option<String>,
+    voice_ref_text: &Option<String>,
     auto_normalize: bool,
     dict_fingerprint: &str,
 ) -> bool {
@@ -3673,7 +3724,7 @@ fn settings_allow_reuse(
         // 词典与兜底开关同类：它改的是 spoken 文本，换词典就不能复用旧音频。
         // 旧工程/没启用时 `dict_hash` 是 None —— 按"空词典"处理，与当前空词典等价。
         && effective_dict_hash(saved) == dict_fingerprint
-        && voice_ref_matches(saved, voice_ref, voice_ref_hash)
+        && voice_ref_matches(saved, voice_ref, voice_ref_hash, voice_ref_text)
 }
 
 /// 工程记录的词典指纹：None（旧工程 / 从没启用过）等价于"空词典"。
@@ -3796,6 +3847,7 @@ fn new_project_from_inputs(
     script: &str,
     model: &str,
     voice_ref: Option<String>,
+    voice_ref_text: Option<String>,
     gap_ms: u64,
     auto_normalize: bool,
     dict: &std::collections::BTreeMap<String, String>,
@@ -3820,20 +3872,63 @@ fn new_project_from_inputs(
     );
     project.auto_normalize = auto_normalize;
     project.dict_hash = Some(dictionaries::fingerprint(dict));
+    // 参考文本与参考音**同进同出**：没有参考音就不该留下孤立的文本（否则"已切回内置音色"
+    // 之后旧文本还在，下次选回同一段音频会静默沿用上一次的转写）。
+    project.voice_ref_text = match project.voice_ref {
+        Some(_) => voice_ref_text,
+        None => None,
+    };
     // 参考音哈希**不在这里算**：`load_resumable` 已经算过一份（算两遍纯属浪费），
     // 版本留档那边由 `project_from_ui` 自己补。这里只管"按输入造工程"。
     project
 }
 
+/// 界面上的音色输入：**唯一入口**。
+///
+/// 返回 `(参考音频路径, 参考音频的文本)`，并在这里统一执行"没有参考音就不带孤立文本"
+/// 这条口径——单篇 / 批量 / 试听 / 模板比对都走它，免得某条路径漏掉一半。
+/// （孤立文本会让"切回内置音色再选回同一段音频"静默沿用上一份转写。）
+fn voice_input_from_ui(ui: &MainWindow) -> (Option<String>, Option<String>) {
+    let path = non_empty(ui.get_voice_ref_path().to_string());
+    let text = path
+        .as_ref()
+        .and_then(|_| non_empty(ui.get_voice_ref_text().to_string()));
+    (path, text)
+}
+
+/// "克隆音色还差参考文本吗"——提交前的拦截判据。
+///
+/// 真正的规则在 `aw_core::VoiceClone::new`（服务端要求路径与文本成对）；这里只是**提前问一次**，
+/// 不另写一份 trim 判断（两份迟早漂移）。返回 true = 该拦住。
+fn reference_text_missing(voice_ref: &Option<String>, voice_ref_text: &Option<String>) -> bool {
+    match voice_ref.as_deref() {
+        Some(path) => {
+            aw_core::VoiceClone::new(path, voice_ref_text.as_deref().unwrap_or_default()).is_err()
+        }
+        None => false,
+    }
+}
+
+// 8 个参数确实多，但每个都是调用方必须显式给出的决策（路径/稿子/引擎/音色两项/停顿/
+// 兜底/词典）。打包成配置结构体只是把同一串东西换个地方写，调用点反而更啰嗦——
+// 与 `Project::new` 的处理一致。
+#[allow(clippy::too_many_arguments)]
 fn load_resumable(
     dir: &Path,
     script: &str,
     model: &str,
     voice_ref: Option<String>,
+    voice_ref_text: Option<String>,
     gap_ms: u64,
     auto_normalize: bool,
     dict: &std::collections::BTreeMap<String, String>,
 ) -> Result<LoadedProject, String> {
+    // 没有参考音就不要带着孤立的参考文本走（与 new_project_from_inputs 同一口径）
+    let voice_ref_text = if voice_ref.is_some() {
+        voice_ref_text
+    } else {
+        None
+    };
     let dict_hash = dictionaries::fingerprint(dict);
     let voice_ref_hash = match voice_ref.as_deref() {
         Some(path) => Some(sha256_file(Path::new(path))?),
@@ -3850,6 +3945,7 @@ fn load_resumable(
             model,
             &voice_ref,
             &voice_ref_hash,
+            &voice_ref_text,
             auto_normalize,
             &dict_hash,
         ) && sentence_texts_match(saved, script)
@@ -3869,6 +3965,7 @@ fn load_resumable(
         script,
         model,
         voice_ref.clone(),
+        voice_ref_text.clone(),
         gap_ms,
         auto_normalize,
         dict,
@@ -3882,6 +3979,7 @@ fn load_resumable(
             model,
             &voice_ref,
             &voice_ref_hash,
+            &voice_ref_text,
             auto_normalize,
             &dict_hash,
         ) {
@@ -4095,7 +4193,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_versions(&ui, &rows, &cmd_tx, &state);
     wire_dictionary(&ui, &rows, &cmd_tx, &msg_tx_ui, &state);
     load_active_dictionary(&ui, &state);
-    wire_voice_panel(&ui, &cmd_tx, &state);
+    wire_voice_panel(&ui, &cmd_tx, &msg_tx_ui, &state);
     wire_voice_library(
         &ui,
         &VoiceLibraryCtx {
@@ -4432,6 +4530,9 @@ fn restore_project(
         ui.set_voice_index(-1);
     }
     ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+    // 参考文本与参考音一起回灌：只回灌路径的话，重开应用后克隆音色会因为"没文本"
+    // 被前置拦截挡住，用户得凭空重填一次（其实工程里存着）
+    ui.set_voice_ref_text(project.voice_ref_text.clone().unwrap_or_default().into());
     refresh_voice_labels(ui);
     // 工程里记着的两个输入回灌界面：兜底开关（决定怎么念）与句间停顿（决定拼装）
     ui.set_auto_normalize(project.auto_normalize);
@@ -5771,7 +5872,12 @@ fn wire_batch(
             return;
         };
         let model = v.name.to_string();
-        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
+        // 与单篇同一条前置拦截：批量里 10 篇 × N 句全红是最坏的失败形态
+        if reference_text_missing(&voice_ref, &voice_ref_text) {
+            ui.set_batch_summary(aw_core::MISSING_REFERENCE_TEXT.into());
+            return;
+        }
 
         // 每条先登记成一条配音任务（排队中），worker 轮到它时用 TaskStarted 抬成运行中
         let mut items = Vec::new();
@@ -5809,6 +5915,7 @@ fn wire_batch(
                 revision: st.project_revision.get(),
                 model,
                 voice_ref,
+                voice_ref_text,
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
                 dict: st.active_dict.borrow().clone(),
@@ -5944,11 +6051,12 @@ fn wire_task_center(
 /// 与 worker 造新工程共用 `new_project_from_inputs`，所以留档下来的东西就是"点开始合成
 /// 会用的那一份"，不是另建一个近似对象。
 fn project_from_ui(ui: &MainWindow, dict: &std::collections::BTreeMap<String, String>) -> Project {
-    let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+    let (voice_ref, voice_ref_text) = voice_input_from_ui(ui);
     let mut project = new_project_from_inputs(
         &ui.get_script_text(),
         &current_model_name(ui).unwrap_or_default(),
         voice_ref.clone(),
+        voice_ref_text,
         gap_ms_from_ui(ui),
         ui.get_auto_normalize(),
         dict,
@@ -5985,6 +6093,7 @@ fn rollback_with_inheritance(
                 &restored.model,
                 &restored.voice_ref,
                 &restored.voice_ref_hash,
+                &restored.voice_ref_text,
                 restored.auto_normalize,
                 &effective_dict_hash(&restored),
             ) =>
@@ -6012,6 +6121,7 @@ fn project_from_version(
         &script,
         &snapshot.model,
         snapshot.voice_ref.clone(),
+        snapshot.voice_ref_text.clone(),
         snapshot.gap_ms,
         snapshot.auto_normalize,
         dict,
@@ -6186,6 +6296,7 @@ fn wire_versions(
                 // 句子行重算（与改稿同一条路径）：这里只有 ui，行模型由 wire_versions 传入
                 rebuild(&ui, &rows, &script);
                 ui.set_voice_ref_path(project.voice_ref.clone().unwrap_or_default().into());
+                ui.set_voice_ref_text(project.voice_ref_text.clone().unwrap_or_default().into());
                 if !restore_voice_index(&ui, &project.model) {
                     ui.set_voice_index(-1);
                 }
@@ -6250,6 +6361,7 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
 
         // 先套用输入（模型索引按名字找回，找不到就把索引清 -1，别静默换成别的引擎）
         ui.set_voice_ref_path(t.voice_ref.clone().unwrap_or_default().into());
+        ui.set_voice_ref_text(t.voice_ref_text.clone().unwrap_or_default().into());
         if !restore_voice_index(&ui, &t.model) {
             ui.set_voice_index(-1);
         }
@@ -6305,6 +6417,7 @@ fn wire_templates(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
             &ui.get_template_name_text(),
             &model,
             non_empty(ui.get_voice_ref_path().to_string()),
+            non_empty(ui.get_voice_ref_text().to_string()),
             ui.get_speed(),
             gap_ms_from_ui(&ui),
             ui.get_auto_normalize(),
@@ -6413,7 +6526,12 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
 /// 音色只有两种来源——模型内置默认音色 / 参考音频克隆出来的音色；
 /// 模型（audio8-tts / index-tts2 / 0.1b / stream…）是**引擎参数**，走 `model-changed`。
 /// 单一事实来源：`voice-ref-path` 为空 = 内置默认音色，非空 = 克隆音色（不设第二个 mode 状态）。
-fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) {
+fn wire_voice_panel(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
+    state: &Rc<UiState>,
+) {
     let weak = ui.as_weak();
     let tx = cmd_tx.clone();
     let st = state.clone();
@@ -6436,7 +6554,7 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
             return;
         };
         let model = v.name.to_string();
-        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
         let what = if voice_ref.is_some() {
             "克隆音色"
         } else {
@@ -6451,6 +6569,7 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
                 revision: st.project_revision.get(),
                 model,
                 voice_ref,
+                voice_ref_text,
                 text: VOICE_PREVIEW_TEXT.to_string(),
             })
             .is_err()
@@ -6470,11 +6589,75 @@ fn wire_voice_panel(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState>) 
             return;
         }
         ui.set_voice_ref_path("".into());
+        // 参考音清掉了，它的文本也一起清：留着孤立的文本会让"下一次选回同一段音频"
+        // 静默沿用上一份转写（用户以为重新转写过）
+        ui.set_voice_ref_text("".into());
+        ui.set_voice_ref_text_status("".into());
         invalidate_worker_project(&tx, &st);
         reset_bgm(&ui, &st);
         ui.set_has_result(false);
         refresh_voice_labels(&ui);
         ui.set_status_text("已切回内置默认音色：请重新开始合成".into());
+    });
+
+    // ── 参考音频的文本：与参考音一样是音色的一部分（服务端拿它做条件）──
+    //    手改 ⇒ 与"换参考音"同一条作废路径；清掉状态行是因为用户已经自己拍板了。
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_voice_ref_text_changed(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_voice_ref_text_status("".into());
+        refresh_voice_labels(&ui);
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：参考音频的文本暂不可改".into());
+            return;
+        }
+        invalidate_worker_project(&tx, &st);
+        reset_bgm(&ui, &st);
+        ui.set_has_result(false);
+        ui.set_status_text("参考音频的文本已改：请重新开始合成".into());
+    });
+
+    // ── 自动转写：**只帮用户填，不替用户决定**。结果回填到输入框 + 状态行要求核对。──
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    let st = state.clone();
+    ui.on_transcribe_reference(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_voice_ref_text_busy() {
+            return;
+        }
+        // 转写期间不能有合成在跑：文本一变就要作废旧工程，跑到一半改输入会让
+        // "界面上是什么"和"这次合成用的是哪份文本"对不上。
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&st) {
+            ui.set_voice_ref_text_status(
+                "有任务正在进行：自动转写要等它结束（转写会作废旧工程音频）".into(),
+            );
+            return;
+        }
+        let Some(path) = non_empty(ui.get_voice_ref_path().to_string()) else {
+            ui.set_voice_ref_text_status("先填参考音频路径，再点「自动转写」".into());
+            return;
+        };
+        if !Path::new(&path).is_file() {
+            ui.set_voice_ref_text_status("参考音频不存在或不可读：先修正路径".into());
+            return;
+        }
+        let model = aw_core::DEFAULT_ASR_MODEL.to_string();
+        ui.set_voice_ref_text_busy(true);
+        ui.set_voice_ref_text_status(format!("正在用 {model} 转写参考音频…").into());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let result = match make_client() {
+                Ok(client) => client.asr(Path::new(&path)).map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            let _ = msg.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::ReferenceTranscribed { model, result },
+            });
+        });
     });
 }
 
@@ -6643,7 +6826,7 @@ fn wire_run(
                 set_status(&model4, i, "待合成");
             }
         }
-        let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
+        let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
         if let Some(path) = voice_ref.as_deref() {
             if !Path::new(path).is_file() {
                 ui.set_status_text(
@@ -6651,6 +6834,13 @@ fn wire_run(
                 );
                 return;
             }
+        }
+        // 克隆音色缺参考文本：**发起前**拦住。发出去的话每一句都会撞同一个 500
+        // （服务端原文用户看不懂，而且 N 句 = N 条一模一样的失败）。
+        // 文案与 `Project::synthesize` 的前置拦截**同一份常量**，不另写一句话。
+        if reference_text_missing(&voice_ref, &voice_ref_text) {
+            ui.set_status_text(aw_core::MISSING_REFERENCE_TEXT.into());
+            return;
         }
         reset_bgm(&ui, &state1);
         stop1.store(false, Ordering::Relaxed);
@@ -6678,6 +6868,7 @@ fn wire_run(
                 script: ui.get_script_text().to_string(),
                 model: model_name.clone(),
                 voice_ref,
+                voice_ref_text,
                 project_name: stem,
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
@@ -7240,6 +7431,8 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BackupDirPicked { .. }
         | Msg::BackupDone { .. }
         | Msg::VoiceImportDirPicked { .. }
+        // 参考音转写：来自后台线程，与稿件版本无关（转的是参考音，不是稿子）
+        | Msg::ReferenceTranscribed { .. }
         | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
         | Msg::SeparationProgress { .. }
@@ -7510,6 +7703,36 @@ fn tick(
                             )
                             .into(),
                         );
+                    }
+                }
+            }
+            Msg::ReferenceTranscribed { model, result } => {
+                ui.set_voice_ref_text_busy(false);
+                match result {
+                    Ok(text) => {
+                        // **填进输入框**而不是替用户拍板：用户能在同一处直接改错字。
+                        // 状态行一直留着提醒，直到他改文本或开始合成（见 on_start_run）。
+                        ui.set_voice_ref_text(text.clone().into());
+                        ui.set_voice_ref_text_status(
+                            format!(
+                                "已用 {model} 转写并填入（{} 字）：**请核对**，转写错字会让克隆音色跑偏。",
+                                text.trim().chars().count()
+                            )
+                            .into(),
+                        );
+                        // 文本变了 ⇒ 旧成品/旧工程不可复用（与手改参考文本同一条路）。
+                        // 必须在这里作废 worker 那份内存工程：否则下一次「重新合成某句」
+                        // 会拿旧文本去合成，用户改了文本却听不出变化。
+                        invalidate_worker_project(cmd_tx, state);
+                        refresh_voice_labels(ui);
+                        ui.set_status_text("参考音频已转写：核对文本后开始合成".into());
+                    }
+                    Err(e) => {
+                        ui.set_voice_ref_text_status(
+                            format!("自动转写失败（{model}）：{e} —— 可以手填这段音频实际念的内容")
+                                .into(),
+                        );
+                        ui.set_status_text("自动转写失败：手动填写参考音频的文本即可继续".into());
                     }
                 }
             }
@@ -8477,6 +8700,7 @@ fn refresh_voice_labels(ui: &MainWindow) {
     ui.set_engine_label(engine.clone().unwrap_or_default().into());
 
     let ref_trimmed = ui.get_voice_ref_path().trim().to_string();
+    let ref_text_trimmed = ui.get_voice_ref_text().trim().to_string();
 
     // 音色名：内置默认音色 / 克隆音色 · <参考音频文件名>（音色 ≠ 模型）
     if ref_trimmed.is_empty() {
@@ -8500,6 +8724,9 @@ fn refresh_voice_labels(ui: &MainWindow) {
         "没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型"
     } else if !ref_trimmed.is_empty() && !exists {
         "参考音频不存在或不可读：修正路径后再开始配音"
+    } else if !ref_trimmed.is_empty() && ref_text_trimmed.is_empty() {
+        // 只在 UI 里说原因；真正的拦截在提交处（用户看的与拦住他的是同一句话）
+        "克隆音色还缺「参考音频的文本」：点「自动转写」或手填这段音频实际念的内容"
     } else {
         ""
     };
@@ -9617,6 +9844,97 @@ mod tests {
         )
     }
 
+    // ── 音色克隆：参考文本是音色的一部分（招牌功能 D11）────────────────────
+    //
+    // 背景（真机）：audio8-tts 收到 voice_ref 却收不到 reference_text 会 HTTP 500，
+    // 修复前每一句都那样。这里钉住三条"改回去就红"的判据。
+
+    /// 拦截判据只在"克隆态 + 缺文本"时为真；内置音色不受影响。
+    #[test]
+    fn reference_text_missing_only_fires_for_clone_without_text() {
+        let path = Some("/x/我的声线.wav".to_string());
+        assert!(
+            reference_text_missing(&path, &None),
+            "克隆态没填文本 → 必须拦住（否则 N 句各撞一次 500）"
+        );
+        assert!(
+            reference_text_missing(&path, &Some("   ".to_string())),
+            "纯空白不算填了"
+        );
+        assert!(
+            !reference_text_missing(&path, &Some("实际念的内容".to_string())),
+            "填了就该放行"
+        );
+        assert!(
+            !reference_text_missing(&None, &None),
+            "内置音色不需要参考文本"
+        );
+    }
+
+    /// 参考文本变了 → 旧音频**不能**复用。
+    ///
+    /// 这是"让用户核对/修正 ASR 转写"能不能真的生效的关键：少了这一条，
+    /// 用户改完文本点开始合成，句子全是 done 被直接复用，听到的还是旧转写的声音。
+    #[test]
+    fn reuse_is_refused_when_only_the_reference_text_changed() {
+        let mut saved = saved_project("第一句。", Some("/x/我的声线.wav"));
+        saved.voice_ref_hash = Some("hash-a".into());
+        saved.voice_ref_text = Some("旧转写。".into());
+
+        let same = (Some("/x/我的声线.wav".to_string()), Some("hash-a".into()));
+        assert!(
+            settings_allow_reuse(
+                &saved,
+                "audio8-tts",
+                &same.0,
+                &same.1,
+                &Some("旧转写。".into()),
+                true,
+                &effective_dict_hash(&saved),
+            ),
+            "三样都一致才允许复用"
+        );
+        assert!(
+            !settings_allow_reuse(
+                &saved,
+                "audio8-tts",
+                &same.0,
+                &same.1,
+                &Some("改过的转写。".into()),
+                true,
+                &effective_dict_hash(&saved),
+            ),
+            "只改参考文本也必须判成换音色"
+        );
+    }
+
+    /// 没有参考音就不能留孤立的参考文本（否则切回内置音色再选回同一段音频，
+    /// 会静默沿用上一份转写）。
+    #[test]
+    fn orphan_reference_text_is_dropped() {
+        let p = new_project_from_inputs(
+            "第一句。",
+            "audio8-tts",
+            None,
+            Some("这段文本没有对应的参考音".into()),
+            GAP_MS,
+            true,
+            &empty_dict(),
+        );
+        assert_eq!(p.voice_ref_text, None, "无参考音时不该留下文本");
+
+        let with_ref = new_project_from_inputs(
+            "第一句。",
+            "audio8-tts",
+            Some("/x/我的声线.wav".into()),
+            Some("实际念的内容".into()),
+            GAP_MS,
+            true,
+            &empty_dict(),
+        );
+        assert_eq!(with_ref.voice_ref_text.as_deref(), Some("实际念的内容"));
+    }
+
     fn save_done_project(dir: &Path, project: &mut Project) {
         std::fs::create_dir_all(dir.join("sentences")).unwrap();
         for sentence in &mut project.sentences {
@@ -9732,6 +10050,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -9750,6 +10069,7 @@ mod tests {
             &dir,
             "第一句。第二句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -9781,6 +10101,7 @@ mod tests {
             &inherited.model,
             &inherited.voice_ref,
             &inherited.voice_ref_hash,
+            &inherited.voice_ref_text,
             inherited.auto_normalize,
             &effective_dict_hash(&inherited),
         ));
@@ -9814,6 +10135,7 @@ mod tests {
                     &version.model,
                     &version.voice_ref,
                     &version.voice_ref_hash,
+                    &version.voice_ref_text,
                     version.auto_normalize,
                     &effective_dict_hash(&version),
                 ),
@@ -9830,7 +10152,15 @@ mod tests {
         let id = versions::save(
             &dir,
             "好版本",
-            &new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true, &empty_dict()),
+            &new_project_from_inputs(
+                "第一句。",
+                "audio8-tts",
+                None,
+                None,
+                GAP_MS,
+                true,
+                &empty_dict(),
+            ),
             1,
         )
         .unwrap();
@@ -9846,9 +10176,17 @@ mod tests {
         );
 
         // 对照：工程文件正常时回滚照常完成
-        new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true, &empty_dict())
-            .save(&dir)
-            .unwrap();
+        new_project_from_inputs(
+            "第一句。",
+            "audio8-tts",
+            None,
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .save(&dir)
+        .unwrap();
         assert!(rollback_with_inheritance(&dir, &id, &empty_dict()).is_ok());
     }
 
@@ -9877,6 +10215,7 @@ mod tests {
             "2024年第一句。",
             "audio8-tts",
             None,
+            None,
             750,
             true,
             &empty_dict(),
@@ -9891,6 +10230,7 @@ mod tests {
         let off = new_project_from_inputs(
             "2024年第一句。",
             "audio8-tts",
+            None,
             None,
             750,
             false,
@@ -9912,6 +10252,7 @@ mod tests {
             "  口播标准  ",
             "audio8-tts",
             Some("/v.wav".into()),
+            None,
             1.1,
             300,
             false,
@@ -9925,7 +10266,8 @@ mod tests {
         assert!(!t.auto_normalize);
 
         for blank in ["", "   ", "\t"] {
-            let err = template_from_inputs(blank, "audio8-tts", None, 1.0, 250, true).unwrap_err();
+            let err =
+                template_from_inputs(blank, "audio8-tts", None, None, 1.0, 250, true).unwrap_err();
             assert!(err.contains("名字"), "{err}");
         }
     }
@@ -10027,7 +10369,8 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let with_dict = new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, true, &dict);
+        let with_dict =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, None, 250, true, &dict);
         assert_eq!(with_dict.sentences[0].spoken, "崇庆的桥。");
         assert_eq!(
             with_dict.dict_hash,
@@ -10036,12 +10379,20 @@ mod tests {
         );
 
         // 关掉数字兜底，词典仍然生效
-        let no_rule = new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, false, &dict);
+        let no_rule =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, None, 250, false, &dict);
         assert_eq!(no_rule.sentences[0].spoken, "崇庆的桥。");
 
         // 空词典 = 原文
-        let empty =
-            new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, true, &empty_dict());
+        let empty = new_project_from_inputs(
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            None,
+            250,
+            true,
+            &empty_dict(),
+        );
         assert!(
             empty.sentences[0].spoken.contains("重庆") || empty.sentences[0].spoken.contains("重")
         );
@@ -10062,8 +10413,15 @@ mod tests {
 
         let dir = temp_dir("dict-change");
         // 当前工程：用词典 A 合成好的句子
-        let mut old =
-            new_project_from_inputs("重庆的桥。", "audio8-tts", None, GAP_MS, true, &dict_a);
+        let mut old = new_project_from_inputs(
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            None,
+            GAP_MS,
+            true,
+            &dict_a,
+        );
         save_done_project(&dir, &mut old);
 
         // 用词典 B 续作：不能复用（旧音频念的是另一套）
@@ -10071,6 +10429,7 @@ mod tests {
             &dir,
             "重庆的桥。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10092,13 +10451,21 @@ mod tests {
         );
 
         // 同一套词典：照旧续作（句子仍是 done）
-        let mut old2 =
-            new_project_from_inputs("重庆的桥。", "audio8-tts", None, GAP_MS, true, &dict_a);
+        let mut old2 = new_project_from_inputs(
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            None,
+            GAP_MS,
+            true,
+            &dict_a,
+        );
         save_done_project(&dir, &mut old2);
         let same = load_resumable(
             &dir,
             "重庆的桥。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10139,6 +10506,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS + 250,
             true,
             &empty_dict(),
@@ -10171,6 +10539,7 @@ mod tests {
             "2024年第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10196,6 +10565,7 @@ mod tests {
             "2024年第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             false,
             &empty_dict(),
@@ -10219,6 +10589,7 @@ mod tests {
             &dir,
             "第一句。改过的第二句。第三句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10252,6 +10623,7 @@ mod tests {
             "丙句。甲句。丁句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10282,6 +10654,7 @@ mod tests {
             &dir,
             "重复句。重复句。不同句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -10319,6 +10692,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(new_voice.display().to_string()),
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10344,6 +10718,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(missing_path),
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10457,6 +10832,7 @@ mod tests {
             "第一句。第二句。",
             "index-tts2",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10486,6 +10862,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             Some(voice_path),
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10889,6 +11266,7 @@ mod tests {
             "第一句。第二句。",
             "audio8-tts",
             None,
+            None,
             GAP_MS,
             true,
             &empty_dict(),
@@ -10909,6 +11287,7 @@ mod tests {
             &fresh,
             "第一句。第二句。",
             "audio8-tts",
+            None,
             None,
             GAP_MS,
             true,
@@ -11055,6 +11434,7 @@ mod tests {
                 revision: 1,
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                voice_ref_text: None,
                 gap_ms: GAP_MS,
                 auto_normalize: true,
                 dict: empty_dict(),
@@ -11137,6 +11517,7 @@ mod tests {
                 revision: 1,
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                voice_ref_text: None,
                 gap_ms: GAP_MS,
                 auto_normalize: true,
                 dict: empty_dict(),
@@ -12105,6 +12486,7 @@ mod tests {
                 script: "第一句测试。第二句测试。".into(),
                 model: "audio8-tts".into(),
                 voice_ref: None,
+                voice_ref_text: None,
                 project_name: "worker-dub-e2e".into(),
                 gap_ms: GAP_MS,
                 auto_normalize: true,
@@ -12803,6 +13185,7 @@ mod tests {
                     revision: 1,
                     model: "audio8-tts".into(),
                     voice_ref: None,
+                    voice_ref_text: None,
                     gap_ms: GAP_MS,
                     auto_normalize: true,
                     dict: empty_dict(),
