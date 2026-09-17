@@ -6669,13 +6669,6 @@ fn run_finished_note(
     }
 }
 
-/// 从工程里取质检台账：**只接受状态是「已合成」的句子**。
-///
-/// 失败/待合成的句子即使文件里还留着旧分数也不贴出来——那种分数描述的不是当前这句
-/// 可用的音频（复核建议：回灌要按状态过滤）。
-///
-/// 每项带 `Option<String>` 的来源模型。**旧工程缺这个字段时是 `None`，要保持 `None`**：
-/// 那是"来源未知"，不是"没测过"（没测过由 `eval_percent == None` 表达，根本不在这里）。
 /// 本轮**没评上、但旧分仍在工程里**的那些句子 → 补进本次结果。
 ///
 /// 关键在来源：这些分是**当年那次质检**测的，来源必须用 `sen.eval_model` **原样带回**，
@@ -6705,6 +6698,13 @@ fn carried_over_scores(
     out
 }
 
+/// 从工程里取质检台账：**只接受状态是「已合成」的句子**。
+///
+/// 失败/待合成的句子即使文件里还留着旧分数也不贴出来——那种分数描述的不是当前这句
+/// 可用的音频（复核建议：回灌要按状态过滤）。
+///
+/// 每项带 `Option<String>` 的来源模型。**旧工程缺这个字段时是 `None`，要保持 `None`**：
+/// 那是"来源未知"，不是"没测过"（没测过由 `eval_percent == None` 表达，根本不在这里）。
 fn eval_ledger_from_project(project: &Project) -> Vec<(usize, f64, Option<String>)> {
     project
         .sentences
@@ -14886,11 +14886,36 @@ mod tests {
         // 第 2 句：没测过 → 不该被沿用
         prj.sentences[2].eval_percent = None;
 
+        // 第 3 句：**失败句但文件里还留着旧分**（脏数据）→ 也不许被沿用。
+        // 这条钉的是函数里"只认 done"那道 guard —— 复核实测：把它删掉整仓仍然全绿
+        // （因为我这条用例原先把三句都设成了 done，压根没走到那个分支）。
+        // 失败形态：失败句的遗留旧分被带进台账 → 会被算进"现有 N 句的分数是谁测的"，
+        // 还会在那一行失败句上显示分数。
+        prj.sentences.push(aw_core::dub::Sentence {
+            index: 3,
+            text: "第四句。".into(),
+            spoken: "第四句。".into(),
+            seed: BASE_SEED,
+            duration: Some(1.0),
+            start: None,
+            status: "error: 模型没加载".into(),
+            eval_percent: Some(33.0),
+            eval_model: Some("fun-asr".into()),
+        });
+
         let already = vec![(1usize, 88.0, Some("audio8-asr".to_string()))];
         let carried = carried_over_scores(&prj, &already);
 
-        assert_eq!(carried.len(), 1, "只有第 0 句该被沿用：{carried:?}");
+        assert_eq!(
+            carried.len(),
+            1,
+            "只有第 0 句该被沿用（第 3 句是失败句的遗留旧分，不该贴）：{carried:?}"
+        );
         assert_eq!(carried[0].0, 0);
+        assert!(
+            !carried.iter().any(|(i, _, _)| *i == 3),
+            "失败句的遗留旧分不许被沿用：{carried:?}"
+        );
         assert_eq!(carried[0].1, 70.0);
         assert_eq!(
             carried[0].2.as_deref(),
