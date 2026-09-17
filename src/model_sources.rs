@@ -189,14 +189,14 @@ pub fn plan_rows(
                         let dest = model_dir.join(&pkg.local_paths[0]);
                         Row {
                             id: m.id.clone(),
-                            action: Some(Action {
+                            // 服务清单里没有这个模型 → 没有服务侧校验信息可谈（空条目）
+                            action: Some(action_for(
+                                &ServerEntry::default(),
                                 url,
-                                sha256: None,
-                                size: None,
                                 dest,
-                                origin: Origin::Builtin,
-                                conflict: None,
-                            }),
+                                Origin::Builtin,
+                                model_dir,
+                            )),
                             reason: String::new(),
                         }
                     }
@@ -235,28 +235,43 @@ fn server_action(s: &ServerEntry, cat: Option<&CatalogModel>, model_dir: &Path) 
     if !url.is_empty() {
         let rel = builtin_rel(cat).unwrap_or_else(|| declared_rel(&s.path, &s.id, url, model_dir));
         let dest = model_dir.join(rel);
-        let sha = s.sha256.trim();
-        return Some(Action {
-            url: url.to_string(),
-            sha256: (!sha.is_empty()).then(|| sha.to_string()),
-            size: s.size,
-            conflict: conflict_note(&s.path, &dest, model_dir),
+        return Some(action_for(
+            s,
+            url.to_string(),
             dest,
-            origin: Origin::Server,
-        });
+            Origin::Server,
+            model_dir,
+        ));
     }
     let pkg = usable_builtin_package(cat)?;
     let rel = &pkg.local_paths[0];
     let url = pkg.files[0].url.clone()?;
     let dest = model_dir.join(rel);
-    Some(Action {
+    Some(action_for(s, url, dest, Origin::Builtin, model_dir))
+}
+
+/// 组装一条下载入口——**唯一一处**（两个分支共用，免得"服务侧校验信息"在其中一条上漂掉）。
+///
+/// 口径是**按字段**回落，不是"要么全用服务、要么全用内置"：
+/// `url` 由调用方决定（服务清单有就用服务的），但 `sha256` / `size` **只要服务清单写了就用
+/// 服务侧的**——内置清单里根本没有这两个字段可打（生成不联网），所以服务侧有就该用；
+/// 丢掉它等于把校验静默降级成"只对长度"。
+fn action_for(
+    s: &ServerEntry,
+    url: String,
+    dest: PathBuf,
+    origin: Origin,
+    model_dir: &Path,
+) -> Action {
+    let sha = s.sha256.trim();
+    Action {
         url,
-        sha256: None,
-        size: None,
+        sha256: (!sha.is_empty()).then(|| sha.to_string()),
+        size: s.size,
         conflict: conflict_note(&s.path, &dest, model_dir),
         dest,
-        origin: Origin::Builtin,
-    })
+        origin,
+    }
 }
 
 /// 内置清单给的相对落点（上游布局，含 `target_directory` 那一层）。
@@ -575,6 +590,114 @@ mod tests {
             .unwrap()
             .conflict
             .is_some());
+    }
+
+    /// **按字段**回落：url 来自内置清单时，服务清单显式写了的 `sha256` / `size` 必须留下。
+    ///
+    /// 复核给的原始反例（这两个字段曾在内置分支被硬写成 `None`）：服务端声明的校验信息
+    /// 被静默丢掉，等于把校验降级成"只对长度"——`server.json` 是服务方写的，它说了算。
+    #[test]
+    fn server_side_checksum_and_size_are_kept_when_the_url_comes_from_the_builtin_catalog() {
+        let catalog = Catalog {
+            models: vec![cat_model(
+                "m",
+                "downloadable",
+                "",
+                Some(pkg("M-GGUF/m.gguf", "https://builtin.example/m.gguf")),
+            )],
+        };
+        let mut s = entry("m", "", "/models/M-GGUF/m.gguf");
+        s.sha256 = "deadbeef".into();
+        s.size = Some(123);
+        let rows = plan_rows(&[s], Ok(&catalog), Path::new("/models"));
+        let a = rows[0].action.as_ref().expect("内置清单有就该有入口");
+        assert_eq!(a.origin, Origin::Builtin, "url 确实来自内置清单");
+        assert_eq!(a.url, "https://builtin.example/m.gguf");
+        assert_eq!(
+            a.sha256.as_deref(),
+            Some("deadbeef"),
+            "服务侧 sha256 不能被丢掉"
+        );
+        assert_eq!(a.size, Some(123), "服务侧 size 不能被丢掉");
+    }
+
+    /// 三个字段**各自**独立回落（不搞"要么全用服务、要么全用内置"）：
+    /// url 有服务侧的用服务侧的，没有才用内置；sha256 / size 各自"服务侧非空即用"。
+    #[test]
+    fn url_checksum_and_size_fall_back_field_by_field() {
+        const BUILTIN: &str = "https://builtin.example/m.gguf";
+        let catalog = Catalog {
+            models: vec![cat_model(
+                "m",
+                "downloadable",
+                "",
+                Some(pkg("M-GGUF/m.gguf", BUILTIN)),
+            )],
+        };
+        /// 服务清单侧给了什么、期望最终算出什么（字段名写清楚，别用嵌套元组——
+        /// 嵌套元组会触发 clippy::type_complexity）。
+        struct Case {
+            server_url: &'static str,
+            server_sha256: &'static str,
+            server_size: Option<u64>,
+            want_url: &'static str,
+            want_sha256: Option<&'static str>,
+            want_size: Option<u64>,
+        }
+        let cases = [
+            // 服务只给了校验信息：url 用内置、校验用服务
+            Case {
+                server_url: "",
+                server_sha256: "deadbeef",
+                server_size: Some(123),
+                want_url: BUILTIN,
+                want_sha256: Some("deadbeef"),
+                want_size: Some(123),
+            },
+            // 服务三个字段都给：全用服务
+            Case {
+                server_url: "https://mirror.example/m.gguf",
+                server_sha256: "cafe",
+                server_size: Some(9),
+                want_url: "https://mirror.example/m.gguf",
+                want_sha256: Some("cafe"),
+                want_size: Some(9),
+            },
+            // 服务什么都没给：全用内置（内置没有校验信息 → None）
+            Case {
+                server_url: "",
+                server_sha256: "",
+                server_size: None,
+                want_url: BUILTIN,
+                want_sha256: None,
+                want_size: None,
+            },
+            // 服务只给了 size：size 用服务，sha 仍然是 None（不能凭 size 编一个 sha）
+            Case {
+                server_url: "",
+                server_sha256: "",
+                server_size: Some(7),
+                want_url: BUILTIN,
+                want_sha256: None,
+                want_size: Some(7),
+            },
+        ];
+        for c in cases {
+            let mut s = entry("m", c.server_url, "");
+            s.sha256 = c.server_sha256.into();
+            s.size = c.server_size;
+            let rows = plan_rows(&[s], Ok(&catalog), Path::new("/models"));
+            let a = rows[0].action.as_ref().unwrap();
+            let got = (a.url.as_str(), a.sha256.as_deref(), a.size);
+            assert_eq!(
+                got,
+                (c.want_url, c.want_sha256, c.want_size),
+                "服务侧 url={:?} sha256={:?} size={:?} 的字段级回落不对",
+                c.server_url,
+                c.server_sha256,
+                c.server_size
+            );
+        }
     }
 
     /// 落点校验：清单 `path` 在模型目录之外 → 必须把两边都摆出来。
