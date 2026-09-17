@@ -1488,12 +1488,31 @@ mod tests {
         assert!(advice.note.contains("另有 1 档体积未知"), "{}", advice.note);
         assert!(advice.note.contains("未参与比较"), "{}", advice.note);
 
-        // 全未知 → 连结论都不给
+        // 全未知 → 连结论都不给；**绝不能出现"装得下"**（未知不是零）
         let all_unknown =
             model_with_tiers("Y-GGUF", &[("q8_0", None, true), ("f16", None, false)], 0);
         let advice = recommend_tier(&tiers_of(&all_unknown), &budget(16.0, 1.0));
         assert_eq!(advice.tier, None);
         assert!(advice.note.contains("体积未知"), "{}", advice.note);
+        assert!(
+            !advice.note.contains("—— 装得下"),
+            "体积未知不能给出「装得下」的结论：{}",
+            advice.note
+        );
+
+        // **单档 + 体积未知**：这条专门钉 `known.is_empty()` 那道守卫。
+        // 少了它就会走到"只有一档"分支，把 `footprint_bytes` 的 0 当真实体积，
+        // 于是输出「估算占用 0 B … —— 装得下」——把"不知道"说成"装得下"。
+        // （多档全未知走的是另一条分支，抓不到这个 bug，所以必须单开一条。）
+        let single_unknown = model_with_tiers("Z-GGUF", &[("q8_0", None, true)], 0);
+        let advice = recommend_tier(&tiers_of(&single_unknown), &budget(16.0, 1.0));
+        assert_eq!(advice.tier, None, "体积未知时不该给出结论");
+        assert!(advice.note.contains("体积未知"), "{}", advice.note);
+        assert!(
+            !advice.note.contains("—— 装得下") && !advice.note.contains("估算占用 0"),
+            "单档体积未知被说成装得下（known.is_empty() 守卫失效）：{}",
+            advice.note
+        );
     }
 
     /// 内存未知：不猜（`tier` 为 None，理由说清是"拿不到物理内存"）。
