@@ -13,6 +13,7 @@
 
 mod batch;
 mod cancel;
+mod dictionaries;
 mod export;
 mod player;
 mod tasks;
@@ -89,6 +90,8 @@ enum Cmd {
         gap_ms: u64,
         /// 文本兜底（数字/年份规范化）开关：影响 spoken 文本 → 变了要重录
         auto_normalize: bool,
+        /// 当前启用的发音词典（空 map = 没启用）：与兜底开关同类，改了要重录
+        dict: std::collections::BTreeMap<String, String>,
     },
     /// 单句重录（换 seed 重合成该句）
     Redo { revision: u64, index: usize },
@@ -101,9 +104,10 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
-        /// 与单篇同一套：句间静音 + 文本兜底开关（批量产物也受它们影响）
+        /// 与单篇同一套：句间静音 + 文本兜底开关 + 发音词典（批量产物也受它们影响）
         gap_ms: u64,
         auto_normalize: bool,
+        dict: std::collections::BTreeMap<String, String>,
         items: Vec<BatchCmdItem>,
     },
     /// 拼装成品 + SRT。`gap_ms` 是当前的句间静音：停顿改了只要重新导出就能应用，
@@ -305,6 +309,10 @@ enum Msg {
         dir: PathBuf,
         outcome: export::BatchExportOutcome,
     },
+    /// 选完要导入的词条文件（.tsv/.csv/.txt）
+    DictFilePicked {
+        path: Option<String>,
+    },
     /// 选完要导入的音色目录（里面有 voice.json + 音频）
     VoiceImportDirPicked {
         path: Option<String>,
@@ -421,6 +429,9 @@ struct AppSettings {
     /// 模型目录：本机模型文件的存放位置（默认 <应用工作目录>/models，用户可选）
     #[serde(default)]
     model_dir: Option<String>,
+    /// 当前启用的发音词典（库内文件名）；缺省 = 不启用。
+    #[serde(default)]
+    dictionary: Option<String>,
     /// BGM 生成的输入（描述 / 压低档位 / 独立生成时长档位）。
     ///
     /// 以前这些只活在 UI 内存里：重启回默认值，用户写的描述白写；跨会话也没法判断
@@ -556,6 +567,91 @@ fn settings_path() -> PathBuf {
 ///
 /// **逐字段解析**：某一段坏掉（手改错、版本不兼容）只丢那一段，不要连带把 host/port
 /// 也清掉——整份 `from_str::<AppSettings>` 失败会让用户"设置全没了"。
+/// 词典库根目录（每套词典一个 JSON）。
+fn dictionaries_root() -> PathBuf {
+    documents_dir().join(WORKSHOP_DIR)
+}
+
+/// 词典列表 → 界面（名字 + 词条数；坏文件计数）。
+fn refresh_dictionaries(ui: &MainWindow, state: &Rc<UiState>) {
+    let (rows, broken) = dictionaries::list(&dictionaries_root());
+    let names: Vec<SharedString> = rows
+        .iter()
+        .map(|r| SharedString::from(format!("{}（{} 条）", r.name, r.count)))
+        .collect();
+    ui.set_dict_names(ModelRc::from(Rc::new(VecModel::from(names))));
+    // 下拉第 0 项固定是「不使用词典」，所以库里的排 1..n
+    let active = state.active_dict_file.borrow().clone();
+    let idx = active
+        .as_deref()
+        .and_then(|f| rows.iter().position(|r| r.file == f))
+        .map(|i| i as i32 + 1)
+        .unwrap_or(0);
+    ui.set_dict_index(idx);
+    let mut status = if rows.is_empty() {
+        "还没有词典".to_string()
+    } else {
+        format!("{} 套词典", rows.len())
+    };
+    if broken > 0 {
+        status.push_str(&format!("（{broken} 个文件读不出来，已跳过）"));
+    }
+    ui.set_dict_status(status.into());
+}
+
+/// 把"启用某套词典"落进 settings.json（失败也不阻断，只提示）。
+fn persist_active_dictionary(ui: &MainWindow, file: Option<&str>) {
+    let snapshot = {
+        let mut guard = match settings().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard.dictionary.as_deref() == file {
+            return;
+        }
+        guard.dictionary = file.map(str::to_string);
+        guard.clone()
+    };
+    if let Err(e) = save_settings(&snapshot) {
+        ui.set_status_text(format!("词典选择没能保存（{e}）：重启后会回到上次的选择").into());
+    }
+}
+
+/// 启用一套词典（或取消启用）：换词典 = 改 spoken 文本 → 与换模型同类，需要重录。
+fn activate_dictionary(
+    ui: &MainWindow,
+    state: &Rc<UiState>,
+    cmd_tx: &Sender<Cmd>,
+    file: Option<String>,
+) {
+    let entries = match file.as_deref() {
+        None => std::collections::BTreeMap::new(),
+        Some(f) => match dictionaries::load_file(&dictionaries_root(), f) {
+            Ok(d) => d.entries,
+            Err(e) => {
+                ui.set_status_text(e.into());
+                return;
+            }
+        },
+    };
+    *state.active_dict_file.borrow_mut() = file.clone();
+    *state.active_dict.borrow_mut() = entries;
+    persist_active_dictionary(ui, file.as_deref());
+    refresh_dictionaries(ui, state);
+    // 词典改的是"这个词该怎么念"→ 旧音频不能复用（与兜底开关同类）
+    invalidate_worker_project(cmd_tx, state);
+    reset_bgm(ui, state);
+    state.assembled.borrow_mut().take();
+    clear_eval_scores(state);
+    ui.set_has_result(false);
+    let what = file
+        .as_deref()
+        .and_then(|f| dictionaries::load_file(&dictionaries_root(), f).ok())
+        .map(|d| d.name)
+        .unwrap_or_else(|| "不使用词典".to_string());
+    ui.set_status_text(format!("词典已切到「{what}」：需要重新合成（旧读法不再复用）").into());
+}
+
 /// 音色库根目录（库目录 + 索引都在它下面）：与应用设置、导出目录同级。
 fn voices_root() -> PathBuf {
     documents_dir().join(WORKSHOP_DIR)
@@ -726,6 +822,112 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
     });
 }
 
+/// 发音词典（P5）：切换 / 导入词条 / 导出词条。
+fn wire_dictionary(
+    ui: &MainWindow,
+    cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
+    state: &Rc<UiState>,
+) {
+    // 切换启用的词典（第 0 项 = 不使用）
+    let weak = ui.as_weak();
+    let st = state.clone();
+    let tx = cmd_tx.clone();
+    ui.on_dict_picked(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        if project_editing_blocked(&ui, &st) || batch_in_flight(&st) {
+            ui.set_status_text("任务进行中：词典等这轮跑完再换".into());
+            refresh_dictionaries(&ui, &st);
+            return;
+        }
+        let file = if i <= 0 {
+            None
+        } else {
+            let (rows, _) = dictionaries::list(&dictionaries_root());
+            rows.get((i - 1) as usize).map(|r| r.file.clone())
+        };
+        activate_dictionary(&ui, &st, &tx, file);
+    });
+
+    // 导入词条
+    let weak = ui.as_weak();
+    let msg = msg_tx.clone();
+    let st_import = state.clone();
+    ui.on_dict_import(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() || !state_dictionary_idle(&st_import) {
+            ui.set_status_text("任务进行中：词典等这轮跑完再导入".into());
+            return;
+        }
+        ui.set_status_text("正在打开文件选择框（词条 .tsv/.csv/.txt）…".into());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let path = pick_text_file_blocking();
+            let _ = msg.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::DictFilePicked { path },
+            });
+        });
+    });
+
+    // 导出当前启用的词典
+    let weak = ui.as_weak();
+    let st_export = state.clone();
+    ui.on_dict_export(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(file) = st_export.active_dict_file.borrow().clone() else {
+            ui.set_status_text("当前没有启用词典：先选一套".into());
+            return;
+        };
+        let dest = PathBuf::from(ui.get_export_dir().to_string());
+        match dictionaries::export_tsv(&dictionaries_root(), &file, &dest, file_stem) {
+            Ok(path) => {
+                toast(&ui, &format!("已导出 {}", file_label(&path)));
+                ui.set_status_text(
+                    format!("词条已导出到 {}（可直接编辑后再导入）", path.display()).into(),
+                );
+            }
+            Err(e) => ui.set_status_text(e.into()),
+        }
+    });
+}
+
+/// 词典区现在能不能动（任务在飞/批量在飞都不行）。
+fn state_dictionary_idle(state: &Rc<UiState>) -> bool {
+    !project_editing_blocked_dummy(state) && !batch_in_flight(state)
+}
+
+/// `project_editing_blocked` 需要 `&MainWindow`，这里只用状态判"有没有任务在飞"。
+fn project_editing_blocked_dummy(state: &Rc<UiState>) -> bool {
+    state
+        .tasks
+        .borrow()
+        .counts()
+        .pending
+        .saturating_add(state.tasks.borrow().counts().running)
+        > 0
+}
+
+/// 启动时按 settings.json 里记的那套启用词典（不触发作废——启动时没有"旧成品"要作废）。
+fn load_active_dictionary(ui: &MainWindow, state: &Rc<UiState>) {
+    let file = settings_snapshot().dictionary;
+    if let Some(f) = file.as_deref() {
+        match dictionaries::load_file(&dictionaries_root(), f) {
+            Ok(d) => {
+                *state.active_dict_file.borrow_mut() = Some(f.to_string());
+                *state.active_dict.borrow_mut() = d.entries;
+            }
+            Err(e) => {
+                // 启用的那套坏了：退回"不启用"，但要说清（不能静默换读法）
+                *state.active_dict_file.borrow_mut() = None;
+                state.active_dict.borrow_mut().clear();
+                ui.set_status_text(format!("上次启用的词典读不出来，已退回不启用：{e}").into());
+            }
+        }
+    }
+    refresh_dictionaries(ui, state);
+}
+
 /// 「导入音色」这套接线要用的两个 sender（与其它 wire_* 一样按引用传）。
 struct VoiceLibraryCtx {
     cmd_tx: Sender<Cmd>,
@@ -812,6 +1014,7 @@ fn load_settings() -> AppSettings {
         host: json_field(&v, "host"),
         port: json_field(&v, "port"),
         model_dir: json_field(&v, "model_dir"),
+        dictionary: json_field(&v, "dictionary"),
         bgm: json_field(&v, "bgm").unwrap_or_default(),
     }
 }
@@ -1253,6 +1456,43 @@ fn apply_engine_discovery(ui: &MainWindow, invalidate: Option<(&Sender<Cmd>, &Rc
     if !note.is_empty() {
         ui.set_status_text(format!("模型清单：{note}").into());
     }
+}
+
+/// 选一个词条文件（系统文件框，后台线程 + 消息回传）。
+fn pick_text_file_blocking() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose file with prompt \"选择词条文件（.tsv/.csv/.txt）\")",
+        ])
+        .output()
+        .ok()?;
+
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+             $d = New-Object System.Windows.Forms.OpenFileDialog; \
+             $d.Filter = '词条文件|*.tsv;*.csv;*.txt|所有文件|*.*'; \
+             if ($d.ShowDialog() -eq \"OK\") { Write-Output $d.FileName }",
+        ])
+        .output()
+        .ok()?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let out = std::process::Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--title=选择词条文件",
+            "--file-filter=词条文件 | *.tsv *.csv *.txt",
+        ])
+        .output()
+        .ok()?;
+
+    pick_output_to_path(out)
 }
 
 /// 系统目录选择框：阻塞式原生对话框，必须放后台线程，结果回消息通道。
@@ -1751,6 +1991,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 project_name,
                 gap_ms,
                 auto_normalize,
+                dict,
             } => {
                 if task_take_started(&ctx, task_id) {
                     // 排队期间被停掉：不载入、不合成，按"用户停止"收尾
@@ -1772,6 +2013,7 @@ fn worker_loop(ctx: WorkerCtx) {
                     voice_ref,
                     gap_ms,
                     auto_normalize,
+                    &dict,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1843,6 +2085,7 @@ fn worker_loop(ctx: WorkerCtx) {
                 voice_ref,
                 gap_ms,
                 auto_normalize,
+                dict,
                 items,
             } => {
                 let total = items.len();
@@ -1895,6 +2138,7 @@ fn worker_loop(ctx: WorkerCtx) {
                         voice_ref.clone(),
                         gap_ms,
                         auto_normalize,
+                        &dict,
                     ) {
                         Ok(p) => p,
                         Err(e) => {
@@ -2803,10 +3047,22 @@ fn settings_allow_reuse(
     voice_ref: &Option<String>,
     voice_ref_hash: &Option<String>,
     auto_normalize: bool,
+    dict_fingerprint: &str,
 ) -> bool {
     saved.model == model
         && saved.auto_normalize == auto_normalize
+        // 词典与兜底开关同类：它改的是 spoken 文本，换词典就不能复用旧音频。
+        // 旧工程/没启用时 `dict_hash` 是 None —— 按"空词典"处理，与当前空词典等价。
+        && effective_dict_hash(saved) == dict_fingerprint
         && voice_ref_matches(saved, voice_ref, voice_ref_hash)
+}
+
+/// 工程记录的词典指纹：None（旧工程 / 从没启用过）等价于"空词典"。
+fn effective_dict_hash(saved: &Project) -> String {
+    saved
+        .dict_hash
+        .clone()
+        .unwrap_or_else(|| dictionaries::fingerprint(&Default::default()))
 }
 
 fn sentence_texts_match(project: &Project, script: &str) -> bool {
@@ -2923,6 +3179,7 @@ fn new_project_from_inputs(
     voice_ref: Option<String>,
     gap_ms: u64,
     auto_normalize: bool,
+    dict: &std::collections::BTreeMap<String, String>,
 ) -> Project {
     let mut project = Project::new(
         script,
@@ -2934,14 +3191,16 @@ fn new_project_from_inputs(
         MAX_CHARS,
         |t| {
             if auto_normalize {
-                aw_core::normalize(t, &Default::default())
+                // 数字/年份规范化**会顺带应用词典**（aw_core::normalize 的实现就是先词典后规则）
+                aw_core::normalize(t, dict)
             } else {
-                // 关掉兜底 = 原文照念（数字/年份交给引擎自己处理）
-                t.to_string()
+                // 关掉兜底 ≠ 关掉词典：词典是"这个词该怎么念"，与数字规则是两件事
+                aw_core::apply_dictionary(t, dict)
             }
         },
     );
     project.auto_normalize = auto_normalize;
+    project.dict_hash = Some(dictionaries::fingerprint(dict));
     // 参考音哈希**不在这里算**：`load_resumable` 已经算过一份（算两遍纯属浪费），
     // 版本留档那边由 `project_from_ui` 自己补。这里只管"按输入造工程"。
     project
@@ -2954,7 +3213,9 @@ fn load_resumable(
     voice_ref: Option<String>,
     gap_ms: u64,
     auto_normalize: bool,
+    dict: &std::collections::BTreeMap<String, String>,
 ) -> Result<LoadedProject, String> {
+    let dict_hash = dictionaries::fingerprint(dict);
     let voice_ref_hash = match voice_ref.as_deref() {
         Some(path) => Some(sha256_file(Path::new(path))?),
         None => None,
@@ -2965,8 +3226,14 @@ fn load_resumable(
     if let Some(saved) = saved.as_ref() {
         // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
         // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
-        if settings_allow_reuse(saved, model, &voice_ref, &voice_ref_hash, auto_normalize)
-            && sentence_texts_match(saved, script)
+        if settings_allow_reuse(
+            saved,
+            model,
+            &voice_ref,
+            &voice_ref_hash,
+            auto_normalize,
+            &dict_hash,
+        ) && sentence_texts_match(saved, script)
         {
             let mut project = saved.clone();
             if project.gap_ms != gap_ms {
@@ -2979,13 +3246,26 @@ fn load_resumable(
         }
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("建工程目录失败: {e}"))?;
-    let mut project =
-        new_project_from_inputs(script, model, voice_ref.clone(), gap_ms, auto_normalize);
+    let mut project = new_project_from_inputs(
+        script,
+        model,
+        voice_ref.clone(),
+        gap_ms,
+        auto_normalize,
+        dict,
+    );
     // 用上面已经算好的哈希（少读一次参考音文件）
     project.voice_ref_hash = voice_ref_hash.clone();
     let reused = if let Some(saved) = saved.as_ref() {
         // 与快路径同一条判据：开关变了就不能逐句继承（旧音频念的是另一套文本）
-        if settings_allow_reuse(saved, model, &voice_ref, &voice_ref_hash, auto_normalize) {
+        if settings_allow_reuse(
+            saved,
+            model,
+            &voice_ref,
+            &voice_ref_hash,
+            auto_normalize,
+            &dict_hash,
+        ) {
             reuse_done_sentences(&mut project, saved, dir)?
         } else {
             0
@@ -3066,6 +3346,9 @@ struct UiState {
     batch_skipped_notes: RefCell<Vec<String>>,
     /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
     batch_export_running: std::cell::Cell<bool>,
+    /// 当前启用的发音词典：库内文件名（None = 不启用）与词条内容（送给 worker 的那份）。
+    active_dict_file: RefCell<Option<String>>,
+    active_dict: RefCell<std::collections::BTreeMap<String, String>>,
     /// 「数字/年份规范化」开关上次被 tick 看到的值。PixelSwitch 没有回调，
     /// 靠它发现"用户切换了"→ 作废工程（spoken 文本会变，旧音频不能算数）。
     auto_normalize_seen: std::cell::Cell<bool>,
@@ -3162,6 +3445,8 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_engine_changes(&ui, &cmd_tx, &state);
     wire_templates(&ui, &cmd_tx, &state);
     wire_versions(&ui, &rows, &cmd_tx, &state);
+    wire_dictionary(&ui, &cmd_tx, &msg_tx_ui, &state);
+    load_active_dictionary(&ui, &state);
     wire_voice_panel(&ui, &cmd_tx, &state);
     wire_voice_library(
         &ui,
@@ -3201,12 +3486,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         let rows = rows.clone();
         let msg_rx = Rc::new(RefCell::new(msg_rx));
+        let cmd_tx_tick = cmd_tx.clone();
         timer.start(
             TimerMode::Repeated,
             Duration::from_millis(TICK_MS),
             move || {
                 if let Some(ui) = weak.upgrade() {
-                    tick(&ui, &rows, &msg_rx, &player, &state);
+                    tick(&ui, &rows, &msg_rx, &player, &state, &cmd_tx_tick);
                 }
             },
         );
@@ -4594,6 +4880,7 @@ fn wire_batch(
                 voice_ref,
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
+                dict: st.active_dict.borrow().clone(),
                 items,
             })
             .is_err()
@@ -4725,7 +5012,7 @@ fn wire_task_center(
 ///
 /// 与 worker 造新工程共用 `new_project_from_inputs`，所以留档下来的东西就是"点开始合成
 /// 会用的那一份"，不是另建一个近似对象。
-fn project_from_ui(ui: &MainWindow) -> Project {
+fn project_from_ui(ui: &MainWindow, dict: &std::collections::BTreeMap<String, String>) -> Project {
     let voice_ref = non_empty(ui.get_voice_ref_path().to_string());
     let mut project = new_project_from_inputs(
         &ui.get_script_text(),
@@ -4733,6 +5020,7 @@ fn project_from_ui(ui: &MainWindow) -> Project {
         voice_ref.clone(),
         gap_ms_from_ui(ui),
         ui.get_auto_normalize(),
+        dict,
     );
     // 留档也要忠实：把参考音的内容哈希一起记下来（算不出来就留 None = 下次保守重录）
     if let Some(path) = voice_ref.as_deref() {
@@ -4746,13 +5034,17 @@ fn project_from_ui(ui: &MainWindow) -> Project {
 /// 关键契约：当前 `project.json` **存在但读不出来**（损坏/权限）时，直接中止并返回
 /// Err——绝不 commit。`Project::load_if_present` 的契约就是"损坏工程不自动重建、不覆盖"，
 /// 回滚如果把 `Err` 当成"没有当前工程"继续写盘，就会把唯一可人工恢复的现场抹掉。
-fn rollback_with_inheritance(dir: &Path, id: &str) -> Result<(Project, usize), String> {
+fn rollback_with_inheritance(
+    dir: &Path,
+    id: &str,
+    dict: &std::collections::BTreeMap<String, String>,
+) -> Result<(Project, usize), String> {
     let inherited = match Project::load_if_present(dir) {
         Ok(p) => p,
         Err(e) => return Err(format!("当前工程读不出来，回滚已中止（不会覆盖现场）：{e}")),
     };
     let snapshot = versions::load_for_rollback(dir, id)?;
-    let mut restored = project_from_version(&snapshot);
+    let mut restored = project_from_version(&snapshot, dict);
     // 与 `load_resumable` 同一条判据：模型 / 兜底开关 / 参考音不一致时**不许复用音频**，
     // 否则回滚会把"另一个模型/音色合成的声音"标成这份版本的已合成。
     let reused = match inherited.as_ref() {
@@ -4763,6 +5055,7 @@ fn rollback_with_inheritance(dir: &Path, id: &str) -> Result<(Project, usize), S
                 &restored.voice_ref,
                 &restored.voice_ref_hash,
                 restored.auto_normalize,
+                &effective_dict_hash(&restored),
             ) =>
         {
             reuse_done_sentences(&mut restored, saved, dir)?
@@ -4777,14 +5070,20 @@ fn rollback_with_inheritance(dir: &Path, id: &str) -> Result<(Project, usize), S
 ///
 /// 快照里的句子状态是留档那一刻的（全 pending），这里**按稿件与设置重建**，
 /// 句级状态交给调用方用"按文本继承"补——保持"状态由合成决定"这条不变式。
-fn project_from_version(snapshot: &Project) -> Project {
+fn project_from_version(
+    snapshot: &Project,
+    dict: &std::collections::BTreeMap<String, String>,
+) -> Project {
     let script: String = snapshot.sentences.iter().map(|s| s.text.as_str()).collect();
+    // 词典用**当前启用的那套**：版本存的是稿件与设置，词典是库里的资产、不随版本走
+    // （`new_project_from_inputs` 会把当前词典的指纹写进工程，复用判据因此仍然自洽）。
     let mut project = new_project_from_inputs(
         &script,
         &snapshot.model,
         snapshot.voice_ref.clone(),
         snapshot.gap_ms,
         snapshot.auto_normalize,
+        dict,
     );
     project.voice_ref_hash = snapshot.voice_ref_hash.clone();
     project
@@ -4894,7 +5193,7 @@ fn wire_versions(
             ui.set_status_text("还没有工程：先开始一次合成再留档".into());
             return;
         };
-        let project = project_from_ui(&ui);
+        let project = project_from_ui(&ui, &st.active_dict.borrow());
         match versions::save(&dir, &ui.get_version_label_text(), &project, now_ms()) {
             Ok(_) => {
                 ui.set_version_label_text("".into());
@@ -4917,7 +5216,7 @@ fn wire_versions(
         let id = id.to_string();
         match versions::load(&dir, &id) {
             Ok(v) => {
-                let current = project_from_ui(&ui);
+                let current = project_from_ui(&ui, &st_diff.active_dict.borrow());
                 let d = versions::diff(&v.project, &current);
                 let text = format_diff(&v.label, &d, &d.lines);
                 ui.set_version_diff_text(text.into());
@@ -4947,7 +5246,8 @@ fn wire_versions(
         // 两步回滚（复核抓到的关键点）：版本快照里的句子全是 pending，直接写回再跑时
         // `load_resumable` 走快路径会原样返回它 —— "文本相同的句子复用"就落空；
         // 而当前工程损坏时必须中止（不能覆盖现场）。两件事都在下面这个函数里定义清楚。
-        match rollback_with_inheritance(&dir, &id) {
+        let dict = st.active_dict.borrow().clone();
+        match rollback_with_inheritance(&dir, &id, &dict) {
             Ok((project, reused)) => {
                 // 界面回灌：稿件 + 引擎/音色/停顿/兜底，全部走与手工编辑同一条路径
                 let script: String = project.sentences.iter().map(|s| s.text.as_str()).collect();
@@ -5430,6 +5730,7 @@ fn wire_run(
                 project_name: stem,
                 gap_ms: gap_ms_from_ui(&ui),
                 auto_normalize: ui.get_auto_normalize(),
+                dict: state1.active_dict.borrow().clone(),
             })
             .is_err()
         {
@@ -5980,6 +6281,7 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::ServerHealth { .. }
         | Msg::ModelDirPicked { .. }
         | Msg::VoiceImportDirPicked { .. }
+        | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
         | Msg::SeparationProgress { .. }
         | Msg::SeparationDone { .. }
@@ -6016,6 +6318,7 @@ fn tick(
     msg_rx: &Rc<RefCell<Receiver<WorkerMsg>>>,
     player: &Rc<player::Player>,
     state: &Rc<UiState>,
+    cmd_tx: &Sender<Cmd>,
 ) {
     // ── 工作线程消息 ──
     let mut run_finished: Option<(usize, bool, usize)> = None;
@@ -6490,6 +6793,75 @@ fn tick(
                 };
                 ui.set_status_text(text.into());
             }
+            Msg::DictFilePicked { path } => {
+                let Some(path) = path else {
+                    ui.set_status_text("取消了导入词条".into());
+                    return;
+                };
+                let outcome = match dictionaries::import_file(Path::new(&path)) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        ui.set_status_text(e.into());
+                        return;
+                    }
+                };
+                if outcome.entries.is_empty() {
+                    let note = if outcome.skipped.is_empty() {
+                        "这个文件里没有词条".to_string()
+                    } else {
+                        format!("没有可导入的词条（{} 条被跳过）", outcome.skipped.len())
+                    };
+                    ui.set_status_text(note.into());
+                    return;
+                }
+                // 目标词典：当前启用的那套；没启用就按文件名新建一套
+                let current_file = state.active_dict_file.borrow().clone();
+                let current_name = current_file
+                    .as_deref()
+                    .and_then(|f| dictionaries::load_file(&dictionaries_root(), f).ok())
+                    .map(|d| d.name)
+                    .unwrap_or_else(|| {
+                        Path::new(&path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("导入的词典")
+                            .to_string()
+                    });
+                let mut merged = state.active_dict.borrow().clone();
+                for e in &outcome.entries {
+                    merged.insert(e.from.clone(), e.to.clone());
+                }
+                match dictionaries::save(
+                    &dictionaries_root(),
+                    &current_name,
+                    merged,
+                    now_ms(),
+                    file_stem,
+                ) {
+                    Ok(entry) => {
+                        let skipped = if outcome.skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "，跳过 {} 条（{}）",
+                                outcome.skipped.len(),
+                                outcome.skipped[0]
+                            )
+                        };
+                        activate_dictionary(ui, state, cmd_tx, Some(entry.file.clone()));
+                        ui.set_status_text(
+                            format!(
+                                "已导入 {} 条词条到「{}」{}",
+                                outcome.entries.len(),
+                                entry.name,
+                                skipped
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(e) => ui.set_status_text(e.into()),
+                }
+            }
             Msg::VoiceImportDirPicked { path } => {
                 let Some(dir) = path else {
                     ui.set_status_text("取消了导入音色".into());
@@ -6914,6 +7286,8 @@ fn wire_global_settings(
             model_dir: (!dir.is_empty() && !is_default_dir).then_some(dir.clone()),
             // BGM 输入不在这里改（有自己的落盘点 save_bgm_settings），原样带上
             bgm: prev.bgm,
+            // 词典选择也不在这里改（有自己的落盘点），原样带上
+            dictionary: prev.dictionary,
         };
         if let Err(e) = save_settings(&next) {
             ui.set_server_ok(false);
@@ -7495,6 +7869,7 @@ mod tests {
             host: None,
             port: Some(9999),
             model_dir: None,
+            dictionary: None,
             bgm: Default::default(),
         };
         assert_eq!(
@@ -7507,6 +7882,7 @@ mod tests {
             host: Some("10.0.0.1".into()),
             port: None,
             model_dir: None,
+            dictionary: None,
             bgm: Default::default(),
         };
         assert_eq!(
@@ -7599,6 +7975,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 测试用的空词典（P5 把词典接进文本层后，构造/续作都要显式给一份）。
+    fn empty_dict() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
     }
 
     fn saved_project(script: &str, voice_ref: Option<&str>) -> Project {
@@ -7725,8 +8106,14 @@ mod tests {
         let inherited = Project::load(&dir).unwrap();
 
         // 版本快照 = 稿件 + 设置（重建出来全是 pending），这正是留档写下的那份
-        let mut restored =
-            new_project_from_inputs("第一句。第二句。", "audio8-tts", None, GAP_MS, true);
+        let mut restored = new_project_from_inputs(
+            "第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        );
         assert!(
             restored.sentences.iter().all(|s| s.status == "pending"),
             "前提：重建成的新工程没有句级状态"
@@ -7737,8 +8124,16 @@ mod tests {
         versions::commit_rollback(&dir, &restored).unwrap();
 
         // 关键断言：下一次「开始合成」不会把这句当成待录
-        let loaded =
-            load_resumable(&dir, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap();
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .unwrap();
         assert!(
             loaded.project.sentences.iter().all(|s| s.status == "done"),
             "回滚后同文本的句子必须仍是已合成（否则会全部重录）"
@@ -7765,6 +8160,7 @@ mod tests {
             &inherited.voice_ref,
             &inherited.voice_ref_hash,
             inherited.auto_normalize,
+            &effective_dict_hash(&inherited),
         ));
 
         // 版本与当前工程只在"被 tweak 的那一项"上不同（其余整份克隆，避免测试自己写错）
@@ -7794,6 +8190,7 @@ mod tests {
                     &version.voice_ref,
                     &version.voice_ref_hash,
                     version.auto_normalize,
+                    &effective_dict_hash(&version),
                 ),
                 "{name}：设置不一致就不该允许复用音频"
             );
@@ -7808,14 +8205,14 @@ mod tests {
         let id = versions::save(
             &dir,
             "好版本",
-            &new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true),
+            &new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true, &empty_dict()),
             1,
         )
         .unwrap();
         let corrupt = b"{ this is not json";
         std::fs::write(dir.join("project.json"), corrupt).unwrap();
 
-        let err = rollback_with_inheritance(&dir, &id).unwrap_err();
+        let err = rollback_with_inheritance(&dir, &id, &empty_dict()).unwrap_err();
         assert!(err.contains("不会覆盖现场"), "{err}");
         assert_eq!(
             std::fs::read(dir.join("project.json")).unwrap(),
@@ -7824,10 +8221,10 @@ mod tests {
         );
 
         // 对照：工程文件正常时回滚照常完成
-        new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true)
+        new_project_from_inputs("第一句。", "audio8-tts", None, GAP_MS, true, &empty_dict())
             .save(&dir)
             .unwrap();
-        assert!(rollback_with_inheritance(&dir, &id).is_ok());
+        assert!(rollback_with_inheritance(&dir, &id, &empty_dict()).is_ok());
     }
 
     /// 版本列表里的时间用"多久以前"说（不引日期库）：四档 + 未来时间兜底。
@@ -7851,7 +8248,14 @@ mod tests {
     /// 这里钉住它真的按输入记下了停顿、兜底开关，并按开关决定 spoken 文本。
     #[test]
     fn new_project_from_inputs_records_settings() {
-        let on = new_project_from_inputs("2024年第一句。", "audio8-tts", None, 750, true);
+        let on = new_project_from_inputs(
+            "2024年第一句。",
+            "audio8-tts",
+            None,
+            750,
+            true,
+            &empty_dict(),
+        );
         assert_eq!(on.gap_ms, 750);
         assert!(on.auto_normalize);
         assert_ne!(
@@ -7859,7 +8263,14 @@ mod tests {
             "开兜底时 spoken 应被规范化（2024年 → 二零二四年）"
         );
 
-        let off = new_project_from_inputs("2024年第一句。", "audio8-tts", None, 750, false);
+        let off = new_project_from_inputs(
+            "2024年第一句。",
+            "audio8-tts",
+            None,
+            750,
+            false,
+            &empty_dict(),
+        );
         assert!(!off.auto_normalize);
         assert_eq!(
             off.sentences[0].spoken, off.sentences[0].text,
@@ -7894,6 +8305,99 @@ mod tests {
         }
     }
 
+    /// 词典真的进了文本层：同一个稿件，带词典时 spoken 变成替换后的读法；
+    /// 而且**关掉数字兜底不影响词典**（词典是"这个词怎么念"，与数字规则是两件事）。
+    #[test]
+    fn dictionary_applies_to_spoken_text() {
+        let dict: std::collections::BTreeMap<String, String> =
+            [("重庆".to_string(), "崇庆".to_string())]
+                .into_iter()
+                .collect();
+
+        let with_dict = new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, true, &dict);
+        assert_eq!(with_dict.sentences[0].spoken, "崇庆的桥。");
+        assert_eq!(
+            with_dict.dict_hash,
+            Some(dictionaries::fingerprint(&dict)),
+            "工程要记下词典指纹"
+        );
+
+        // 关掉数字兜底，词典仍然生效
+        let no_rule = new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, false, &dict);
+        assert_eq!(no_rule.sentences[0].spoken, "崇庆的桥。");
+
+        // 空词典 = 原文
+        let empty =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, 250, true, &empty_dict());
+        assert!(
+            empty.sentences[0].spoken.contains("重庆") || empty.sentences[0].spoken.contains("重")
+        );
+        assert_ne!(empty.dict_hash, with_dict.dict_hash);
+    }
+
+    /// 换词典 = 改 spoken 文本 → 旧音频一律不复用（与换模型/换兜底开关同类）。
+    #[test]
+    fn dictionary_change_invalidates_reuse() {
+        let dict_a: std::collections::BTreeMap<String, String> =
+            [("重庆".to_string(), "崇庆".to_string())]
+                .into_iter()
+                .collect();
+        let dict_b: std::collections::BTreeMap<String, String> =
+            [("重庆".to_string(), "重青".to_string())]
+                .into_iter()
+                .collect();
+
+        let dir = temp_dir("dict-change");
+        // 当前工程：用词典 A 合成好的句子
+        let mut old =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, GAP_MS, true, &dict_a);
+        save_done_project(&dir, &mut old);
+
+        // 用词典 B 续作：不能复用（旧音频念的是另一套）
+        let loaded = load_resumable(
+            &dir,
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &dict_b,
+        )
+        .unwrap();
+        assert_eq!(loaded.reused, 0);
+        assert!(
+            loaded
+                .project
+                .sentences
+                .iter()
+                .all(|s| s.status == "pending"),
+            "换词典要重录，不能把旧读法留在成品里"
+        );
+        assert_eq!(
+            loaded.project.dict_hash,
+            Some(dictionaries::fingerprint(&dict_b))
+        );
+
+        // 同一套词典：照旧续作（句子仍是 done）
+        let mut old2 =
+            new_project_from_inputs("重庆的桥。", "audio8-tts", None, GAP_MS, true, &dict_a);
+        save_done_project(&dir, &mut old2);
+        let same = load_resumable(
+            &dir,
+            "重庆的桥。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &dict_a,
+        )
+        .unwrap();
+        assert!(
+            same.project.sentences.iter().all(|s| s.status == "done"),
+            "词典没变就该续作"
+        );
+    }
+
     /// 停顿输入的归一：留空/非法回落默认，越界夹住（不做数值输入报错，界面上两句话写清）。
     #[test]
     fn gap_input_normalizes_and_clamps() {
@@ -7924,6 +8428,7 @@ mod tests {
             None,
             GAP_MS + 250,
             true,
+            &empty_dict(),
         )
         .unwrap();
         assert_eq!(loaded.reused, 0, "不改文本时走快路径，不报「继承」");
@@ -7955,6 +8460,7 @@ mod tests {
             None,
             GAP_MS,
             true,
+            &empty_dict(),
         )
         .unwrap();
         assert_eq!(loaded.reused, 0);
@@ -7979,6 +8485,7 @@ mod tests {
             None,
             GAP_MS,
             false,
+            &empty_dict(),
         )
         .unwrap();
         assert!(
@@ -8002,6 +8509,7 @@ mod tests {
             None,
             GAP_MS,
             true,
+            &empty_dict(),
         )
         .unwrap();
         let loaded = loaded.project;
@@ -8026,8 +8534,16 @@ mod tests {
         let mut old = saved_project("甲句。乙句。丙句。", None);
         save_done_project(&dir, &mut old);
 
-        let loaded =
-            load_resumable(&dir, "丙句。甲句。丁句。", "audio8-tts", None, GAP_MS, true).unwrap();
+        let loaded = load_resumable(
+            &dir,
+            "丙句。甲句。丁句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .unwrap();
         assert_eq!(loaded.reused, 2);
         let loaded = loaded.project;
         assert_eq!(loaded.sentences[0].status, "done");
@@ -8056,6 +8572,7 @@ mod tests {
             None,
             GAP_MS,
             true,
+            &empty_dict(),
         )
         .unwrap();
         assert_eq!(loaded.reused, 3);
@@ -8091,6 +8608,7 @@ mod tests {
             Some(new_voice.display().to_string()),
             GAP_MS,
             true,
+            &empty_dict(),
         )
         .unwrap();
         assert_eq!(loaded.reused, 0);
@@ -8115,6 +8633,7 @@ mod tests {
             Some(missing_path),
             GAP_MS,
             true,
+            &empty_dict(),
         )
         .unwrap_err();
         assert!(err.contains("参考音频不可读"), "应明确报错: {err}");
@@ -8220,8 +8739,16 @@ mod tests {
         let mut old = saved_project("第一句。第二句。", None);
         save_done_project(&dir, &mut old);
 
-        let loaded =
-            load_resumable(&dir, "第一句。第二句。", "index-tts2", None, GAP_MS, true).unwrap();
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "index-tts2",
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .unwrap();
         assert_eq!(loaded.reused, 0);
         assert!(loaded
             .project
@@ -8248,6 +8775,7 @@ mod tests {
             Some(voice_path),
             GAP_MS,
             true,
+            &empty_dict(),
         )
         .unwrap();
         assert_eq!(loaded.reused, 0);
@@ -8639,8 +9167,16 @@ mod tests {
         let broken = br#"{"sentences": [{"index": 1,"#;
         std::fs::write(dir.join("project.json"), broken).unwrap();
 
-        let err =
-            load_resumable(&dir, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap_err();
+        let err = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .unwrap_err();
         assert!(err.contains("工程文件损坏"), "实得 {err}");
         assert!(err.contains("project.json"), "要说清哪个文件：{err}");
         assert!(err.contains("没有自动重建"), "要明确不替用户做决定：{err}");
@@ -8652,8 +9188,16 @@ mod tests {
 
         // 回归：没有 project.json 的目录仍然按全新工程走，不能被这条守卫误伤
         let fresh = temp_dir("fresh-project");
-        let loaded =
-            load_resumable(&fresh, "第一句。第二句。", "audio8-tts", None, GAP_MS, true).unwrap();
+        let loaded = load_resumable(
+            &fresh,
+            "第一句。第二句。",
+            "audio8-tts",
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .unwrap();
         assert_eq!(loaded.project.sentences.len(), 2);
     }
 
@@ -8796,6 +9340,7 @@ mod tests {
                 voice_ref: None,
                 gap_ms: GAP_MS,
                 auto_normalize: true,
+                dict: empty_dict(),
                 items: vec![
                     BatchCmdItem {
                         task_id: 41,
@@ -8877,6 +9422,7 @@ mod tests {
                 voice_ref: None,
                 gap_ms: GAP_MS,
                 auto_normalize: true,
+                dict: empty_dict(),
                 items: vec![
                     BatchCmdItem {
                         task_id: 51,
@@ -9400,6 +9946,7 @@ mod tests {
                 project_name: "worker-dub-e2e".into(),
                 gap_ms: GAP_MS,
                 auto_normalize: true,
+                dict: empty_dict(),
             })
             .unwrap();
 
@@ -9931,6 +10478,7 @@ mod tests {
                     voice_ref: None,
                     gap_ms: GAP_MS,
                     auto_normalize: true,
+                    dict: empty_dict(),
                     items: vec![
                         BatchCmdItem {
                             task_id: first_task_id,

@@ -396,6 +396,10 @@ export component DubWorkbench inherits Rectangle {
     in-out property <bool> auto-normalize: true;
     /// 句间停顿（毫秒，字符串收；留空/非法由 Rust 侧归一成默认 250）
     in-out property <string> gap-ms-text: "250";
+    /// 发音词典（P5）：第 0 项固定「不使用词典」，其余是库里的那几套
+    in property <[string]> dict-names: [];
+    in-out property <int> dict-index: 0;
+    in property <string> dict-status: "";
     /// 音色库（P4）：保存 / 应用 / 导出 / 导入
     in property <[VoiceLibRow]> library-rows: [];
     in property <string> library-status: "";
@@ -452,6 +456,9 @@ export component DubWorkbench inherits Rectangle {
     callback speed-changed(float);
     /// 停顿改了：只作废"拼装成品"（音频没变，重新导出即可应用）
     callback gap-edited();
+    callback dict-picked(int);
+    callback dict-import();
+    callback dict-export();
     callback version-save();
     callback version-diff(string);
     callback version-rollback(string);
@@ -892,6 +899,48 @@ export component DubWorkbench inherits Rectangle {
                                 color: PixelTheme.dim;
                                 font-size: 12px;
                                 vertical-alignment: center;
+                            }
+                        }
+
+                        // 发音词典（P5）：多套词典切换 + 词条批量导入导出
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "词典";
+                                width: 40px;
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelComboBox {
+                                width: 220px;
+                                model: root.dict-names;
+                                index <=> root.dict-index;
+                                placeholder: "不使用词典";
+                                enabled: !root.running && !root.busy && !root.batch-running;
+                                selected(i) => { root.dict-picked(i); }
+                            }
+                            PixelButton {
+                                width: 92px;
+                                text: "导入词条…";
+                                Tooltip { text: @markdown("选一个词条文件（每行「词条<Tab/逗号/等号>替换」）；导入进当前选中的词典，没选就按文件名新建一套"); }
+                                enabled: !root.running && !root.busy && !root.batch-running;
+                                clicked => { root.dict-import(); }
+                            }
+                            PixelButton {
+                                width: 80px;
+                                text: "导出词条";
+                                Tooltip { text: @markdown("把当前启用的词典导成 TSV 到导出目录（dict-<名字>.tsv）"); }
+                                enabled: !root.running && !root.busy && !root.batch-running && root.dict-index > 0;
+                                clicked => { root.dict-export(); }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.dict-status;
+                                color: PixelTheme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
                         }
 

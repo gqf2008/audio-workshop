@@ -73,6 +73,10 @@ export component MainWindow inherits Window {
     in-out property <bool> auto-normalize: true;
     /// 句间停顿（毫秒）：配音独有，放本页「高级」
     in-out property <string> gap-ms-text: "250";
+    /// 发音词典（P5）：第 0 项固定「不使用词典」
+    in property <[string]> dict-names: [];
+    in-out property <int> dict-index: 0;
+    in property <string> dict-status: "";
     // ── 工程版本（P3）：留档 / 对比 / 回滚 ──
     in property <[VersionRow]> version-rows: [];
     in property <string> version-status: "还没有留档";
@@ -230,6 +234,9 @@ export component MainWindow inherits Window {
     callback redo-one(int);
     callback speed-changed(float);
     callback gap-edited();
+    callback dict-picked(int);
+    callback dict-import();
+    callback dict-export();
     callback version-save();
     callback version-diff(string);
     callback version-rollback(string);
@@ -383,6 +390,12 @@ export component MainWindow inherits Window {
                     speed-label: root.speed-label;
                     auto-normalize <=> root.auto-normalize;
                     gap-ms-text <=> root.gap-ms-text;
+                    dict-names: root.dict-names;
+                    dict-index <=> root.dict-index;
+                    dict-status: root.dict-status;
+                    dict-picked(i) => { root.dict-picked(i); }
+                    dict-import => { root.dict-import(); }
+                    dict-export => { root.dict-export(); }
                     template-names: root.template-names;
                     template-index <=> root.template-index;
                     template-name-text <=> root.template-name-text;
