@@ -91,8 +91,9 @@ spctl -a -t open (DMG)           → accepted (source=Notarized Developer ID)
 - **只有 macOS 包**。Windows/Linux 安装包没有（M3 未达「第二个平台可自用」，见
   `docs/m3-platform-status.md`）。
 - **目标机需要 onnxruntime**（见上文第 1 点）。
-- **自动更新还没配好**：默认清单地址是私有仓库的 GitHub Release API，匿名访问必然 404
-  （见 `docs/update.md`）。打包出来的 app 点「检查更新」会如实报 404，而不是假装成功。
+- **自动更新只差一个 Release**：仓库 2026-09-18 已转 **public**（匿名 API 实测 200），
+  但**还没发过 Release**，所以 `releases/latest` 现在仍是 404（见 `docs/update.md`）。
+  发第一个 Release 后这条链路即通；在那之前 app 点「检查更新」会如实报 404，不是假装成功。
 - **未做公证后的"全新机器"验证**：本机验证覆盖了签名/公证/装订/启动，但没有在
   一台没装过 homebrew 的干净机器上试过（那台机器大概率会因为缺 onnxruntime 起不来）。
 - **没有版本化的 Release 流程**：目前产物在 `dist/`，还没打 tag、没上传到任何 Release。

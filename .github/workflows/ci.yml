@@ -5,8 +5,9 @@
 # `cargo check` 与 Windows GNU 交叉 check 能过。M3 的关闭判据是「第二个平台可自用」，
 # 需要真机；在拿到真机之前，这套矩阵至少把**编译/clippy/单测**这三件在真机上跑。
 #
-# 成本提醒：仓库是私有的，私有仓库的 Actions 会消耗账号额度。workflow_dispatch 与
-# pull_request/push 都会触发；额度策略未定前不要在每次提交都依赖它。
+# 成本：仓库自 2026-09-18 起是 **public**，public 仓库在 standard runner 上**不计额度**
+# （此前是 private、要算额度，那段口径已不适用）。即便不计钱，单跑仍要十几分钟
+# （含 cargo build --release 与三平台矩阵），所以并发控制照旧。
 name: ci
 
 "on":
@@ -15,7 +16,7 @@ name: ci
     branches: [main]
   workflow_dispatch:
 
-# 同一分支的新推送取消旧的进行中任务，别让排队吃掉私有仓库额度。
+# 同一分支的新推送取消旧的进行中任务 —— release 构建十几分钟，排队白等很浪费。
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

@@ -71,33 +71,27 @@
 （见 `LESSON_自动更新大文件下载须per-read超时且应用替换禁止cp_R嵌套.md`）。
 这两条常量是 `src/update.rs` 的 `CONNECT_TIMEOUT` / `READ_TIMEOUT`，改它们要按 `RULE_阈值变更.md` 独立提交。
 
-## 已知前提：默认清单地址要求仓库**可匿名读取**
+## 已知前提：默认清单地址要求仓库**可匿名读取**（已满足）+ **至少有一个 Release**（还没有）
 
-默认地址走的是 **未认证**请求（不给 token）。2026-09-17 实测：
+默认地址走的是 **未认证**请求（不给 token）。**2026-09-18 已把仓库从 private 转为 public**，实测：
 
 ```console
-$ curl -s -o /dev/null -w '%{http_code}\n' -H 'User-Agent: audio-workshop/0.1.0' \
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.github.com/repos/gqf2008/audio-workshop
+200                     # 匿名可读：仓库已公开
+$ curl -s -o /dev/null -w '%{http_code}\n' \
     https://api.github.com/repos/gqf2008/audio-workshop/releases/latest
-404
-$ curl -s -o /dev/null -w '%{http_code}\n' https://api.github.com/repos/rust-lang/rust
-200                     # 本机到 GitHub API 是通的（不是网络问题）
-$ git -c credential.helper= ls-remote github
-fatal: could not read Username for 'https://github.com'   # 去掉本机凭据就取不到
+404                     # ← 现在 404 的原因只剩这一个：还没发过 Release
 ```
 
-即：**`gqf2008/audio-workshop` 目前不是匿名可读的**（带本机 keychain 凭据的 git 能 `ls-remote`，
-不带凭据的 API 一律 404）。所以现在点「检查更新」会如实得到
-「服务器返回 HTTP 404——地址不对、仓库不是匿名可读（GitHub 对私有仓库也回 404）、或还没有 Release；
-确认「清单地址」指向一个匿名可读的已发布 Release」，而不是某个假结果。
+也就是说，**「仓库不可匿名读」这个原因已经消失**；现在点「检查更新」拿到 404，只可能是
+**还没有一个「正式」Release**。注意 `releases/latest` 只认 **非 draft、非 prerelease** 的
+Release —— 发成 draft 或 prerelease 时它照样 404。发布第一个正式 Release（带 tag）之后这条链路即通。
 
-要让它真正可用，三选一（都不在本批范围）：
-
-1. 把仓库/Release 变成匿名可读；
-2. 把清单发布到一个匿名可读的位置（CDN / 对象存储 / 静态站点），在设置里覆盖「清单地址」；
-3. 以后单独一批做带凭据的清单访问（token 放哪、怎么存，是独立的安全设计）。
-
-**不选 3 的理由**：把一个 token 塞进"检查更新"这条默认路径会引入凭据分发/存储问题，
-而 v1 的目标只是"知道有新版本"；先用可匿名读取的清单把这条链路跑通更划算。
+> 历史留档（2026-09-17）：当时仓库是 private，带本机 keychain 凭据的 git 能 `ls-remote`、
+> 不带凭据的 API 一律 404。当时列了三个选项（① 仓库/Release 变成匿名可读；② 把清单发到
+> 自建 CDN/对象存储并用「清单地址」覆盖；③ 做带凭据的清单访问），**用户 2026-09-18 选了 ①**。
+> 选项 ③ 仍然不做：把一个 token 塞进"检查更新"的默认路径会引入凭据分发/存储问题，而 v1 的
+> 目标只是"知道有新版本"。
 
 ## 安全边界：发布页只认 http(s)
 

@@ -98,7 +98,7 @@ cargo check --workspace --target x86_64-pc-windows-msvc
   版本上仍可能有差异；
 - Metal 侧的实机性能（RTF、峰值内存）CI 完全不涉及。
 
-**成本与触发**：仓库是私有的，私有仓库的 Actions 会消耗账号额度。workflow 由
-`pull_request` / `push: main` / `workflow_dispatch` 触发，并带 `concurrency` 取消同分支的旧任务；
-额度策略未定之前别把它当成「每次提交都必须等绿」的门禁 —— `RULE_开发流程规范` 第 9 步本来
-也只要求发布（tag/release）时远程 CI 通过。
+**成本与触发**：仓库自 2026-09-18 起为 **public**，public 仓库在 standard runner 上不计额度。
+workflow 由 `pull_request` / `push: main` / `workflow_dispatch` 触发，并带 `concurrency`
+取消同分支的旧任务。即便不计钱，一次三平台矩阵仍要十几分钟（含 `cargo build --release`），
+所以 `RULE_开发流程规范` 第 9 步「远程 CI 只在发布时要求通过」的口径不变。
