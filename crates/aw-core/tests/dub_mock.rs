@@ -1,11 +1,12 @@
 //! 合成/拼装的**失败可见性**与默认参数（评审第 10/11 条），用进程内 mock 跑真链路：
-//! - 请求体的 `options` 只许出现后端 spec 声明过的键（`instruction` 不在其中）
+//! - 请求体的 `options` 只许出现后端 spec 声明过的键（普通 TTS 不含 `instruction`；
+//!   VoiceDesign 的 `vdes` 路径才允许它）
 //! - 全句失败时 `synthesize` 必须返回失败句数，而不是 `Ok(())` 的假成功
 //! - `assemble` 必须报出被跳过的句数，而不是静默丢句
 
 mod support;
 
-use aw_core::{Client, Project};
+use aw_core::{Client, Project, VoiceSource};
 use std::time::Duration;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -30,6 +31,46 @@ fn project() -> Project {
 
 fn client(base: &str) -> Client {
     Client::new(base).with_retry(2, Duration::from_millis(1))
+}
+
+/// VoiceDesign 的真报文契约：`vdes` 模型走 `options.instruction`，不能发旧键
+/// `voice_design`，也不能混进普通 TTS 的克隆字段。这个用例从 Client 发到 mock HTTP，
+/// 比只测 `build_synth_request` 更接近真实链路。
+#[test]
+fn voice_design_request_uses_instruction_not_voice_design() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+    let out = client(&mock.base)
+        .synth(
+            "qwen3-tts-voicedesign",
+            "这是一句试听文本。",
+            None,
+            VoiceSource::Design("低沉磁性的中年男声，语速偏慢"),
+        )
+        .expect("VoiceDesign 请求应成功");
+    assert_eq!(out, wav);
+
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(&bodies[0]).expect("请求体是 JSON");
+    assert_eq!(body["model"], "qwen3-tts-voicedesign");
+    assert_eq!(body["request"]["text"], "这是一句试听文本。");
+    assert_eq!(
+        body["request"]["options"]["instruction"],
+        "低沉磁性的中年男声，语速偏慢"
+    );
+    assert!(
+        body["request"].get("voice_ref").is_none(),
+        "设计路径不能带克隆字段: {body}"
+    );
+    assert!(
+        body["request"].get("reference_text").is_none(),
+        "设计路径不能带参考文本: {body}"
+    );
+    assert!(
+        !bodies[0].contains("voice_design"),
+        "旧键 voice_design 必须从报文里消失: {body}"
+    );
 }
 
 #[test]

@@ -281,3 +281,33 @@ fn voice_clone_reference_text_end_to_end() {
         "给了参考音+参考文本后产物必须与内置音色不同（否则说明 reference_text 没生效）"
     );
 }
+
+/// VoiceDesign 真机：`task=vdes` 模型 + `options.instruction` 的完整请求。
+///
+/// 该模型不是普通 TTS：清单 task 必须注册成 `vdes`，旧键 `voice_design` 会被
+/// 服务端直接拒绝。用 `-- --ignored` 显式跑，默认仍不依赖本机服务。
+#[test]
+#[ignore = "需要本机 audiocpp_server + qwen3-tts-voicedesign；用 -- --ignored 显式跑"]
+fn voice_design_end_to_end() {
+    let base = env_or("AW_SERVER", "http://127.0.0.1:8080");
+    let model = env_or("AW_VOICE_DESIGN_MODEL", "qwen3-tts-voicedesign");
+    let client = Client::new(&base);
+    assert!(
+        client.healthy(),
+        "服务不可用: {base}/health（先 audio-service server ensure）"
+    );
+
+    let wav = client
+        .synth(
+            &model,
+            "这是一句音色设计的真机验证。",
+            None,
+            VoiceSource::Design("低沉磁性的中年男声，语速偏慢，带一点沙哑"),
+        )
+        .unwrap_or_else(|e| panic!("VoiceDesign 合成失败（{model}）：{e}"));
+
+    assert!(wav.len() > 44, "应返回完整 WAV，而不是空壳");
+    assert_eq!(&wav[0..4], b"RIFF", "WAV 头必须以 RIFF 开头");
+    assert_eq!(&wav[8..12], b"WAVE", "WAV 头必须以 WAVE 标识格式");
+    eprintln!("  VoiceDesign {model}: {} 字节", wav.len());
+}

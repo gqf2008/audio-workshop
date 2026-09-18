@@ -24,6 +24,14 @@
       "role": ""
     },
     {
+      "id": "qwen3-tts-voicedesign",
+      "known_issues": [],
+      "mode": "offline",
+      "product_excluded": false,
+      "requires": null,
+      "role": ""
+    },
+    {
       "id": "yue2",
       "known_issues": [
         "spec 标称仅英文，实测中文咬字可通过（ASR 回查 85%）",

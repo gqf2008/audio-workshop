@@ -6,7 +6,7 @@
 //   · 顶部 5 个主 Tab：配音 / BGM / 人声分离 / 音乐制作 / 音色设计，常驻可见
 //   · 每屏一个主任务，恰好 1 个主操作
 //   · 参数进当前 Tab 的高级抽屉；默认 0 个高级参数
-//   · 能力没接的地方（人声分离 / 音乐制作 / 文本生成音色）显示“未接入 + 缺什么”，
+//   · 能力没接的地方（人声分离等）显示“未接入 + 缺什么”，
 //     不放假按钮（诚实原则见 competitive-analysis.md「不采用清单」）
 //
 // 窗口边框：no-frame 自绘窗，参考 ../abb 的做法——贴窗口边 2px 纯黑描边 +
@@ -237,6 +237,7 @@ export component MainWindow inherits Window {
     in property <string> design-status: "";
     in property <bool> design-busy: false;
     in property <bool> design-blocked: false;
+    in property <bool> design-model-ready: false;
     in property <string> design-reason: "";
     in property <bool> design-ready: false;
 
@@ -647,6 +648,7 @@ export component MainWindow inherits Window {
                     design-status: root.design-status;
                     design-busy: root.design-busy;
                     design-blocked: root.design-blocked;
+                    design-model-ready: root.design-model-ready;
                     design-reason: root.design-reason;
                     design-ready: root.design-ready;
                     edited => { root.voice-ref-changed(); }

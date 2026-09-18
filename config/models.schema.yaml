@@ -66,9 +66,8 @@ models:
     text_overrides:
       normalization: enforce                # 本模型不接 TN → 配置层强制先做
     # 故意不给 request_defaults：audio8_tts 的 spec（options.request）里没有 instruction
-    # 这个旋钮——声明了它的只有 breeze_tts / cosyvoice3 / dots_tts / firered_audio /
-    # fireredtts3 / irodori_tts，本产品一个都选不到。写在这里会渲染成服务端不认的键，
-    # 让"我们有语气控制"看起来像真的（真机实测改 instruction 输出字节相同）。
+    # 这个旋钮——它只归 VoiceDesign（qwen3_tts 的 vdes 路径）使用。写在这里会渲染成
+    # 服务端不认的键，让"我们有语气控制"看起来像真的（真机实测改 instruction 输出字节相同）。
     limits: { max_chars_per_request: 300 }
     known_issues:                           # 让产品"知道自己站在什么上"
       - "数字/电话/金额读法不稳定，必须依赖 text.normalization"
@@ -83,6 +82,11 @@ models:
       normalization: engine                 # 上游已接 → 不重复处理（避免双重转换）
     request_defaults: { duration_factor: 1.0 }
     known_issues: ["不接 voice_ref 会直接报错，需在 UI 层强制选音色"]
+
+  qwen3-tts-voicedesign:
+    family: qwen3_tts
+    task: vdes                              # audio.cpp 只接受 vdes；注册成 tts 会被服务端拒绝
+    path: ${models_root}/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
 
   yue2:
     family: yue2

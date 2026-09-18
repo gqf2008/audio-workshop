@@ -1657,15 +1657,28 @@ fn read_server_config() -> Option<ServerConfig> {
 // 清单里 `task == "asr"` 的模型（不硬编名字：清单加一个就多一项）。
 // ===========================================================================
 
-/// 清单里第一个可用的**音色设计**模型 id：`task == "vdes"` 且未被产品层排除。
+/// 一个清单条目能否作为 App 的音色设计引擎。
+///
+/// 不只是 `task == "vdes"`：audio.cpp 已确认支持 VoiceDesign 的 family 是
+/// `qwen3_tts` 与 `breeze_tts`；流式/产品排除项不能走离线一次性生成。
+/// 把“取第一个”收成显式白名单，避免清单顺序变化时静默选到一个服务端会拒的模型。
+fn is_voice_design_model(m: &ServerModel) -> bool {
+    m.task == "vdes"
+        && !m.id.trim().is_empty()
+        && !m.caps.product_excluded
+        && !m.caps.is_streaming_only()
+        && matches!(m.family.as_str(), "qwen3_tts" | "breeze_tts")
+}
+
+/// 清单里第一个可用的**音色设计**模型 id。
 ///
 /// 与 `asr_models_from` 同族：不硬编 `qwen3_tts_1_7b_voicedesign_q8_0`——清单加一个
-/// 设计模型就多一个候选，这里取第一个（本批只接单设计模型）。
+/// 已知 family 的 vdes 模型就多一个候选，这里取第一个（本批只接单设计模型）。
 fn design_model_from(cfg: Option<&ServerConfig>) -> Option<String> {
     cfg.and_then(|c| {
         c.models
             .iter()
-            .find(|m| m.task == "vdes" && !m.id.trim().is_empty() && !m.caps.product_excluded)
+            .find(|m| is_voice_design_model(m))
             .map(|m| m.id.clone())
     })
 }
@@ -8911,6 +8924,7 @@ fn refresh_design_action(ui: &MainWindow, state: &Rc<UiState>) {
     let text = ui.get_design_text();
     let description = ui.get_design_description();
     let design_busy = ui.get_design_busy();
+    ui.set_design_model_ready(model.is_some());
     let any_busy = ui.get_running() || ui.get_busy() || tasks_in_flight(state);
     let blocked =
         design_generate_blocked(model.as_deref(), &text, &description, design_busy, any_busy);
@@ -14515,12 +14529,13 @@ mod tests {
         );
     }
 
-    /// 音色设计模型挑选：`task == "vdes"` 且未被产品层排除，取清单第一个。
+    /// 音色设计模型挑选：`task == "vdes"`、已知 family、离线且未被产品层排除。
     #[test]
-    fn design_model_from_picks_first_non_excluded_design_task() {
+    fn design_model_from_requires_vdes_offline_known_family() {
         let excluded = ServerModel {
             id: "qwen3-tts-voicedesign-bf16".into(),
             task: "vdes".into(),
+            family: "qwen3_tts".into(),
             caps: model_capabilities::Capability {
                 product_excluded: true,
                 ..Default::default()
@@ -14530,22 +14545,41 @@ mod tests {
         let tts = ServerModel {
             id: "audio8-tts".into(),
             task: "tts".into(),
+            family: "audio8_tts".into(),
+            ..Default::default()
+        };
+        let streaming = ServerModel {
+            id: "qwen3-tts-voicedesign-stream".into(),
+            task: "vdes".into(),
+            family: "qwen3_tts".into(),
+            caps: model_capabilities::Capability {
+                mode: "streaming".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let wrong_family = ServerModel {
+            id: "not-a-design-model".into(),
+            task: "vdes".into(),
+            family: "mystery_tts".into(),
             ..Default::default()
         };
         let first = ServerModel {
             id: "qwen3-tts-voicedesign-q8_0".into(),
             task: "vdes".into(),
+            family: "qwen3_tts".into(),
             ..Default::default()
         };
         let cfg = ServerConfig {
             host: None,
             port: None,
             min_free_memory_mb: None,
-            models: vec![excluded, tts, first],
+            models: vec![excluded, tts, streaming, wrong_family, first],
         };
         assert_eq!(
             design_model_from(Some(&cfg)).as_deref(),
-            Some("qwen3-tts-voicedesign-q8_0")
+            Some("qwen3-tts-voicedesign-q8_0"),
+            "只能选已确认支持 VoiceDesign 的离线 family"
         );
         let empty = ServerConfig {
             host: None,
@@ -14556,8 +14590,42 @@ mod tests {
         assert_eq!(
             design_model_from(Some(&empty)),
             None,
-            "没有 design 模型时不能凭空捏一个 id"
+            "没有 vdes 模型时不能凭空捏一个 id"
         );
+    }
+
+    /// 用真实 server.json 形状过一遍解析：VoiceDesign 选中后不再混进普通 TTS 下拉。
+    #[test]
+    fn parsed_voice_design_model_is_isolated_from_tts_picker() {
+        let raw = r#"{
+          "host": "127.0.0.1",
+          "port": 8080,
+          "models": [
+            {
+              "id": "audio8-tts",
+              "family": "audio8_tts",
+              "task": "tts",
+              "path": "/tmp/audio8.gguf"
+            },
+            {
+              "id": "qwen3-tts-voicedesign",
+              "family": "qwen3_tts",
+              "task": "vdes",
+              "path": "/tmp/qwen3-vd.gguf",
+              "mode": "offline"
+            }
+          ]
+        }"#;
+        let cfg = parse_server_config(raw).expect("server.json 形状应可解析");
+        assert_eq!(
+            design_model_from(Some(&cfg)).as_deref(),
+            Some("qwen3-tts-voicedesign")
+        );
+        let tts_ids: Vec<String> = tts_engine_voices(&cfg.models)
+            .into_iter()
+            .map(|v| v.name.to_string())
+            .collect();
+        assert_eq!(tts_ids, vec!["audio8-tts"], "vdes 不能被普通 TTS 下拉选中");
     }
 
     /// 音色设计「生成」的可用性矩阵：模型 / 试听文本 / 音色描述 / busy 都要有说法。

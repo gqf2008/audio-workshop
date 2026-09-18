@@ -26,6 +26,7 @@ export component VoiceDesignTab inherits Rectangle {
     in property <bool> design-busy: false;
     /// 「生成」能不能点（Rust 单点投影）；理由就地显示，不放哑按钮
     in property <bool> design-blocked: false;
+    in property <bool> design-model-ready: false;
     in property <string> design-reason: "";
     /// 是否有可「用作配音音色」的生成结果
     in property <bool> design-ready: false;
@@ -184,8 +185,8 @@ export component VoiceDesignTab inherits Rectangle {
                                 vertical-alignment: center;
                             }
                             PixelBadge {
-                                text: "可用";
-                                width: 46px;
+                                text: root.design-model-ready ? "可用" : "未就绪";
+                                width: 58px;
                                 height: 20px;
                             }
                         }
