@@ -8,3 +8,6 @@ models/
 eval/
 target/
 .worktrees/
+
+# 打包产物（package.sh / release.sh）：不进仓库，别人自己 build
+dist/
