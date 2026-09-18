@@ -110,9 +110,10 @@ python3 tools/model_fetch.py audio8-tts          # 从上游源拉权重（幂�
 单独公证且在 `.app` 装订之后重建 —— 这两条不做的话，产物要么一启动就 dyld 报错、
 要么 Gatekeeper 直接拒。
 
-**当前发行版的前提**：目标机需装有 onnxruntime（人声分离后端）；只有 macOS 包；
-自动更新**只差一个 GitHub Release** —— 仓库已公开（匿名 API 200），但还没发过 Release，
-所以 `releases/latest` 现在仍是 404。
+**当前发行版的前提**：目标机需装有 onnxruntime（人声分离后端）；只有 macOS 包。
+自动更新这条链路**已通并验过**：v0.1.0 已发布，`releases/latest` 实测 200
+（见 [docs/update.md](docs/update.md) 的真链路用例）。发版步骤见
+[docs/release.md](docs/release.md#怎么发一个版本)。
 
 ## 本地验证
 

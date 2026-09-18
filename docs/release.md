@@ -102,9 +102,43 @@ spctl -a -t open (DMG)           → accepted (source=Notarized Developer ID)
 - **只有 macOS 包**。Windows/Linux 安装包没有（M3 未达「第二个平台可自用」，见
   `docs/m3-platform-status.md`）。
 - **目标机需要 onnxruntime**（见上文第 1 点）。
-- **自动更新只差一个 Release**：仓库 2026-09-18 已转 **public**（匿名 API 实测 200），
-  但**还没发过 Release**，所以 `releases/latest` 现在仍是 404（见 `docs/update.md`）。
-  发第一个 Release 后这条链路即通；在那之前 app 点「检查更新」会如实报 404，不是假装成功。
+- **自动更新已端到端验过**（2026-09-18）：仓库 public（匿名 API 200）+ 第一个正式 Release
+  `v0.1.0`（资产 `AudioWorkshop-0.1.0.dmg`）→ `releases/latest` 实测 **200**。
+  真链路用例 `real_default_manifest_is_parseable` 拿到过 tag/url/**sha256**/**size**（见 `docs/update.md`）。
 - **未做公证后的"全新机器"验证**：本机验证覆盖了签名/公证/装订/启动，但没有在
   一台没装过 homebrew 的干净机器上试过（那台机器大概率会因为缺 onnxruntime 起不来）。
-- **没有版本化的 Release 流程**：目前产物在 `dist/`，还没打 tag、没上传到任何 Release。
+- **只有一个正式 Release**（`v0.1.0`）。版本化流程见下面一节；`v0.1.1` 起沿用同一套步骤。
+
+## 怎么发一个版本
+
+按这个顺序做，每一步都实测过（`v0.1.0` 就是这么发出去的）：
+
+```sh
+# 1) 改版本号（Info.plist 与 DMG 文件名都从它来，见上文「版本号从哪来」）
+$EDITOR Cargo.toml            # version = "X.Y.Z"
+cargo build --release         # 让 Cargo.lock 跟上（改了版本号必须重编一次）
+
+# 2) 打包 + 签名 + 公证 + 装订（.app 与 DMG 各一次公证）
+./release.sh                  # 需要 Keychain profile audio-workshop-notary
+
+# 3) 打 tag 并推到**两个**远端（walgit 与 GitHub）
+git tag -a vX.Y.Z -m "音频作坊 vX.Y.Z"
+git push origin vX.Y.Z
+git push github vX.Y.Z
+
+# 4) 建 Release 并上传 DMG（资产名必须 ASCII，见下文「三个坑」）
+gh release create vX.Y.Z "dist/AudioWorkshop-X.Y.Z.dmg" \
+  --repo gqf2008/audio-workshop --title "音频作坊 vX.Y.Z（macOS）" --notes-file /tmp/notes.md
+
+# 5) 核实「检查更新」这条链路真的通（会真打 GitHub API）
+cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
+```
+
+### 三个坑（都踩过）
+
+1. **资产名必须 ASCII**：`音频作坊-0.1.0.dmg` 上传后会被 GitHub 平台 sanitize 成
+   `-0.1.0.dmg`（中文剥掉、下载链接跟着坏）。`package.sh` 里有 `assert_ascii` 拦这一条。
+2. **DMG 要在 `.app` 装订之后重建**：否则装进去的是没有公证票据的那份 `.app`。
+   `release.sh` 的第 2 步就是为此存在。
+3. **公证要显式传 entitlements**：通用脚本会重新签名，不带 `--entitlements` 会把
+   `disable-library-validation` 洗掉 —— 结果是"公证过了但一启动就 dyld 报错"。
