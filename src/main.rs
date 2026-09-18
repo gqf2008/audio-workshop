@@ -4590,15 +4590,13 @@ fn reuse_done_sentences(new: &mut Project, old: &Project, dir: &Path) -> Result<
                 aw_core::dub::write_failure_note(&temp.0, 0, &e)
             )
         })?;
-        std::fs::File::open(&temp.0)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| {
-                format!(
-                    "复用第 {} 句落盘失败：{}",
-                    old_sentence.index,
-                    aw_core::dub::write_failure_note(&temp.0, 0, &e)
-                )
-            })?;
+        aw_core::dub::sync_file(&temp.0).map_err(|e| {
+            format!(
+                "复用第 {} 句落盘失败：{}",
+                old_sentence.index,
+                aw_core::dub::write_failure_note(&temp.0, 0, &e)
+            )
+        })?;
         staged.push(StagedReuse {
             new_index: i,
             temp,
@@ -12697,7 +12695,7 @@ mod tests {
     }
 
     /// 复核抓到的：`Cmd::Assemble` 改 gap 后 save 失败，**内存里的 gap 不能被改掉**。
-    /// 做法：工程目录设成只读，连续发两次同值 Assemble——两次都必须报"保存工程失败"。
+    /// 做法：让"保存工程"这条路必失败，连续发两次同值 Assemble——两次都必须报"保存工程失败"。
     /// 如果实现是"先改内存再 save"，第二次会因为字段已相等而跳过 save、直接去拼装，
     /// 最后拼出与 project.json 记录不一致的成品。
     #[test]
@@ -12708,10 +12706,18 @@ mod tests {
         let mut project = saved_project("第一句。第二句。", None);
         save_done_project(&root, &mut project);
 
-        let before = std::fs::metadata(&root).unwrap().permissions();
-        let mut ro = before.clone();
-        ro.set_readonly(true);
-        std::fs::set_permissions(&root, ro).unwrap();
+        // 注入"保存工程必失败"。**必须与平台无关**：
+        //
+        // 原来这里是把工程目录 chmod 成只读 —— 那条注入只在 Unix 生效。Windows 的
+        // READONLY 属性**不阻止**在目录里创建/改名文件，于是那边 assemble 会真的拼成功，
+        // 测试反过来报"目录不可写，不该拼成功"（2026-09-18 三平台 CI 实测）。
+        //
+        // 换成"project.json 是非空目录"：`write_atomic` 最后那步 rename(临时文件 → project.json)
+        // 在 Windows 与 Unix 上**都会**失败，注入与平台无关；而 out/ 仍可写，所以拼装本身不受影响
+        // —— 这正好保持用例的原意（拼装能跑，是**保存工程**失败）。
+        std::fs::remove_file(root.join("project.json")).unwrap();
+        std::fs::create_dir_all(root.join("project.json")).unwrap();
+        std::fs::write(root.join("project.json").join("keep"), b"x").unwrap();
 
         let (cmd_tx, cmd_rx) = channel::<Cmd>();
         let (msg_tx, msg_rx) = channel::<WorkerMsg>();
@@ -12762,8 +12768,10 @@ mod tests {
 
         drop(cmd_tx);
         handle.join().unwrap();
-        // 恢复权限，别给 temp 清理留坑
-        std::fs::set_permissions(&root, before).unwrap();
+        // 收尾：把注入的"project.json 目录"还原掉，别给 temp 清理留坑
+        // （原来是恢复目录权限；注入方式换了，收尾也跟着换）
+        let _ = std::fs::remove_file(root.join("project.json").join("keep"));
+        let _ = std::fs::remove_dir_all(root.join("project.json"));
     }
 
     /// 停顿输入的即时反馈：留空/非法/超上限各有说法（与 `normalize_gap_ms` 同一判据）。

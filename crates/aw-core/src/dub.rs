@@ -529,9 +529,7 @@ impl Project {
             .finalize()
             .map_err(|e| hound_error_note(&final_wav, 0, &e))?;
         // 关文件后补一次 fsync 再 rename（wave 关闭不落盘到点，掉电可能留下空成品）
-        std::fs::File::open(&final_tmp)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| write_failure_note(&final_wav, 0, &e))?;
+        sync_file(&final_tmp).map_err(|e| write_failure_note(&final_wav, 0, &e))?;
         std::fs::rename(&final_tmp, &final_wav)
             .map_err(|e| write_failure_note(&final_wav, 0, &e))?;
         let srt_path = out_dir.join("final.srt");
@@ -648,25 +646,30 @@ pub fn write_failure_note(path: &Path, bytes: usize, err: &std::io::Error) -> St
 /// 导出以前用 `std::fs::copy`，失败时会留下**写了一半的目标文件**——所以
 /// `write_failure_note` 里那句"已写好的文件不会被破坏"对导出并不成立（复核指出）。
 /// 导出是用户交付物，同样值得原子化：要么旧文件不变，要么新文件完整。
+/// 给刚写好的文件补一次 fsync。
+///
+/// **必须用带写权限的句柄**：Windows 上 `sync_all` 落到 `FlushFileBuffers`，微软文档
+/// 明确要求「The file handle must have the GENERIC_WRITE access right」—— 用
+/// `File::open`（只读）会直接 ERROR_ACCESS_DENIED。Unix 上 fsync 只读 fd 没问题，
+/// 所以「只读句柄 + sync_all」这个反模式**只在 Windows 上炸**，而且是在**每次**
+/// 导出/拼装/BGM/句子复用时都炸（2026-09-18 三平台 CI 实测，全仓共 5 处）。
+///
+/// 收成一个函数是因为它已经出现过 5 次 —— 抄一遍就容易漏一处（第一次修的时候就只
+/// 修了 1 处，复核把另外 4 处抓了出来）。
+pub fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all())
+}
+
 pub fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     let tmp = temp_sibling(dst);
     // 三步都算在结果里：只有 rename 成功才算落地。任何一步失败都清临时文件——
     // 只在 copy/sync 失败时清会漏掉"临时文件写完但 rename 失败（例如目标被目录占着）"，
     // 那种情况会在目录里留下 .tmp 残渣（复核抓到）。
     let result = std::fs::copy(src, &tmp)
-        .and_then(|_| {
-            // 这里**必须带写权限**打开再 sync_all。
-            //
-            // Windows 上 sync_all 落到 FlushFileBuffers，而微软文档明确写着
-            // 「The file handle must have the GENERIC_WRITE access right」——
-            // 用 `File::open`（只读）会直接 ERROR_ACCESS_DENIED。Unix 上 fsync 只读 fd 没问题，
-            // 所以这个坑**只在 Windows 上炸，而且每一次导出都炸**（2026-09-18 三平台 CI 实测：
-            // export.rs 那 9 个用例全部因为 copy_atomic 返回 Failed 而失败）。
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&tmp)
-                .and_then(|f| f.sync_all())
-        })
+        .and_then(|_| sync_file(&tmp))
         .and_then(|()| std::fs::rename(&tmp, dst));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);

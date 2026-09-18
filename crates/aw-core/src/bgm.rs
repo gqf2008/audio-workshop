@@ -325,9 +325,7 @@ pub fn assemble_bgm(dir: &Path, options: &BgmOptions) -> Result<PathBuf, String>
     writer
         .finalize()
         .map_err(|e| hound_error_note(&out, 0, &e))?;
-    std::fs::File::open(&tmp)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| write_failure_note(&out, 0, &e))?;
+    crate::dub::sync_file(&tmp).map_err(|e| write_failure_note(&out, 0, &e))?;
     std::fs::rename(&tmp, &out).map_err(|e| write_failure_note(&out, 0, &e))?;
     Ok(out)
 }
@@ -474,9 +472,7 @@ pub fn mix_project(dir: &Path, options: &BgmOptions) -> Result<BgmArtifacts, Str
     }
     out.finalize()
         .map_err(|e| hound_error_note(&mixed_path, 0, &e))?;
-    std::fs::File::open(&tmp)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| write_failure_note(&mixed_path, 0, &e))?;
+    crate::dub::sync_file(&tmp).map_err(|e| write_failure_note(&mixed_path, 0, &e))?;
     std::fs::rename(&tmp, &mixed_path).map_err(|e| write_failure_note(&mixed_path, 0, &e))?;
     Ok(BgmArtifacts {
         voice: Some(voice_copy),
