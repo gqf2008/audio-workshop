@@ -14409,12 +14409,18 @@ mod tests {
 
     /// 排队中就被取消的批量条目：worker 轮到它时**不加载模型、不合成**，
     /// 直接回报 skipped，并且整批继续往下跑。这条不需要服务端（压根不该发出请求）。
+    ///
+    /// 两条取消都必须在 `cmd_tx.send` **之前**登记：worker 线程 spawn 后随时可能
+    /// 消费消息，若把 42 的取消放在发送之后，就与 worker 形成竞态——worker 一旦
+    /// 抢先处理到 42，它会当成正常条目去 `make_client()`，在干净 runner 上（没有
+    /// server.json）必然 Failed，测试变成 flaky（曾经红过）。
     #[test]
     fn cancelled_queued_batch_items_are_skipped_without_work() {
         let (cmd_tx, cmd_rx) = channel::<Cmd>();
         let (msg_tx, msg_rx) = channel::<WorkerMsg>();
         let cancel = cancel::CancelRegistry::new();
         cancel.cancel(41);
+        cancel.cancel(42);
         let worker_cancel = cancel.clone();
         let handle = std::thread::spawn(move || {
             worker_loop(WorkerCtx {
@@ -14451,7 +14457,6 @@ mod tests {
                 ],
             })
             .unwrap();
-        cancel.cancel(42);
 
         let mut skipped_ids = Vec::new();
         let summary = loop {
