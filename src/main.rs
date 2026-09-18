@@ -166,7 +166,7 @@ enum Cmd {
         voice_ref_text: Option<String>,
         text: String,
     },
-    /// 文本描述生成音色（voice_design）：用一段描述合成一句试听文本，只播不落工程、
+    /// 文本描述生成音色（vdes）：用一段描述合成一句试听文本，只播不落工程、
     /// 不改 current。设计形态是 `VoiceSource::Design(description)` —— 不经过克隆字段。
     DesignVoice {
         revision: u64,
@@ -1657,7 +1657,7 @@ fn read_server_config() -> Option<ServerConfig> {
 // 清单里 `task == "asr"` 的模型（不硬编名字：清单加一个就多一项）。
 // ===========================================================================
 
-/// 清单里第一个可用的**音色设计**模型 id：`task == "design"` 且未被产品层排除。
+/// 清单里第一个可用的**音色设计**模型 id：`task == "vdes"` 且未被产品层排除。
 ///
 /// 与 `asr_models_from` 同族：不硬编 `qwen3_tts_1_7b_voicedesign_q8_0`——清单加一个
 /// 设计模型就多一个候选，这里取第一个（本批只接单设计模型）。
@@ -1665,7 +1665,7 @@ fn design_model_from(cfg: Option<&ServerConfig>) -> Option<String> {
     cfg.and_then(|c| {
         c.models
             .iter()
-            .find(|m| m.task == "design" && !m.id.trim().is_empty() && !m.caps.product_excluded)
+            .find(|m| m.task == "vdes" && !m.id.trim().is_empty() && !m.caps.product_excluded)
             .map(|m| m.id.clone())
     })
 }
@@ -5484,7 +5484,10 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
         }
         "design" => {
             ui.set_scene(4);
-            ui.set_status_text("音色设计：参考音频克隆 + 文本描述生成音色（voice_design）".into());
+            ui.set_status_text(
+                "音色设计：参考音频克隆 + 文本描述生成音色（task vdes / options.instruction）"
+                    .into(),
+            );
         }
         "advanced" => {
             ui.set_dub_advanced(true);
@@ -10958,7 +10961,7 @@ const SCENE_NOTES: [&str; 5] = [
     "BGM：按描述生成，自动对齐配音时长并 ducking",
     "人声分离：后端未接入，占位",
     "音乐制作：写歌 / 文生音乐（yue2 · ace-step）",
-    "音色设计：参考音频克隆 / 文本描述生成音色（voice_design）",
+    "音色设计：参考音频克隆 / 文本描述生成音色（task vdes / options.instruction）",
 ];
 
 fn export_dir() -> String {
@@ -14512,12 +14515,12 @@ mod tests {
         );
     }
 
-    /// 音色设计模型挑选：`task == "design"` 且未被产品层排除，取清单第一个。
+    /// 音色设计模型挑选：`task == "vdes"` 且未被产品层排除，取清单第一个。
     #[test]
     fn design_model_from_picks_first_non_excluded_design_task() {
         let excluded = ServerModel {
             id: "qwen3-tts-voicedesign-bf16".into(),
-            task: "design".into(),
+            task: "vdes".into(),
             caps: model_capabilities::Capability {
                 product_excluded: true,
                 ..Default::default()
@@ -14531,7 +14534,7 @@ mod tests {
         };
         let first = ServerModel {
             id: "qwen3-tts-voicedesign-q8_0".into(),
-            task: "design".into(),
+            task: "vdes".into(),
             ..Default::default()
         };
         let cfg = ServerConfig {
@@ -14623,7 +14626,7 @@ mod tests {
         );
         assert!(
             !extra.contains("audio.cpp 无 voice design"),
-            "后端明明有 voice_design，不许再写「后端没有」"
+            "后端明明有 VoiceDesign（task vdes / options.instruction），不许再写「后端没有」"
         );
         assert!(
             !extra.contains("文本描述生成音色：后端未接入"),

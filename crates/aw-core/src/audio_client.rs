@@ -282,16 +282,16 @@ impl<'a> VoiceClone<'a> {
 /// 三种音色来源：请求组装时**必须**二选一（不能三个 Option 叠着）。
 ///
 /// 为什么是 enum 而不是再叠一个 `Option<&str>`：克隆路径要 `voice_ref` +
-/// `reference_text` 成对（见 [`VoiceClone`]），设计路径只要 `voice_design` 描述，
+/// `reference_text` 成对（见 [`VoiceClone`]），设计路径只要 `instruction` 描述，
 /// 内置路径两者都不要。三个 `Option` 会让「只给了描述却带了个克隆」「既给了克隆
 /// 又给了描述」这类非法组合在类型上表达不出来，只能靠调用点自己记得拦。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceSource<'a> {
-    /// 模型内置默认音色：不带 voice_ref / reference_text / voice_design。
+    /// 模型内置默认音色：不带 voice_ref / reference_text / instruction。
     BuiltIn,
     /// 参考音频克隆：`voice_ref` + `reference_text` 顶层成对下发。
     Clone(VoiceClone<'a>),
-    /// 文本描述生成音色：`options.voice_design = "<描述>"`。
+    /// 文本描述生成音色：`options.instruction = "<描述>"`（服务端任务 `vdes`）。
     Design(&'a str),
 }
 
@@ -304,15 +304,11 @@ pub struct Client {
 /// `synth` 请求体 `options` 里**允许**出现的键（白名单）。
 ///
 /// 依据是服务端 spec 的 `options.request`（`~/.local/opt/audio.cpp/model_specs/*.json`）：
-/// 本 App 选得到的两个 TTS 引擎（`audio8_tts` / `index_tts2`）都**没有** `instruction`
-/// —— 声明了它的只有 breeze_tts / cosyvoice3 / dots_tts / firered_audio / fireredtts3 /
-/// irodori_tts，本 App 一个都选不到。后端不认的键不报错、只是被忽略，所以"发了但没接"
-/// 只能靠这条白名单挡住。真机对照（同 seed、同文本，只改 instruction）两个输出的
-/// sha256 完全相同：`214f41f3…`。
-///
-/// `voice_design` 来自 `qwen3_tts` family 的 `capabilities.design`（唯一设计键）。
+/// 常规 TTS 引擎（`audio8_tts` / `index_tts2`）只接受 `seed` / `reference_text`；
+/// `instruction` 只由 `qwen3_tts` VoiceDesign（服务端任务 `vdes`）路径使用。
+/// 后端不认的键不报错、只是被忽略，所以"发了但没接"只能靠这条白名单挡住。
 /// 加键之前先核对服务端 spec 的 `options.request`，否则用户会以为那个旋钮生效。
-pub const SYNTH_REQUEST_OPTIONS: &[&str] = &["seed", "reference_text", "voice_design"];
+pub const SYNTH_REQUEST_OPTIONS: &[&str] = &["seed", "reference_text", "instruction"];
 
 /// 白名单的唯一判据。
 fn synth_option_allowed(key: &str) -> bool {
@@ -332,15 +328,14 @@ fn insert_whitelisted(options: &mut serde_json::Map<String, Value>, key: &str, v
 /// 组装 `/v1/tasks/run` 的 TTS 请求体：**唯一**组装点，白名单在这里生效。
 ///
 /// `voice_ref` / `reference_text` 是顶层字段（服务端 spec 里属 capabilities，不在
-/// `options` 里）；`voice_design` 是 `options` 里的设计键（`qwen3_tts` 的
-/// `capabilities.design`）。
+/// `options` 里）；`instruction` 是 `options` 里的设计键（`qwen3_tts` VoiceDesign）。
 fn build_synth_request(text: &str, seed: Option<u64>, source: VoiceSource<'_>) -> Value {
     let mut options = serde_json::Map::new();
     if let Some(s) = seed {
         insert_whitelisted(&mut options, "seed", json!(s.to_string()));
     }
     if let VoiceSource::Design(description) = source {
-        insert_whitelisted(&mut options, "voice_design", json!(description));
+        insert_whitelisted(&mut options, "instruction", json!(description));
     }
     let mut request = json!({ "text": text, "options": Value::Object(options) });
     if let VoiceSource::Clone(c) = source {
@@ -369,12 +364,13 @@ impl Client {
     /// 合成一句话，返回 wav 字节。seed 固定可复现（audio8-* 支持）。
     ///
     /// 请求体只由 [`build_synth_request`] 组装——那里的白名单是**唯一**决定
-    /// "哪个键能发给后端"的地方。本函数不再收 `instruction` 这类自由旋钮：后端 spec
-    /// 没声明的键发过去**不报错、直接忽略**，从调用点看不出来（见 `SYNTH_REQUEST_OPTIONS`）。
+    /// "哪个键能发给后端"的地方。本函数不暴露 `instruction` 自由旋钮：只有
+    /// [`VoiceSource::Design`] 这一个受类型约束的入口会写它；常规 TTS 引擎发过去
+    /// **不报错、直接忽略**，从调用点看不出来（见 `SYNTH_REQUEST_OPTIONS`）。
     ///
     /// `source` 决定音色形态：内置不带克隆字段；克隆**成对**发 `voice_ref` +
     /// `reference_text`（服务端硬要求两者同时给，见 [`VoiceClone`]）；设计只发
-    /// `options.voice_design`。
+    /// `options.instruction`。
     pub fn synth(
         &self,
         model: &str,
@@ -582,26 +578,32 @@ mod tests {
     }
 
     /// 白名单**有牙**：后端 spec 没声明的旋钮进不了请求体。
-    /// 把 `insert_whitelisted` 的 `if` 去掉（或把 instruction 加回白名单）→ 本用例红。
+    /// `instruction` 是 VoiceDesign（task `vdes`）声明过的键；`voice_design` / `style`
+    /// 不是。把 `insert_whitelisted` 的 `if` 去掉（或把 style 加回白名单）→ 本用例红。
     #[test]
     fn synth_option_whitelist_drops_knobs_the_backend_never_declared() {
         let mut options = serde_json::Map::new();
         insert_whitelisted(&mut options, "seed", json!("7"));
         insert_whitelisted(&mut options, "instruction", json!("悲伤、缓慢、低沉"));
+        insert_whitelisted(&mut options, "voice_design", json!("错的键"));
         insert_whitelisted(&mut options, "style", json!("念白"));
         assert!(
             options.contains_key("seed"),
             "seed 在 spec 白名单里，应放行"
         );
         assert!(
-            !options.contains_key("instruction"),
-            "audio8_tts / index_tts2 的 spec 都没有 instruction，不该发（实测输出字节相同）"
+            options.contains_key("instruction"),
+            "instruction 是 VoiceDesign 的 spec 键，应放行"
+        );
+        assert!(
+            !options.contains_key("voice_design"),
+            "audio.cpp 的请求键是 instruction，不是 voice_design"
         );
         assert!(!options.contains_key("style"), "越白名单的键一律丢弃");
     }
 
     /// 组装出来的请求体逐键核对白名单——**不是**拿单个 helper 自证。
-    /// 真机曾经的请求体：`{"text":"…","options":{"seed":"7","instruction":"自然、清晰的叙述语气"}}`。
+    /// 常规 TTS 不能带 instruction；只有 VoiceDesign 分支才允许它出现。
     #[test]
     fn synth_request_body_only_carries_whitelisted_options() {
         let body = build_synth_request("你好。", Some(7), VoiceSource::BuiltIn);
@@ -615,7 +617,7 @@ mod tests {
         assert_eq!(options.get("seed").and_then(Value::as_str), Some("7"));
         assert!(
             !body.to_string().contains("instruction"),
-            "请求体不该再出现 instruction: {body}"
+            "常规 TTS 的请求体不该出现 instruction: {body}"
         );
         // voice_ref 走顶层，不进 options（服务端 spec 的 capabilities 在 options 之外）
         let clone = VoiceClone::new("/tmp/ref.wav", "参考音念的内容").unwrap();
@@ -625,24 +627,24 @@ mod tests {
         assert!(with_ref["options"].as_object().unwrap().is_empty());
     }
 
-    /// 三种音色来源各只有自己的字段：内置两不沾、克隆成对、设计只发 voice_design。
-    /// 这条就是"三形态用 enum 表达"的牙——把 voice_design 从白名单删掉转红，
+    /// 三种音色来源各只有自己的字段：内置两不沾、克隆成对、设计只发 instruction。
+    /// 这条就是"三形态用 enum 表达"的牙——把 instruction 从白名单删掉转红，
     /// 把 Clone 写成只发 voice_ref 转红。
     #[test]
     fn three_voice_sources_produce_their_own_shape() {
         let builtin = build_synth_request("你好。", None, VoiceSource::BuiltIn);
         assert!(!builtin.to_string().contains("voice_ref"));
-        assert!(!builtin.to_string().contains("voice_design"));
+        assert!(!builtin.to_string().contains("instruction"));
 
         let clone = VoiceClone::new("/tmp/ref.wav", "实际念的内容").unwrap();
         let cloned = build_synth_request("你好。", None, VoiceSource::Clone(clone));
         assert_eq!(cloned["voice_ref"], json!("/tmp/ref.wav"));
         assert_eq!(cloned["reference_text"], json!("实际念的内容"));
-        assert!(!cloned.to_string().contains("voice_design"));
+        assert!(!cloned.to_string().contains("instruction"));
 
         let design = build_synth_request("你好。", None, VoiceSource::Design("低沉磁性的中年男声"));
         assert_eq!(
-            design["options"]["voice_design"],
+            design["options"]["instruction"],
             json!("低沉磁性的中年男声")
         );
         assert!(!design.to_string().contains("voice_ref"));

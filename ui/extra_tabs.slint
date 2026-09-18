@@ -4,7 +4,7 @@
 // 诚实原则（见 docs/ui/redesign-v1/competitive-analysis.md「不采用清单」）：
 //   后端没有的能力一律显示“未接入 + 缺什么”，不放假按钮、不装成已完成。
 //   · 参考音频克隆：真实可用（配音链路 voice_ref + reference_text → audio8-tts / index-tts2）
-//   · 文本描述生成音色：真实可用（qwen3_tts 的 voice_design 任务 → options.voice_design）
+//   · 文本描述生成音色：真实可用（qwen3_tts 的 vdes 任务 → options.instruction）
 // ============================================================================
 import { PixelBadge, PixelButton, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
 
@@ -160,7 +160,7 @@ export component VoiceDesignTab inherits Rectangle {
                     }
                 }
 
-                // ── 可用：文本描述生成音色（qwen3_tts 的 voice_design 任务）──
+                // ── 可用：文本描述生成音色（qwen3_tts 的 vdes 任务 → options.instruction）──
                 Rectangle {
                     width: 100%;
                     vertical-stretch: 0;
