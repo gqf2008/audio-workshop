@@ -98,6 +98,21 @@ python3 tools/model_fetch.py audio8-tts          # 从上游源拉权重（幂�
 的 source of truth），下载后校验落点并打印 `server.json` 手动路径配置片段。
 上游 checkout 位置：环境变量 `AUDIOCPP_DIR`，默认本仓库同级的 `../audio.cpp`。
 
+## 打包与发版（macOS）
+
+```sh
+./release.sh     # 打包 → 签名 → 公证（.app 与 DMG）→ 装订，产物在 dist/
+./package.sh     # 只要 .app（自己用，不提交公证）
+```
+
+签名身份与公证凭据都是机器级秘密，**不在仓库里**（见 [docs/release.md](docs/release.md)）。
+两个实测踩过的坑写在同一篇里：打包后必须的 `disable-library-validation`、以及 DMG 要
+单独公证且在 `.app` 装订之后重建 —— 这两条不做的话，产物要么一启动就 dyld 报错、
+要么 Gatekeeper 直接拒。
+
+**当前发行版的前提**：目标机需装有 onnxruntime（人声分离后端）；只有 macOS 包；
+自动更新未配（默认清单地址匿名必然 404）。
+
 ## 本地验证
 
 ```bash
