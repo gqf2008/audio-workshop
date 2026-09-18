@@ -519,11 +519,20 @@ mod tests {
         std::fs::create_dir_all(dir.join("bgm/segments")).unwrap();
         write_test_segment(&dir.join("bgm/segments/000.wav"));
 
-        let bgm_dir = dir.join("bgm");
-        let before = std::fs::metadata(&bgm_dir).unwrap().permissions();
-        let mut ro = before.clone();
-        ro.set_readonly(true);
-        std::fs::set_permissions(&bgm_dir, ro).unwrap();
+        // 注入"写不进去"。**必须与平台无关**：
+        //
+        // 原来这里是把 `bgm/` 目录 chmod 成只读 —— 那条注入只在 Unix 生效。Windows 的
+        // READONLY 属性不阻止在目录里创建/改名文件，于是那边 `assemble_bgm` 会真的写成功，
+        // `unwrap_err()` 直接 panic（2026-09-18 三平台 CI 实测）。
+        //
+        // 换成"目标 `bgm/bgm.wav` 是非空目录"：`assemble_bgm` 先写 tmp 再
+        // `rename(tmp → bgm.wav)`，rename 到非空目录上在 Windows 与 Unix 上都会失败。
+        // 注意它命中的是 `write_failure_note` 的**兜底分支**（不是 PermissionDenied 那条），
+        // 所以下面按兜底文案的动作断言；PermissionDenied 的专门措辞由 dub.rs 的
+        // `write_failure_note_is_actionable_per_error_kind` 覆盖。
+        let out_path = dir.join("bgm/bgm.wav");
+        std::fs::create_dir_all(&out_path).unwrap();
+        std::fs::write(out_path.join("keep"), b"x").unwrap();
 
         let options = BgmOptions {
             prompt: "test prompt".into(),
@@ -532,8 +541,9 @@ mod tests {
         };
         let err = assemble_bgm(&dir, &options).unwrap_err();
 
-        // 先复原权限，保证测试结束能清理临时目录
-        std::fs::set_permissions(&bgm_dir, before).unwrap();
+        // 收尾：把注入的目录挪开，别给临时目录清理留坑
+        let _ = std::fs::remove_file(out_path.join("keep"));
+        let _ = std::fs::remove_dir_all(&out_path);
 
         assert!(
             err.contains("没有写入权限") || err.contains("写入失败"),
@@ -541,7 +551,9 @@ mod tests {
         );
         assert!(err.contains("bgm.wav"), "要说清写的是哪个文件：{err}");
         assert!(
-            err.contains("检查该目录权限") || err.contains("请释放空间"),
+            err.contains("检查该目录权限")
+                || err.contains("请释放空间")
+                || err.contains("检查磁盘与目录权限"),
             "要给动作：{err}"
         );
     }

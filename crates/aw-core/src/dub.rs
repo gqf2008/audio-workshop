@@ -842,15 +842,41 @@ mod tests {
     }
 
     /// 落盘失败的文案必须可执行：说清哪个路径、要多少空间、下一步做什么。
+    /// 造一个"磁盘满"的 io::Error，**平台无关**。
+    ///
+    /// 别用 `from_raw_os_error(28)`：28 是 POSIX 的 ENOSPC，而 Windows 的磁盘满是
+    /// ERROR_DISK_FULL=112 —— 拿 28 在 Windows 上会得到 `Uncategorized`，测试直接红
+    /// （2026-09-18 三平台 CI 实测）。这里只负责造出那个 kind；errno→kind 的**映射本身**
+    /// 是平台事实，另用分平台断言钉住，不混进业务断言里。
+    fn storage_full_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::StorageFull, "disk full")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enospc_errno_maps_to_storage_full_on_unix() {
+        assert_eq!(
+            std::io::Error::from_raw_os_error(28).kind(), // POSIX ENOSPC
+            std::io::ErrorKind::StorageFull
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn error_disk_full_errno_maps_to_storage_full_on_windows() {
+        assert_eq!(
+            std::io::Error::from_raw_os_error(112).kind(), // ERROR_DISK_FULL
+            std::io::ErrorKind::StorageFull
+        );
+    }
+
     /// 尤其 ENOSPC——原来的 `e.to_string()` 只有 `No space left on device (os error 28)`。
     #[test]
     fn write_failure_note_is_actionable_per_error_kind() {
         let path = Path::new("/tmp/音频作坊/projects/demo/sentences/012.wav");
 
-        // POSIX ENOSPC=28（Rust 归到 StorageFull）；这条要先钉住错误映射本身，
-        // 否则换工具链后 kind() 变了，测试会在别处莫名其妙地挂
-        let enospc = std::io::Error::from_raw_os_error(28);
-        assert_eq!(enospc.kind(), std::io::ErrorKind::StorageFull);
+        // 磁盘满用平台无关的构造（见 storage_full_error 的注释）
+        let enospc = storage_full_error();
         let note = write_failure_note(path, 600 * 1024, &enospc);
         assert!(note.contains("磁盘空间不足"), "实得 {note}");
         assert!(note.contains("sentences/012.wav"), "要说清路径：{note}");
@@ -937,12 +963,9 @@ mod tests {
     /// 若把 StorageFull 分支删掉，这条会红。
     #[test]
     fn write_failure_status_maps_enospc_to_the_cli_wording() {
-        let enospc = std::io::Error::from_raw_os_error(28); // POSIX ENOSPC
-        assert_eq!(
-            enospc.kind(),
-            std::io::ErrorKind::StorageFull,
-            "前提：ENOSPC 要归到 StorageFull，否则下面的映射走不到"
-        );
+        // 用平台无关的方式造出 StorageFull；errno→kind 的**映射本身**由
+        // enospc_errno_maps_to_storage_full_* 那条分平台用例单独钉住。
+        let enospc = storage_full_error();
         assert_eq!(
             write_failure_status(3 * 1024 * 1024, &enospc),
             "error: ENOSPC（需要 3.0 MB）"
@@ -1004,13 +1027,13 @@ mod tests {
     #[test]
     fn zero_byte_write_note_omits_size_and_hound_errors_are_classified() {
         let path = Path::new("/tmp/音频作坊/projects/demo/out/final.wav");
-        let enospc = std::io::Error::from_raw_os_error(28);
+        let enospc = storage_full_error();
         let note = write_failure_note(path, 0, &enospc);
         assert!(note.contains("磁盘空间不足"), "{note}");
         assert!(!note.contains("MB"), "拿不到字节数就别提大小：{note}");
         assert!(note.contains("final.wav"), "{note}");
 
-        let hound_err = hound::Error::IoError(std::io::Error::from_raw_os_error(28));
+        let hound_err = hound::Error::IoError(storage_full_error());
         let note = hound_error_note(path, 0, &hound_err);
         assert!(
             note.contains("磁盘空间不足") && note.contains("final.wav"),
