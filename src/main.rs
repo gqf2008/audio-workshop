@@ -13716,7 +13716,7 @@ mod tests {
     /// 这条会红（对应第三轮复核的“只测 helper 不等于有隔离”）。
     #[test]
     fn apply_project_to_rows_routes_through_status_helper() {
-        let source = include_str!("main.rs");
+        let source = src_lf(include_str!("main.rs"));
         let start = source
             .find("fn apply_project_to_rows(")
             .expect("生产恢复 wrapper 必须存在");
@@ -16641,7 +16641,7 @@ mod tests {
     /// 而真机 e2e 是 `#[ignore]` 的，跑不到就等于没保护。
     #[test]
     fn report_and_request_read_the_run_model_not_a_literal() {
-        let src = include_str!("main.rs");
+        let src = src_lf(include_str!("main.rs"));
         // 这个"针"必须拼出来：直接写完整字面量的话，它会命中**本用例自己的源码**，
         // 断言恒真、改坏也不红（第一次写就踩了这个坑，阳性对照抓出来的）。
         let request = format!("client.asr_with({}, &wav)", "&model");
@@ -16927,8 +16927,8 @@ mod tests {
     /// 所以只能统计"调用点"，不能统计裸名字（否则断言会被自己的源码喂饱、恒真——本仓踩过）。
     #[test]
     fn rewrite_url_has_exactly_one_production_call_site() {
-        let src = include_str!("main.rs");
-        let production = src.split("mod tests {").next().unwrap_or(src);
+        let src = src_lf(include_str!("main.rs"));
+        let production = src.split("mod tests {").next().unwrap_or(&src);
         let demo_start = production
             .find("fn download_source_demo_lines()")
             .expect("演示对照函数必须存在（守卫按这个函数名给豁免）");
@@ -17037,12 +17037,22 @@ mod tests {
     /// 不切掉测试模块，守卫里的字面量（`"picker::pick_"` 之类）会被自己命中，
     /// 断言恒真——本仓已经踩过这个坑（`LESSON_系列_测试断言与e2e.md`
     /// 「扫自己源码的守卫：断言里的『针』会被它自己的源码命中」）。
-    fn production_source() -> &'static str {
-        let src = include_str!("main.rs");
+    /// 扫自己源码的守卫要读**归一化成 LF** 的文本。
+    ///
+    /// Windows 上 git checkout 会把工作区写成 CRLF（本仓库没有 .gitattributes 强制 LF），
+    /// 而 `include_str!` 读的正是工作区那份 —— 于是所有按 `\n` 写的模式都匹配不上，
+    /// 守卫不是"变红"而是 `.expect(...)` 直接 panic。2026-09-18 三平台 CI 实测：5 个守卫
+    /// 在 Windows 上就是这么挂的。
+    fn src_lf(s: &str) -> String {
+        s.replace("\r\n", "\n")
+    }
+
+    fn production_source() -> String {
+        let src = src_lf(include_str!("main.rs"));
         let cut = src
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("测试模块的起点变了：守卫会退化成扫全文件（字面量自命中、断言恒真）");
-        &src[..cut]
+        src[..cut].to_string()
     }
 
     /// 选择器的三态必须在**每个调用点显式分流**：`Cancelled`（用户关窗）与

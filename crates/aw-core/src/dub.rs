@@ -654,7 +654,19 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     // 只在 copy/sync 失败时清会漏掉"临时文件写完但 rename 失败（例如目标被目录占着）"，
     // 那种情况会在目录里留下 .tmp 残渣（复核抓到）。
     let result = std::fs::copy(src, &tmp)
-        .and_then(|_| std::fs::File::open(&tmp).and_then(|f| f.sync_all()))
+        .and_then(|_| {
+            // 这里**必须带写权限**打开再 sync_all。
+            //
+            // Windows 上 sync_all 落到 FlushFileBuffers，而微软文档明确写着
+            // 「The file handle must have the GENERIC_WRITE access right」——
+            // 用 `File::open`（只读）会直接 ERROR_ACCESS_DENIED。Unix 上 fsync 只读 fd 没问题，
+            // 所以这个坑**只在 Windows 上炸，而且每一次导出都炸**（2026-09-18 三平台 CI 实测：
+            // export.rs 那 9 个用例全部因为 copy_atomic 返回 Failed 而失败）。
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)
+                .and_then(|f| f.sync_all())
+        })
         .and_then(|()| std::fs::rename(&tmp, dst));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);

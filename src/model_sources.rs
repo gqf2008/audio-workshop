@@ -1189,6 +1189,11 @@ mod tests {
             Path::new("/tmp/aw-nowhere/models"),
         );
         let conflict = rows[0].action.as_ref().unwrap().conflict.clone().unwrap();
+        // `conflict` 里是 `Path::display()`，Windows 上分隔符是 `\` —— 硬编码 `/` 的断言
+        // 在那边必然假红（2026-09-18 三平台 CI 实测）。把两边都归一成 `/` 再比，
+        // 断言的**强度不变**（仍然要求把两边路径都点出来），只是不再假设平台分隔符。
+        let slashes = |s: &str| s.replace('\\', "/");
+        let conflict = slashes(&conflict);
         assert!(
             conflict.contains("M-GGUF/m.gguf"),
             "要点名清单里的落点：{conflict}"
