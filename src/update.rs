@@ -45,9 +45,12 @@ pub struct Release {
     pub notes: String,
     /// 发布页地址（「打开发布页」用的就是它）
     pub url: String,
-    /// 安装包的 sha256（清单自带时才有；v1 不下载，只如实带出来）
+    /// 安装包的 sha256。v1 不下载安装包，只是如实带出来。
+    ///
+    /// 两个来源：GitHub Release 的资产 `digest`（2026-09-18 发 v0.1.0 后实测确实会给，
+    /// `sha256:be892dd6…`），以及自建清单里的顶层字段。都没有就是 `None`。
     pub sha256: Option<String>,
-    /// 安装包字节数（清单自带时才有；状态行用它显示体积）
+    /// 安装包字节数（同样来自资产元数据或自建清单；状态行用它显示体积）
     pub size: Option<u64>,
 }
 
@@ -791,6 +794,53 @@ mod tests {
         assert!(!e.contains("  "), "文案里有连续空格断层：{e:?}");
         // 4xx 不能被当成"已是最新"
         assert_eq!(mock.hits(), 1);
+    }
+
+    /// **真链路**（需要网络，默认不跑）：拿默认清单地址打一次真实的 GitHub API。
+    ///
+    /// 为什么要有它：mock 用例只能证明「给定这种形状的 JSON 能解析对」，**证不了线上那份
+    /// JSON 真的是这个形状**。仓库从 private 转 public、以及第一次发 Release，都是只有真打
+    /// 一次才知道的。跑法：
+    ///
+    /// ```console
+    /// cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "打真实 GitHub API；用 --ignored 显式跑"]
+    fn real_default_manifest_is_parseable() {
+        // 1) 线上确实存在一个能解析的正式 Release（拿一个更旧的版本号去比，必然 Newer）
+        let newer = match check(DEFAULT_MANIFEST_URL, "0.0.1") {
+            Ok(UpdateCheck::Newer(r)) => r,
+            Ok(UpdateCheck::UpToDate) => {
+                panic!("线上最新版本不比 0.0.1 新 —— 要么没有正式 Release，要么清单被解析成了空")
+            }
+            Err(e) => panic!("默认清单地址打不通/解析不了：{e}"),
+        };
+        println!(
+            "线上最新 = {}（notes {} 字，url {}，sha256 {:?}，size {:?}）",
+            newer.version,
+            newer.notes.chars().count(),
+            newer.url,
+            newer.sha256,
+            newer.size
+        );
+        assert!(!newer.version.is_empty(), "版本号不该是空的");
+        assert!(
+            newer.url.starts_with("https://"),
+            "发布页应是 https：{}",
+            newer.url
+        );
+        // 界面要展示发布说明；空正文说明 Release 发的姿势不对（不是代码问题，但值得报出来）
+        assert!(
+            !newer.notes.trim().is_empty(),
+            "Release 正文是空的，界面没东西可显示"
+        );
+
+        // 2) 当前已经是最新时**不能误报**（同一份线上数据，换个 current）
+        match check(DEFAULT_MANIFEST_URL, &newer.version) {
+            Ok(UpdateCheck::UpToDate) => {}
+            other => panic!("同版本应当 UpToDate，实得 {other:?}"),
+        }
     }
 
     #[test]
