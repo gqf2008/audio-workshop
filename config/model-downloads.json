@@ -1200,6 +1200,324 @@
       "aux_bytes": 0,
       "aux_files": [],
       "aux_unresolved": [],
+      "entry": {
+        "bytes": null,
+        "default": false,
+        "display_name": "Qwen3 TTS 12Hz 1.7B VoiceDesign Q8_0 GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "bytes": null,
+            "remote_path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+            "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "qwen3_tts_1_7b_voicedesign_q8_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf"
+        ],
+        "precision": "q8_0",
+        "reason": "",
+        "repo": "audio-cpp/audio.cpp-gguf",
+        "revision": "main",
+        "target_directory": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF"
+      },
+      "family": "qwen3_tts",
+      "id": "qwen3-tts-voicedesign",
+      "note": "落点精确匹配：qwen3_tts_1_7b_voicedesign_q8_0",
+      "packages": [
+        {
+          "bytes": null,
+          "default": true,
+          "display_name": "Qwen3 TTS 12Hz 1.7B Base Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_base_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-Base-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B Base BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-bf16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_base_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-Base-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B Base Original-Dtype GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-orig.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-orig.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_base_orig",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-orig.gguf"
+          ],
+          "precision": "orig",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-Base-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B CustomVoice Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_customvoice_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B CustomVoice BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-bf16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_customvoice_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B VoiceDesign Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_voicedesign_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B VoiceDesign BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-bf16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_voicedesign_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 0.6B Base Q8_0 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_0_6b_base_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-0.6B-Base-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 0.6B Base BF16 GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-bf16.gguf",
+              "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "qwen3_tts_0_6b_base_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/audio.cpp-gguf",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-0.6B-Base-GGUF"
+        },
+        {
+          "bytes": null,
+          "default": false,
+          "display_name": "Qwen3 TTS 12Hz 1.7B Base Safetensors",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": null,
+              "remote_path": "config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/config.json"
+            },
+            {
+              "bytes": null,
+              "remote_path": "generation_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/generation_config.json"
+            },
+            {
+              "bytes": null,
+              "remote_path": "model.safetensors",
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/model.safetensors"
+            },
+            {
+              "bytes": null,
+              "remote_path": "speech_tokenizer/config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/speech_tokenizer/config.json"
+            },
+            {
+              "bytes": null,
+              "remote_path": "speech_tokenizer/model.safetensors",
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/speech_tokenizer/model.safetensors"
+            },
+            {
+              "bytes": null,
+              "remote_path": "tokenizer_config.json",
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/tokenizer_config.json"
+            }
+          ],
+          "format": "safetensors",
+          "gated": false,
+          "id": "qwen3_tts_1_7b_base_safetensors",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Qwen3-TTS-12Hz-1.7B-Base/config.json",
+            "Qwen3-TTS-12Hz-1.7B-Base/generation_config.json",
+            "Qwen3-TTS-12Hz-1.7B-Base/model.safetensors",
+            "Qwen3-TTS-12Hz-1.7B-Base/speech_tokenizer/config.json",
+            "Qwen3-TTS-12Hz-1.7B-Base/speech_tokenizer/model.safetensors",
+            "Qwen3-TTS-12Hz-1.7B-Base/tokenizer_config.json"
+          ],
+          "precision": "native",
+          "reason": "",
+          "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+          "revision": "main",
+          "target_directory": "Qwen3-TTS-12Hz-1.7B-Base"
+        }
+      ],
+      "path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+      "spec": "qwen3_tts.json",
+      "status": "downloadable"
+    },
+    {
+      "aux_bytes": 0,
+      "aux_files": [],
+      "aux_unresolved": [],
       "entry": null,
       "family": "sheetsage2",
       "id": "sheetsage2",
