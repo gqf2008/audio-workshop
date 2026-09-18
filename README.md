@@ -111,7 +111,8 @@ python3 tools/model_fetch.py audio8-tts          # 从上游源拉权重（幂�
 要么 Gatekeeper 直接拒。
 
 **当前发行版的前提**：目标机需装有 onnxruntime（人声分离后端）；只有 macOS 包；
-自动更新未配（默认清单地址匿名必然 404）。
+自动更新**只差一个 GitHub Release** —— 仓库已公开（匿名 API 200），但还没发过 Release，
+所以 `releases/latest` 现在仍是 404。
 
 ## 本地验证
 
