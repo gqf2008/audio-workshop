@@ -11,7 +11,7 @@
 //! 策略类断言（重试/失败计数/请求参数白名单）在 tests/client_retry.rs 与
 //! tests/dub_mock.rs 里用进程内 mock 确定性验证，不依赖真机。
 
-use aw_core::{Client, Project};
+use aw_core::{Client, Project, VoiceSource};
 use std::collections::BTreeMap;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -240,7 +240,7 @@ fn voice_clone_reference_text_end_to_end() {
 
     // ① 内置音色（不带两个字段）：拿到基准产物
     let builtin = client
-        .synth(&model, text, Some(831001), None)
+        .synth(&model, text, Some(831001), VoiceSource::BuiltIn)
         .unwrap_or_else(|e| panic!("内置音色合成失败（{model}）：{e}"));
 
     // ② 裸 HTTP 负对照：只给 voice_ref。修复前 `synth` 发的就是这个报文，
@@ -266,7 +266,7 @@ fn voice_clone_reference_text_end_to_end() {
     // ③ 成对克隆：走真正的代码路径
     let clone = aw_core::VoiceClone::new(&reference, &reference_text).expect("参考文本非空");
     let cloned = client
-        .synth(&model, text, Some(831001), Some(clone))
+        .synth(&model, text, Some(831001), VoiceSource::Clone(clone))
         .unwrap_or_else(|e| panic!("克隆合成失败（{model} + reference_text）：{e}"));
 
     eprintln!(

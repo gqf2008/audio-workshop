@@ -1,16 +1,15 @@
 // ============================================================================
-// 音频作坊 · 音色设计 Tab + 能力未接入占位 Tab
+// 音频作坊 · 音色设计 Tab
 //
 // 诚实原则（见 docs/ui/redesign-v1/competitive-analysis.md「不采用清单」）：
 //   后端没有的能力一律显示“未接入 + 缺什么”，不放假按钮、不装成已完成。
 //   · 参考音频克隆：真实可用（配音链路 voice_ref + reference_text → audio8-tts / index-tts2）
-//   · 文本描述生成音色：后端未接入（audio.cpp 无 voice design 任务）
-//   · 人声分离 / 音乐制作：本分支未接入
+//   · 文本描述生成音色：真实可用（qwen3_tts 的 voice_design 任务 → options.voice_design）
 // ============================================================================
 import { PixelBadge, PixelButton, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
 
 // ---------------------------------------------------------------------------
-// 音色设计：v1 只做真实可用的「参考音频克隆」，文本生成音色明确标注未接入
+// 音色设计：参考音频克隆 + 文本描述生成音色（都真实可用）
 // ---------------------------------------------------------------------------
 export component VoiceDesignTab inherits Rectangle {
     in-out property <string> reference-path: "";
@@ -19,12 +18,25 @@ export component VoiceDesignTab inherits Rectangle {
     in property <string> reference-text-status: "";
     in property <bool> transcribing: false;
     in property <bool> busy: false;
+    /// 文本描述生成音色的输入：试听文本 + 音色描述
+    in-out property <string> design-text: "";
+    in-out property <string> design-description: "";
+    /// 生成的状态/错误文案（在飞、成功、失败），与 disabled 原因分开
+    in property <string> design-status: "";
+    in property <bool> design-busy: false;
+    /// 「生成」能不能点（Rust 单点投影）；理由就地显示，不放哑按钮
+    in property <bool> design-blocked: false;
+    in property <string> design-reason: "";
+    /// 是否有可「用作配音音色」的生成结果
+    in property <bool> design-ready: false;
 
     callback edited();
     callback clear-reference();
     callback use-in-dubbing();
     callback reference-text-edited();
     callback transcribe-reference();
+    callback design-generate();
+    callback design-use-in-dubbing();
 
     HorizontalLayout {
         horizontal-stretch: 1;
@@ -148,11 +160,11 @@ export component VoiceDesignTab inherits Rectangle {
                     }
                 }
 
-                // ── 未接入：文本描述生成音色（ElevenLabs Voice Design 那一套）──
+                // ── 可用：文本描述生成音色（qwen3_tts 的 voice_design 任务）──
                 Rectangle {
                     width: 100%;
                     vertical-stretch: 0;
-                    background: PixelTheme.bg;
+                    background: PixelTheme.panel;
                     border-width: 2px;
                     border-color: PixelTheme.edge;
 
@@ -166,36 +178,65 @@ export component VoiceDesignTab inherits Rectangle {
                             Text {
                                 horizontal-stretch: 1;
                                 text: "文本描述生成音色";
-                                color: PixelTheme.dim;
+                                color: PixelTheme.text;
                                 font-size: 15px;
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
                             PixelBadge {
-                                text: "未接入";
-                                width: 64px;
+                                text: "可用";
+                                width: 46px;
                                 height: 20px;
-                                face: PixelTheme.dim;
-                                border: PixelTheme.dim;
                             }
                         }
                         Text {
-                            text: "输入音色描述（如“沙哑的老年巫师”）直接合成新音色。本机 audio.cpp 目前没有 voice design 任务，这一块不做假按钮。";
+                            text: "用一句话描述想要的音色（如“低沉磁性的中年男声，语速偏慢”），生成后会念一遍你填的试听文本。需要服务清单里登记了 Qwen3-TTS VoiceDesign 模型。";
                             color: PixelTheme.dim;
                             font-size: 12px;
                             wrap: word-wrap;
+                        }
+                        PixelTextInput {
+                            width: 100%;
+                            enabled: !root.busy && !root.design-busy;
+                            text <=> root.design-text;
+                            placeholder: "试听文本（生成时念的这句话）";
                         }
                         PixelTextArea {
                             width: 100%;
                             height: 64px;
                             frame-height: 64px;
-                            enabled: false;
-                            placeholder: "音色描述（未接入）";
+                            enabled: !root.busy && !root.design-busy;
+                            text <=> root.design-description;
+                            placeholder: "音色描述，如“低沉磁性的中年男声，语速偏慢”";
                         }
-                        PixelButton {
-                            width: 150px;
-                            text: "生成音色";
-                            enabled: false;
+                        if root.design-status != "" : Text {
+                            text: root.design-status;
+                            color: PixelTheme.dim;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if root.design-reason != "" : Text {
+                            text: root.design-reason;
+                            color: PixelTheme.danger;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            PixelButton {
+                                width: 150px;
+                                variant: "primary";
+                                text: root.design-busy ? "生成中…" : "生成音色";
+                                enabled: !root.design-blocked;
+                                clicked => { root.design-generate(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            PixelButton {
+                                width: 150px;
+                                text: "用作配音音色";
+                                enabled: root.design-ready && !root.busy && !root.design-busy;
+                                clicked => { root.design-use-in-dubbing(); }
+                            }
                         }
                     }
                 }

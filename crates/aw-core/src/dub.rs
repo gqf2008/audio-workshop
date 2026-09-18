@@ -8,7 +8,7 @@
 //! - 重录必须换 seed，否则拿回同一条不满意的音频
 //! - 合成/拼装的失败句必须**报数**，不能静默跳过（成品少一句没人知道）
 
-use crate::audio_client::{Client, ClientError, VoiceClone};
+use crate::audio_client::{Client, ClientError, VoiceClone, VoiceSource};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -247,12 +247,12 @@ impl Project {
         // 前置拦截：克隆音色必须成对给出音频与文本。放在**循环之前**——放在循环里会让
         // 每一句都重复撞同一个错误，用户看到的是 N 条一模一样的 `error:`。
         // 唯一判据在 `VoiceClone::new`，这里只是提前调用它（不另写一份 trim 判断）。
-        let clone = match self.voice_ref.as_deref() {
-            Some(path) => Some(VoiceClone::new(
+        let source = match self.voice_ref.as_deref() {
+            Some(path) => VoiceSource::Clone(VoiceClone::new(
                 path,
                 self.voice_ref_text.as_deref().unwrap_or_default(),
             )?),
-            None => None,
+            None => VoiceSource::BuiltIn,
         };
         let mut failed = 0usize;
         // 按下标迭代而不是 iter_mut：循环体里要 self.save(dir)（逐句落盘），
@@ -294,8 +294,8 @@ impl Project {
                 &self.model,
                 &spoken,
                 Some(seed),
-                // clone 在循环外已校验过；这里只是把它成对传下去
-                clone,
+                // source 在循环外已校验过；这里只是把它成对传下去
+                source,
             ) {
                 Ok(wav) => {
                     let path = dir.join(format!("sentences/{index:03}.wav"));

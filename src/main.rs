@@ -46,8 +46,8 @@ use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, Timer, Time
 
 use aw_core::{
     assemble_bgm, bgm_only_artifacts, generate_cover, generate_segments_stoppable, generate_song,
-    mix_project, BgmArtifacts, BgmOptions, BgmRun, Client, Project, SongModel, SongOptions,
-    DEFAULT_PUNCTUATION,
+    mix_project, BgmArtifacts, BgmOptions, BgmRun, Client, ClientError, Project, SongModel,
+    SongOptions, VoiceSource, DEFAULT_PUNCTUATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -165,6 +165,14 @@ enum Cmd {
         /// 试听也必须成对：否则克隆音色的试听永远 500，用户按试听选音色会被误导
         voice_ref_text: Option<String>,
         text: String,
+    },
+    /// 文本描述生成音色（voice_design）：用一段描述合成一句试听文本，只播不落工程、
+    /// 不改 current。设计形态是 `VoiceSource::Design(description)` —— 不经过克隆字段。
+    DesignVoice {
+        revision: u64,
+        model: String,
+        text: String,
+        description: String,
     },
     /// 人声分离（本地 htdemucs）：两轨写到 out_dir。
     ///
@@ -403,6 +411,20 @@ enum Msg {
     VoicePreviewFailed {
         label: String,
         error: String,
+    },
+    /// 文本描述生成音色完成（wav 字节 + 生成时用的试听文本 + 设计模型）。
+    ///
+    /// `text` 必须随消息回来：点「用作配音音色」时它就是 reference_text，
+    /// 不能再去读界面输入框（那个值可能已经被用户改过了）。
+    DesignVoiceDone {
+        wav: Vec<u8>,
+        text: String,
+        model: String,
+    },
+    /// 文本描述生成音色失败。
+    DesignVoiceFailed {
+        error: String,
+        model: String,
     },
     /// 参考音频的**自动转写**结果（后台线程发回，与工程版本无关）。
     ///
@@ -1634,6 +1656,19 @@ fn read_server_config() -> Option<ServerConfig> {
 // 而应用把回读模型写死成它 —— 质检整条功能不可用。这里让它可选，并且**动态**列
 // 清单里 `task == "asr"` 的模型（不硬编名字：清单加一个就多一项）。
 // ===========================================================================
+
+/// 清单里第一个可用的**音色设计**模型 id：`task == "design"` 且未被产品层排除。
+///
+/// 与 `asr_models_from` 同族：不硬编 `qwen3_tts_1_7b_voicedesign_q8_0`——清单加一个
+/// 设计模型就多一个候选，这里取第一个（本批只接单设计模型）。
+fn design_model_from(cfg: Option<&ServerConfig>) -> Option<String> {
+    cfg.and_then(|c| {
+        c.models
+            .iter()
+            .find(|m| m.task == "design" && !m.id.trim().is_empty() && !m.caps.product_excluded)
+            .map(|m| m.id.clone())
+    })
+}
 
 /// 清单里所有 `task == "asr"` 的模型 id（保持清单顺序，跳过空 id）。
 fn asr_models_from(cfg: Option<&ServerConfig>) -> Vec<String> {
@@ -3220,12 +3255,17 @@ fn worker_loop(ctx: WorkerCtx) {
                                 path,
                                 voice_ref_text.as_deref().unwrap_or_default(),
                             ) {
-                                Ok(clone) => {
-                                    client.synth(&model, &text, Some(BASE_SEED), Some(clone))
-                                }
+                                Ok(clone) => client.synth(
+                                    &model,
+                                    &text,
+                                    Some(BASE_SEED),
+                                    VoiceSource::Clone(clone),
+                                ),
                                 Err(e) => Err(e),
                             },
-                            None => client.synth(&model, &text, Some(BASE_SEED), None),
+                            None => {
+                                client.synth(&model, &text, Some(BASE_SEED), VoiceSource::BuiltIn)
+                            }
                         };
                         match outcome {
                             Ok(wav) => Msg::VoicePreview {
@@ -3242,6 +3282,22 @@ fn worker_loop(ctx: WorkerCtx) {
                         label: model.clone(),
                         error: e,
                     },
+                };
+                let _ = ctx.tx.send(WorkerMsg { revision, msg });
+            }
+            Cmd::DesignVoice {
+                revision,
+                model,
+                text,
+                description,
+            } => {
+                let msg = match make_client() {
+                    Ok(client) => {
+                        let outcome =
+                            client.synth(&model, &text, None, VoiceSource::Design(&description));
+                        design_voice_msg(model, text, outcome)
+                    }
+                    Err(e) => Msg::DesignVoiceFailed { error: e, model },
                 };
                 let _ = ctx.tx.send(WorkerMsg { revision, msg });
             }
@@ -4458,6 +4514,23 @@ fn project_dir(stem: &str) -> PathBuf {
     projects_root().join(stem)
 }
 
+/// 音色设计产物的落点：~/Documents/音频作坊/voice-design/（与应用设置、导出目录同级）。
+fn voice_design_dir() -> PathBuf {
+    workshop_dir().join("voice-design")
+}
+
+/// 把生成的音色设计 wav 落盘，返回完整路径。
+///
+/// 文件名带毫秒时间戳：每次生成都是**新文件**。不能写死一个名字——用户先"用作配音
+/// 音色"把 voice_ref 指到它，再重新设计一次，写死名字会把已经指着的参考音频覆盖掉。
+fn save_design_voice(wav: &[u8]) -> Result<PathBuf, String> {
+    let dir = voice_design_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}", e))?;
+    let path = dir.join(format!("voice-design-{}.wav", now_ms()));
+    std::fs::write(&path, wav).map_err(|e| format!("{}", e))?;
+    Ok(path)
+}
+
 #[derive(Debug)]
 struct LoadedProject {
     project: Project,
@@ -4860,6 +4933,10 @@ struct UiState {
     bgm_artifacts: RefCell<Option<BgmArtifacts>>,
     /// 最近一次歌曲产物（路径、时长）。
     song_artifact: RefCell<Option<(PathBuf, f64)>>,
+    /// 文本描述生成音色的结果：None = 还没有可用结果。
+    /// (音频文件路径, 生成时用的试听文本) —— 点「用作配音音色」时据此填
+    /// voice_ref/reference_text，不能再去读界面输入框（那个值可能已被用户改过）。
+    design_result: RefCell<Option<(PathBuf, String)>>,
     /// 翻唱源音频路径（None = 未选择）。与 `sep_input` 同族：路径是真相，
     /// UI 的 source-path / source-summary / source-picked 都只是它的投影。
     song_source: RefCell<Option<String>>,
@@ -5407,7 +5484,7 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
         }
         "design" => {
             ui.set_scene(4);
-            ui.set_status_text("音色设计：参考音频克隆可用；文本生成音色未接入".into());
+            ui.set_status_text("音色设计：参考音频克隆 + 文本描述生成音色（voice_design）".into());
         }
         "advanced" => {
             ui.set_dub_advanced(true);
@@ -7956,6 +8033,75 @@ fn wire_voice_panel(
             });
         });
     });
+
+    // ── 文本描述生成音色：生成 / 用作配音音色 ──
+    //    生成是短操作，不排队：有任务在飞时明确拒绝（与"试听"同一条守则）。
+    let weak = ui.as_weak();
+    let tx = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_design_generate(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let model = design_model_from(read_server_config().as_ref());
+        let text = ui.get_design_text().to_string();
+        let description = ui.get_design_description().to_string();
+        let any_busy = ui.get_running() || ui.get_busy() || tasks_in_flight(&st);
+        // 点击回调与按钮 enabled 用**同一份判据**（改动见 design_generate_refusal 注释）
+        if let Some(refusal) = design_generate_refusal(
+            model.as_deref(),
+            &text,
+            &description,
+            ui.get_design_busy(),
+            any_busy,
+        ) {
+            ui.set_design_status(refusal.into());
+            return;
+        }
+        let Some(model) = model else {
+            ui.set_design_status("本机没有可用的音色设计模型".into());
+            return;
+        };
+        ui.set_design_busy(true);
+        ui.set_design_status(format!("正在生成音色（{model}）…").into());
+        if tx
+            .send(Cmd::DesignVoice {
+                revision: 0,
+                model,
+                text,
+                description,
+            })
+            .is_err()
+        {
+            // 发不出去就必须把 busy 放掉，否则按钮永远卡在"生成中"
+            ui.set_design_busy(false);
+            ui.set_design_status("工作线程不可用：生成未发出，请重启应用".into());
+        }
+    });
+
+    let weak = ui.as_weak();
+    let tx_use = cmd_tx.clone();
+    let st = state.clone();
+    ui.on_design_use_in_dubbing(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some((path, text)) = st.design_result.borrow().clone() else {
+            ui.set_status_text("还没有可用的生成结果：先描述音色并生成".into());
+            return;
+        };
+        if ui.get_running() || ui.get_busy() || tasks_in_flight(&st) {
+            ui.set_status_text("有任务正在进行：音色暂不可改，等它结束再使用".into());
+            return;
+        }
+        set_voice_ref(&ui, &path.to_string_lossy());
+        ui.set_voice_ref_text(text.into());
+        ui.set_voice_ref_text_status("".into());
+        // 与手改参考音同一条作废路径：旧工程音频不能再导出
+        invalidate_worker_project(&tx_use, &st);
+        reset_bgm(&ui, &st);
+        ui.set_has_result(false);
+        refresh_voice_labels(&ui);
+        ui.set_scene(0);
+        ui.set_dub_voice(true);
+        ui.set_status_text("已用作配音音色：去配音页开始合成（克隆路径会用它做条件）".into());
+    });
 }
 
 fn wire_sentence_actions(
@@ -8718,6 +8864,75 @@ fn refresh_song_action(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_song_generate_reason(reason.into());
 }
 
+/// 音色设计「生成」的提交拦截判据。**单点**：按钮 enabled 与点击回调都用它，
+/// 不在 Slint 里重拼条件。
+fn design_generate_refusal(
+    design_model: Option<&str>,
+    text: &str,
+    description: &str,
+    design_busy: bool,
+    any_busy: bool,
+) -> Option<String> {
+    if design_busy {
+        return Some("音色生成中：等它完成".into());
+    }
+    if any_busy {
+        return Some("有任务正在进行：生成音色要等它结束（生成是短操作，不排队）".into());
+    }
+    if design_model.is_none() {
+        return Some("本机没有可用的音色设计模型：需在服务清单里登记 Qwen3-TTS VoiceDesign".into());
+    }
+    if text.trim().is_empty() {
+        return Some("先填试听文本".into());
+    }
+    if description.trim().is_empty() {
+        return Some("先填音色描述".into());
+    }
+    None
+}
+
+/// 音色设计生成按钮的 bool 形态：与 [`design_generate_refusal`] 同一份判据。
+fn design_generate_blocked(
+    design_model: Option<&str>,
+    text: &str,
+    description: &str,
+    design_busy: bool,
+    any_busy: bool,
+) -> bool {
+    design_generate_refusal(design_model, text, description, design_busy, any_busy).is_some()
+}
+
+/// 把音色设计按钮的可用性/原因投影到 UI（每 tick 同步）。
+fn refresh_design_action(ui: &MainWindow, state: &Rc<UiState>) {
+    let model = design_model_from(read_server_config().as_ref());
+    let text = ui.get_design_text();
+    let description = ui.get_design_description();
+    let design_busy = ui.get_design_busy();
+    let any_busy = ui.get_running() || ui.get_busy() || tasks_in_flight(state);
+    let blocked =
+        design_generate_blocked(model.as_deref(), &text, &description, design_busy, any_busy);
+    let reason =
+        design_generate_refusal(model.as_deref(), &text, &description, design_busy, any_busy)
+            .unwrap_or_default();
+    ui.set_design_blocked(blocked);
+    ui.set_design_reason(reason.into());
+    // 试听文本/描述一变，旧结果虽还能试听，但「用作配音音色」的语义仍是那份旧产物；
+    // ready 只由「有没有结果」决定，这里不改它。
+}
+
+/// 音色设计合成的结果 → Msg。**失败文案必须经 `ClientError::to_string()`**：那里是
+/// OOM 可执行文案的唯一入口（`memory_shortfall_note` 给出「释放模型内存」下一步）。
+/// 谁在这里改成裸 `format!("{code}")`，OOM 提示就会从音色设计这条路上消失。
+fn design_voice_msg(model: String, text: String, outcome: Result<Vec<u8>, ClientError>) -> Msg {
+    match outcome {
+        Ok(wav) => Msg::DesignVoiceDone { wav, text, model },
+        Err(e) => Msg::DesignVoiceFailed {
+            error: e.to_string(),
+            model,
+        },
+    }
+}
+
 /// 写入翻唱源音频（唯一写入点）：路径是真相，UI 的 source-path / source-summary /
 /// source-picked 都是它的投影。源音频变了就作废旧歌曲产物（试听/导出别指向旧输入）。
 fn set_song_source(ui: &MainWindow, state: &Rc<UiState>, path: String) {
@@ -9075,6 +9290,10 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::VoiceImportDirPicked { .. }
         // 参考音转写：来自后台线程，与稿件版本无关（转的是参考音，不是稿子）
         | Msg::ReferenceTranscribed { .. }
+        // 文本描述生成音色：来自 worker，但只合成一句试听文本、不碰当前工程，
+        // 与稿件版本无关；用 revision 0 发回，否则期间改稿会把终态丢掉、界面停在"生成中…"
+        | Msg::DesignVoiceDone { .. }
+        | Msg::DesignVoiceFailed { .. }
         | Msg::DictFilePicked { .. }
         | Msg::SeparationInputPicked { .. }
         | Msg::SongSourcePicked { .. }
@@ -9374,6 +9593,37 @@ fn tick(
                         );
                     }
                 }
+            }
+            Msg::DesignVoiceDone { wav, text, model } => {
+                ui.set_design_busy(false);
+                match save_design_voice(&wav) {
+                    Ok(path) => {
+                        *state.design_result.borrow_mut() = Some((path.clone(), text.clone()));
+                        ui.set_design_ready(true);
+                        ui.set_design_status(
+                            format!("已生成（{model}）：可试听或用作配音音色").into(),
+                        );
+                        // 生成即试听，用户不用再点一次"播放"才知道设计出来的是什么声音
+                        match player.play_wav(&path) {
+                            Ok(()) => {
+                                ui.set_playing(true);
+                                ui.set_status_text(format!("音色设计完成：{model}").into());
+                            }
+                            Err(e) => {
+                                ui.set_status_text(format!("音色已生成，但试听失败：{e}").into())
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ui.set_design_status(format!("音色已生成，但保存失败：{e}").into());
+                        ui.set_status_text(format!("音色设计保存失败：{e}").into());
+                    }
+                }
+            }
+            Msg::DesignVoiceFailed { error, model } => {
+                ui.set_design_busy(false);
+                ui.set_design_status(format!("生成失败（{model}）：{error}").into());
+                ui.set_status_text(format!("音色设计失败（{model}）：{error}").into());
             }
             Msg::ReferenceTranscribed { model, result } => {
                 ui.set_voice_ref_text_busy(false);
@@ -10085,6 +10335,9 @@ fn tick(
     // ── 音乐制作主按钮能不能点 + 原因：同一处投影，不在 Slint 重拼 ──
     refresh_song_action(ui, state);
 
+    // ── 音色设计「生成」能不能点 + 原因：同上，单点投影 ──
+    refresh_design_action(ui, state);
+
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
         ui.set_playing(false);
@@ -10705,7 +10958,7 @@ const SCENE_NOTES: [&str; 5] = [
     "BGM：按描述生成，自动对齐配音时长并 ducking",
     "人声分离：后端未接入，占位",
     "音乐制作：写歌 / 文生音乐（yue2 · ace-step）",
-    "音色设计：参考音频克隆可用；文本生成音色未接入",
+    "音色设计：参考音频克隆 / 文本描述生成音色（voice_design）",
 ];
 
 fn export_dir() -> String {
@@ -14256,6 +14509,125 @@ mod tests {
         assert!(
             !workbench.contains("root.style != \"\""),
             "不许在 Slint 里重拼风格判据"
+        );
+    }
+
+    /// 音色设计模型挑选：`task == "design"` 且未被产品层排除，取清单第一个。
+    #[test]
+    fn design_model_from_picks_first_non_excluded_design_task() {
+        let excluded = ServerModel {
+            id: "qwen3-tts-voicedesign-bf16".into(),
+            task: "design".into(),
+            caps: model_capabilities::Capability {
+                product_excluded: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tts = ServerModel {
+            id: "audio8-tts".into(),
+            task: "tts".into(),
+            ..Default::default()
+        };
+        let first = ServerModel {
+            id: "qwen3-tts-voicedesign-q8_0".into(),
+            task: "design".into(),
+            ..Default::default()
+        };
+        let cfg = ServerConfig {
+            host: None,
+            port: None,
+            min_free_memory_mb: None,
+            models: vec![excluded, tts, first],
+        };
+        assert_eq!(
+            design_model_from(Some(&cfg)).as_deref(),
+            Some("qwen3-tts-voicedesign-q8_0")
+        );
+        let empty = ServerConfig {
+            host: None,
+            port: None,
+            min_free_memory_mb: None,
+            models: vec![],
+        };
+        assert_eq!(
+            design_model_from(Some(&empty)),
+            None,
+            "没有 design 模型时不能凭空捏一个 id"
+        );
+    }
+
+    /// 音色设计「生成」的可用性矩阵：模型 / 试听文本 / 音色描述 / busy 都要有说法。
+    #[test]
+    fn design_generate_refusal_requires_model_text_and_description() {
+        let model = Some("qwen3-tts-voicedesign-q8_0");
+        assert!(design_generate_refusal(model, "试听", "低沉男声", false, false).is_none());
+        let no_model = design_generate_refusal(None, "试听", "低沉男声", false, false).unwrap();
+        assert!(
+            no_model.contains("VoiceDesign"),
+            "缺模型要说清是哪个：{no_model}"
+        );
+        let no_text = design_generate_refusal(model, "   ", "低沉男声", false, false).unwrap();
+        assert!(no_text.contains("试听文本"), "缺试听文本要点名：{no_text}");
+        let no_desc = design_generate_refusal(model, "试听", "   ", false, false).unwrap();
+        assert!(no_desc.contains("音色描述"), "缺描述要点名：{no_desc}");
+        let busy = design_generate_refusal(model, "试听", "低沉男声", true, false).unwrap();
+        assert!(busy.contains("生成中"), "生成中要给出等待说法：{busy}");
+        let any = design_generate_refusal(model, "试听", "低沉男声", false, true).unwrap();
+        assert!(any.contains("任务正在进行"), "有任务在飞要拒绝：{any}");
+    }
+
+    /// 音色设计失败**必须**复用 OOM 唯一文案入口：503 + insufficient_memory 时，
+    /// 用户看到的是可执行下一步（释放模型内存 / 需要多少 / 可用多少），不是裸 503。
+    #[test]
+    fn design_voice_failure_preserves_oom_actionable_note() {
+        let body = r#"{"error":{"message":"cannot load model 'qwen3-tts-12hz-1.7b-voicedesign-q8_0': estimated 4.06 GiB + 1024 MiB headroom exceeds available host memory (2.25 GiB)","type":"insufficient_memory"}}"#;
+        let err = aw_core::ClientError::Server(503, body.to_string());
+        let msg = design_voice_msg(
+            "qwen3-tts-12hz-1.7b-voicedesign-q8_0".into(),
+            "试听文本".into(),
+            Err(err),
+        );
+        let Msg::DesignVoiceFailed { error, model } = msg else {
+            panic!("合成失败应为 DesignVoiceFailed")
+        };
+        assert!(error.contains("内存不足（OOM）"), "{error}");
+        assert!(error.contains("释放模型内存"), "{error}");
+        assert!(error.contains("4.06 GiB"), "{error}");
+        assert!(error.contains("2.25 GiB"), "{error}");
+        assert!(model.contains("voicedesign"), "{model}");
+    }
+
+    /// 阳性对照：模型忙碌也是 503，不能因为 503 就说成内存不足。
+    #[test]
+    fn design_voice_busy_503_is_not_reported_as_oom() {
+        let busy = aw_core::ClientError::Server(
+            503,
+            r#"{"error":{"message":"model is busy","type":"model_busy"}}"#.to_string(),
+        );
+        let msg = design_voice_msg("m".into(), "t".into(), Err(busy));
+        let Msg::DesignVoiceFailed { error, .. } = msg else {
+            panic!("合成失败应为 DesignVoiceFailed")
+        };
+        assert!(!error.contains("释放模型内存"), "{error}");
+        assert!(!error.contains("内存不足（OOM）"), "{error}");
+    }
+
+    /// 源码级守卫：音色设计「生成」按钮必须吃 Rust 投影，且不再写「后端没有 voice design」。
+    #[test]
+    fn design_generate_button_consumes_projection_and_drops_stale_copy() {
+        let extra = include_str!("../ui/extra_tabs.slint");
+        assert!(
+            extra.contains("enabled: !root.design-blocked;"),
+            "生成按钮 enabled 必须直接吃 Rust 投影 design-blocked"
+        );
+        assert!(
+            !extra.contains("audio.cpp 无 voice design"),
+            "后端明明有 voice_design，不许再写「后端没有」"
+        );
+        assert!(
+            !extra.contains("文本描述生成音色：后端未接入"),
+            "文本描述生成音色已接入，不许再标未接入"
         );
     }
 

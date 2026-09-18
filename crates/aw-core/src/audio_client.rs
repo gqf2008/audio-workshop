@@ -279,6 +279,22 @@ impl<'a> VoiceClone<'a> {
     }
 }
 
+/// 三种音色来源：请求组装时**必须**二选一（不能三个 Option 叠着）。
+///
+/// 为什么是 enum 而不是再叠一个 `Option<&str>`：克隆路径要 `voice_ref` +
+/// `reference_text` 成对（见 [`VoiceClone`]），设计路径只要 `voice_design` 描述，
+/// 内置路径两者都不要。三个 `Option` 会让「只给了描述却带了个克隆」「既给了克隆
+/// 又给了描述」这类非法组合在类型上表达不出来，只能靠调用点自己记得拦。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceSource<'a> {
+    /// 模型内置默认音色：不带 voice_ref / reference_text / voice_design。
+    BuiltIn,
+    /// 参考音频克隆：`voice_ref` + `reference_text` 顶层成对下发。
+    Clone(VoiceClone<'a>),
+    /// 文本描述生成音色：`options.voice_design = "<描述>"`。
+    Design(&'a str),
+}
+
 pub struct Client {
     base: String,
     retries: u32,
@@ -294,8 +310,9 @@ pub struct Client {
 /// 只能靠这条白名单挡住。真机对照（同 seed、同文本，只改 instruction）两个输出的
 /// sha256 完全相同：`214f41f3…`。
 ///
+/// `voice_design` 来自 `qwen3_tts` family 的 `capabilities.design`（唯一设计键）。
 /// 加键之前先核对服务端 spec 的 `options.request`，否则用户会以为那个旋钮生效。
-pub const SYNTH_REQUEST_OPTIONS: &[&str] = &["seed", "reference_text"];
+pub const SYNTH_REQUEST_OPTIONS: &[&str] = &["seed", "reference_text", "voice_design"];
 
 /// 白名单的唯一判据。
 fn synth_option_allowed(key: &str) -> bool {
@@ -314,14 +331,19 @@ fn insert_whitelisted(options: &mut serde_json::Map<String, Value>, key: &str, v
 
 /// 组装 `/v1/tasks/run` 的 TTS 请求体：**唯一**组装点，白名单在这里生效。
 ///
-/// `voice_ref` 是顶层字段（服务端 spec 里属 capabilities，不在 `options` 里）。
-fn build_synth_request(text: &str, seed: Option<u64>, clone: Option<VoiceClone<'_>>) -> Value {
+/// `voice_ref` / `reference_text` 是顶层字段（服务端 spec 里属 capabilities，不在
+/// `options` 里）；`voice_design` 是 `options` 里的设计键（`qwen3_tts` 的
+/// `capabilities.design`）。
+fn build_synth_request(text: &str, seed: Option<u64>, source: VoiceSource<'_>) -> Value {
     let mut options = serde_json::Map::new();
     if let Some(s) = seed {
         insert_whitelisted(&mut options, "seed", json!(s.to_string()));
     }
+    if let VoiceSource::Design(description) = source {
+        insert_whitelisted(&mut options, "voice_design", json!(description));
+    }
     let mut request = json!({ "text": text, "options": Value::Object(options) });
-    if let Some(c) = clone {
+    if let VoiceSource::Clone(c) = source {
         // 两行必须同进同出：只发 voice_ref 就是那个"每句都 500"的老 bug（见 VoiceClone）。
         request["voice_ref"] = json!(c.path());
         request["reference_text"] = json!(c.reference_text());
@@ -350,16 +372,17 @@ impl Client {
     /// "哪个键能发给后端"的地方。本函数不再收 `instruction` 这类自由旋钮：后端 spec
     /// 没声明的键发过去**不报错、直接忽略**，从调用点看不出来（见 `SYNTH_REQUEST_OPTIONS`）。
     ///
-    /// `clone` 为 `Some` 时**成对**发送 `voice_ref` + `reference_text`
-    /// ——服务端硬要求两者同时给，见 `VoiceClone`。
+    /// `source` 决定音色形态：内置不带克隆字段；克隆**成对**发 `voice_ref` +
+    /// `reference_text`（服务端硬要求两者同时给，见 [`VoiceClone`]）；设计只发
+    /// `options.voice_design`。
     pub fn synth(
         &self,
         model: &str,
         text: &str,
         seed: Option<u64>,
-        clone: Option<VoiceClone<'_>>,
+        source: VoiceSource<'_>,
     ) -> Result<Vec<u8>, ClientError> {
-        self.run_audio(model, build_synth_request(text, seed, clone))
+        self.run_audio(model, build_synth_request(text, seed, source))
     }
 
     /// 发送任意 audio.cpp 音频任务并取回 wav 字节。TTS 之外的 gen 场景
@@ -581,7 +604,7 @@ mod tests {
     /// 真机曾经的请求体：`{"text":"…","options":{"seed":"7","instruction":"自然、清晰的叙述语气"}}`。
     #[test]
     fn synth_request_body_only_carries_whitelisted_options() {
-        let body = build_synth_request("你好。", Some(7), None);
+        let body = build_synth_request("你好。", Some(7), VoiceSource::BuiltIn);
         let options = body["options"].as_object().expect("options 应是对象");
         for key in options.keys() {
             assert!(
@@ -596,9 +619,34 @@ mod tests {
         );
         // voice_ref 走顶层，不进 options（服务端 spec 的 capabilities 在 options 之外）
         let clone = VoiceClone::new("/tmp/ref.wav", "参考音念的内容").unwrap();
-        let with_ref = build_synth_request("你好。", None, Some(clone));
+        let with_ref = build_synth_request("你好。", None, VoiceSource::Clone(clone));
         assert_eq!(with_ref["voice_ref"], json!("/tmp/ref.wav"));
+        assert_eq!(with_ref["reference_text"], json!("参考音念的内容"));
         assert!(with_ref["options"].as_object().unwrap().is_empty());
+    }
+
+    /// 三种音色来源各只有自己的字段：内置两不沾、克隆成对、设计只发 voice_design。
+    /// 这条就是"三形态用 enum 表达"的牙——把 voice_design 从白名单删掉转红，
+    /// 把 Clone 写成只发 voice_ref 转红。
+    #[test]
+    fn three_voice_sources_produce_their_own_shape() {
+        let builtin = build_synth_request("你好。", None, VoiceSource::BuiltIn);
+        assert!(!builtin.to_string().contains("voice_ref"));
+        assert!(!builtin.to_string().contains("voice_design"));
+
+        let clone = VoiceClone::new("/tmp/ref.wav", "实际念的内容").unwrap();
+        let cloned = build_synth_request("你好。", None, VoiceSource::Clone(clone));
+        assert_eq!(cloned["voice_ref"], json!("/tmp/ref.wav"));
+        assert_eq!(cloned["reference_text"], json!("实际念的内容"));
+        assert!(!cloned.to_string().contains("voice_design"));
+
+        let design = build_synth_request("你好。", None, VoiceSource::Design("低沉磁性的中年男声"));
+        assert_eq!(
+            design["options"]["voice_design"],
+            json!("低沉磁性的中年男声")
+        );
+        assert!(!design.to_string().contains("voice_ref"));
+        assert!(!design.to_string().contains("reference_text"));
     }
 
     /// 真机 503 body（本机 16 GiB / qwen3-asr 装不下）必须能解析出模型名与三个数字。

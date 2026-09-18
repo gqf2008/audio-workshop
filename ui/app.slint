@@ -231,6 +231,14 @@ export component MainWindow inherits Window {
     in-out property <string> voice-ref-text: "";
     in property <string> voice-ref-text-status: "";
     in property <bool> voice-ref-text-busy: false;
+    // 文本描述生成音色：输入/状态/可用性都是 Rust 侧的投影（单点判据）
+    in-out property <string> design-text: "";
+    in-out property <string> design-description: "";
+    in property <string> design-status: "";
+    in property <bool> design-busy: false;
+    in property <bool> design-blocked: false;
+    in property <string> design-reason: "";
+    in property <bool> design-ready: false;
 
     // ── 音色库（P4）：自建的多音色存档 ──
     in property <[VoiceLibRow]> library-rows: [];
@@ -322,6 +330,8 @@ export component MainWindow inherits Window {
     // ── 音色选择器 / 音色设计事件出口 ──
     callback preview-voice();
     callback clear-voice-reference();
+    callback design-generate();
+    callback design-use-in-dubbing();
     callback song-generate();
     callback song-stop();
     callback song-preview();
@@ -632,6 +642,13 @@ export component MainWindow inherits Window {
                     reference-text-status: root.voice-ref-text-status;
                     transcribing: root.voice-ref-text-busy;
                     busy: root.busy || root.running;
+                    design-text <=> root.design-text;
+                    design-description <=> root.design-description;
+                    design-status: root.design-status;
+                    design-busy: root.design-busy;
+                    design-blocked: root.design-blocked;
+                    design-reason: root.design-reason;
+                    design-ready: root.design-ready;
                     edited => { root.voice-ref-changed(); }
                     reference-text-edited => { root.voice-ref-text-changed(); }
                     transcribe-reference => { root.transcribe-reference(); }
@@ -641,6 +658,8 @@ export component MainWindow inherits Window {
                         root.scene-changed(0);
                         root.dub-voice = true;
                     }
+                    design-generate => { root.design-generate(); }
+                    design-use-in-dubbing => { root.design-use-in-dubbing(); }
                 }
             }
 

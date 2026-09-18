@@ -3,7 +3,7 @@
 
 mod support;
 
-use aw_core::Client;
+use aw_core::{Client, VoiceSource};
 use std::time::Duration;
 
 fn client(base: &str, retries: u32) -> Client {
@@ -22,7 +22,9 @@ fn retries_on_503_until_success() {
         ),
     ]);
     let c = client(&mock.base, 6);
-    let wav = c.synth("audio8-tts", "你好", Some(1), None).unwrap();
+    let wav = c
+        .synth("audio8-tts", "你好", Some(1), VoiceSource::BuiltIn)
+        .unwrap();
     assert!(!wav.is_empty());
     assert_eq!(mock.hit_count(), 3, "503 后应重试直到成功");
 }
@@ -34,7 +36,9 @@ fn insufficient_memory_is_not_retried() {
     let body = r#"{"error":{"message":"cannot load model 'qwen3-asr': estimated 3.31 GiB + 1024 MiB headroom exceeds available host memory (3.84 GiB)","type":"insufficient_memory"}}"#;
     let mock = support::Mock::start(vec![(503, body.into())]);
     let c = client(&mock.base, 6);
-    let err = c.synth("audio8-tts", "你好", Some(1), None).unwrap_err();
+    let err = c
+        .synth("audio8-tts", "你好", Some(1), VoiceSource::BuiltIn)
+        .unwrap_err();
     assert_eq!(mock.hit_count(), 1, "OOM 必须只发一次，不能自动重试");
     let note = err.to_string();
     assert!(note.contains("释放模型内存"), "提示要有可执行动作: {note}");
@@ -87,7 +91,9 @@ fn long_insufficient_memory_body_is_not_truncated_on_the_http_path() {
 fn gives_up_after_six_attempts_like_python() {
     let mock = support::Mock::start(vec![(503, r#"{"error":"一直忙"}"#.into())]);
     let c = client(&mock.base, aw_core::audio_client::DEFAULT_RETRIES);
-    let err = c.synth("audio8-tts", "你好", Some(1), None).unwrap_err();
+    let err = c
+        .synth("audio8-tts", "你好", Some(1), VoiceSource::BuiltIn)
+        .unwrap_err();
     assert_eq!(err.status(), Some(503));
     assert_eq!(
         mock.hit_count(),
@@ -185,7 +191,9 @@ fn a_500_body_mentioning_503_is_not_retryable() {
         r#"{"error":"后端在 503 号槽位启动失败"}"#.into(),
     )]);
     let c = client(&mock.base, 6);
-    let err = c.synth("audio8-tts", "你好", Some(1), None).unwrap_err();
+    let err = c
+        .synth("audio8-tts", "你好", Some(1), VoiceSource::BuiltIn)
+        .unwrap_err();
     assert_eq!(err.status(), Some(500));
     assert_eq!(mock.hit_count(), 1, "500 不该重试");
 }
@@ -218,7 +226,9 @@ fn transport_errors_are_not_retried() {
 
     let backoff = Duration::from_millis(300);
     let c = Client::new(format!("http://{addr}")).with_retry(6, backoff);
-    let err = c.synth("audio8-tts", "你好", Some(1), None).unwrap_err();
+    let err = c
+        .synth("audio8-tts", "你好", Some(1), VoiceSource::BuiltIn)
+        .unwrap_err();
     assert!(err.status().is_none(), "传输错误没有状态码: {err}");
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),

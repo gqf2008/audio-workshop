@@ -55,6 +55,6 @@ HTTP 500 Audio8 TTS prepare with inline reference audio requires reference_text 
 
 - **不改服务端**，不做多参考音（`multi_reference_cond`）。
 - 不做 `index-tts2` 的专用参数；它同样要求参考音，走的是同一条路。
-- 不做「文本描述生成音色」（audio.cpp 没有 voice design 任务，界面里标着"未接入"）。
+- 「文本描述生成音色」已接入（`qwen3_tts` 的 `voice_design` 任务：试听文本 + 音色描述 →  `options.voice_design`）；本条只讲「参考音频克隆」这一条。
 - 转写**不做模型自动降级**：用 `DEFAULT_ASR_MODEL`，失败就如实报模型名 + 原因。
   （质检那条链路的模型选择是另一件事，见 `docs/quality-check.md`。）

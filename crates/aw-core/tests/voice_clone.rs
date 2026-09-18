@@ -8,7 +8,7 @@
 
 mod support;
 
-use aw_core::{Client, Project, VoiceClone};
+use aw_core::{Client, Project, VoiceClone, VoiceSource};
 use std::time::Duration;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -44,7 +44,7 @@ fn clone_sends_reference_text_paired_with_voice_ref() {
 
     let clone = VoiceClone::new("/tmp/ref.wav", "这是一段参考音频。").unwrap();
     client(&mock.base)
-        .synth("audio8-tts", "你好。", Some(1), Some(clone))
+        .synth("audio8-tts", "你好。", Some(1), VoiceSource::Clone(clone))
         .unwrap();
 
     let bodies = mock.bodies();
