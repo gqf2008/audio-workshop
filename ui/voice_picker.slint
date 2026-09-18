@@ -31,7 +31,7 @@ component VoiceOptionRow inherits Rectangle {
 
     height: 52px;
     background: root.current ? PixelTheme.hover : transparent;
-    border-width: 2px;
+    border-width: PixelTheme.border-width;
     border-color: root.current ? PixelTheme.accent : PixelTheme.edge;
 
     HorizontalLayout {
@@ -45,7 +45,7 @@ component VoiceOptionRow inherits Rectangle {
             height: 10px;
             border-radius: 5px;
             background: root.current ? PixelTheme.accent : transparent;
-            border-width: 2px;
+            border-width: PixelTheme.border-width;
             border-color: root.current ? PixelTheme.accent : PixelTheme.dim;
         }
         VerticalLayout {
@@ -127,7 +127,7 @@ export component VoicePanel inherits Rectangle {
     // 与「高级」同款：整行宽、自然高度，跟着页面排版展开（不做浮层）
     width: 100%;
     background: PixelTheme.bg;
-    border-width: 2px;
+    border-width: PixelTheme.border-width;
     border-color: PixelTheme.edge;
 
     VerticalLayout {

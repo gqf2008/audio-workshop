@@ -454,7 +454,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                     spacing: 6px;
                     for d in root.download-rows : Rectangle {
                         width: 100%;
-                        border-width: 2px;
+                        border-width: PixelTheme.border-width;
                         border-color: d.state == "失败" ? PixelTheme.danger : root.hairline;
                         border-radius: 2px;
                         VerticalLayout {
@@ -752,7 +752,7 @@ export component DubWorkbench inherits Rectangle {
                 Rectangle { // 首屏
                     width: 100%;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
 
                     VerticalLayout {
@@ -769,7 +769,7 @@ export component DubWorkbench inherits Rectangle {
                                 height: 10px;
                                 border-radius: 5px;
                                 background: root.voice-hint == "" ? PixelTheme.accent : transparent;
-                                border-width: 2px;
+                                border-width: PixelTheme.border-width;
                                 border-color: root.voice-hint == "" ? PixelTheme.accent : PixelTheme.dim;
                             }
                             Text {
@@ -864,7 +864,7 @@ export component DubWorkbench inherits Rectangle {
                                     height: 22px;
                                     visible: root.script-text != "" && !root.running && !root.busy;
                                     background: clear-ta.pressed ? PixelTheme.shadow : (clear-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
-                                    border-width: 2px;
+                                    border-width: PixelTheme.border-width;
                                     border-color: PixelTheme.edge;
                                     Text {
                                         width: 100%;
@@ -957,7 +957,7 @@ export component DubWorkbench inherits Rectangle {
                 if root.show-advanced : Rectangle {
                     width: 100%;
                     background: PixelTheme.bg;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
 
                     VerticalLayout {
@@ -1052,7 +1052,7 @@ export component DubWorkbench inherits Rectangle {
                         if root.version-open : Rectangle {
                             width: 100%;
                             background: PixelTheme.bg;
-                            border-width: 2px;
+                            border-width: PixelTheme.border-width;
                             border-color: PixelTheme.hover;
                             VerticalLayout {
                                 padding: 10px;

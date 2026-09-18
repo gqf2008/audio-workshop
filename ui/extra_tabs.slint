@@ -78,7 +78,7 @@ export component VoiceDesignTab inherits Rectangle {
                     width: 100%;
                     vertical-stretch: 0;
                     background: PixelTheme.panel;
-                    border-width: 1px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
 
                     VerticalLayout {
@@ -156,10 +156,7 @@ export component VoiceDesignTab inherits Rectangle {
                             Rectangle { horizontal-stretch: 1; }
                             PixelButton {
                                 width: 150px;
-                                variant: "default";
-                                active: true;
-                                face: #ffffff;
-                                text-color: #000000;
+                                variant: "primary";
                                 text: "去配音使用";
                                 enabled: !root.busy;
                                 clicked => { root.use-in-dubbing(); }
@@ -173,7 +170,7 @@ export component VoiceDesignTab inherits Rectangle {
                     width: 100%;
                     vertical-stretch: 0;
                     background: PixelTheme.panel;
-                    border-width: 1px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
 
                     VerticalLayout {
@@ -258,10 +255,7 @@ export component VoiceDesignTab inherits Rectangle {
                             spacing: 12px;
                             PixelButton {
                                 width: 150px;
-                                variant: "default";
-                                active: true;
-                                face: #ffffff;
-                                text-color: #000000;
+                                variant: "primary";
                                 text: root.design-busy ? "生成中…" : "生成音色";
                                 enabled: !root.design-blocked;
                                 clicked => { root.design-generate(); }

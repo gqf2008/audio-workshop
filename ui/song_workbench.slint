@@ -92,7 +92,7 @@ export component SongWorkbench inherits Rectangle {
                     width: 100%;
                     height: 56px;
                     background: PixelTheme.bg;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: root.cover-source-picked ? PixelTheme.edge : PixelTheme.dim;
                     HorizontalLayout {
                         padding-left: 12px;
@@ -181,7 +181,7 @@ export component SongWorkbench inherits Rectangle {
                 if root.show-advanced : Rectangle {
                     width: 100%;
                     background: PixelTheme.bg;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
                     VerticalLayout {
                         padding: 12px;
@@ -234,7 +234,7 @@ export component SongWorkbench inherits Rectangle {
                 if root.has-result : Rectangle { // 首屏-结果就绪
                     width: 100%;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
                     HorizontalLayout {
                         padding-left: 12px;

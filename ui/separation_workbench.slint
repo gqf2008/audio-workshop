@@ -75,7 +75,7 @@ export component SeparationWorkbench inherits Rectangle {
                     width: 100%;
                     height: 92px;
                     background: PixelTheme.bg;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: root.ready ? PixelTheme.edge : PixelTheme.dim;
 
                     if !root.ready : VerticalLayout {
@@ -150,7 +150,7 @@ export component SeparationWorkbench inherits Rectangle {
                 if root.show-advanced : Rectangle {
                     width: 100%;
                     background: PixelTheme.bg;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
                     VerticalLayout {
                         padding: 12px;
@@ -224,7 +224,7 @@ export component SeparationWorkbench inherits Rectangle {
                 if root.has-result : Rectangle { // 首屏-结果就绪
                     width: 100%;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: root.result-available ? PixelTheme.edge : PixelTheme.danger;
                     VerticalLayout {
                         padding: 12px;
@@ -239,7 +239,7 @@ export component SeparationWorkbench inherits Rectangle {
                             width: 100%;
                             height: 44px;
                             background: transparent;
-                            border-width: 2px;
+                            border-width: PixelTheme.border-width;
                             border-color: PixelTheme.hover;
                             HorizontalLayout {
                                 padding-left: 10px;
@@ -280,7 +280,7 @@ export component SeparationWorkbench inherits Rectangle {
                 Rectangle {
                     width: 100%;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.hover;
                     VerticalLayout {
                         padding: 10px;
@@ -308,7 +308,7 @@ export component SeparationWorkbench inherits Rectangle {
                                     width: 100%;
                                     height: 46px;
                                     background: h.available ? transparent : PixelTheme.bg;
-                                    border-width: 2px;
+                                    border-width: PixelTheme.border-width;
                                     border-color: h.available ? PixelTheme.hover : PixelTheme.danger;
                                     HorizontalLayout {
                                         padding-left: 8px;

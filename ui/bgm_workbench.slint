@@ -24,7 +24,7 @@ component TrackRow inherits Rectangle {
     width: 100%;
     height: 44px;
     background: transparent;
-    border-width: 2px;
+    border-width: PixelTheme.border-width;
     border-color: PixelTheme.hover;
 
     HorizontalLayout {
@@ -166,7 +166,7 @@ export component BgmWorkbench inherits Rectangle {
                 if root.show-advanced : Rectangle {
                     width: 100%;
                     background: PixelTheme.bg;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: PixelTheme.edge;
                     VerticalLayout {
                         padding: 12px;
@@ -242,7 +242,7 @@ export component BgmWorkbench inherits Rectangle {
                 if root.has-result : Rectangle { // 首屏-结果就绪
                     width: 100%;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: PixelTheme.border-width;
                     border-color: root.stale ? PixelTheme.danger : PixelTheme.edge;
                     VerticalLayout {
                         padding: 12px;

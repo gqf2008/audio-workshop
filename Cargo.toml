@@ -12,7 +12,7 @@ build = "build.rs"
 # （slint-pixel 的 install_title_bar_controls / install_window_resize 依赖它）。
 slint = { version = "1.18", features = ["unstable-winit-030"] }
 # 像素风组件库：全部界面控件经 `@slint_pixel` 导入（Pixel* 前缀），无 std-widgets 控件。
-slint-pixel = "0.2.2"
+slint-pixel = "0.2.3"
 # 配音链路核心（切句/文本兜底/逐句合成/拼装），与 Python tools/ 行为由 parity 夹具固定。
 aw-core = { path = "crates/aw-core" }
 # 校听播放（rodio → macOS CoreAudio）。只播本地 wav：逐句试听播 sentences/xxx.wav，
@@ -37,7 +37,7 @@ fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
 [build-dependencies]
 slint-build = "1.18"
 # build.rs 需要 slint_pixel::library_paths() 注册 `@slint_pixel` 库路径。
-slint-pixel = "0.2.2"
+slint-pixel = "0.2.3"
 
 # Cargo 工作区。当前成员：aw-core 核心库（配音链路/文本兜底/服务客户端）。
 # 后续批量/模板等能力（CHARTER 第 9 节 M4）再拆成员 crate，往 members 里加即可。
@@ -49,3 +49,8 @@ members = ["crates/aw-core"]
 opt-level = "z"
 lto = "thin"
 strip = true
+
+# 统一控件描边宽度：0.2.3 增加 PixelTheme.border-width；在 crates.io 正式发布前先用
+# 固定 git rev，保证 CI 与本机拿到同一份组件实现。
+[patch.crates-io]
+slint-pixel = { git = "https://github.com/gqf2008/slint-pixel", rev = "daffdf7bba74bbe57bdf6aec5e1f43770296c950" }

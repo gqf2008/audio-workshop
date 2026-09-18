@@ -365,7 +365,12 @@ export component MainWindow inherits Window {
 
     property <string> capabilities-note: "本机 audio.cpp 未提供该任务，接入前不显示假按钮。";
 
-    init => { PixelTheme.scheme = root.theme-scheme; }
+    init => {
+        PixelTheme.scheme = root.theme-scheme;
+        // 全应用统一细描边：避免卡片、按钮、输入框 1px/2px/3px 混搭。
+        PixelTheme.border-width = 1px;
+        PixelTheme.primary-border-width = 1px;
+    }
     changed theme-scheme => { PixelTheme.scheme = root.theme-scheme; }
 
     // ═══ 根：贴窗口的 2px 纯黑描边 + 10px 圆角（参考 ../abb） ═══
@@ -407,7 +412,7 @@ export component MainWindow inherits Window {
                     width: 26px;
                     height: 26px;
                     background: drawer-ta.pressed ? PixelTheme.shadow : (drawer-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
-                    border-width: 1px;
+                    border-width: PixelTheme.border-width;
                     border-color: root.drawer-open ? PixelTheme.accent : PixelTheme.edge;
 
                     Rectangle { x: 5px; y: 7px; width: 12px; height: 2px; background: PixelTheme.text; }
@@ -703,7 +708,7 @@ export component MainWindow inherits Window {
                         width: task-chip-text.preferred-width + 16px;
                         height: 22px;
                         background: root.task-center-open ? PixelTheme.hover : PixelTheme.panel;
-                        border-width: 2px;
+                        border-width: PixelTheme.border-width;
                         border-color: root.task-failed > 0 ? PixelTheme.danger
                             : (root.task-running > 0 ? PixelTheme.accent : PixelTheme.edge);
 
@@ -767,7 +772,7 @@ export component MainWindow inherits Window {
             width: 380px;
             height: parent.height - 74px - 42px;
             background: PixelTheme.panel;
-            border-width: 1px;
+            border-width: PixelTheme.border-width;
             border-color: PixelTheme.edge;
             border-radius: 8px;
             clip: true;
@@ -860,7 +865,7 @@ export component MainWindow inherits Window {
         width: 460px;
         height: Math.min(parent.height - 122px, 92px + root.task-rows.length * 62px);
         background: PixelTheme.panel;
-        border-width: 2px;
+        border-width: PixelTheme.border-width;
         border-color: PixelTheme.edge;
         border-radius: 8px;
         clip: true;
@@ -922,7 +927,7 @@ export component MainWindow inherits Window {
                         width: 100%;
                         height: 56px;
                         background: t.state == "运行中" ? PixelTheme.hover : transparent;
-                        border-width: 2px;
+                        border-width: PixelTheme.border-width;
                         border-color: t.state == "失败" ? PixelTheme.danger : PixelTheme.edge;
 
                         HorizontalLayout {
@@ -1008,7 +1013,7 @@ export component MainWindow inherits Window {
         width: 460px;
         height: Math.min(parent.height - 122px, 132px + root.batch-rows.length * 52px);
         background: PixelTheme.panel;
-        border-width: 2px;
+        border-width: PixelTheme.border-width;
         border-color: PixelTheme.edge;
         border-radius: 8px;
         clip: true;
@@ -1077,7 +1082,7 @@ export component MainWindow inherits Window {
                         width: 100%;
                         height: 46px;
                         background: b.state == "合成本" ? PixelTheme.hover : transparent;
-                        border-width: 2px;
+                        border-width: PixelTheme.border-width;
                         border-color: b.state == "失败" ? PixelTheme.danger : PixelTheme.edge;
                         HorizontalLayout {
                             padding-left: 10px;
