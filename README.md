@@ -103,10 +103,14 @@ python3 tools/model_fetch.py audio8-tts          # 从上游源拉权重（幂�
 ```bash
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace            # 含 mock 服务的策略测试与 parity 夹具
+cargo build --release             # 发版必须过：debug 门禁发现不了 release-only 的 cfg 断口
 cargo test -p aw-core -- --ignored  # 需要本机服务在线的真实 e2e
 ```
 
-发布版无演示后门：`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0。
+发布版无演示后门：**先 `cargo build --release`**，再
+`strings target/release/audio-workshop | grep -c AW_UI_STATE` → 0。
+（`AW_UI_STATE` 的演示态全是 `#[cfg(debug_assertions)]` 门控的；反过来 debug 版里这条
+grep 应该 > 0 —— 否则说明这条检查没有鉴别力。）
 
 ## 许可红线
 
