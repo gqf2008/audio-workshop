@@ -2,7 +2,7 @@
 //!
 //! ## 为什么要有它
 //! P7 的下载队列（串行 / 断点续传 / 校验后提交）本身是好的，但**下载入口只在服务清单
-//! 的模型带 `url` 时才出现**，而 `server.json` 是引擎写的，13 个模型一个 `url` 都没有——
+//! 的模型带 `url` 时才出现**，而 `server.json` 是引擎写的，随包清单里的模型一个 `url` 都没有——
 //! 于是真机上「下载」按钮一个都不出现：机制有了、没有数据源。
 //!
 //! 数据源是上游 audio.cpp 的 `model_specs/*.json`（CHARTER §6 认定的 source of truth）。
@@ -1245,8 +1245,8 @@ mod tests {
         let c = catalog().expect("内置清单必须能解析");
         assert_eq!(
             c.models.len(),
-            13,
-            "本机 server.json 的 13 个模型都该在清单里"
+            14,
+            "随包清单的 14 个产品模型都该在 model-downloads.json 里"
         );
 
         let by_id: HashMap<&str, &CatalogModel> =
@@ -1327,16 +1327,16 @@ mod tests {
         }
     }
 
-    /// 真实 13 个模型的规划结果：**8 个有入口、5 个如实标没有源**（issue 验收 ⑥ 的数字）。
+    /// 真实 14 个产品模型的规划结果：**9 个有入口、5 个如实标没有源**。
     #[test]
-    fn plan_for_the_real_machine_counts_eight_with_entry_and_five_without() {
+    fn plan_for_the_real_machine_counts_nine_with_entry_and_five_without() {
         let c = catalog().unwrap();
         let server: Vec<ServerEntry> = c
             .models
             .iter()
             .map(|m| ServerEntry {
                 id: m.id.clone(),
-                // 真机 server.json 13/13 都没有 url
+                // 随包清单里的条目默认都没有显式 url；显式 url 的覆盖在别的用例验证
                 url: String::new(),
                 sha256: String::new(),
                 size: None,
@@ -1363,10 +1363,11 @@ mod tests {
                 "fun-asr",
                 "index-tts2",
                 "qwen3-asr",
+                "qwen3-tts-voicedesign",
                 "sortformer-diar",
                 "stable-audio-small-music",
             ],
-            "8 个有下载入口"
+            "9 个有下载入口"
         );
         assert_eq!(
             missing,

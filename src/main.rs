@@ -728,9 +728,9 @@ fn nearest_existing(p: &Path) -> Option<PathBuf> {
 /// 默认模型目录：**优先跟着服务清单的模型根走**（`server.json` 里那些 path 的公共父目录），
 /// 推不出来才回落到 `<应用工作目录>/models`。
 ///
-/// 动机（2026-09-17 真机）：默认值是 `<cwd>/models`，本机根本不存在，而 13 个模型的 path 全在
-/// `/Volumes/DataExt/models/...` —— 抽屉里「模型目录」长期显示"目录不存在（清单里有 13 个模型）"，
-/// 下载面板 8 条入口**每条**都挂着「⚠ 落点与 server.json 对不上」（照默认值下完，服务确实找不到）。
+/// 动机（2026-09-17 真机）：默认值是 `<cwd>/models`，本机根本不存在，而清单里的模型 path 全在
+/// `/Volumes/DataExt/models/...` —— 抽屉里「模型目录」长期显示“目录不存在（清单里有 N 个模型）”，
+/// 下载面板的入口**每条**都挂着「⚠ 落点与 server.json 对不上」（照默认值下完，服务确实找不到）。
 fn default_model_dir() -> PathBuf {
     default_model_dir_from(read_server_config().as_ref())
 }
@@ -1666,7 +1666,7 @@ fn is_voice_design_model(m: &ServerModel) -> bool {
     m.task == "vdes"
         && !m.id.trim().is_empty()
         && !m.caps.product_excluded
-        && !m.caps.is_streaming_only()
+        && m.caps.mode.eq_ignore_ascii_case("offline")
         && matches!(m.family.as_str(), "qwen3_tts" | "breeze_tts")
 }
 
@@ -5336,7 +5336,7 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                 default_model_dir().display()
             );
             // 抽屉里那条「模型目录」提示也打出来：以前默认目录不存在时会显示
-            // "目录不存在（清单里有 13 个模型）"。读的是启动时 `apply_engine_discovery`
+            // “目录不存在（清单里有 N 个模型）”。读的是启动时 `apply_engine_discovery`
             // → `refresh_settings_view` 已经投影好的 UI 真实值，不在这里另拼一份文案。
             eprintln!(
                 "AW_UI_STATE=model-sources：模型区提示 = {}",
@@ -11651,7 +11651,7 @@ mod tests {
         }
     }
 
-    /// ① 多条 path（文件 + 目录混着，就是真机 13 条的形状）→ 收敛到它们的公共父目录。
+    /// ① 多条 path（文件 + 目录混着，真机清单就是这种形状）→ 收敛到它们的公共父目录。
     #[test]
     fn model_root_is_the_common_parent_of_declared_paths() {
         let a = abs_path("models/ModelA/a.gguf");
@@ -12249,7 +12249,7 @@ mod tests {
 
     /// 验收①：**不改 server.json** 也能拿到能力提示 —— 服务端没写的字段回落随包清单。
     ///
-    /// 本机真机的形状就是这条：13 个模型里 `requires` / `role` / `known_issues`
+    /// 本机真机的形状就是这条：server.json 的模型里 `requires` / `role` / `known_issues`
     /// 一个都没有（只有 `mode`，两个 0.1b 有 `product_excluded`），所以改前界面
     /// "不误禁、但也不提示"。
     ///
@@ -14568,6 +14568,10 @@ mod tests {
             id: "qwen3-tts-voicedesign-q8_0".into(),
             task: "vdes".into(),
             family: "qwen3_tts".into(),
+            caps: model_capabilities::Capability {
+                mode: "offline".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cfg = ServerConfig {
