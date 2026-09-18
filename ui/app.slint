@@ -238,6 +238,9 @@ export component MainWindow inherits Window {
     in property <bool> design-busy: false;
     in property <bool> design-blocked: false;
     in property <bool> design-model-ready: false;
+    in property <[string]> design-model-names: [];
+    in-out property <int> design-model-index: -1;
+    in property <string> design-model-note: "";
     in property <string> design-reason: "";
     in property <bool> design-ready: false;
 
@@ -333,6 +336,7 @@ export component MainWindow inherits Window {
     callback clear-voice-reference();
     callback design-generate();
     callback design-use-in-dubbing();
+    callback design-model-picked(int);
     callback song-generate();
     callback song-stop();
     callback song-preview();
@@ -403,7 +407,7 @@ export component MainWindow inherits Window {
                     width: 26px;
                     height: 26px;
                     background: drawer-ta.pressed ? PixelTheme.shadow : (drawer-ta.has-hover ? PixelTheme.hover : PixelTheme.bg);
-                    border-width: 2px;
+                    border-width: 1px;
                     border-color: root.drawer-open ? PixelTheme.accent : PixelTheme.edge;
 
                     Rectangle { x: 5px; y: 7px; width: 12px; height: 2px; background: PixelTheme.text; }
@@ -649,6 +653,9 @@ export component MainWindow inherits Window {
                     design-busy: root.design-busy;
                     design-blocked: root.design-blocked;
                     design-model-ready: root.design-model-ready;
+                    design-model-names: root.design-model-names;
+                    design-model-index <=> root.design-model-index;
+                    design-model-note: root.design-model-note;
                     design-reason: root.design-reason;
                     design-ready: root.design-ready;
                     edited => { root.voice-ref-changed(); }
@@ -662,6 +669,7 @@ export component MainWindow inherits Window {
                     }
                     design-generate => { root.design-generate(); }
                     design-use-in-dubbing => { root.design-use-in-dubbing(); }
+                    design-model-picked(i) => { root.design-model-picked(i); }
                 }
             }
 
@@ -755,14 +763,18 @@ export component MainWindow inherits Window {
         // 面板：浮动圆角卡片
         Rectangle {
             x: parent.width - 380px - 10px;
-            y: 80px;   // 与任务中心同一条基线：标题栏 + Tab 行之下
+            y: 74px;   // 内容区顶边：2px 内边距 + 34px 标题栏 + 38px Tab
             width: 380px;
-            height: parent.height - 80px - 42px;
+            height: parent.height - 74px - 42px;
             background: PixelTheme.panel;
-            border-width: 2px;
+            border-width: 1px;
             border-color: PixelTheme.edge;
             border-radius: 8px;
             clip: true;
+
+            // 面板空白区自己吃掉点击：否则点击按钮边缘时会穿到下面的遮罩，
+            // 第一次点击被当成“关闭抽屉”，看起来像按钮要点两次。
+            TouchArea { width: 100%; height: 100%; }
 
             VerticalLayout {
                 padding: 16px;

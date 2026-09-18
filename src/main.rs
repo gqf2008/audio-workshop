@@ -566,6 +566,12 @@ struct AppSettings {
     /// 质检报告落盘，三处必须是同一份推导（两份实现必然漂移）。
     #[serde(default)]
     asr_model: Option<String>,
+    /// 音色设计用哪个模型：在服务清单 `task == "vdes"` 的模型里选。
+    ///
+    /// 缺省 = 清单里第一个可用设计模型。与 ASR 一样，用户选的 id 不在当前清单时
+    /// **照用不改**，由服务拒绝并如实报错，避免静默换模型。
+    #[serde(default)]
+    design_model: Option<String>,
     /// 模型下载源镜像前缀（M4-P7）：缺省/空 = 用清单里的官方地址。
     ///
     /// 只有 HF 官方 URL 会被改写（`src/download_mirror.rs` 是唯一实现）；
@@ -1394,6 +1400,7 @@ fn load_settings_at(path: &Path) -> AppSettings {
         bgm: json_field(&v, "bgm").unwrap_or_default(),
         update_url: json_field(&v, "update_url"),
         asr_model: json_field(&v, "asr_model"),
+        design_model: json_field(&v, "design_model"),
         download_mirror: json_field(&v, "download_mirror"),
         download_concurrency: json_field(&v, "download_concurrency"),
     }
@@ -1670,17 +1677,92 @@ fn is_voice_design_model(m: &ServerModel) -> bool {
         && matches!(m.family.as_str(), "qwen3_tts" | "breeze_tts")
 }
 
-/// 清单里第一个可用的**音色设计**模型 id。
+/// 清单里所有可用的**音色设计**模型 id（保持清单顺序，跳过空 id）。
 ///
-/// 与 `asr_models_from` 同族：不硬编 `qwen3_tts_1_7b_voicedesign_q8_0`——清单加一个
-/// 已知 family 的 vdes 模型就多一个候选，这里取第一个（本批只接单设计模型）。
-fn design_model_from(cfg: Option<&ServerConfig>) -> Option<String> {
-    cfg.and_then(|c| {
+/// 候选只来自服务清单，不硬编具体模型：Breeze 2、Qwen3 或以后新增的已知 family
+/// 都会自动出现。`task=vdes` 是引擎硬要求，`mode=offline` 是 VoiceDesign 当前只有
+/// 离线通道，`product_excluded` 保持产品层的排除权。
+fn design_models_from(cfg: Option<&ServerConfig>) -> Vec<String> {
+    cfg.map(|c| {
         c.models
             .iter()
-            .find(|m| is_voice_design_model(m))
+            .filter(|m| is_voice_design_model(m))
             .map(|m| m.id.clone())
+            .collect()
     })
+    .unwrap_or_default()
+}
+
+/// 下拉里给人看的模型名。未知 id 原样显示，不猜厂商/大小。
+fn design_model_label(id: &str) -> String {
+    match id {
+        "breeze-tts-voicedesign" => "BreezeTTS 2 · 音色设计".to_string(),
+        "qwen3-tts-voicedesign" => "Qwen3-TTS 1.7B · 音色设计".to_string(),
+        _ => id.to_string(),
+    }
+}
+
+/// 当前生效的设计模型：设置 > 清单第一个。
+///
+/// 用户选的 id 不在当前清单时也**照用不改**（与 ASR 同一条约定）：VoiceDesign
+/// 模型质量/速度差异明显，静默换模型会改变用户听到的结果；服务拒绝就如实报错。
+fn effective_design_model_from(s: &AppSettings, models: &[String]) -> Option<String> {
+    s.design_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| models.first().cloned())
+}
+
+/// 从当前清单读出的生效设计模型。
+fn effective_design_model(s: &AppSettings) -> Option<String> {
+    effective_design_model_from(s, &design_models_from(read_server_config().as_ref()))
+}
+
+/// 下拉要显示什么 + 每个下标对应哪个 id + 当前选中下标。
+///
+/// 与 ASR 下拉同一条约定：显示、id、选中下标必须来自同一份推导；当前模型不在
+/// 清单里时插到第 0 项并标注，避免清单变化时静默改掉用户的生效值。
+fn design_picker_view(models: &[String], current: Option<&str>) -> (Vec<String>, Vec<String>, i32) {
+    let mut ids = models.to_vec();
+    let current = current.map(str::trim).filter(|m| !m.is_empty());
+    if let Some(cur) = current {
+        if !ids.iter().any(|m| m == cur) {
+            ids.insert(0, cur.to_string());
+        }
+    }
+    let labels = ids
+        .iter()
+        .map(|id| {
+            let label = design_model_label(id);
+            if models.iter().any(|m| m == id) {
+                label
+            } else {
+                format!("{label}（不在当前清单）")
+            }
+        })
+        .collect();
+    let index = current
+        .and_then(|cur| ids.iter().position(|m| m == cur))
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    (ids, labels, index)
+}
+
+/// 设计模型下拉的常驻说明：候选来源/当前值是否还在清单里。
+fn design_model_note(models: &[String], current: Option<&str>) -> String {
+    if models.is_empty() {
+        return "没读到服务清单里 task=vdes 的设计模型：检查 server.json 与 audiocpp_server"
+            .to_string();
+    }
+    let mut note = format!("候选来自服务清单（{} 个设计模型）", models.len());
+    if let Some(cur) = current {
+        if !models.iter().any(|m| m == cur) {
+            note.push_str(&format!("·当前选的 {cur} 不在清单里，服务可能加载不了"));
+        }
+    }
+    note
 }
 
 /// 清单里所有 `task == "asr"` 的模型 id（保持清单顺序，跳过空 id）。
@@ -1958,6 +2040,68 @@ fn wire_asr_model(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, state: &Rc<UiS
             }
         }
         refresh_asr_models(&ui);
+    });
+}
+
+/// 把选中的音色设计模型落进 settings.json（失败也不阻断，只提示）。
+fn persist_design_model(model: &str) -> Result<String, String> {
+    persist_design_model_at(settings(), &settings_path(), model)
+}
+
+/// `persist_design_model` 的唯一实现（注入缝，单测不写真实 settings.json）。
+fn persist_design_model_at(
+    store: &std::sync::Mutex<AppSettings>,
+    path: &Path,
+    model: &str,
+) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("设计模型不能为空".into());
+    }
+    let snapshot = {
+        let mut guard = store.lock().map_err(|_| "设置锁不可用".to_string())?;
+        guard.design_model = Some(model.to_string());
+        guard.clone()
+    };
+    save_settings_at(path, &snapshot).map_err(|e| e.to_string())?;
+    Ok(model.to_string())
+}
+
+/// 把设计模型下拉刷成"清单 + 当前生效值"的投影（候选、标签、选中项同源）。
+fn refresh_design_models(ui: &MainWindow) {
+    let models = design_models_from(read_server_config().as_ref());
+    let current = effective_design_model_from(&settings_snapshot(), &models);
+    let (_, labels, index) = design_picker_view(&models, current.as_deref());
+    let labels: Vec<SharedString> = labels.into_iter().map(SharedString::from).collect();
+    ui.set_design_model_names(ModelRc::from(Rc::new(VecModel::from(labels))));
+    ui.set_design_model_index(index);
+    ui.set_design_model_note(design_model_note(&models, current.as_deref()).into());
+}
+
+/// 音色设计模型下拉：候选来自服务清单，切换落 settings.json。
+fn wire_design_model(ui: &MainWindow, state: &Rc<UiState>) {
+    let weak = ui.as_weak();
+    let st = state.clone();
+    ui.on_design_model_picked(move |i| {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_design_busy() || ui.get_running() || ui.get_busy() || tasks_in_flight(&st) {
+            ui.set_design_status("任务进行中：等这轮跑完再换设计模型".into());
+            refresh_design_models(&ui);
+            return;
+        }
+        let models = design_models_from(read_server_config().as_ref());
+        let current = effective_design_model_from(&settings_snapshot(), &models);
+        let (ids, _, _) = design_picker_view(&models, current.as_deref());
+        let picked = ids.get(i.max(0) as usize).cloned();
+        if let Some(id) = picked.filter(|id| Some(id.as_str()) != current.as_deref()) {
+            match persist_design_model(&id) {
+                Ok(saved) => ui.set_design_status(format!("设计模型已改为 {saved}").into()),
+                Err(e) => ui.set_design_status(
+                    format!("设计模型没能保存（{e}）：重启后会回到上次的选择").into(),
+                ),
+            }
+        }
+        refresh_design_models(&ui);
     });
 }
 
@@ -2285,6 +2429,8 @@ fn apply_engine_discovery(ui: &MainWindow, invalidate: Option<(&Sender<Cmd>, &Rc
     ui.set_voice_index(pick);
     // 音乐制作的引擎清单也来自同一份 server.json（task=gen），不写死 yue2 / ace-step
     refresh_song_engine_options(ui);
+    // 音色设计模型候选也来自同一份 server.json（task=vdes）
+    refresh_design_models(ui);
     refresh_settings_view(ui);
     refresh_voice_labels(ui);
 
@@ -5112,6 +5258,7 @@ fn main() -> Result<(), slint::PlatformError> {
     load_active_dictionary(&ui, &state);
     wire_asr_model(&ui, &rows, &state);
     refresh_asr_models(&ui);
+    wire_design_model(&ui, &state);
     // voice-clone 批给这个函数加了 msg_tx_ui（「自动转写」要后台跑 ASR 再回消息）
     wire_voice_panel(&ui, &cmd_tx, &msg_tx_ui, &state);
     wire_voice_library(
@@ -8057,7 +8204,7 @@ fn wire_voice_panel(
     let st = state.clone();
     ui.on_design_generate(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let model = design_model_from(read_server_config().as_ref());
+        let model = effective_design_model(&settings_snapshot());
         let text = ui.get_design_text().to_string();
         let description = ui.get_design_description().to_string();
         let any_busy = ui.get_running() || ui.get_busy() || tasks_in_flight(&st);
@@ -8896,7 +9043,7 @@ fn design_generate_refusal(
         return Some("有任务正在进行：生成音色要等它结束（生成是短操作，不排队）".into());
     }
     if design_model.is_none() {
-        return Some("本机没有可用的音色设计模型：需在服务清单里登记 Qwen3-TTS VoiceDesign".into());
+        return Some("本机没有可用的 VoiceDesign 模型：需在服务清单里登记 task=vdes 的设计模型（BreezeTTS 2 / Qwen3-TTS 等）".into());
     }
     if text.trim().is_empty() {
         return Some("先填试听文本".into());
@@ -8920,7 +9067,7 @@ fn design_generate_blocked(
 
 /// 把音色设计按钮的可用性/原因投影到 UI（每 tick 同步）。
 fn refresh_design_action(ui: &MainWindow, state: &Rc<UiState>) {
-    let model = design_model_from(read_server_config().as_ref());
+    let model = effective_design_model(&settings_snapshot());
     let text = ui.get_design_text();
     let description = ui.get_design_description();
     let design_busy = ui.get_design_busy();
@@ -10603,6 +10750,8 @@ fn wire_global_settings(
             update_url: prev.update_url,
             // 质检回读模型也不在这里改（自己的落盘点 persist_asr_model），原样带上
             asr_model: prev.asr_model,
+            // 音色设计模型也不在这里改（自己的落盘点 persist_design_model），原样带上
+            design_model: prev.design_model,
             // 下载源镜像 / 并发：本批自己的值，就在这里写
             download_mirror: mirror.clone(),
             download_concurrency: conc,
@@ -14531,7 +14680,7 @@ mod tests {
 
     /// 音色设计模型挑选：`task == "vdes"`、已知 family、离线且未被产品层排除。
     #[test]
-    fn design_model_from_requires_vdes_offline_known_family() {
+    fn design_models_from_requires_vdes_offline_known_family() {
         let excluded = ServerModel {
             id: "qwen3-tts-voicedesign-bf16".into(),
             task: "vdes".into(),
@@ -14581,7 +14730,7 @@ mod tests {
             models: vec![excluded, tts, streaming, wrong_family, first],
         };
         assert_eq!(
-            design_model_from(Some(&cfg)).as_deref(),
+            design_models_from(Some(&cfg)).into_iter().next().as_deref(),
             Some("qwen3-tts-voicedesign-q8_0"),
             "只能选已确认支持 VoiceDesign 的离线 family"
         );
@@ -14592,7 +14741,7 @@ mod tests {
             models: vec![],
         };
         assert_eq!(
-            design_model_from(Some(&empty)),
+            design_models_from(Some(&empty)).into_iter().next(),
             None,
             "没有 vdes 模型时不能凭空捏一个 id"
         );
@@ -14622,7 +14771,7 @@ mod tests {
         }"#;
         let cfg = parse_server_config(raw).expect("server.json 形状应可解析");
         assert_eq!(
-            design_model_from(Some(&cfg)).as_deref(),
+            design_models_from(Some(&cfg)).into_iter().next().as_deref(),
             Some("qwen3-tts-voicedesign")
         );
         let tts_ids: Vec<String> = tts_engine_voices(&cfg.models)
@@ -14630,6 +14779,59 @@ mod tests {
             .map(|v| v.name.to_string())
             .collect();
         assert_eq!(tts_ids, vec!["audio8-tts"], "vdes 不能被普通 TTS 下拉选中");
+    }
+
+    /// 设计模型下拉：候选顺序来自清单，显示名做产品化映射；清单外旧选择不会丢。
+    #[test]
+    fn design_picker_view_labels_known_models_and_keeps_stale_choice() {
+        let models = vec![
+            "breeze-tts-voicedesign".to_string(),
+            "qwen3-tts-voicedesign".to_string(),
+        ];
+        let (ids, labels, index) = design_picker_view(&models, Some("qwen3-tts-voicedesign"));
+        assert_eq!(ids, models);
+        assert_eq!(
+            labels,
+            vec!["BreezeTTS 2 · 音色设计", "Qwen3-TTS 1.7B · 音色设计"]
+        );
+        assert_eq!(index, 1);
+
+        let (ids, labels, index) = design_picker_view(&models, Some("gone-model"));
+        assert_eq!(ids[0], "gone-model");
+        assert_eq!(labels[0], "gone-model（不在当前清单）");
+        assert_eq!(index, 0);
+        assert_eq!(ids.len(), 3, "旧选择插到第 0 项，不静默换模型");
+    }
+
+    /// 生效设计模型：有保存值用保存值；否则取清单第一个（Breeze 在前就用 Breeze）。
+    #[test]
+    fn effective_design_model_honors_saved_choice_then_first_candidate() {
+        let models = vec![
+            "breeze-tts-voicedesign".to_string(),
+            "qwen3-tts-voicedesign".to_string(),
+        ];
+        let default = AppSettings::default();
+        assert_eq!(
+            effective_design_model_from(&default, &models).as_deref(),
+            Some("breeze-tts-voicedesign")
+        );
+        let picked = AppSettings {
+            design_model: Some("qwen3-tts-voicedesign".into()),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            effective_design_model_from(&picked, &models).as_deref(),
+            Some("qwen3-tts-voicedesign")
+        );
+        let stale = AppSettings {
+            design_model: Some("gone-model".into()),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            effective_design_model_from(&stale, &models).as_deref(),
+            Some("gone-model"),
+            "清单外旧选择照用不改，服务拒绝才能暴露真因"
+        );
     }
 
     /// 音色设计「生成」的可用性矩阵：模型 / 试听文本 / 音色描述 / busy 都要有说法。
@@ -17272,6 +17474,18 @@ mod tests {
             unknown_current.last().unwrap().starts_with("qwen3-asr"),
             "有数字的在前（即便比当前大也不装懂）：{unknown_current:?}"
         );
+    }
+
+    /// 设计模型选择也要跨重启：persist 的落盘值与读回后的生效值一致。
+    #[test]
+    fn design_model_choice_survives_a_settings_roundtrip() {
+        let dir = temp_dir("design-model-settings");
+        let path = dir.join("settings.json");
+        let store = std::sync::Mutex::new(AppSettings::default());
+        let saved = persist_design_model_at(&store, &path, " qwen3-tts-voicedesign ").unwrap();
+        assert_eq!(saved, "qwen3-tts-voicedesign");
+        let back = load_settings_at(&path);
+        assert_eq!(back.design_model.as_deref(), Some("qwen3-tts-voicedesign"));
     }
 
     /// 下载源 / 并发也要跨重启：落盘 -> 读回 -> 生效值。

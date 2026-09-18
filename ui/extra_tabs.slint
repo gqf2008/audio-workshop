@@ -4,9 +4,9 @@
 // 诚实原则（见 docs/ui/redesign-v1/competitive-analysis.md「不采用清单」）：
 //   后端没有的能力一律显示“未接入 + 缺什么”，不放假按钮、不装成已完成。
 //   · 参考音频克隆：真实可用（配音链路 voice_ref + reference_text → audio8-tts / index-tts2）
-//   · 文本描述生成音色：真实可用（qwen3_tts 的 vdes 任务 → options.instruction）
+//   · 文本描述生成音色：真实可用（BreezeTTS 2 / Qwen3-TTS 的 vdes 任务 → options.instruction）
 // ============================================================================
-import { PixelBadge, PixelButton, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelComboBox, PixelTextArea, PixelTextInput, PixelTheme } from "@slint_pixel";
 
 // ---------------------------------------------------------------------------
 // 音色设计：参考音频克隆 + 文本描述生成音色（都真实可用）
@@ -27,6 +27,9 @@ export component VoiceDesignTab inherits Rectangle {
     /// 「生成」能不能点（Rust 单点投影）；理由就地显示，不放哑按钮
     in property <bool> design-blocked: false;
     in property <bool> design-model-ready: false;
+    in property <[string]> design-model-names: [];
+    in-out property <int> design-model-index: -1;
+    in property <string> design-model-note: "";
     in property <string> design-reason: "";
     /// 是否有可「用作配音音色」的生成结果
     in property <bool> design-ready: false;
@@ -38,6 +41,7 @@ export component VoiceDesignTab inherits Rectangle {
     callback transcribe-reference();
     callback design-generate();
     callback design-use-in-dubbing();
+    callback design-model-picked(int);
 
     HorizontalLayout {
         horizontal-stretch: 1;
@@ -74,7 +78,7 @@ export component VoiceDesignTab inherits Rectangle {
                     width: 100%;
                     vertical-stretch: 0;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: 1px;
                     border-color: PixelTheme.edge;
 
                     VerticalLayout {
@@ -152,7 +156,10 @@ export component VoiceDesignTab inherits Rectangle {
                             Rectangle { horizontal-stretch: 1; }
                             PixelButton {
                                 width: 150px;
-                                variant: "primary";
+                                variant: "default";
+                                active: true;
+                                face: #ffffff;
+                                text-color: #000000;
                                 text: "去配音使用";
                                 enabled: !root.busy;
                                 clicked => { root.use-in-dubbing(); }
@@ -161,12 +168,12 @@ export component VoiceDesignTab inherits Rectangle {
                     }
                 }
 
-                // ── 可用：文本描述生成音色（qwen3_tts 的 vdes 任务 → options.instruction）──
+                // ── 可用：文本描述生成音色（task=vdes，BreezeTTS 2 / Qwen3-TTS → options.instruction）──
                 Rectangle {
                     width: 100%;
                     vertical-stretch: 0;
                     background: PixelTheme.panel;
-                    border-width: 2px;
+                    border-width: 1px;
                     border-color: PixelTheme.edge;
 
                     VerticalLayout {
@@ -191,10 +198,35 @@ export component VoiceDesignTab inherits Rectangle {
                             }
                         }
                         Text {
-                            text: "用一句话描述想要的音色（如“低沉磁性的中年男声，语速偏慢”），生成后会念一遍你填的试听文本。需要服务清单里登记了 Qwen3-TTS VoiceDesign 模型。";
+                            text: "用一句话描述想要的音色（如“低沉磁性的中年男声，语速偏慢”），生成后会念一遍你填的试听文本。模型可选 BreezeTTS 2 / Qwen3-TTS 等本机已登记的设计模型。";
                             color: PixelTheme.dim;
                             font-size: 12px;
                             wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 64px;
+                                text: "设计模型";
+                                color: PixelTheme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            PixelComboBox {
+                                width: 300px;
+                                model: root.design-model-names;
+                                index <=> root.design-model-index;
+                                enabled: !root.busy && !root.design-busy && root.design-model-names.length > 0;
+                                selected(i) => { root.design-model-picked(i); }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.design-model-note;
+                                color: PixelTheme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
                         }
                         PixelTextInput {
                             width: 100%;
@@ -226,7 +258,10 @@ export component VoiceDesignTab inherits Rectangle {
                             spacing: 12px;
                             PixelButton {
                                 width: 150px;
-                                variant: "primary";
+                                variant: "default";
+                                active: true;
+                                face: #ffffff;
+                                text-color: #000000;
                                 text: root.design-busy ? "生成中…" : "生成音色";
                                 enabled: !root.design-blocked;
                                 clicked => { root.design-generate(); }
