@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 
 def legacy_dir() -> Path:

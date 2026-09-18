@@ -83,6 +83,7 @@ sys.path.insert(0, str(HERE))
 
 # 复用「上游 checkout 在哪」的唯一口径（环境变量 AUDIOCPP_DIR 优先，其次 <repo>/../audio.cpp）
 from model_fetch import find_upstream  # noqa: E402
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 SCHEMA_PATH = REPO_ROOT / "config" / "models.schema.yaml"
 OUT_PATH = REPO_ROOT / "config" / "model-downloads.json"

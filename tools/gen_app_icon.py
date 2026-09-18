@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 try:
     from PIL import Image, ImageDraw

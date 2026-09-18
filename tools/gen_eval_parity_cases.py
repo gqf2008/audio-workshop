@@ -13,6 +13,7 @@
   python3 tools/gen_eval_parity_cases.py --check  # 只校验是否与权威实现一致
 """
 import argparse, hashlib, importlib.util, os, sys
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(HERE)
