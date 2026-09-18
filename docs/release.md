@@ -12,11 +12,22 @@
 
 | 文件 | 说明 |
 |---|---|
-| `音频作坊.app` | 已签名 + 已公证 + 已装订 |
-| `音频作坊-<version>.dmg` | 拖进 Applications 的安装镜像，**自身也签了名、公证过、装订过** |
+| `音频作坊.app` | 已签名 + 已公证 + 已装订（目录名中文没问题，它不进 HTTP 文件名） |
+| `AudioWorkshop-<version>.dmg` | 拖进 Applications 的安装镜像，**自身也签了名、公证过、装订过** |
 
 只要 `.app`（比如自己用、不对外分发）：`./package.sh` 即可 —— 它会签 Developer ID
 （自动从 Keychain 挑），但不提交公证。
+
+## 为什么 DMG 叫 `AudioWorkshop-…` 而 app 叫 `音频作坊.app`
+
+**显示名**和**分发文件名**是两件事，早期版本把它们用一个变量串起来，踩了坑：
+
+> v0.1.0 发 Release 时实测 —— `dist/音频作坊-0.1.0.dmg` 上传后资产名变成 **`-0.1.0.dmg`**
+> （中文被剥掉），下载链接跟着坏。只能删掉重传。
+
+所以现在：`.app` 目录名与 `CFBundleDisplayName` 用中文（用户看到的名字），而**要上传的文件名**
+（DMG、公证用的 zip）一律 ASCII：`AudioWorkshop-<version>.dmg`。
+`package.sh` 里有一条 `assert_ascii` 断言，非 ASCII 直接红 —— 宁可本地红，也别等上传完才发现。
 
 ## 版本号从哪来
 
