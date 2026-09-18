@@ -29,7 +29,10 @@ ureq = "2"
 dirs = "6"
 # Linux: 让 Slint/fontique 运行时 dlopen fontconfig，避免发布包硬链某一版
 # libfontconfig，也便于在 macOS 上做 Linux 交叉 check。
-fontique = { version = "0.10", features = ["fontconfig-dlopen"] }
+# **版本必须与 Slint 内嵌的 fontique 对齐**：Cargo 的 feature unification 会让
+# yeslogic-fontconfig-sys 共享一份；只给 0.10 开 dlopen、而 Slint 的 0.11.1 没开时，
+# 0.11.1 会走非 dlopen 的根导入并在 Linux 编译失败（CI E0432）。
+fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
 
 [build-dependencies]
 slint-build = "1.18"
