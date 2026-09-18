@@ -17,6 +17,7 @@ import argparse, base64, errno, json, os, re, shutil, sys, time, urllib.request,
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 import audio_config as cfgmod  # 复用配置层：规范化 + 词典 + 场景定义
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 SERVER = "http://127.0.0.1:8080"
 

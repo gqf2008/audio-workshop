@@ -4,7 +4,7 @@
 mod support;
 
 use aw_core::Client;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn client(base: &str, retries: u32) -> Client {
     // 退避取 1ms：测的是"重不重试/重试几次"，不是退避时长
@@ -193,17 +193,36 @@ fn a_500_body_mentioning_503_is_not_retryable() {
 /// 死服务不该让每句白等一整个退避周期（旧实现连传输错误也重试 7 次）
 #[test]
 fn transport_errors_are_not_retried() {
+    // **数连接次数**，不看耗时。
+    //
+    // 原来这条是用"耗时 < backoff"当作"没重试"的代理指标 —— 那个代理**在 Windows 上不成立**：
+    // 连一个没人监听的本地端口，单次 connect 就要 ~2s（SYN 重传），于是它会红，
+    // 尽管重试逻辑根本没跑（`retryable = e.status() == Some(503)`，传输错误 status 是 None）。
+    // 数连接次数是直接判据，且与平台/时序无关。
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener); // 端口随即关闭：连接必被拒绝
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    std::thread::spawn(move || {
+        // 接受连接后立刻关掉：客户端拿到的是**传输错误**（读不到响应），不是 HTTP 状态码
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(s);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let backoff = Duration::from_millis(300);
     let c = Client::new(format!("http://{addr}")).with_retry(6, backoff);
-    let t0 = Instant::now();
     let err = c.synth("audio8-tts", "你好", Some(1), None).unwrap_err();
-    let elapsed = t0.elapsed();
     assert!(err.status().is_none(), "传输错误没有状态码: {err}");
-    assert!(
-        elapsed < backoff,
-        "传输错误应立即返回（否则每句白等 {backoff:?}×5），实际 {elapsed:?}"
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "传输错误只该试一次（重试会很贵：每句白等 {backoff:?}×5）"
     );
 }

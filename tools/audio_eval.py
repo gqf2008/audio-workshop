@@ -13,6 +13,7 @@
 import argparse, base64, json, os, re, subprocess, sys, threading, time, urllib.request, wave, io, difflib
 
 from platform_paths import eval_dir_path
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 
 # 与框架 src/framework/text/chinese_normalization.cpp 同一套规则：

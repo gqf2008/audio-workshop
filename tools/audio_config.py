@@ -17,6 +17,7 @@
 import argparse, json, os, re, subprocess, sys, urllib.request
 
 from platform_paths import detect_backend, resolve_models_root, server_json_path
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 CFG_DEFAULT = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "models.schema.yaml")
 SERVER_JSON = str(server_json_path())

@@ -27,6 +27,7 @@ import subprocess
 import sys
 
 from platform_paths import resolve_models_root, server_json_path
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 SCHEMA = os.path.join(REPO_ROOT, "config", "models.schema.yaml")

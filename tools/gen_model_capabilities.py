@@ -34,6 +34,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import _console  # noqa: F401  副作用 import：stdout→UTF-8，见该模块注释（Windows 上必须）
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
