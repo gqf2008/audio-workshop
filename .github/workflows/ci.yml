@@ -76,6 +76,13 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      # release 构建也必须过。`#[cfg(debug_assertions)]` 的项在 debug 下是存在的，
+      # 所以 fmt / clippy / test 都发现不了「调用点没加 cfg、函数在 release 里被编掉」
+      # 这类断口 —— 2026-09-18 就踩过一次（seed_shot_batch 漏 cfg，cargo build
+      # --release 报 E0425，而整条 debug 门禁全绿）。发版前必须能出 release 二进制。
+      - name: cargo build --release
+        run: cargo build --release
+
       # Windows 的 GitHub runner 上解释器叫 python（python3 不在 PATH 里）；
       # 这不是「跳过测试」，两边跑的是同一条 unittest 命令。
       - name: python 单测

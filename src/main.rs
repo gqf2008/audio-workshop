@@ -5054,6 +5054,7 @@ fn main() -> Result<(), slint::PlatformError> {
     refresh_tasks(&ui, &state);
     #[cfg(debug_assertions)]
     seed_shot_tasks(&ui, &state);
+    #[cfg(debug_assertions)]
     seed_shot_batch(&ui, &state);
     #[cfg(debug_assertions)]
     seed_shot_bgm_artifacts(&ui, &state);
