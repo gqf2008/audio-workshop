@@ -84,7 +84,8 @@ $ curl -s -o /dev/null -w '%{http_code}\n' \
 ```
 
 也就是说，**「仓库不可匿名读」这个原因已经消失**；现在点「检查更新」拿到 404，只可能是
-**还没发布 Release**。发布第一个 Release（带 tag）之后这条链路即通。
+**还没有一个「正式」Release**。注意 `releases/latest` 只认 **非 draft、非 prerelease** 的
+Release —— 发成 draft 或 prerelease 时它照样 404。发布第一个正式 Release（带 tag）之后这条链路即通。
 
 > 历史留档（2026-09-17）：当时仓库是 private，带本机 keychain 凭据的 git 能 `ls-remote`、
 > 不带凭据的 API 一律 404。当时列了三个选项（① 仓库/Release 变成匿名可读；② 把清单发到
