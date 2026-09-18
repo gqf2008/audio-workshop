@@ -83,6 +83,33 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+      # python 单测依赖 pyyaml。第一轮真跑时 ubuntu 因 runner 镜像预装了 pyyaml 而绿，
+      # macOS 的 homebrew python 没有它，`import yaml` 直接 ModuleNotFoundError。
+      # 根因是 CI 从没装项目自己的 python 依赖，所以在这步显式补上。
+      #
+      # --break-system-packages 为什么必须有：
+      #   macOS 的 python3 是 homebrew 装的（/opt/homebrew/Cellar/python@...），
+      #   ubuntu 的 python3 是系统 python —— 两者都是 PEP 668 externally-managed。
+      #   pip>=23.0 起，`--user` 不再绕过这个检查，单独 `--user` 照样被拒成
+      #   externally-managed-environment；只有 --break-system-packages 能关掉它。
+      # --user 为什么还要加：
+      #   关掉检查后如果不加 --user，会把包装进 homebrew/系统自己的 site-packages，
+      #   这正是 homebrew 报错里 STRONGLY 建议避免的；--user 装到用户目录，
+      #   不碰 brew/系统 site-packages（homebrew 推荐组合就是 --user + 该开关）。
+      # 对 ubuntu：pyyaml 已预装时这步是幂等的（Requirement already satisfied，退出 0），
+      #   不会把现在已绿的 ubuntu 改坏。
+      # 装不上就该红：不加 `|| true` / continue-on-error。
+      - name: 安装 python 依赖（pyyaml）
+        if: runner.os != 'Windows'
+        run: python3 -m pip install --user --break-system-packages pyyaml
+
+      # Windows runner 的解释器叫 python（python3 不在 PATH 里），照下面单测那两步
+      # 同样的按 runner.os 拆分。Windows 的 CPython 不是 externally-managed，
+      # 不需要 --break-system-packages；--user 同样避免写系统目录。
+      - name: 安装 python 依赖（pyyaml，Windows）
+        if: runner.os == 'Windows'
+        run: python -m pip install --user pyyaml
+
       # Windows 的 GitHub runner 上解释器叫 python（python3 不在 PATH 里）；
       # 这不是「跳过测试」，两边跑的是同一条 unittest 命令。
       - name: python 单测
