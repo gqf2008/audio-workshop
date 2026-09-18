@@ -18,13 +18,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_DISPLAY_NAME="音频作坊"
+ARTIFACT_NAME="AudioWorkshop"      # ASCII：见 package.sh 与 docs/release.md 的说明
 PROFILE="${NOTARY_PROFILE:-audio-workshop-notary}"
 NOTARIZE_SH="${NOTARIZE_SH:-$HOME/scripts/notarize.sh}"
 APP="dist/${APP_DISPLAY_NAME}.app"
 ENTITLEMENTS="packaging/entitlements.plist"
 
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
-DMG="dist/${APP_DISPLAY_NAME}-${VERSION}.dmg"
+DMG="dist/${ARTIFACT_NAME}-${VERSION}.dmg"
 
 ./package.sh
 
@@ -41,7 +42,7 @@ echo "===== 1/2：.app 签名 + 公证 + 装订 ====="
 # 那份 disable-library-validation 洗掉了 —— 结果是"公证过了但一启动就 dyld 报错"。
 "${NOTARIZE_SH}" "${APP}" --profile "${PROFILE}" \
   --entitlements "${ENTITLEMENTS}" \
-  --zip "dist/${APP_DISPLAY_NAME}-notarize.zip"
+  --zip "dist/${ARTIFACT_NAME}-${VERSION}-notarize.zip"
 
 echo
 echo "===== 2/2：DMG 重建 + 签名 + 公证 + 装订 ====="

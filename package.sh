@@ -12,12 +12,30 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# 显示名与**分发文件名**是两回事，别用一个变量串起来：
+#   · 显示名（.app 目录名 / CFBundleDisplayName）用中文，用户在 Finder 里看到的就是它；
+#   · 上传到 Release 的文件名必须 ASCII —— v0.1.0 实测过：`音频作坊-0.1.0.dmg` 上传后
+#     变成 `-0.1.0.dmg`（中文被剥掉），下载链接跟着坏。
 APP_DISPLAY_NAME="音频作坊"
+ARTIFACT_NAME="AudioWorkshop"
 BIN_NAME="audio-workshop"
 BUNDLE_ID="com.sqb.audio-workshop"   # 稳定值：改了等于换了一个 app，偏好/TCC 授权都会另起一份
 MIN_MACOS="12.0"
 DIST="dist"
-APP="${DIST}/${APP_DISPLAY_NAME}.app"
+APP="${DIST}/${APP_DISPLAY_NAME}.app"    # .app 目录名可以中文：它不进 HTTP 文件名
+
+# 断言"要上传的文件名"是 ASCII。宁可在这里红，也别等上传完才发现名字被截断。
+assert_ascii() {
+  # 只看**文件名**：传进来的可能是 dist/xxx 这样的路径，路径分隔符不在允许集里，
+  # 直接拿整个路径去匹配会把合法的 ASCII 名字也判红（写这条时第一版就是这么错的）。
+  local name; name="$(basename "$1")"
+  case "$name" in
+    *[!A-Za-z0-9._-]*)
+      echo "❌ 分发文件名含非 ASCII 字符：${name}" >&2
+      echo "   （GitHub Release 上传会截断它 —— v0.1.0 的 '-0.1.0.dmg' 就是这么来的）" >&2
+      exit 1 ;;
+  esac
+}
 
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 [ -n "${VERSION}" ] || { echo "❌ 读不到 Cargo.toml 里的 version" >&2; exit 1; }
@@ -82,7 +100,8 @@ fi
 codesign --verify --strict --verbose=1 "${APP}"
 
 echo "== [5/6] 打 DMG =="
-DMG="${DIST}/${APP_DISPLAY_NAME}-${VERSION}.dmg"
+DMG="${DIST}/${ARTIFACT_NAME}-${VERSION}.dmg"
+assert_ascii "${DMG}"
 packaging/make_dmg.sh "${APP}" "${DMG}"
 
 echo "== [6/6] 完成 =="
