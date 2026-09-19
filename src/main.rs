@@ -2216,6 +2216,32 @@ fn engine_data_dir() -> PathBuf {
     documents_dir().join(WORKSHOP_DIR).join("engine")
 }
 
+/// 按需拉起随包引擎。**启动时**与**模型下载成功后**共用这一条路径 —— 引擎没有模型
+/// 就拒绝启动（`config.cpp:275`），所以"刚下完第一个模型"正是它第一次能起来的时候。
+///
+/// 已经起过（句柄还在）就直接返回，不重复拉起；外部服务优先的判据在 `ensure_serving` 里。
+fn ensure_engine_serving() -> engine_supervisor::StartOutcome {
+    if ENGINE_SUPERVISOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        return engine_supervisor::StartOutcome::Started;
+    }
+    let (base, explicit) = server_base_for_engine();
+    let cat = match model_sources::catalog() {
+        Ok(c) => c,
+        Err(e) => return engine_supervisor::StartOutcome::Failed(format!("模型清单不可用：{e}")),
+    };
+    let mut sup = engine_supervisor::EngineSupervisor::new();
+    let outcome = sup.ensure_serving(&base, explicit, &model_dir(), cat, &engine_data_dir());
+    if matches!(outcome, engine_supervisor::StartOutcome::Started) {
+        eprintln!("随包引擎已启动：{base}");
+        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(sup);
+    }
+    outcome
+}
+
 /// 重新读 /health 并刷新状态栏的后端标签（启动、测试连接、应用并重连后都调用）。
 /// duck 强度档位 → duck_gain 系数。
 ///
@@ -5199,30 +5225,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::default());
 
     // ── 随包引擎：用户没自己配地址、且回环地址上没有服务时，拉起内置的那份 ──
-    {
-        let (engine_base, explicit) = server_base_for_engine();
-        let mut sup = engine_supervisor::EngineSupervisor::new();
-        let outcome = match model_sources::catalog() {
-            Ok(cat) => sup.ensure_serving(
-                &engine_base,
-                explicit,
-                &model_dir(),
-                cat,
-                &engine_data_dir(),
-            ),
-            Err(e) => engine_supervisor::StartOutcome::Failed(format!("模型清单不可用：{e}")),
-        };
-        match outcome {
-            engine_supervisor::StartOutcome::Started => {
-                eprintln!("随包引擎已启动：{engine_base}");
-            }
-            engine_supervisor::StartOutcome::Failed(why) => {
-                eprintln!("随包引擎启动失败：{why}");
-            }
-            _ => {}
+    match ensure_engine_serving() {
+        engine_supervisor::StartOutcome::Failed(why) => {
+            eprintln!("随包引擎启动失败：{why}");
         }
-        // 句柄必须活到进程退出：交给全局托管槽，退出时统一回收。
-        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(sup);
+        _ => {}
     }
 
     // ── 引擎发现 → 模型清单（默认优先 audio8-tts）──
@@ -10210,6 +10217,8 @@ fn tick(
                 let label = snap.label.clone();
                 let id = snap.id;
                 let terminal = snap.state.is_terminal();
+                // 先记下"这条终态是不是成功"：`snap` 马上就要被 merge 吃掉
+                let finished_ok = matches!(snap.state, download::State::Done);
                 {
                     let mut list = state.downloads.borrow_mut();
                     merge_download_snapshot(&mut list, snap);
@@ -10218,6 +10227,16 @@ fn tick(
                     // 终态才摘登记：中途摘掉会让「取消」按钮又变成「下载」再排一条。
                     // 而且要**认领自己的 id**——旧任务的迟到终态不能把新任务摘掉（复核 B1）。
                     release_download_id(&mut state.download_ids.borrow_mut(), &label, id);
+                    if finished_ok {
+                        // 下完第一个模型，随包引擎才第一次有可能起来（它没有模型会拒绝启动）。
+                        // 只记日志：失败原因已经能通过状态栏的后端标签与 /health 看到，
+                        // 在这里抢状态行会把"下载成功"的提示顶掉。
+                        if let engine_supervisor::StartOutcome::Failed(why) =
+                            ensure_engine_serving()
+                        {
+                            eprintln!("模型下载完成，但随包引擎没能起来：{why}");
+                        }
+                    }
                 }
                 refresh_download_rows(ui, state);
             }
