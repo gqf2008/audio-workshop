@@ -271,10 +271,13 @@ pwsh -File packaging/package_windows.ps1 -MakeInstaller   # 需要 ISCC.exe（ch
 
 ## 三条守卫（都能红，别删）
 
-1. **图标真的嵌进 PE 了吗** —— `python tools/check_windows_icon.py <exe> [<setup.exe>]`。
+1. **图标真的嵌进 PE 了吗 + 是不是 GUI 子系统** ——
+   `python tools/check_windows_icon.py <exe> [<setup.exe>]`。
    `release.yml` 的 Windows 任务与 `package_windows.ps1` 都会跑；直接读 PE 资源目录，
    不看"能不能提取出图标"（`ExtractAssociatedIcon` 在没图标时会返回系统默认图标，那是假绿）。
-   2026-09-19 本机实测：带图标的 PE → `RT_ICON ×7、RT_GROUP_ICON ×1`；不带的 → 红。
+   同时断言可选头的 Subsystem 是 2（WINDOWS_GUI）—— 这条对应"启动多一个控制台黑窗"，
+   同样是"没人报错、只有用户看得见"。2026-09-19 本机实测：带图标 + GUI 的 PE 过；
+   不带图标的红；带图标但控制台子系统的红（`--allow-console` 可显式放宽）。
 2. **`.iss` 必须是 UTF-8** —— `file packaging/windows-installer.iss` 期望 `UTF-8 Unicode text`。
    存成 GBK 会让中文应用名/快捷方式名又变乱码（旧 NSIS 版就是这么坏的）。
 3. **嵌不进去必须红** —— `build.rs` 的 `embed_windows_icon` 用的是
