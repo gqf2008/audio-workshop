@@ -29,7 +29,9 @@ $Stage = Join-Path $Dist "windows-x64"
 
 # 版本从 Cargo.toml 现读（与 macOS/Linux 同一条理由：写死必然漂移）
 $cargoToml = [System.IO.File]::ReadAllText((Join-Path (Get-Location) "Cargo.toml"), [System.Text.Encoding]::UTF8)
-$version = ([regex]'^version = "(.+)"').Match($cargoToml).Groups[1].Value
+# MultiLine 必须有：`^` 默认只匹配整个字符串的开头，而 version 在第 3 行 —— 少了这个
+# 标志会得到空版本号（CI 实测：读不到 Cargo.toml 的 version）。
+$version = ([regex]'(?m)^version = "(.+)"').Match($cargoToml).Groups[1].Value
 if (-not $version) { throw "读不到 Cargo.toml 的 version" }
 
 Write-Host "== [1/4] release 构建（静态 ONNX Runtime）=="
