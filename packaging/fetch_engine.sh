@@ -78,16 +78,19 @@ fi
 # 上游压缩包里还有 cli/gguf/tools/model_specs（model spec 已编进 server），随发布会白白变大。
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
+# 两种包内布局都要吃得下：
+#   · 上游 release 资产：文件在归档根（`audiocpp_server` / `LICENSE`）
+#   · GitHub Actions artifact 形态：多一层 `<artifact-name>/` 目录
 case "${ASSET}" in
   *.zip)
-    unzip -q -j "${TARBALL}" "*/${BIN_NAME}" "*/LICENSE" -d "${OUT_DIR}" ;;
+    if ! unzip -q -j "${TARBALL}" "${BIN_NAME}" "LICENSE" -d "${OUT_DIR}" 2>/dev/null; then
+      unzip -q -j "${TARBALL}" "*/${BIN_NAME}" "*/LICENSE" -d "${OUT_DIR}"
+    fi ;;
   *)
-    tar xzf "${TARBALL}" -C "${OUT_DIR}" --strip-components=1 \
-      --wildcards "*/${BIN_NAME}" "*/LICENSE" 2>/dev/null \
-      || tar xzf "${TARBALL}" -C "${OUT_DIR}" \
-           "$(tar tzf "${TARBALL}" | grep -m1 "/${BIN_NAME}$")" \
-           "$(tar tzf "${TARBALL}" | grep -m1 '/LICENSE$')"
-    ;;
+    if ! tar xzf "${TARBALL}" -C "${OUT_DIR}" "${BIN_NAME}" "LICENSE" 2>/dev/null; then
+      tar xzf "${TARBALL}" -C "${OUT_DIR}" --strip-components=1 \
+        --wildcards "*/${BIN_NAME}" "*/LICENSE"
+    fi ;;
 esac
 
 [ -f "${OUT_DIR}/${BIN_NAME}" ] || { echo "❌ 解包后找不到 ${BIN_NAME}" >&2; exit 1; }

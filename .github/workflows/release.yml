@@ -1,0 +1,136 @@
+# 三平台发布：打 tag（v*）或手动触发 → 构建 + 打包 + 发布。
+#
+# 与上游 audio.cpp 的分工：
+#   · 引擎（audiocpp_server）**不在这里编** —— 它是 C++/CMake 工程，产物由上游那套
+#     流水线出（fork 的 tag v0.8.2-metalbf16），这里只按 engine-lock.json 校验 sha256 后取件。
+#     两件事分开，是因为引擎构建要 CUDA/Metal 工具链与 2 小时级 runner，而壳只要几分钟。
+#   · 这条流水线只负责"壳 + 引擎 → 用户能装的包"。
+#
+# 为什么每个平台各自打包（而不是在 Linux 上交叉打三平台）：
+#   壳要链系统 GUI 库（Cocoa / WebView2 / X11/ALSA），签名与安装器也只能在目标平台做。
+name: release
+
+"on":
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "构建后是否创建 GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: 打包（含随包引擎）
+        env:
+          # 静态 ONNX Runtime；取引擎走 engine-lock.json（含 sha256 校验）
+          LIBONNXRUNTIME_NO_PKG_CONFIG: "1"
+        run: ./package.sh
+      - name: 校验包内依赖（不得有非系统库）
+        run: |
+          set -euo pipefail
+          APP="dist/音频作坊.app"
+          codesign --verify --deep --strict "$APP"
+          for bin in "$APP/Contents/MacOS/audio-workshop" \
+                     "$APP/Contents/Resources/engine/audiocpp_server"; do
+            leaked="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+              | grep -Ev '^(/usr/lib/|/System/)' || true)"
+            [ -z "$leaked" ] || { echo "❌ $bin 链了非系统库：$leaked"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWorkshop-macos-arm64
+          path: |
+            dist/AudioWorkshop-*.dmg
+            dist/AudioWorkshop-*-notarize.zip
+
+  linux:
+    name: Linux (x64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libasound2-dev libfontconfig1-dev libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: 打包
+        env:
+          LIBONNXRUNTIME_NO_PKG_CONFIG: "1"
+        run: packaging/package_linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWorkshop-linux-x64
+          path: dist/AudioWorkshop-*-linux-x64.tar.gz
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # NSIS 出安装器；zip 形态也保留（免安装/绿色版）
+      - name: 安装 NSIS
+        run: choco install nsis --no-progress -y
+      - name: 打包（zip + 安装器）
+        shell: pwsh
+        run: |
+          chcp 65001 | Out-Null
+          packaging/package_windows.ps1 -MakeInstaller
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWorkshop-windows-x64
+          path: |
+            dist/AudioWorkshop-*-windows-x64.zip
+            dist/AudioWorkshop-*-windows-x64-setup.exe
+
+  publish:
+    name: 发布
+    needs: [macos, linux, windows]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
