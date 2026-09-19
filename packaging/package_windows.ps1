@@ -14,14 +14,22 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
+# Windows PowerShell 默认用系统代码页（中文机器上是 GBK）读子进程输出，而 `cargo metadata`
+# 与 Python 都按 UTF-8 输出 —— 实测报 `UnicodeDecodeError: 'charmap' codec can't decode
+# byte 0x8f`。三处一起设才干净：控制台代码页、PowerShell 的输出编码、以及传给子进程的
+# 输入编码。少任何一处都还会在某个子进程上复发。
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+chcp 65001 | Out-Null
+
 $BinName = "audio-workshop"
 $ArtifactName = "AudioWorkshop"
 $Dist = "dist"
 $Stage = Join-Path $Dist "windows-x64"
 
 # 版本从 Cargo.toml 现读（与 macOS/Linux 同一条理由：写死必然漂移）
-$version = (Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"' |
-    Select-Object -First 1).Matches[0].Groups[1].Value
+$cargoToml = [System.IO.File]::ReadAllText((Join-Path (Get-Location) "Cargo.toml"), [System.Text.Encoding]::UTF8)
+$version = ([regex]'^version = "(.+)"').Match($cargoToml).Groups[1].Value
 if (-not $version) { throw "读不到 Cargo.toml 的 version" }
 
 Write-Host "== [1/4] release 构建（静态 ONNX Runtime）=="
