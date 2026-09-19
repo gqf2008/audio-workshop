@@ -571,7 +571,8 @@ mod tests {
     #[test]
     fn is_running_detects_a_dead_child() {
         let mut sup = EngineSupervisor::new();
-        let mut c = std::process::Command::new("sleep")
+        // 句柄只被移动进 `sup.child`（不再 `&mut` 用），`let mut` 会撞 clippy 的 unused_mut
+        let c = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
@@ -632,6 +633,10 @@ mod tests {
         if !gone {
             let _ = fake.kill();
         }
+        // 无条件收尸：没等到就（已经）杀掉再等，等到的那次 `try_wait` 已经收过状态、
+        // 再 `wait()` 只是把缓存的退出状态拿回来。不留僵尸进程也不给 clippy 留把柄
+        // （clippy 1.98 的 `zombie_processes` 会因为"某条路径没 wait"直接判红）。
+        let _ = fake.wait();
         assert!(gone, "假引擎必须被收掉，否则真实场景就是孤儿进程");
         // 反过来：壳还活着时不许动引擎
         assert!(

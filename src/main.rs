@@ -5256,11 +5256,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::default());
 
     // ── 随包引擎：用户没自己配地址、且回环地址上没有服务时，拉起内置的那份 ──
-    match ensure_engine_serving() {
-        engine_supervisor::StartOutcome::Failed(why) => {
-            eprintln!("随包引擎启动失败：{why}");
-        }
-        _ => {}
+    if let engine_supervisor::StartOutcome::Failed(why) = ensure_engine_serving() {
+        eprintln!("随包引擎启动失败：{why}");
     }
 
     // ── 引擎发现 → 模型清单（默认优先 audio8-tts）──
