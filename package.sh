@@ -9,6 +9,14 @@
 #
 # 为什么 Info.plist 的版本要现读 Cargo.toml：写死必然漂移 —— 改了 Cargo.toml 忘了改
 # plist，就会出现"关于本机显示 0.1.0、自动更新却按 0.2.0 比"这种最难查的错。
+#
+# 为什么构建前强制 LIBONNXRUNTIME_NO_PKG_CONFIG=1（人声分离的 ONNX Runtime）：
+# ort-sys 的 build.rs 是「pkg-config 优先 → 失败才下载官方预编译包」。开发机装了
+# homebrew onnxruntime 时 pkg-config 一命中，就会把 /opt/homebrew/.../libonnxruntime
+# 链进发布包 —— 后果是用户必须自己 `brew install onnxruntime`，而且那份 dylib 还
+# 拖着 86 个 homebrew 依赖（abseil/protobuf/onnx/re2…），全都得随包重签。
+# 设成 1 之后 ort-sys 走「手工 setup」分支，改用官方静态库（实测 mac 二进制
+# 从 19MB → 33MB，DMG 10.5MB → 16.3MB），发布包恢复成零第三方依赖。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -41,8 +49,8 @@ VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 [ -n "${VERSION}" ] || { echo "❌ 读不到 Cargo.toml 里的 version" >&2; exit 1; }
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
 
-echo "== [1/6] release 构建 =="
-cargo build --release --bin "${BIN_NAME}"
+echo "== [1/6] release 构建（静态 ONNX Runtime，见文件头说明）=="
+LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo build --release --bin "${BIN_NAME}"
 # 用 cargo 自己报的 target 目录，不靠猜：CARGO_TARGET_DIR 与 .cargo/config.toml 都会影响它
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
@@ -54,6 +62,20 @@ rm -rf "${APP}"
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 cp -f "${BIN_SRC}" "${APP}/Contents/MacOS/${BIN_NAME}"
 chmod +x "${APP}/Contents/MacOS/${BIN_NAME}"
+
+# 硬门禁：发布包的二进制只允许链系统库。历史上 homebrew onnxruntime 会静默混进来，
+# 表现是"发布包在开发者机器上好好的，用户机器一启动就 dyld 报错"。
+# 这里在打包阶段就红，别等用户装。
+leaked="$(otool -L "${APP}/Contents/MacOS/${BIN_NAME}" \
+  | tail -n +2 | awk '{print $1}' \
+  | grep -Ev '^(/usr/lib/|/System/)' || true)"
+if [ -n "${leaked}" ]; then
+  echo "❌ ${BIN_NAME} 链了非系统库，发布包会依赖用户机器上的第三方 dylib：" >&2
+  echo "${leaked}" | sed 's/^/     /' >&2
+  echo "   → 人声分离的 ONNX Runtime 必须走静态链接（LIBONNXRUNTIME_NO_PKG_CONFIG=1）。" >&2
+  exit 1
+fi
+echo "   → 依赖检查通过：只链系统库"
 
 if [ -f assets/icon.icns ]; then
   cp -f assets/icon.icns "${APP}/Contents/Resources/icon.icns"
