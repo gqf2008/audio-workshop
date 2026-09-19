@@ -16,6 +16,10 @@
 ;   SourceDir     已组装好的发行目录（壳 + engine\ + 图标）
 ;   IconFile      assets/icon.ico（安装器图标 + 装进 {app} 给快捷方式用）
 ;   OutDir        产物目录（默认仓库根的 dist\）
+;   LangFile      中文消息文件（.isl）的**绝对路径**。默认值是"Inno 安装目录里的那份"，
+;                 但 Inno 官方安装包与 choco 包都**不带中文**（2026-09-19 CI 实测），
+;                 实际由 package_windows.ps1 找/下载一份再传进来 —— 别手工直接跑 ISCC，
+;                 除非你自己给 LangFile（`ISCC /DLangFile=... windows-installer.iss`）。
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -28,6 +32,9 @@
 #endif
 #ifndef OutDir
   #define OutDir "..\dist"
+#endif
+#ifndef LangFile
+  #define LangFile "compiler:Languages\ChineseSimplified.isl"
 #endif
 
 #define MyAppName "音频作坊"
@@ -62,7 +69,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]
 ; 中文放第一个 = 向导默认中文（本产品面向中文用户）；英文保留给排障
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "{#LangFile}"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]

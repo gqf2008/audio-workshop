@@ -248,8 +248,26 @@ cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
 pwsh -File packaging/package_windows.ps1 -MakeInstaller   # 需要 ISCC.exe（choco install innosetup）
 ```
 
-`packaging/windows-installer.iss` 的四个变量都由脚本用 `/D` 传入（`MyAppVersion` / `SourceDir` /
-`IconFile` / `OutDir`，一律绝对路径），文件里的 `#ifndef` 默认值只给手工跑留。
+`packaging/windows-installer.iss` 的五个变量都由脚本用 `/D` 传入（`MyAppVersion` / `SourceDir` /
+`IconFile` / `OutDir` / `LangFile`，一律绝对路径），文件里的 `#ifndef` 默认值只给手工跑留。
+
+### 中文向导的消息文件（Inno 不带）
+
+**Inno Setup 官方安装包不含中文消息文件**（2026-09-19 CI 实测：choco 装的 Inno Setup 6.7.1
+里没有 `Languages\ChineseSimplified.isl`），所以 `package_windows.ps1` 会：
+
+1. 先在 `Program Files` / `Program Files (x86)` / `LOCALAPPDATA\Programs` 下的
+   `Inno Setup 6\Languages\` 找现成的那份（版本与安装的 Inno 匹配，优先用）；
+2. 都没有就从 `jrsoftware/issrc` 取一份放到 `dist\setup-lang\`（构建产物目录，不进仓库、
+   不进发布资产），取不到就按失败处理（不静默降级成英文向导）；
+3. 把这份 **.isl 的绝对路径**按 `/DLangFile=` 交给 ISCC。
+
+离线环境或想固定某一份翻译时用 `-InnoLangFile <path>` 显式指定。
+
+为什么传绝对路径、而不是让脚本写 `compiler:Languages\...`：choco 装的 Inno 在 PATH 上的
+`ISCC.exe` 是 **shim**，"ISCC 旁边"不是安装目录 —— 第一版就是照 `Split-Path $iscc -Parent`
+去补文件，结果 .isl 落进了 `C:\ProgramData\Chocolatey\bin\Languages\`，ISCC 仍去
+`Program Files (x86)` 找，报 `Couldn't open include file`（CI 日志实测）。
 
 ## 三条守卫（都能红，别删）
 
@@ -276,6 +294,6 @@ mingw-w64 真编两个 PE（一个带图标、一个不带），前者必须过�
   状态栏与 `/health`；要诊断就在 Windows 上跑 `cargo run`（debug，带控制台）。
 - **macOS/Linux 的构建也多编一个 build-dep**（embed-resource）。理由：`embed_resource::` 必须能在
   build.rs 里写出来，而"要不要资源"是**目标**属性，运行时按 `CARGO_CFG_TARGET_OS` 判。
-- **Windows CI 需联网补语言文件**：choco 的 innosetup 包偶尔缺
-  `Languages\ChineseSimplified.isl`，`package_windows.ps1` 会从 `jrsoftware/issrc` 取一份；
-  取不到就按编译失败处理（不静默降级成英文向导）。
+- **Windows 打包可能需要联网**：Inno 不带中文消息文件（见上文「中文向导的消息文件」），
+  本机找不到时 `package_windows.ps1` 会去 `jrsoftware/issrc` 取一份；离线环境用
+  `-InnoLangFile` 指定现成的那份。

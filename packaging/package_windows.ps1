@@ -14,7 +14,10 @@
 # 注意：脚本用 UTF-8 输出，Windows 控制台默认代码页会乱码 —— CI 里先 chcp 65001。
 param(
     [switch]$MakeInstaller,
-    [string]$InstallerVersion = ""
+    [string]$InstallerVersion = "",
+    # 中文消息文件（.isl）的现成路径；留空 = 自己找，找不到就联网取一份。
+    # 离线环境 / 想固定某一份翻译时显式传它。
+    [string]$InnoLangFile = ""
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
@@ -90,28 +93,46 @@ if ($MakeInstaller) {
         throw "-MakeInstaller 需要 ISCC.exe（CI 里 chocolatey install innosetup）—— 找过 PATH 与常见安装目录"
     }
 
-    # 向导的中文消息文件：官方 Inno 自带，choco 的包有时缺。缺了不补，ISCC 会直接失败在
-    # [Languages] 那一行（不是静默降级成英文）。
-    $innoDir = Split-Path $iscc -Parent
-    $langDir = Join-Path $innoDir "Languages"
-    $langFile = Join-Path $langDir "ChineseSimplified.isl"
-    if (-not (Test-Path $langFile)) {
-        New-Item -ItemType Directory -Path $langDir -Force | Out-Null
-        $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl"
-        Write-Host "   缺少 $langFile，从官方仓库取一份"
-        Invoke-WebRequest -Uri $url -OutFile $langFile
-    }
-
     $stageAbs = (Resolve-Path $Stage).Path
     $distAbs = (Resolve-Path $Dist).Path
     $iconAbs = (Resolve-Path $iconSrc).Path
+
+    # 向导的中文消息文件。**Inno 官方安装包不含中文**（2026-09-19 CI 实测：choco 装的
+    # Inno Setup 6.7.1 里根本没有 Languages\ChineseSimplified.isl）；不补一份，ISCC 会
+    # 直接失败在 [Languages] 那行（不是静默降级成英文向导）。
+    #
+    # 补到的是一份**绝对路径**、按 /DLangFile 传给脚本，而不是让 .iss 写
+    # `compiler:Languages\...`：choco 装的 Inno 在 PATH 上的 ISCC.exe 是 shim，
+    # "ISCC 旁边"不是安装目录 —— 第一版就是这么栽的（把 .isl 下进了 shim 目录，
+    # ISCC 仍去 Program Files 找，报 Couldn't open include file）。
+    $langFile = $InnoLangFile
+    if (-not $langFile) {
+        $langCandidates = @()
+        if ($env:ProgramFiles) { $langCandidates += (Join-Path $env:ProgramFiles "Inno Setup 6\Languages\ChineseSimplified.isl") }
+        if (${env:ProgramFiles(x86)}) { $langCandidates += (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\Languages\ChineseSimplified.isl") }
+        if ($env:LOCALAPPDATA) { $langCandidates += (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\Languages\ChineseSimplified.isl") }
+        $langFile = $langCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
+    if (-not $langFile) {
+        # 落到 dist 下：构建产物目录（已被 .gitignore 覆盖，也不会进发布资产）
+        $langDir = Join-Path $distAbs "setup-lang"
+        New-Item -ItemType Directory -Path $langDir -Force | Out-Null
+        $langFile = Join-Path $langDir "ChineseSimplified.isl"
+        if (-not (Test-Path $langFile)) {
+            $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl"
+            Write-Host "   没有现成的中文消息文件，从官方仓库取一份：$url"
+            Invoke-WebRequest -Uri $url -OutFile $langFile
+        }
+    }
+    $langFile = (Resolve-Path $langFile).Path
+
     $v = if ($InstallerVersion) { $InstallerVersion } else { $version }
     # 输入一律给**绝对路径**：安装器脚本的默认值是相对仓库的（给人手工跑用），
     # 显式传绝对路径就不会被"当前目录 / 脚本目录"的解释差异坑到。
     # 产物名由 .iss 的 OutputBaseFilename 决定（用同一个 $v，别一边 $version 一边 $v）
     $setup = Join-Path $distAbs "$ArtifactName-$v-windows-x64-setup.exe"
     & $iscc "/DMyAppVersion=$v" "/DSourceDir=$stageAbs" "/DIconFile=$iconAbs" `
-        "/DOutDir=$distAbs" "packaging\windows-installer.iss"
+        "/DOutDir=$distAbs" "/DLangFile=$langFile" "packaging\windows-installer.iss"
     if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
     if (-not (Test-Path $setup)) { throw "ISCC 报成功但没产出 $setup" }
     Write-Host "   $setup"
