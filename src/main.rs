@@ -2221,12 +2221,18 @@ fn engine_data_dir() -> PathBuf {
 ///
 /// 已经起过（句柄还在）就直接返回，不重复拉起；外部服务优先的判据在 `ensure_serving` 里。
 fn ensure_engine_serving() -> engine_supervisor::StartOutcome {
-    if ENGINE_SUPERVISOR
+    // 手动路径（启动、下载完成后）不受节流：那是用户明确动作之后的一次尝试。
+    // 崩溃自愈的节流在 `ensure_engine_serving_throttled` 里。
+    if let Some(sup) = ENGINE_SUPERVISOR
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .is_some()
+        .as_mut()
     {
-        return engine_supervisor::StartOutcome::Started;
+        if sup.is_running() {
+            return engine_supervisor::StartOutcome::Started;
+        }
+        // 走到了这里说明引擎已经退出：把死句柄丢掉再往下重拉
+        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     let (base, explicit) = server_base_for_engine();
     let cat = match model_sources::catalog() {
@@ -2240,6 +2246,19 @@ fn ensure_engine_serving() -> engine_supervisor::StartOutcome {
         *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(sup);
     }
     outcome
+}
+
+/// 崩溃自愈入口：健康检查发现连不上时调用。
+///
+/// 与手动路径的区别只有一条 —— **带节流**：引擎一起就崩的情况下，不能每轮健康检查
+/// 都重启一次（那会变成重启风暴）。
+fn ensure_engine_serving_throttled() {
+    if !engine_supervisor::autostart_allowed(std::time::Instant::now()) {
+        return;
+    }
+    if let engine_supervisor::StartOutcome::Failed(why) = ensure_engine_serving() {
+        eprintln!("随包引擎自愈失败：{why}");
+    }
 }
 
 /// 重新读 /health 并刷新状态栏的后端标签（启动、测试连接、应用并重连后都调用）。
@@ -3329,6 +3348,10 @@ fn spawn_server_check(msg_tx: Sender<WorkerMsg>, revision: u64) {
                 if Client::new(b.clone()).healthy() {
                     (true, format!("已连接 {b}"))
                 } else {
+                    // 连不上分两种：外部服务没起（我们不该管），或我们托管的引擎崩了
+                    // （该拉起来）。`ensure_engine_serving_throttled` 内部会按
+                    // "用户是否显式配了地址"重新判一遍，所以这里无脑调用是安全的。
+                    ensure_engine_serving_throttled();
                     (false, format!("连不上 {b}：服务没起或端口不对"))
                 }
             }

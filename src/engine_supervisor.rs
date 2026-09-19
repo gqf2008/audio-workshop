@@ -290,6 +290,26 @@ pub fn monitor_entry(args: &[String]) -> bool {
     true
 }
 
+/// 重启节流：两次自动拉起之间至少间隔这么久。
+///
+/// 用来挡住"引擎一起来就崩"时的重启风暴 —— 没有它，健康检查线程会每轮都试一次。
+pub const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(20);
+
+/// 上一次自动拉起的时刻（全局一份：自动拉起本来就只有一条路径）。
+static LAST_AUTOSTART: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// 现在允许再拉一次吗？允许就顺手记下时刻（判断与记账同一把锁，不会两次都放行）。
+pub fn autostart_allowed(now: Instant) -> bool {
+    let mut last = LAST_AUTOSTART.lock().unwrap_or_else(|e| e.into_inner());
+    match *last {
+        Some(prev) if now.duration_since(prev) < RESTART_MIN_INTERVAL => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
 /// 托管实例：持有子进程句柄，**只回收自己拉起的那一个**。
 #[derive(Debug, Default)]
 pub struct EngineSupervisor {
@@ -301,6 +321,21 @@ pub struct EngineSupervisor {
 impl EngineSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 托管的引擎还活着吗。子进程已退出（崩溃/被杀）时清掉句柄并返回 false，
+    /// 这样后续 `ensure_serving` 才会真的重新拉起，而不是被"句柄还在"挡住。
+    pub fn is_running(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                self.child = None;
+                false
+            }
+        }
     }
 
     /// 按上文的优先级确保服务可用。
@@ -509,6 +544,48 @@ mod tests {
         let got = managed_models(&dir, catalog());
         let _ = std::fs::remove_dir_all(&dir);
         assert!(got.is_empty(), "空目录不该产出条目：{got:?}");
+    }
+
+    /// 节流器：间隔内只放行一次，间隔外再放行一次。
+    #[test]
+    fn autostart_is_throttled_between_attempts() {
+        let t0 = Instant::now();
+        // 注意全局状态：用"相对上次"的断言，避免与其他测试的执行顺序耦合
+        let first = autostart_allowed(t0);
+        let second = autostart_allowed(t0 + Duration::from_secs(1));
+        if first {
+            assert!(!second, "距上次仅 1s，不该再放行");
+            assert!(
+                autostart_allowed(t0 + RESTART_MIN_INTERVAL + Duration::from_secs(1)),
+                "超过最小间隔后应放行"
+            );
+        } else {
+            // 上一轮（别的测试/上一条用例）刚放过：这里只验证"不放行"
+            assert!(!second);
+        }
+    }
+
+    /// 子进程已经退出时 `is_running` 必须返回 false 并清掉句柄，否则崩了的引擎永远
+    /// 不会被重拉（句柄还在 → 被当成"正在运行"）。
+    #[cfg(unix)]
+    #[test]
+    fn is_running_detects_a_dead_child() {
+        let mut sup = EngineSupervisor::new();
+        let mut c = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = c.id() as i32;
+        sup.child = Some(c);
+        assert!(sup.is_running(), "活着的子进程应报运行中");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // 等它真的退出
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!sup.is_running(), "已退出的子进程必须报未运行");
+        assert!(sup.child.is_none(), "句柄要被清掉，否则挡住重拉");
     }
 
     /// 监视逻辑必须真的能收掉引擎 —— 这是"壳被强杀后不残留孤儿"的唯一保证。
