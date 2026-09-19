@@ -26,6 +26,9 @@ sha2 = "0.10"
 #   · 检查更新（M4-P8）：只读拉一份发布清单。
 # 两条路径都只用 ureq 2 的 timeout_connect / timeout_read（per-read），**不设总超时**。
 ureq = "2"
+# 进程监护用：`kill(pid, 0)` 探活 + SIGTERM/SIGKILL（见 engine_supervisor::run_monitor）。
+# 只在 Unix 上用到，Windows 那份是空实现。
+libc = "0.2"
 dirs = "6"
 # Linux: 让 Slint/fontique 运行时 dlopen fontconfig，避免发布包硬链某一版
 # libfontconfig，也便于在 macOS 上做 Linux 交叉 check。

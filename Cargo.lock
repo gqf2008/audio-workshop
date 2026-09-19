@@ -474,6 +474,7 @@ dependencies = [
  "aw-core",
  "dirs",
  "fontique",
+ "libc",
  "rodio",
  "serde",
  "serde_json",

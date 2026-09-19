@@ -200,10 +200,102 @@ pub fn render_server_config(
     serde_json::to_string_pretty(&cfg).unwrap_or_default()
 }
 
+/// 进程监护：**自己拉起的引擎不能变成孤儿**。
+///
+/// 为什么需要它：壳被 `SIGTERM`/崩溃带走时 `ui.run()` 不会正常返回，`stop()` 没机会跑
+/// —— 实测 `pkill` 壳之后，包内引擎继续占着端口活下去。`Drop` 也兜不住：进程被信号
+/// 直接终结时 Rust 不跑析构。
+///
+/// 做法：**壳侧**再起一个线程（`--engine-monitor <壳pid> <引擎pid>`），每秒看一次壳还在不在，
+/// 壳没了就把引擎收掉再退出。不用"引擎自己监视父进程"，是因为那要改 audio.cpp；壳侧线程
+/// 只需要自己的 pid 与引擎 pid，不动引擎一行代码。
+///
+/// 局限（如实写在这里，别让人以为万能）：Windows 上 `kill(pid, 0)` 不可用，
+/// 当前实现只覆盖 Unix；Windows 靠用户正常关闭窗口（走 `stop()`）与安装器卸载兜底，
+/// 强杀进程组那条 P1 再补（需要 `OpenProcess`/Job Object）。
+pub const ENGINE_MONITOR_ARG: &str = "--engine-monitor";
+
+/// `kill(pid, 0)`：只探测目标是否存在，不发任何信号。
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+#[cfg(not(unix))]
+fn process_alive(pid: i32) -> bool {
+    let _ = pid;
+    true
+}
+
+/// 一次监视动作：壳没了就收引擎。返回 true 表示"已经收掉，监视者该结束了"。
+///
+/// 拆成 `monitor_once` 是为了**可测**：`run_monitor` 里那一步是 `std::process::exit`，
+/// 直接在测试里调会把测试进程一起杀掉（实测：测试结果根本打不出来）。
+#[cfg(unix)]
+pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
+    if process_alive(shell_pid) {
+        return false;
+    }
+    unsafe {
+        libc::kill(engine_pid, libc::SIGTERM);
+    }
+    // 给它一秒收尾的机会，再硬杀 —— 引擎当前没有优雅停机路径，
+    // 这一步只是尽量让它有机会自己释放端口/显存。
+    std::thread::sleep(Duration::from_secs(1));
+    if process_alive(engine_pid) {
+        unsafe {
+            libc::kill(engine_pid, libc::SIGKILL);
+        }
+    }
+    true
+}
+
+#[cfg(not(unix))]
+pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
+    let _ = (shell_pid, engine_pid);
+    false
+}
+
+/// 监视线程主体：壳没了就收掉引擎，然后自己退出。
+#[cfg(unix)]
+pub fn run_monitor(shell_pid: i32, engine_pid: i32) {
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if monitor_once(shell_pid, engine_pid) {
+            std::process::exit(0);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn run_monitor(shell_pid: i32, engine_pid: i32) {
+    let _ = (shell_pid, engine_pid);
+}
+
+/// `main` 最开头判这一条：本次运行是监护线程而不是正常启动。
+/// 返回 true 表示"已处理完，调用方应直接退出"。
+pub fn monitor_entry(args: &[String]) -> bool {
+    let Some(pos) = args.iter().position(|a| a == ENGINE_MONITOR_ARG) else {
+        return false;
+    };
+    let shell_pid = args
+        .get(pos + 1)
+        .and_then(|p| p.parse::<i32>().ok())
+        .unwrap_or(0);
+    let engine_pid = args
+        .get(pos + 2)
+        .and_then(|p| p.parse::<i32>().ok())
+        .unwrap_or(0);
+    run_monitor(shell_pid, engine_pid);
+    true
+}
+
 /// 托管实例：持有子进程句柄，**只回收自己拉起的那一个**。
 #[derive(Debug, Default)]
 pub struct EngineSupervisor {
     child: Option<Child>,
+    /// 监视进程句柄（壳正常退出时一并回收）。
+    monitor: Option<Child>,
 }
 
 impl EngineSupervisor {
@@ -281,7 +373,21 @@ impl EngineSupervisor {
             Ok(c) => c,
             Err(e) => return StartOutcome::Failed(format!("拉起引擎失败：{e}")),
         };
+        let engine_pid = child.id();
         self.child = Some(child);
+        // 壳侧监视进程：壳被强杀时由它收掉引擎（见 run_monitor 的说明）。
+        if let Ok(exe) = std::env::current_exe() {
+            let mut mon = Command::new(exe);
+            mon.arg(ENGINE_MONITOR_ARG)
+                .arg(std::process::id().to_string())
+                .arg(engine_pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Ok(m) = mon.spawn() {
+                self.monitor = Some(m);
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if healthy(base) {
@@ -313,6 +419,10 @@ impl EngineSupervisor {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(mut mon) = self.monitor.take() {
+            let _ = mon.kill();
+            let _ = mon.wait();
         }
     }
 }
@@ -399,6 +509,58 @@ mod tests {
         let got = managed_models(&dir, catalog());
         let _ = std::fs::remove_dir_all(&dir);
         assert!(got.is_empty(), "空目录不该产出条目：{got:?}");
+    }
+
+    /// 监视逻辑必须真的能收掉引擎 —— 这是"壳被强杀后不残留孤儿"的唯一保证。
+    ///
+    /// 用一个假的"引擎"（`sleep`）代替真引擎：这里验的是**回收语义**，与引擎是谁无关，
+    /// 也不该依赖真引擎产物（CI 上没有）。
+    #[cfg(unix)]
+    #[test]
+    fn monitor_reaps_a_child_after_the_shell_is_gone() {
+        use std::process::Command;
+        // 假引擎：活得比测试久
+        let mut fake = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep 应可执行");
+        let engine_pid = fake.id() as i32;
+        // 壳也用一个真进程再**杀掉**：直接取"某个立刻退出的进程的 pid"会踩 pid 复用
+        // （刚释放的号可能马上被别的进程拿走，`kill(pid,0)` 于是恒真、监视者永远不收）。
+        let mut shell = Command::new("sleep").arg("30").spawn().unwrap();
+        let shell_pid = shell.id() as i32;
+        let _ = shell.kill();
+        let _ = shell.wait();
+        // 等到它真的从进程表消失
+        let gone_deadline = Instant::now() + Duration::from_secs(3);
+        while process_alive(shell_pid) && Instant::now() < gone_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!process_alive(shell_pid), "前置条件：壳进程必须已经不在了");
+
+        // 直接跑一次监视动作：壳已死 → 它必须收掉引擎
+        assert!(
+            monitor_once(shell_pid, engine_pid),
+            "壳不在时监视动作必须报告'已收掉'"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut gone = false;
+        while Instant::now() < deadline {
+            if fake.try_wait().ok().flatten().is_some() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !gone {
+            let _ = fake.kill();
+        }
+        assert!(gone, "假引擎必须被收掉，否则真实场景就是孤儿进程");
+        // 反过来：壳还活着时不许动引擎
+        assert!(
+            !monitor_once(std::process::id() as i32, engine_pid),
+            "壳活着的时候监视者不该收引擎"
+        );
     }
 
     /// **真起来一个引擎**：只在本机手动跑（`--ignored`），因为它要启动真实进程、

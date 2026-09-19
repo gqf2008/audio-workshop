@@ -5220,6 +5220,14 @@ struct UiState {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // 监护线程入口：必须在起界面之前判，否则它也会开一个界面窗口。
+    // 见 engine_supervisor::run_monitor 的说明（壳被强杀时用它收引擎）。
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if engine_supervisor::monitor_entry(&args) {
+            return Ok(());
+        }
+    }
     let ui = MainWindow::new()?;
 
     let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::default());
