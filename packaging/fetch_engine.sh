@@ -22,6 +22,26 @@ cd "$(dirname "$0")/.."
 LOCK="engine-lock.json"
 [ -f "${LOCK}" ] || { echo "❌ 缺少 ${LOCK}" >&2; exit 1; }
 
+# 跨平台算 sha256：Windows 的 Git Bash **没有 shasum**（CI 实测 `shasum: command not found`），
+# 所以按可用性依次尝试。python3 排第一：三平台的 CI 与开发机上都有（本脚本其它部分也依赖它）。
+sha256_of() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import hashlib,sys
+h=hashlib.sha256()
+f=open(sys.argv[1],"rb")
+for chunk in iter(lambda: f.read(1048576), b""):
+    h.update(chunk)
+print(h.hexdigest())' "$1"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "找不到任何 sha256 工具（python3 / shasum / sha256sum）" >&2
+    return 1
+  fi
+}
+
 detect_platform() {
   case "$(uname -s)" in
     Darwin)
@@ -68,7 +88,7 @@ fi
 if [ "${WANT_SHA}" = "PENDING_CI" ]; then
   echo "   ⚠️  engine-lock.json 里 ${PLATFORM} 的 sha256 还是 PENDING_CI —— 跳过校验（仅限发版前）"
 else
-  GOT_SHA="$(shasum -a 256 "${TARBALL}" | awk '{print $1}')"
+  GOT_SHA="$(sha256_of "${TARBALL}")"
   if [ "${GOT_SHA}" != "${WANT_SHA}" ]; then
     echo "❌ 引擎 sha256 不匹配（期望 ${WANT_SHA}，实际 ${GOT_SHA}）" >&2
     echo "   → 不匹配就不许装包：随包引擎被替换过，或下载被截断。" >&2
