@@ -8,6 +8,9 @@
 #
 # 为什么不在 package.sh 里内联：三个平台都用同一份取件逻辑，各写一遍必然漂移。
 #
+# Windows（CI 里走 Git Bash）：脚本里的 python 调用一律显式 encoding="utf-8" ——
+# 默认代码页是 cp1252，读 engine-lock.json 里的中文注释会直接 UnicodeDecodeError（实测）。
+#
 # 离线/本地构建场景：
 #   AW_ENGINE_TARBALL=/path/to/audio-....tar.gz  packaging/fetch_engine.sh <out-dir>
 #   直接复用现成压缩包，但仍按 engine-lock.json 校验 sha256（锁里是 PENDING 时跳过校验）。
@@ -36,7 +39,7 @@ PLATFORM="${2:-$(detect_platform)}"
 
 read_lock() { python3 - "$LOCK" "$PLATFORM" "$1" <<'PY'
 import json, sys
-lock = json.load(open(sys.argv[1]))
+lock = json.load(open(sys.argv[1], encoding="utf-8"))
 art = lock["artifacts"].get(sys.argv[2])
 if art is None:
     print(f"❌ engine-lock.json 里没有平台 {sys.argv[2]}", file=sys.stderr)
@@ -47,7 +50,7 @@ PY
 
 ASSET="$(read_lock asset)"
 WANT_SHA="$(read_lock sha256)"
-BASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release_base"])' "$LOCK")"
+BASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["release_base"])' "$LOCK")"
 BIN_NAME="$(read_lock binary)"
 
 CACHE_DIR="${TMPDIR:-/tmp}/audio-workshop-engine"
