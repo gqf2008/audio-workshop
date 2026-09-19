@@ -17,6 +17,12 @@ mod cancel;
 mod dictionaries;
 mod download;
 mod download_mirror;
+mod engine_supervisor;
+
+/// 随包引擎的进程级句柄槽。放全局是因为壳的退出路径只有 `main` 末尾一处 ——
+/// 句柄走局部变量会在 `ui.run()` 阻塞期间被借用打结，走全局反而只有一条回收路径。
+static ENGINE_SUPERVISOR: std::sync::Mutex<Option<engine_supervisor::EngineSupervisor>> =
+    std::sync::Mutex::new(None);
 mod export;
 /// 随包分发的模型下载清单（M4-P7 第二段：下载源）。映射规则与诚实边界都在那里。
 mod model_capabilities;
@@ -2189,6 +2195,25 @@ fn server_endpoint() -> (String, String, bool) {
         None,
     );
     (host, port, false)
+}
+
+/// 供随包引擎启动用：返回 (base, 地址是否来自**用户显式配置**)。
+///
+/// "显式"= `AW_SERVER` 或全局设置里写了 host/port。只有非显式（也就是地址纯粹来自
+/// 清单默认值或内置默认）时，才允许壳去拉起随包引擎 —— 用户显式配了地址就是明确
+/// 表示"我自己有服务/我连别人的"，那时壳不该自作主张再起一个。
+fn server_base_for_engine() -> (String, bool) {
+    let over = settings_snapshot();
+    let cfg = read_server_config();
+    let env_base = std::env::var("AW_SERVER").ok();
+    let (base, from_env) = resolve_base(&over, &cfg, env_base.as_deref());
+    let explicit = from_env || over.host.is_some() || over.port.is_some();
+    (base, explicit)
+}
+
+/// 随包引擎的可写数据目录（`server.json` / 日志）。**绝不落安装目录**。
+fn engine_data_dir() -> PathBuf {
+    documents_dir().join(WORKSHOP_DIR).join("engine")
 }
 
 /// 重新读 /health 并刷新状态栏的后端标签（启动、测试连接、应用并重连后都调用）。
@@ -5173,6 +5198,33 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let rows: Rc<VecModel<Sentence>> = Rc::new(VecModel::default());
 
+    // ── 随包引擎：用户没自己配地址、且回环地址上没有服务时，拉起内置的那份 ──
+    {
+        let (engine_base, explicit) = server_base_for_engine();
+        let mut sup = engine_supervisor::EngineSupervisor::new();
+        let outcome = match model_sources::catalog() {
+            Ok(cat) => sup.ensure_serving(
+                &engine_base,
+                explicit,
+                &model_dir(),
+                cat,
+                &engine_data_dir(),
+            ),
+            Err(e) => engine_supervisor::StartOutcome::Failed(format!("模型清单不可用：{e}")),
+        };
+        match outcome {
+            engine_supervisor::StartOutcome::Started => {
+                eprintln!("随包引擎已启动：{engine_base}");
+            }
+            engine_supervisor::StartOutcome::Failed(why) => {
+                eprintln!("随包引擎启动失败：{why}");
+            }
+            _ => {}
+        }
+        // 句柄必须活到进程退出：交给全局托管槽，退出时统一回收。
+        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(sup);
+    }
+
     // ── 引擎发现 → 模型清单（默认优先 audio8-tts）──
     let (_, base, discover_note) = discover_engine();
     if !discover_note.is_empty() {
@@ -5316,7 +5368,16 @@ fn main() -> Result<(), slint::PlatformError> {
         );
     }
 
-    ui.run()
+    let result = ui.run();
+    // 只回收自己拉起的那份（外部服务不在我们句柄里，本来就动不到）
+    if let Some(mut sup) = ENGINE_SUPERVISOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        sup.stop();
+    }
+    result
 }
 
 fn ready_note(base: Option<&str>) -> String {
