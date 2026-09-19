@@ -39,14 +39,22 @@ chmod +x "${STAGE}/${BIN_NAME}"
 
 # 硬门禁：发布包的壳只允许依赖系统库。与 package.sh 同一条理由 ——
 # homebrew/自装的 onnxruntime 会静默混进来，等用户机器上才发现就是 dyld/ld 报错。
-leaked="$(ldd "${STAGE}/${BIN_NAME}" 2>/dev/null | awk '{print $3}' \
-  | grep -Ev '^$|^/lib|^/usr/lib' || true)"
-if [ -n "${leaked}" ]; then
-  echo "❌ ${BIN_NAME} 链了非系统库：" >&2
-  echo "${leaked}" | sed 's/^/     /' >&2
-  exit 1
+# `ldd` 只对当前平台的 ELF 有意义：脚本在 macOS/Linux 上都能跑，但依赖门禁只在 Linux 生效
+# （macOS 上 ldd 不存在，会得到空结果 —— 那等于没有门禁，所以显式跳过并说明）。
+if command -v ldd >/dev/null 2>&1; then
+  leaked="$(ldd "${STAGE}/${BIN_NAME}" 2>/dev/null | awk '{print $3}' \
+    | grep -Ev '^$|^/lib|^/usr/lib' || true)"
+  if [ -n "${leaked}" ]; then
+    echo "❌ ${BIN_NAME} 链了非系统库（发布包会依赖用户机器上的第三方 .so）：" >&2
+    echo "${leaked}" | sed 's/^/     /' >&2
+    echo "   → 人声分离的 ONNX Runtime 必须走静态链接（LIBONNXRUNTIME_NO_PKG_CONFIG=1）。" >&2
+    exit 1
+  fi
+  echo "   → 依赖检查通过：只链系统库"
+else
+  # 不静默放过：门禁没跑就得说出来，否则"没检查"会被读成"检查通过"。
+  echo "   ⚠️ 本机没有 ldd，跳过依赖门禁（正式发布在 Linux runner 上跑，那里会真检查）"
 fi
-echo "   → 依赖检查通过：只链系统库"
 
 packaging/fetch_engine.sh "${STAGE}/engine" linux-x64
 
