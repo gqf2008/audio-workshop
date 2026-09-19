@@ -71,11 +71,11 @@ component SentenceRow inherits Rectangle {
         mouse-cursor: pointer;
     }
 
-    // 选中指示：左侧 3px 竖条
+    // 选中指示：左侧竖条，宽度跟随全应用主题描边
     Rectangle {
         visible: root.picked;
         x: 0px; y: 0px;
-        width: 3px; height: parent.height;
+        width: PixelTheme.primary-border-width; height: parent.height;
         background: PixelTheme.accent;
     }
 
@@ -257,7 +257,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
             }
 
-            Rectangle { height: 2px; background: root.hairline; }
+            Rectangle { height: PixelTheme.border-width; background: root.hairline; }
 
             // ── 工程（当前工程名，五个 Tab 共用这一份）──
             VerticalLayout {
@@ -278,7 +278,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
             }
 
-            Rectangle { height: 2px; background: root.hairline; }
+            Rectangle { height: PixelTheme.border-width; background: root.hairline; }
 
             // ── 服务：本应用连哪个 audiocpp_server ──
             VerticalLayout {
@@ -341,7 +341,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
             }
 
-            Rectangle { height: 2px; background: root.hairline; }
+            Rectangle { height: PixelTheme.border-width; background: root.hairline; }
 
             // ── 模型：模型目录（本机模型文件放哪儿）──
             VerticalLayout {
@@ -516,7 +516,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
             }
 
-            Rectangle { height: 2px; background: root.hairline; }
+            Rectangle { height: PixelTheme.border-width; background: root.hairline; }
 
             // ── 备份：把工程与自建资产复制成一份自包含目录 ──
             VerticalLayout {
@@ -547,7 +547,7 @@ export component WorkbenchDrawer inherits VerticalLayout {
                 }
             }
 
-            Rectangle { height: 2px; background: root.hairline; }
+            Rectangle { height: PixelTheme.border-width; background: root.hairline; }
 
             // ── 更新：当前版本 / 检查更新 / 打开发布页（只读，不改本机任何文件）──
             VerticalLayout {
