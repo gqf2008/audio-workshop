@@ -426,8 +426,26 @@ pub fn tiers_and_advice(
 
 /// 本机物理内存（字节）。拿不到就是 `None` —— 推荐必须能区分"内存未知"，
 /// 不许拿 0 兜底（0 会让每一档都判成装不下，等于凭空编一个结论）。
+///
+/// **进程内只探一次**：Windows 的探测要起一个 PowerShell（WMI 查询，冷启动几百毫秒到
+/// 数秒），而调用方（下载面板每次重建行都会问一遍）跟着下载进度被反复调到 —— 2026-09-19
+/// 真机反馈的"下载模型界面卡死"正是这条：每条 64 KiB 的进度快照都去 spawn 一个
+/// powershell.exe，界面永远回不到事件循环。物理内存是机器属性，问一次就够；缓存放这里
+/// 而不是调用方，以后多个调用点也不会各自探一遍。
 pub fn physical_memory_bytes() -> Option<u64> {
-    physical_memory_with(&platform_memory_probe)
+    static CACHE: OnceLock<Option<u64>> = OnceLock::new();
+    physical_memory_once(&CACHE, &platform_memory_probe)
+}
+
+/// 带缓存的探测：`probe` 只会被调用一次（`OnceLock` 保证），拿到的（哪怕是失败）就是答案。
+///
+/// 拆出来是为了可测：`probe` 计数即可证明"没有反复探测"（平台探测本身要用真命令，
+/// 单测里换不了）。
+fn physical_memory_once(
+    cache: &OnceLock<Option<u64>>,
+    probe: &dyn Fn() -> Option<String>,
+) -> Option<u64> {
+    *cache.get_or_init(|| physical_memory_with(probe))
 }
 
 /// 探测缝：`probe` 给平台的原始输出，解析是纯函数（三种格式在任一平台上都可测）。
@@ -480,12 +498,16 @@ fn platform_memory_probe() -> Option<String> {
 
 #[cfg(windows)]
 fn platform_memory_probe() -> Option<String> {
+    use std::os::windows::process::CommandExt as _;
+    // `CREATE_NO_WINDOW`：壳是 GUI 子系统（无控制台），起控制台子进程默认会**弹一个黑窗**。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
             "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     out.status
@@ -1691,5 +1713,39 @@ mod tests {
             "物理内存 {} 字节小得可疑，探测可能解析错了",
             total
         );
+    }
+
+    /// 探测只做一次：下载面板每次重建行都会问物理内存，而 Windows 的探测要起一个
+    /// PowerShell —— 每条进度快照都探一遍就是真机上"下载界面卡死"的成因。
+    ///
+    /// 这里用计数探针证明缓存真的生效（同一次探测的返回值也必须一致）。
+    #[test]
+    fn physical_memory_is_probed_once_per_process() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some("17179869184".to_string())
+        };
+        let cache = OnceLock::new();
+        assert_eq!(physical_memory_once(&cache, &probe), Some(17179869184));
+        assert_eq!(physical_memory_once(&cache, &probe), Some(17179869184));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "第二次不该再探（探测要起 PowerShell / sysctl）"
+        );
+
+        // 探测失败也要缓存：不然拿不到的机器会每条进度都重试一次
+        let fails = AtomicUsize::new(0);
+        let failing = || {
+            fails.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let cache = OnceLock::new();
+        assert_eq!(physical_memory_once(&cache, &failing), None);
+        assert_eq!(physical_memory_once(&cache, &failing), None);
+        assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 }

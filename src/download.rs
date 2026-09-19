@@ -20,12 +20,62 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 /// 读盘缓冲区：64 KiB 在进度粒度与系统调用次数之间取平衡。
 const CHUNK: usize = 64 * 1024;
+
+/// 进度快照的最小间隔。
+///
+/// 读循环是**每读一跳一条快照**，而 `reader.read` 每次真正拿到多少字节由 socket 缓冲决定
+/// —— 实测本地 mock 下 4 MiB 就推了 512 条（见 `progress_snapshots_are_throttled_*`），
+/// 1 GiB 权重轻松上万条。UI 侧每收到一条都要重建整张下载表（`refresh_download_rows`，
+/// Windows 上还要探一次物理内存），消息泵与重绘会被压满，界面看上去就是"卡死"
+/// （2026-09-19 真机反馈）。
+///
+/// 100 ms ≈ 10 fps：进度条足够顺，同时给 UI 留下绝大部分时间。
+/// **状态变化不吃这个时间窗**（见 `ProgressGate::state`）：排队→下载→校验→终态是语义，
+/// 不能被节流吞掉。
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 只放行"按时间窗节流过的进度"与"必须落地的状态变化"。
+struct ProgressGate<F: FnMut(&Snapshot)> {
+    inner: F,
+    /// 上一条快照的时间；`None` = 还没推过（第一条进度必须推，否则用户先看到的永远是 0%）
+    last: Option<Instant>,
+    interval: Duration,
+}
+
+impl<F: FnMut(&Snapshot)> ProgressGate<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner,
+            last: None,
+            interval: PROGRESS_INTERVAL,
+        }
+    }
+
+    /// 状态变化（校验中、续传说明等）：无条件推，并重置时间窗。
+    fn state(&mut self, snap: &Snapshot) {
+        self.last = Some(Instant::now());
+        (self.inner)(snap);
+    }
+
+    /// 纯字节进度：时间窗内的丢弃。
+    fn progress(&mut self, snap: &Snapshot) {
+        let now = Instant::now();
+        if let Some(last) = self.last {
+            // `duration_since` 在时钟倒退时会 panic，用 `saturating_duration_since` 兜住
+            if now.saturating_duration_since(last) < self.interval {
+                return;
+            }
+        }
+        self.last = Some(now);
+        (self.inner)(snap);
+    }
+}
 
 /// 网络超时。用**单次 socket 读超时**而不是 ureq 的总超时：总超时会把"下 2 GB 权重"
 /// 整条判失败，读超时只判"连接还在但一直不给数据"——正是"服务端卡住，用户点了取消
@@ -208,8 +258,9 @@ pub fn download_with(
     spec: &TaskSpec,
     cancel: &AtomicBool,
     timeouts: Timeouts,
-    mut on_progress: impl FnMut(&Snapshot),
+    on_progress: impl FnMut(&Snapshot),
 ) -> Result<Outcome, DownloadError> {
+    let mut on_progress = ProgressGate::new(on_progress);
     // 还没开始就被取消：一个网络请求都不发（取消排队中的任务走这条）
     if cancel.load(Ordering::Relaxed) {
         return Err(DownloadError::Cancelled);
@@ -319,7 +370,7 @@ pub fn download_with(
             // 续传/重下说明要一直带着，别被后续进度覆盖掉
             snap.note = note.clone();
         }
-        on_progress(&snap);
+        on_progress.progress(&snap);
     }
     writer
         .flush()
@@ -334,7 +385,8 @@ pub fn download_with(
     snap.downloaded = downloaded;
     snap.total = total.or(Some(downloaded));
     snap.note = "校验中".to_string();
-    on_progress(&snap);
+    // 状态变化：即使刚推过进度也必须落地（否则 UI 会停在"下载中 100%"）
+    on_progress.state(&snap);
 
     let got = std::fs::metadata(&part)
         .map(|m| m.len())
@@ -992,6 +1044,40 @@ mod tests {
         let mut seen = Vec::new();
         let r = download(spec, cancel, |s| seen.push(s.clone()));
         (r, seen)
+    }
+
+    /// 进度快照必须**节流**：读循环每读一跳推一条，不节流时本地 4 MiB 就是 512 条
+    /// （1 GiB 权重上万条），而 UI 每收到一条都要重建整张下载表 —— 2026-09-19 真机反馈的
+    /// "下载模型界面卡死"就是这条路被灌满。
+    ///
+    /// 钉两条：① 条数远小于字节块数；② 状态变化（校验中）不被时间窗吃掉。
+    #[test]
+    fn progress_snapshots_are_throttled_but_state_changes_are_not() {
+        let root = temp_dir("throttle");
+        let body = vec![6u8; 4 * 1024 * 1024]; // 64 KiB × 64 块
+        let srv = MockServer::start(body.clone(), false);
+        let dest = root.join("model.bin");
+        let s = spec(srv.url("/m/model.bin"), dest.clone(), &body);
+
+        let (r, seen) = run(&s, &AtomicBool::new(false));
+        r.expect("下载应成功");
+        let progress: Vec<&Snapshot> = seen
+            .iter()
+            .filter(|s| s.state == State::Downloading)
+            .collect();
+        assert!(
+            progress.len() <= 4,
+            "本地 4 MiB 下载最多留几条进度快照，实际 {} 条（实测不节流时是 512 条）",
+            progress.len()
+        );
+        assert!(
+            !progress.is_empty(),
+            "第一条进度不能被节流掉 —— 否则界面先看到的永远是 0%"
+        );
+        assert!(
+            seen.iter().any(|s| s.state == State::Verifying),
+            "校验态是状态变化，必须推给 UI"
+        );
     }
 
     #[test]
