@@ -142,3 +142,81 @@ cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
    `release.sh` 的第 2 步就是为此存在。
 3. **公证要显式传 entitlements**：通用脚本会重新签名，不带 `--entitlements` 会把
    `disable-library-validation` 洗掉 —— 结果是"公证过了但一启动就 dyld 报错"。
+
+---
+
+# 随包推理引擎（2026-09-19 起）
+
+从这一版开始，安装包里**自带 `audiocpp_server`**：用户下载即用，不需要自己编译、也不需要
+先跑一个服务。壳在启动时按下面的顺序决定用哪个服务（实现见 `src/engine_supervisor.rs`）：
+
+1. 用户**显式**配了地址（`AW_SERVER`，或全局设置里写了 host/port）→ 一律不拉内置引擎
+   （可能连的是别的机器，不能自作主张）；
+2. 该地址上已有服务在响应 `/health` → 复用；
+3. 否则拉起包内引擎（只在回环地址、且引擎文件确实存在时）。
+
+## 引擎从哪来
+
+引擎不在这条流水线里编（它是 C++/CMake 工程，要 Metal/CUDA 工具链与 2 小时级 runner），
+产物由上游那套流水线出，这里只按 `engine-lock.json` **校验 sha256 后取件**：
+
+```json
+{
+  "source": { "repo": "gqf2008/audio.cpp", "tag": "v0.8.2-metalbf16", "base": "0xShug0/audio.cpp v0.8.1" },
+  "artifacts": { "macos-arm64": { "asset": "...", "sha256": "..." } }
+}
+```
+
+`v0.8.2-metalbf16` = 上游 v0.8.1 + 三个 **Metal BF16** 补丁（BreezeTTS 2 的 bf16 激活与
+bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文件，然后**重跑三平台验收**。
+
+## 各平台的产物形态
+
+| 平台 | 产物 | 引擎落点 |
+|---|---|---|
+| macOS | `AudioWorkshop-<v>.dmg` | `<App>.app/Contents/Resources/engine/audiocpp_server` |
+| Windows | `...-windows-x64.zip` + `...-setup.exe`（per-user NSIS，免 UAC） | `engine\audiocpp_server.exe`（exe 同级） |
+| Linux | `...-linux-x64.tar.gz` | `engine/audiocpp_server`（exe 同级） |
+
+## 两个必须记住的前提
+
+1. **引擎没有模型就拒绝启动**（上游 `app/server/config.cpp:275`，实测）——所以"装完即用"
+   仍然要求用户先下载至少一个模型。壳会在**模型下载完成后**自动拉起引擎（不要求重启应用）。
+   一个模型都没有时，壳如实显示"没有服务"，不假装能跑。
+2. **人声分离的 ONNX Runtime 走静态链接**（`LIBONNXRUNTIME_NO_PKG_CONFIG=1`）。
+   `ort-sys` 的 build.rs 是"pkg-config 优先 → 失败才下载官方预编译包"，开发机装了
+   homebrew onnxruntime 时会静默把它链进发布包 → 用户必须自己 `brew install`。
+   `package.sh` / `package_linux.sh` 里有硬门禁：出现任何非系统库直接红。
+
+## 三平台发布流程
+
+```sh
+# 1) 本地（macOS）：打包 + 签名 + 公证 + 装订
+./release.sh                       # 引擎已随包；公证 profile: audio-workshop-notary
+
+# 2) 三平台构建 + 打包（CI，dry-run 不带发布）
+gh workflow run release --repo gqf2008/audio-workshop --ref main -f publish=false
+
+# 3) 打 tag → 触发正式发布（会创建 GitHub Release 并附三平台产物）
+git tag -a vX.Y.Z -m "音频作坊 vX.Y.Z"
+git push github vX.Y.Z
+
+# 4) 核实"检查更新"链路
+cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
+```
+
+### 这一块踩过的坑
+
+1. **Windows 上必须显式设 UTF-8**：`cargo metadata` 的 UTF-8 输出经管道进
+   `ConvertFrom-Json` 时，Windows PowerShell 按系统代码页解码，报
+   `UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f`。
+   三处一起设：`[Console]::OutputEncoding`、`$OutputEncoding`、读 Cargo.toml 用 `ReadAllText(..., UTF8)`。
+   只 `chcp 65001` 不够（子进程输出仍按旧编码解码）。
+2. **嵌套可执行文件必须先签**：引擎是 `.app` 里的嵌套二进制，顺序必须是"先签引擎、再签
+   `.app`"，反了公证报 `nested code is not signed`。
+3. **壳被强杀会留孤儿引擎**：`SIGTERM`/崩溃时 `ui.run()` 不返回、`Drop` 不执行，实测包内
+   引擎继续占着端口。现在壳侧另起一个监视进程（`--engine-monitor`），每秒探壳是否还在，
+   壳没了先 SIGTERM、宽限 1s 再 SIGKILL。Windows 侧暂为空实现（`kill(pid,0)` 无等价物），
+   P1 用 Job Object 补。
+4. **`LSMinimumSystemVersion` 跟引擎走**：上游产物的 `minos` 实测 13.3，比壳自己需要的
+   12.0 高，所以取 13.3；改了引擎要同步核 `otool -l` 的 `LC_BUILD_VERSION`。
