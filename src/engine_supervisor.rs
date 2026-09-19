@@ -216,21 +216,21 @@ pub fn render_server_config(
 pub const ENGINE_MONITOR_ARG: &str = "--engine-monitor";
 
 /// `kill(pid, 0)`：只探测目标是否存在，不发任何信号。
+///
+/// **只有 Unix 一份实现**：Windows 上没有监视实现（见 `run_monitor`），所以这里连桩都不留 ——
+/// 留一个"永远返回 true"的桩在 Windows 构建里没有任何调用点，`-D warnings` 下直接变成
+/// `dead_code` 报错（2026-09-19 CI 的 windows gate 实测）。
 #[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
-}
-
-#[cfg(not(unix))]
-fn process_alive(pid: i32) -> bool {
-    let _ = pid;
-    true
 }
 
 /// 一次监视动作：壳没了就收引擎。返回 true 表示"已经收掉，监视者该结束了"。
 ///
 /// 拆成 `monitor_once` 是为了**可测**：`run_monitor` 里那一步是 `std::process::exit`，
 /// 直接在测试里调会把测试进程一起杀掉（实测：测试结果根本打不出来）。
+///
+/// 同样只有 Unix 一份：这里的语义是"发信号"，Windows 侧没有等价物（见 `run_monitor`）。
 #[cfg(unix)]
 pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
     if process_alive(shell_pid) {
@@ -250,12 +250,6 @@ pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
     true
 }
 
-#[cfg(not(unix))]
-pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
-    let _ = (shell_pid, engine_pid);
-    false
-}
-
 /// 监视线程主体：壳没了就收掉引擎，然后自己退出。
 #[cfg(unix)]
 pub fn run_monitor(shell_pid: i32, engine_pid: i32) {
@@ -267,6 +261,12 @@ pub fn run_monitor(shell_pid: i32, engine_pid: i32) {
     }
 }
 
+/// Windows：**如实什么都不做**（监视进程被拉起后立刻退出）。
+///
+/// 不是"等以后再说"的托词，而是当前唯一诚实的行为：`kill(pid, 0)` 那套在 Windows 上不存在，
+/// 真要做需要 `OpenProcess`/`WaitForSingleObject` 或 Job Object（模块文档里记的 P1）。
+/// 在此之前：壳**正常**关闭时引擎由 `stop()` 回收（这条所有平台都有），只有"强杀壳"的
+/// 场景在 Windows 上会留下引擎 —— 已知边界，不假装覆盖。
 #[cfg(not(unix))]
 pub fn run_monitor(shell_pid: i32, engine_pid: i32) {
     let _ = (shell_pid, engine_pid);

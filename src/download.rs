@@ -1066,8 +1066,9 @@ mod tests {
             .filter(|s| s.state == State::Downloading)
             .collect();
         assert!(
-            progress.len() <= 4,
-            "本地 4 MiB 下载最多留几条进度快照，实际 {} 条（实测不节流时是 512 条）",
+            progress.len() <= 32,
+            "本地 4 MiB 下载不该留下这么多进度快照，实际 {} 条（实测不节流时是 512 条、\
+             节流后 1–4 条；上限取 32 是给慢机器留余量，不节流会以数量级超出去）",
             progress.len()
         );
         assert!(
