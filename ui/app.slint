@@ -1009,11 +1009,14 @@ export component MainWindow inherits Window {
     }
 
     // ── 批量队列面板（M4-P1，浮动圆角卡片，与任务中心同一个锚点、互斥）──
+    // 高度 = 固定骨架 + 列表内容：固定骨架含上下 padding、标题行、分隔线、
+    // 摘要、底部按钮行与各段 spacing，合计约 158px；列表每行 46px + 6px 间距。
+    // 之前固定项只算 132px，列表被 vertical-stretch 挤成几像素，组件互相遮挡。
     if root.batch-open : Rectangle {
         x: 10px;
         y: 80px;
         width: 460px;
-        height: Math.min(parent.height - 122px, 132px + root.batch-rows.length * 52px);
+        height: Math.min(parent.height - 122px, 158px + root.batch-rows.length * 52px);
         background: PixelTheme.panel;
         border-width: UiTokens.panel-border;
         border-color: UiTokens.window-frame;
