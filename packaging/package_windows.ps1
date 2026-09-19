@@ -82,8 +82,12 @@ if ($MakeInstaller) {
     }
     Write-Host "== 打 NSIS 安装器（$mk）=="
     $v = if ($InstallerVersion) { $InstallerVersion } else { $version }
-    $setup = Join-Path $Dist "$ArtifactName-$version-windows-x64-setup.exe"
-    & $mk /DVERSION=$v /DSRCDIR=$Stage /DOUTFILE=$setup packaging/windows-installer.nsi
+    # NSIS 的 File 指令**不做相对路径解析**：给相对目录会报 "no files found"（CI 实测）。
+    # 一律传绝对路径（stage 已被 Resolve-Path 规范化）。
+    $stageAbs = (Resolve-Path $Stage).Path
+    $outAbs = Join-Path (Resolve-Path $Dist).Path "$ArtifactName-$version-windows-x64-setup.exe"
+    $setup = $outAbs
+    & $mk /DVERSION=$v "/DSRCDIR=$stageAbs" "/DOUTFILE=$outAbs" packaging/windows-installer.nsi
     if ($LASTEXITCODE -ne 0) { throw "makensis 失败" }
     if (-not (Test-Path $setup)) { throw "makensis 报成功但没产出 $setup" }
     Write-Host "   $setup"
