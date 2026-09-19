@@ -1,3 +1,13 @@
+// Windows 上以 GUI 子系统运行：不加这一条，双击/开始菜单启动的 exe 会**多弹一个控制台
+// 黑窗**（2026-09-19 真机反馈），窗口里还会滚出 UTF-8 的诊断行 —— 中文 Windows 的控制台
+// 代码页是 GBK，看着就是乱码。
+//
+// 只在 release 生效（装给用户的那个）：debug 保留控制台，否则 `cargo test` 在 Windows 上
+// 的输出会被"无控制台"吞掉（测试二进制同样吃到这个属性）。release 下 stderr 写不出去不会
+// 崩：std 把 Windows 的 ERROR_INVALID_HANDLE 当"丢弃"处理（`io::stdio::handle_ebadf`），
+// 只是诊断看不到 —— 用户可见的状态都在界面状态栏与 /health 里。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! 音频作坊 · 配音工作台（M1 桌面壳——真实链路版）
 //!
 //! 链路：UI（本文件）↔ 工作线程（合成/拼装）↔ audiocpp_server
