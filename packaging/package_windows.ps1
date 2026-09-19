@@ -66,7 +66,9 @@ if ($MakeInstaller) {
     # `makensis` 常常不在 PATH 上：choco 装完 shim 落在 C:\ProgramData\chocolatey\bin，
     # 而 NSIS 本体在 Program Files (x86)\NSIS。两处都找，别只靠 Get-Command（CI 实测
     # 装了 choco 包仍报"需要 makensis"）。
-    $mk = (Get-Command makensis -ErrorAction SilentlyContinue)?.Source
+    # 不用 `?.`：那是 PS7 语法，脚本要在 Windows PowerShell 5.1 上也能跑
+    $mkCmd = Get-Command makensis -ErrorAction SilentlyContinue
+    $mk = if ($mkCmd) { $mkCmd.Source } else { $null }
     if (-not $mk) {
         $candidates = @(
             (Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"),
