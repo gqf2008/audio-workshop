@@ -42,6 +42,18 @@ slint-build = "1.18"
 # build.rs 需要 slint_pixel::library_paths() 注册 `@slint_pixel` 库路径。
 slint-pixel = "0.2.3"
 
+# Windows 目标的 exe 图标资源（build.rs 里把 assets/icon.ico 编进 PE 资源段）。
+# **故意不加 `[target.'cfg(windows)']` 门控**：那样在非 Windows 宿主机上编译 build.rs 时
+# 这个 crate 根本不在 extern 表里，代码里连写 `embed_resource::` 都过不了编译（实测
+# E0433）—— 而"哪个目标平台要资源"本来就是**目标**属性（CARGO_CFG_TARGET_OS），
+# 由 build.rs 在运行时判（见 embed_windows_icon）。
+# 工具链：MSVC 走 Windows SDK 的 rc.exe（embed-resource 自己去注册表/Windows Kits 找，
+# 不依赖 PATH）、windows-gnu 走 windres。
+#
+# 已知代价：macOS/Linux 上构建也会多编这个 build-dep（cc/memchr/toml/rustc_version），
+# 换来的是"跨平台编译到 windows 目标也能嵌图标"这条路径真的可达。
+embed-resource = "3"
+
 # Cargo 工作区。当前成员：aw-core 核心库（配音链路/文本兜底/服务客户端）。
 # 后续批量/模板等能力（CHARTER 第 9 节 M4）再拆成员 crate，往 members 里加即可。
 [workspace]

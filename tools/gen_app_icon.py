@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生成 macOS 应用图标（像素风，与 slint-pixel 的界面配色同源）。
+"""生成应用图标（像素风，与 slint-pixel 的界面配色同源）。
 
-用法：python3 tools/gen_app_icon.py            # 写 assets/icon.iconset/ 与 assets/icon.icns
-      python3 tools/gen_app_icon.py --png-only # 只出 iconset（没装 iconutil 时）
+用法：python3 tools/gen_app_icon.py            # 写 assets/icon.iconset/、assets/icon.icns、assets/icon.ico
+      python3 tools/gen_app_icon.py --png-only # 不出 .icns（没装 iconutil 时；.ico 照样出）
+
+两个平台的图标**必须同源**：macOS 要 .icns、Windows 要 .ico（exe 资源 + 安装器 + 快捷方式
+都读它）。各画一份必然漂移，所以这里一次渲染、三种封装。
 
 为什么要生成而不是随手画一个二进制：图标要能跟着配色改。配色取的是 `slint-pixel`
 主题里那套 PICO-8 色（界面用的就是它），所以图标和 UI 是同一套颜色，不会各调各的。
@@ -63,6 +66,9 @@ def render() -> Image.Image:
 
 
 SIZES = [16, 32, 64, 128, 256, 512, 1024]
+# .ico 里要有哪些尺寸：16/32 是资源管理器列表与任务栏、48/64 是中图标视图、
+# 256 是超大图标视图（Windows 在标题栏/Alt-Tab 里挑的也是这几个）。
+ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
 
 
 def main() -> int:
@@ -81,6 +87,12 @@ def main() -> int:
         if s >= 32:
             base.resize((s, s), Image.LANCZOS).save(os.path.join(iconset, f"icon_{s // 2}x{s // 2}@2x.png"))
     print(f"iconset → {iconset}")
+
+    # Windows 图标：exe 资源（build.rs 用 embed-resource 嵌进去）、Inno 安装器、快捷方式
+    # 三处共用这一份。Pillow 会按 sizes 逐档下采样，256 那档存 PNG（Vista+ 支持）。
+    ico = os.path.join(a.out, "icon.ico")
+    base.save(ico, format="ICO", sizes=[(s, s) for s in ICO_SIZES])
+    print(f"ico     → {ico}  ({os.path.getsize(ico)} 字节)")
 
     if a.png_only:
         return 0
