@@ -35,6 +35,8 @@ export { BatchRow, DownloadRow, Sentence, SeparationHistoryRow, TaskRow, Version
 // 窗口描边色：与 ../abb 一致，纯黑（用户明确要求，不用灰）。
 export global UiTokens {
     in property <color> window-frame: #000000;
+    // 浮动面板（抽屉 / 任务中心 / 批量）与窗口外框同宽同色，保证“弹窗和窗口一致”。
+    in property <length> panel-border: 2px;
 }
 
 export component MainWindow inherits Window {
@@ -772,8 +774,8 @@ export component MainWindow inherits Window {
             width: 380px;
             height: parent.height - 74px - 42px;
             background: PixelTheme.panel;
-            border-width: PixelTheme.border-width;
-            border-color: PixelTheme.edge;
+            border-width: UiTokens.panel-border;
+            border-color: UiTokens.window-frame;
             border-radius: 8px;
             clip: true;
 
@@ -865,8 +867,8 @@ export component MainWindow inherits Window {
         width: 460px;
         height: Math.min(parent.height - 122px, 92px + root.task-rows.length * 62px);
         background: PixelTheme.panel;
-        border-width: PixelTheme.border-width;
-        border-color: PixelTheme.edge;
+        border-width: UiTokens.panel-border;
+        border-color: UiTokens.window-frame;
         border-radius: 8px;
         clip: true;
 
@@ -1013,8 +1015,8 @@ export component MainWindow inherits Window {
         width: 460px;
         height: Math.min(parent.height - 122px, 132px + root.batch-rows.length * 52px);
         background: PixelTheme.panel;
-        border-width: PixelTheme.border-width;
-        border-color: PixelTheme.edge;
+        border-width: UiTokens.panel-border;
+        border-color: UiTokens.window-frame;
         border-radius: 8px;
         clip: true;
 

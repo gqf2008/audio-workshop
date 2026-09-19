@@ -5017,7 +5017,7 @@ dependencies = [
 [[package]]
 name = "slint-pixel"
 version = "0.2.3"
-source = "git+https://github.com/gqf2008/slint-pixel?rev=daffdf7bba74bbe57bdf6aec5e1f43770296c950#daffdf7bba74bbe57bdf6aec5e1f43770296c950"
+source = "git+https://github.com/gqf2008/slint-pixel?rev=63b34c4d58d675db2c4c7d63eb8552a6cc993dd4#63b34c4d58d675db2c4c7d63eb8552a6cc993dd4"
 dependencies = [
  "image",
  "raw-window-handle",
