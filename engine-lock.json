@@ -1,0 +1,38 @@
+{
+  "_comment": "随包推理引擎的来源与校验。改这里等于换引擎，必须重新跑三平台验收。",
+  "_why": "audio.cpp 的 audiocpp_server 随包分发，用户下载即用、不需要自己编译或跑服务。",
+  "source": {
+    "repo": "gqf2008/audio.cpp",
+    "tag": "v0.8.2-metalbf16",
+    "base": "0xShug0/audio.cpp v0.8.1",
+    "patches": "Metal 后端启用 BreezeTTS 2 的 bf16 激活与 bf16 KV cache（含 f16<->bf16 拷贝内核）",
+    "license": "Apache-2.0"
+  },
+  "release_base": "https://github.com/gqf2008/audio.cpp/releases/download/v0.8.2-metalbf16",
+  "artifacts": {
+    "macos-arm64": {
+      "asset": "audio-v0.8.2-metalbf16-bin-macos-arm64-metal.tar.gz",
+      "sha256": "PENDING_CI",
+      "binary": "audiocpp_server",
+      "backend": "metal"
+    },
+    "macos-x64": {
+      "asset": "audio-v0.8.2-metalbf16-bin-macos-x64-metal.tar.gz",
+      "sha256": "PENDING_CI",
+      "binary": "audiocpp_server",
+      "backend": "metal"
+    },
+    "windows-x64": {
+      "asset": "audio-v0.8.2-metalbf16-bin-windows-x64-cpu-portable.zip",
+      "sha256": "PENDING_CI",
+      "binary": "audiocpp_server.exe",
+      "backend": "cpu"
+    },
+    "linux-x64": {
+      "asset": "audio-v0.8.2-metalbf16-bin-ubuntu-x64-cpu-portable.tar.gz",
+      "sha256": "PENDING_CI",
+      "binary": "audiocpp_server",
+      "backend": "cpu"
+    }
+  }
+}

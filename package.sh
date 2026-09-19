@@ -28,7 +28,10 @@ APP_DISPLAY_NAME="音频作坊"
 ARTIFACT_NAME="AudioWorkshop"
 BIN_NAME="audio-workshop"
 BUNDLE_ID="com.sqb.audio-workshop"   # 稳定值：改了等于换了一个 app，偏好/TCC 授权都会另起一份
-MIN_MACOS="12.0"
+# 引擎(上游 audiocpp_server)实测 minos=13.3。壳自己只需要 12.0，但随包分发时
+# 两者必须取更严的那个，否则 12.x 用户装完一启动引擎就被 dyld 拒。改这里要同步核
+# engine-lock.json 里那份产物的 LC_BUILD_VERSION。
+MIN_MACOS="13.3"
 DIST="dist"
 APP="${DIST}/${APP_DISPLAY_NAME}.app"    # .app 目录名可以中文：它不进 HTTP 文件名
 
@@ -83,6 +86,18 @@ else
   echo "⚠️  没有 assets/icon.icns —— 用系统默认图标（要生成：python3 tools/gen_app_icon.py）"
 fi
 
+# 随包推理引擎：用户下载即用，不需要自己跑 audiocpp_server。
+# 放 Contents/Resources/engine/（只读程序数据）；模型/日志/server.json 一律不在这里，
+# 那些是运行时数据，落用户的 Documents（见「运行时可写数据严禁落安装目录」）。
+echo "== 取随包推理引擎 =="
+ENGINE_DIR="${APP}/Contents/Resources/engine"
+case "$(uname -m)" in
+  arm64) ENGINE_PLATFORM="macos-arm64" ;;
+  x86_64) ENGINE_PLATFORM="macos-x64" ;;
+  *) echo "❌ 不支持的构建机架构：$(uname -m)" >&2; exit 1 ;;
+esac
+packaging/fetch_engine.sh "${ENGINE_DIR}" "${ENGINE_PLATFORM}"
+
 echo "== [3/6] 写 Info.plist（版本 ${VERSION} / build ${BUILD_NUMBER}）=="
 cat > "${APP}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -111,11 +126,17 @@ IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
   | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
 ENTITLEMENTS="packaging/entitlements.plist"
 [ -f "${ENTITLEMENTS}" ] || { echo "❌ 缺少 ${ENTITLEMENTS}" >&2; exit 1; }
+# 引擎是嵌套可执行文件：**必须先签它再签外层 .app**。顺序反了的话外层签名会把
+# 未签名的引擎一起封进去，公证时被判 invalid（"nested code is not signed"）。
+ENGINE_BIN="${APP}/Contents/Resources/engine/audiocpp_server"
 if [ -n "${IDENTITY}" ]; then
   codesign --force --options runtime --timestamp \
+    --entitlements "${ENTITLEMENTS}" --sign "${IDENTITY}" "${ENGINE_BIN}"
+  codesign --force --options runtime --timestamp \
     --entitlements "${ENTITLEMENTS}" --sign "${IDENTITY}" "${APP}"
-  echo "   → ${IDENTITY}（附 entitlements：disable-library-validation，见文件里的说明）"
+  echo "   → ${IDENTITY}（引擎先签、.app 后签；附 entitlements，见文件里的说明）"
 else
+  codesign --force --options runtime --entitlements "${ENTITLEMENTS}" --sign - "${ENGINE_BIN}"
   codesign --force --options runtime --entitlements "${ENTITLEMENTS}" --sign - "${APP}"
   echo "   → ad-hoc（本机可跑，但别人下载会被 Gatekeeper 拦；要分发请走 ./release.sh）"
 fi
