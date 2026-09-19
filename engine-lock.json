@@ -12,25 +12,25 @@
   "artifacts": {
     "macos-arm64": {
       "asset": "audio-v0.8.2-metalbf16-bin-macos-arm64-metal.tar.gz",
-      "sha256": "PENDING_CI",
+      "sha256": "6231af8ff44122529e0bc2dd9625ab580654515154c40f3e801bf347d5e97067",
       "binary": "audiocpp_server",
       "backend": "metal"
     },
     "macos-x64": {
       "asset": "audio-v0.8.2-metalbf16-bin-macos-x64-metal.tar.gz",
-      "sha256": "PENDING_CI",
+      "sha256": "97dad9e7e11afb4ef921f5bf793b0f1744f3de2de0068e753aa13d4386075ccd",
       "binary": "audiocpp_server",
       "backend": "metal"
     },
     "windows-x64": {
       "asset": "audio-v0.8.2-metalbf16-bin-windows-x64-cpu-portable.zip",
-      "sha256": "PENDING_CI",
+      "sha256": "691fc5cf1c6aba3300cf41e71b9827bbbe9ded0c4c08d3d7cd8f781847afcb39",
       "binary": "audiocpp_server.exe",
       "backend": "cpu"
     },
     "linux-x64": {
       "asset": "audio-v0.8.2-metalbf16-bin-ubuntu-x64-cpu-portable.tar.gz",
-      "sha256": "PENDING_CI",
+      "sha256": "f825337d4e4955ed779928999d7eacb5b00d2334fb8003b524ec96a95402f765",
       "binary": "audiocpp_server",
       "backend": "cpu"
     }
