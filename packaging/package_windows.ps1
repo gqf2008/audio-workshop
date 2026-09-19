@@ -63,13 +63,26 @@ Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $out
 Write-Host "   $out"
 
 if ($MakeInstaller) {
-    if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
-        throw "-MakeInstaller 需要 makensis（CI 里 chocolatey install nsis）"
+    # `makensis` 常常不在 PATH 上：choco 装完 shim 落在 C:\ProgramData\chocolatey\bin，
+    # 而 NSIS 本体在 Program Files (x86)\NSIS。两处都找，别只靠 Get-Command（CI 实测
+    # 装了 choco 包仍报"需要 makensis"）。
+    $mk = (Get-Command makensis -ErrorAction SilentlyContinue)?.Source
+    if (-not $mk) {
+        $candidates = @(
+            (Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"),
+            (Join-Path $env:ProgramFiles "NSIS\makensis.exe"),
+            "C:\ProgramData\chocolatey\bin\makensis.exe"
+        )
+        $mk = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     }
+    if (-not $mk) {
+        throw "-MakeInstaller 需要 makensis（CI 里 chocolatey install nsis）—— 找过 PATH 与常见安装目录"
+    }
+    Write-Host "== 打 NSIS 安装器（$mk）=="
     $v = if ($InstallerVersion) { $InstallerVersion } else { $version }
-    Write-Host "== 打 NSIS 安装器 =="
     $setup = Join-Path $Dist "$ArtifactName-$version-windows-x64-setup.exe"
-    makensis /DVERSION=$v /DSRCDIR=$Stage /DOUTFILE=$setup packaging/windows-installer.nsi
+    & $mk /DVERSION=$v /DSRCDIR=$Stage /DOUTFILE=$setup packaging/windows-installer.nsi
     if ($LASTEXITCODE -ne 0) { throw "makensis 失败" }
+    if (-not (Test-Path $setup)) { throw "makensis 报成功但没产出 $setup" }
     Write-Host "   $setup"
 }
