@@ -237,10 +237,8 @@ cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
 
 ## 装什么、怎么装
 
-| 平台 | 产物 | 引擎落点 |
-|---|---|---|
-| Windows | `AudioWorkshop-<v>-windows-x64.zip`（绿色版）+ `AudioWorkshop-<v>-windows-x64-setup.exe` | `engine\audiocpp_server.exe`（exe 同级） |
-
+产物形态见上文「各平台的产物形态」表：Windows 出
+`AudioWorkshop-<v>-windows-x64.zip`（绿色版）与 `AudioWorkshop-<v>-windows-x64-setup.exe`。
 安装器形态与 `../abb` 的 `app-assets/ABB.iss` 一致：**per-user**（`{localappdata}\Programs\AudioWorkshop`，
 免 UAC）、`PrivilegesRequired=lowest`、卸载只删自己。目录名与旧 NSIS 版相同，**升级是原地覆盖**；
 `.iss` 里额外删掉旧版的 `uninstall.exe` 与手写的卸载注册表项，免得"应用和功能"里出现两条。

@@ -119,8 +119,10 @@ if ($MakeInstaller) {
     # 图标守卫：exe 图标 / 快捷方式图标都靠 PE 资源，"没嵌上"能让整条流水线照样绿，
     # 用户看到的却是空白图标（2026-09-19 真机反馈）。有 python 就当场查一遍；
     # 没有 python 时由发布流水线里的同一命令兜底（那里的 python 一定在）。
+    # 路径里带 `\WindowsApps\` 的是"应用执行别名"的占位 exe（没装 Python 时也会命中
+    # Get-Command），拿它跑检查会报一堆无关错误、看着像产物有问题 —— 按"没有 python"处理
     $py = Get-Command python -ErrorAction SilentlyContinue
-    if ($py) {
+    if ($py -and $py.Source -notlike "*\WindowsApps\*") {
         & $py.Source tools\check_windows_icon.py (Join-Path $Stage "$BinName.exe") $setup
         if ($LASTEXITCODE -ne 0) { throw "产物没有图标资源（见上面的检查输出）" }
     } else {
