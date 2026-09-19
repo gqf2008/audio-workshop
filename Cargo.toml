@@ -53,4 +53,4 @@ strip = true
 # 统一控件描边宽度：0.2.3 增加 PixelTheme.border-width；在 crates.io 正式发布前先用
 # 固定 git rev，保证 CI 与本机拿到同一份组件实现。
 [patch.crates-io]
-slint-pixel = { git = "https://github.com/gqf2008/slint-pixel", rev = "d6fa1bbc170b55144b8f5a14e9a9edf8c15f09d8" }
+slint-pixel = { git = "https://github.com/gqf2008/slint-pixel", rev = "daffdf7bba74bbe57bdf6aec5e1f43770296c950" }

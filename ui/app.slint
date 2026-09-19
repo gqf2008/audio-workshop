@@ -373,25 +373,25 @@ export component MainWindow inherits Window {
     }
     changed theme-scheme => { PixelTheme.scheme = root.theme-scheme; }
 
-    // ═══ 根：贴窗口的 1px 纯黑描边 + 10px 圆角（与全应用细描边一致） ═══
+    // ═══ 根：贴窗口的 2px 纯黑描边 + 10px 圆角（参考 ../abb） ═══
     Rectangle {
         width: 100%;
         height: 100%;
         background: PixelTheme.bg;
-        border-width: PixelTheme.border-width;
+        border-width: 2px;
         border-color: UiTokens.window-frame;
         border-radius: 10px;
 
         VerticalLayout {
-            // 留 1px = 描边宽度：不让铺满的子元素盖掉边框
-            padding: 1px;
+            // 留 2px = 描边宽度：不让铺满的子元素盖掉边框（abb 踩过的坑）
+            padding: 2px;
             spacing: 0px;
 
-            // ── 标题栏：内圈圆角 10 − 1 = 9px ──
+            // ── 标题栏：内圈圆角 10 − 2 = 8px ──
             Rectangle { // 首屏
                 height: 34px;
-                border-top-left-radius: 9px;
-                border-top-right-radius: 9px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
                 clip: true;
 
                 PixelTitleBar {
@@ -678,17 +678,17 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // ── 状态栏：内圈圆角 10 − 1 = 9px ──
+            // ── 状态栏：内圈圆角 10 − 2 = 8px ──
             Rectangle { // 首屏
                 height: 30px;
                 background: PixelTheme.panel;
-                border-bottom-left-radius: 9px;
-                border-bottom-right-radius: 9px;
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
                 clip: true;
 
                 Rectangle {
                     x: 0px; y: 0px;
-                    width: 100%; height: PixelTheme.border-width;
+                    width: 100%; height: 2px;
                     background: PixelTheme.edge;
                 }
                 HorizontalLayout {
@@ -812,7 +812,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Rectangle { height: PixelTheme.border-width; background: PixelTheme.edge; }
+                Rectangle { height: 2px; background: PixelTheme.edge; }
 
                 WorkbenchDrawer {
                     vertical-stretch: 1;
@@ -907,7 +907,7 @@ export component MainWindow inherits Window {
                 }
             }
 
-            Rectangle { height: PixelTheme.border-width; background: PixelTheme.edge; }
+            Rectangle { height: 2px; background: PixelTheme.edge; }
 
             if root.task-rows.length == 0 : Text {
                 text: "还没有任务。任一 Tab 发起生成后，这里会显示进度；切 Tab 不会取消任务。";
@@ -1055,7 +1055,7 @@ export component MainWindow inherits Window {
                 }
             }
 
-            Rectangle { height: PixelTheme.border-width; background: PixelTheme.edge; }
+            Rectangle { height: 2px; background: PixelTheme.edge; }
 
             Text {
                 text: root.batch-summary;
