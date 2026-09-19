@@ -105,14 +105,23 @@ jobs:
             ~/.cargo/git
             target
           key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
-      # NSIS 出安装器；zip 形态也保留（免安装/绿色版）
-      - name: 安装 NSIS
-        run: choco install nsis --no-progress -y
+      # Inno Setup 出安装器（与 ../abb 同一套做法）；zip 形态也保留（免安装/绿色版）。
+      # 中文消息文件由 package_windows.ps1 在缺失时补（choco 的 innosetup 包有时不带）。
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
       - name: 打包（zip + 安装器）
         shell: pwsh
         run: |
           chcp 65001 | Out-Null
           packaging/package_windows.ps1 -MakeInstaller
+      # 图标守卫：exe 图标 / 桌面快捷方式图标都来自 PE 资源与安装器的 SetupIconFile，
+      # "没嵌上"不会让任何构建步骤失败（用户看到的却是空白图标）。这里对**真产物**断言。
+      # 与 package_windows.ps1 里那条同一命令，这里再跑一次是因为流水线产出的才是发布件。
+      - name: 校验产物带图标资源
+        run: |
+          $exe = "dist/windows-x64/audio-workshop.exe"
+          $setup = (Get-ChildItem dist/AudioWorkshop-*-windows-x64-setup.exe | Select-Object -First 1).FullName
+          python tools/check_windows_icon.py $exe $setup
       - uses: actions/upload-artifact@v4
         with:
           name: AudioWorkshop-windows-x64

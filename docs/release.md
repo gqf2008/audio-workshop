@@ -175,7 +175,7 @@ bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文�
 | 平台 | 产物 | 引擎落点 |
 |---|---|---|
 | macOS | `AudioWorkshop-<v>.dmg` | `<App>.app/Contents/Resources/engine/audiocpp_server` |
-| Windows | `...-windows-x64.zip` + `...-setup.exe`（per-user NSIS，免 UAC） | `engine\audiocpp_server.exe`（exe 同级） |
+| Windows | `...-windows-x64.zip` + `...-windows-x64-setup.exe`（per-user Inno Setup，免 UAC） | `engine\audiocpp_server.exe`（exe 同级） |
 | Linux | `...-linux-x64.tar.gz` | `engine/audiocpp_server`（exe 同级） |
 
 ## 两个必须记住的前提
@@ -220,3 +220,64 @@ cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
    P1 用 Job Object 补。
 4. **`LSMinimumSystemVersion` 跟引擎走**：上游产物的 `minos` 实测 13.3，比壳自己需要的
    12.0 高，所以取 13.3；改了引擎要同步核 `otool -l` 的 `LC_BUILD_VERSION`。
+
+---
+
+# Windows 包（Inno Setup，2026-09-19 真机反馈后重做）
+
+`v0.1.3` 的 Windows 安装包在真机上暴露了五个问题，逐条对应的修法如下（都在本仓库内）：
+
+| 真机现象 | 根因 | 修法 |
+|---|---|---|
+| 启动多一个控制台黑窗 | 二进制是 console 子系统 | `src/main.rs` 的 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（debug 保留控制台，否则 `cargo test` 输出会被吞） |
+| 应用没有图标 | exe 里没有 PE 图标资源（资源管理器/任务栏只看这个） | `build.rs` 用 embed-resource 把 `assets/icon.ico` 编进资源段 |
+| 桌面图标也没有 | 快捷方式没指定图标（旧 NSIS 脚本没写 `IconFile`） | `.iss` 的 `SetupIconFile` + `[Icons].IconFilename` + 图标随包装一份 |
+| 中文乱码 | `.nsi` 是不带 BOM 的 UTF-8，makensis 按系统 ANSI（中文 Windows = GBK）解释源码 | 换 Inno Setup 6 —— `.iss` 默认按 UTF-8 读（BOM 可有可无）；本文件内的中文写坏就会立刻看出来 |
+| 下载模型界面卡死 | ① 每读一跳就推一条进度并重建整张下载表（实测本地 4 MiB 就 512 条）；② 每次重建都在 UI 线程 spawn 一个 `powershell` 查物理内存 | ① `download::PROGRESS_INTERVAL`（100 ms）节流，状态变化不节流；② `model_sources::physical_memory_bytes()` 进程内只探一次 + `CREATE_NO_WINDOW`（GUI 子系统下不会再闪黑窗） |
+
+## 装什么、怎么装
+
+| 平台 | 产物 | 引擎落点 |
+|---|---|---|
+| Windows | `AudioWorkshop-<v>-windows-x64.zip`（绿色版）+ `AudioWorkshop-<v>-windows-x64-setup.exe` | `engine\audiocpp_server.exe`（exe 同级） |
+
+安装器形态与 `../abb` 的 `app-assets/ABB.iss` 一致：**per-user**（`{localappdata}\Programs\AudioWorkshop`，
+免 UAC）、`PrivilegesRequired=lowest`、卸载只删自己。目录名与旧 NSIS 版相同，**升级是原地覆盖**；
+`.iss` 里额外删掉旧版的 `uninstall.exe` 与手写的卸载注册表项，免得"应用和功能"里出现两条。
+
+```powershell
+# 本机（Windows）打包
+pwsh -File packaging/package_windows.ps1 -MakeInstaller   # 需要 ISCC.exe（choco install innosetup）
+```
+
+`packaging/windows-installer.iss` 的四个变量都由脚本用 `/D` 传入（`MyAppVersion` / `SourceDir` /
+`IconFile` / `OutDir`，一律绝对路径），文件里的 `#ifndef` 默认值只给手工跑留。
+
+## 三条守卫（都能红，别删）
+
+1. **图标真的嵌进 PE 了吗** —— `python tools/check_windows_icon.py <exe> [<setup.exe>]`。
+   `release.yml` 的 Windows 任务与 `package_windows.ps1` 都会跑；直接读 PE 资源目录，
+   不看"能不能提取出图标"（`ExtractAssociatedIcon` 在没图标时会返回系统默认图标，那是假绿）。
+   2026-09-19 本机实测：带图标的 PE → `RT_ICON ×7、RT_GROUP_ICON ×1`；不带的 → 红。
+2. **`.iss` 必须是 UTF-8** —— `file packaging/windows-installer.iss` 期望 `UTF-8 Unicode text`。
+   存成 GBK 会让中文应用名/快捷方式名又变乱码（旧 NSIS 版就是这么坏的）。
+3. **嵌不进去必须红** —— `build.rs` 的 `embed_windows_icon` 用的是
+   `manifest_required()`（不是 `manifest_optional()`）：找不到资源编译器时直接编译失败。
+   2026-09-19 实测（`RC=/nonexistent/rc.exe cargo build --target x86_64-pc-windows-gnu`）：
+   `嵌入 Windows 图标资源失败（compilation not attempted: Couldn't execute /nonexistent/rc.exe）`，
+   退出码 101。改成 optional 就会静默产出没图标的包 —— 那正是用户抱怨的那个包。
+
+`tools/check_windows_icon.py` 自带阳性/阴性对照：`tools/tests/test_check_windows_icon.py` 用本机
+mingw-w64 真编两个 PE（一个带图标、一个不带），前者必须过、后者必须红；没有 mingw 的机器会打印
+原因后跳过（发布流水线对真产物跑同一条命令，那里是硬失败的步骤）。
+
+## 必须知道的代价
+
+- **release 版没有控制台，诊断也写不出去**：`eprintln!` 的引擎启动/自愈信息在 GUI 子系统下会被
+  丢弃（std 把 Windows 的 `ERROR_INVALID_HANDLE` 当"丢弃"处理，不会 panic）。用户可见的状态在
+  状态栏与 `/health`；要诊断就在 Windows 上跑 `cargo run`（debug，带控制台）。
+- **macOS/Linux 的构建也多编一个 build-dep**（embed-resource）。理由：`embed_resource::` 必须能在
+  build.rs 里写出来，而"要不要资源"是**目标**属性，运行时按 `CARGO_CFG_TARGET_OS` 判。
+- **Windows CI 需联网补语言文件**：choco 的 innosetup 包偶尔缺
+  `Languages\ChineseSimplified.isl`，`package_windows.ps1` 会从 `jrsoftware/issrc` 取一份；
+  取不到就按编译失败处理（不静默降级成英文向导）。
