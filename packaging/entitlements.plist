@@ -1,20 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  为什么需要 disable-library-validation：
+  为什么保留 disable-library-validation（防御性，当前发布包用不到）：
 
-  人声分离走 ort → ONNX Runtime，而本机（以及 homebrew 的封装）给的是**动态库**
-  libonnxruntime.1.dylib。开了 hardened runtime 之后，macOS 会拒绝加载「不是本 Team ID
-  签的」库 —— 实测启动直接死：
+  人声分离走 ort → ONNX Runtime。**动态链接泄漏时期**（把 homebrew 的 libonnxruntime.1.dylib
+  链进发布包）开了 hardened runtime 后，macOS 会拒绝加载「不是本 Team ID 签的」库，打包后
+  启动即死：
 
     dyld: Library not loaded: /opt/homebrew/opt/onnxruntime/lib/libonnxruntime.1.dylib
     Reason: mapping process and mapped file (non-platform) have different Team IDs
 
-  （debug 版没签名所以一直没暴露；只有打包成 .app 才会撞上。）
-
-  另一条路是把 libonnxruntime 连同它依赖的 ~90 个 homebrew dylib 一起塞进 .app 并逐个
-  re-sign —— 复杂度高、升级 onnxruntime 就要重来一遍，暂不做。先用 Apple 给这个场景的
-  正规 entitlement，并在文档里如实写明「需要本机有 onnxruntime」这个前提。
+  这个前提已不存在：package.sh 强制 LIBONNXRUNTIME_NO_PKG_CONFIG=1 静态链接 ONNX Runtime，
+  并用 otool 硬门禁（出现任何非系统库直接红；CI 的 macOS job 对 .app 内两个二进制同样断言），
+  目标机**不需要**安装 onnxruntime（不用 brew install，也没有那 ~90 个 homebrew dylib）。
+  这条 entitlement 仍保留作防御：将来若有库重新走动态链接、或要加载非本 Team ID 签名的
+  插件，不至于再变成「只在用户机器上 dyld 报错」。历史与验收见 docs/release.md 的
+  「两个容易踩的点」。
 -->
 <plist version="1.0">
 <dict>
