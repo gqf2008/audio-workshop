@@ -102,11 +102,16 @@ pub struct Package {
     pub files: Vec<PackageFile>,
 }
 
+/// 文件级 `sha256` 也在清单里，应用真的会读它（内置清单侧的校验兜底，见 `action_for`）。
+/// 本模块的约定仍是只声明"应用真的会读"的字段（serde 忽略其余）；`bytes` / `remote_path`
+/// 等是生成脚本离线重生成时自己要沿用的，应用不读。
 #[derive(Debug, Clone, serde::Deserialize)]
-/// 文件级 `bytes` 也在清单里（生成脚本离线沿用它），但**应用只读包级 `bytes`**——本模块
-/// 的约定是只声明"应用真的会读"的字段，serde 忽略其余。
 pub struct PackageFile {
     pub url: Option<String>,
+    /// 上游 LFS 真 sha256（生成脚本 `--fetch-hashes` 从 HF tree API 的 `lfs.oid` 取到；
+    /// 取不到是 null）。**只描述这个 `url` 指向的那份文件**。
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// 内置清单。`Err` = **内置文件本身坏了**（读不出来），不是"这个模型没有下载源"——
@@ -623,12 +628,14 @@ pub fn plan_rows(
                         let dest = model_dir.join(&pkg.local_paths[0]);
                         Row {
                             id: m.id.clone(),
-                            // 服务清单里没有这个模型 → 没有服务侧校验信息可谈（空条目）
+                            // 服务清单里没有这个模型 → 服务侧校验信息没得谈（空条目）；
+                            // sha256 由内置清单 per-file 兜底
                             action: Some(action_for(
                                 &ServerEntry::default(),
                                 url,
                                 dest,
                                 Origin::Builtin,
+                                pkg.files[0].sha256.as_deref(),
                                 model_dir,
                             )),
                             reason: String::new(),
@@ -669,11 +676,13 @@ fn server_action(s: &ServerEntry, cat: Option<&CatalogModel>, model_dir: &Path) 
     if !url.is_empty() {
         let rel = builtin_rel(cat).unwrap_or_else(|| declared_rel(&s.path, &s.id, url, model_dir));
         let dest = model_dir.join(rel);
+        let builtin_sha = usable_builtin_package(cat).and_then(|p| p.files[0].sha256.as_deref());
         return Some(action_for(
             s,
             url.to_string(),
             dest,
             Origin::Server,
+            builtin_sha,
             model_dir,
         ));
     }
@@ -681,26 +690,43 @@ fn server_action(s: &ServerEntry, cat: Option<&CatalogModel>, model_dir: &Path) 
     let rel = &pkg.local_paths[0];
     let url = pkg.files[0].url.clone()?;
     let dest = model_dir.join(rel);
-    Some(action_for(s, url, dest, Origin::Builtin, model_dir))
+    Some(action_for(
+        s,
+        url,
+        dest,
+        Origin::Builtin,
+        pkg.files[0].sha256.as_deref(),
+        model_dir,
+    ))
 }
 
 /// 组装一条下载入口——**唯一一处**（两个分支共用，免得"服务侧校验信息"在其中一条上漂掉）。
 ///
 /// 口径是**按字段**回落，不是"要么全用服务、要么全用内置"：
-/// `url` 由调用方决定（服务清单有就用服务的），但 `sha256` / `size` **只要服务清单写了就用
-/// 服务侧的**——内置清单里根本没有这两个字段可打（生成不联网），所以服务侧有就该用；
-/// 丢掉它等于把校验静默降级成"只对长度"。
+/// `url` 由调用方决定（服务清单有就用服务的）；`sha256` 服务清单写了就用服务侧的，没写就
+/// 用内置清单 per-file 的（生成脚本 `--fetch-hashes` 从 HF tree API 的 `lfs.oid` 取到，
+/// 描述的就是内置清单那条 url 指向的文件）；两者都没有 → `None`（只按大小校验，界面会如实说）。
+/// `size` 仍只认服务侧：内置清单的包级体积是**估算口径**，不做校验依据。
 fn action_for(
     s: &ServerEntry,
     url: String,
     dest: PathBuf,
     origin: Origin,
+    builtin_sha: Option<&str>,
     model_dir: &Path,
 ) -> Action {
-    let sha = s.sha256.trim();
+    let server_sha = s.sha256.trim();
+    let sha = if !server_sha.is_empty() {
+        Some(server_sha.to_string())
+    } else {
+        builtin_sha
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string)
+    };
     Action {
         url,
-        sha256: (!sha.is_empty()).then(|| sha.to_string()),
+        sha256: sha,
         size: s.size,
         conflict: conflict_note(&s.path, &dest, model_dir),
         dest,
@@ -834,6 +860,10 @@ mod tests {
     }
 
     fn pkg(local: &str, url: &str) -> Package {
+        pkg_sha(local, url, None)
+    }
+
+    fn pkg_sha(local: &str, url: &str, sha256: Option<&str>) -> Package {
         Package {
             id: format!("pkg-{local}"),
             precision: "q8_0".into(),
@@ -844,6 +874,7 @@ mod tests {
             gated: false,
             files: vec![PackageFile {
                 url: Some(url.into()),
+                sha256: sha256.map(str::to_string),
             }],
         }
     }
@@ -866,6 +897,7 @@ mod tests {
                 gated: false,
                 files: vec![PackageFile {
                     url: Some(format!("https://example.com/{dir}/{precision}.gguf")),
+                    sha256: None,
                 }],
             })
             .collect();
@@ -1090,6 +1122,7 @@ mod tests {
     ///
     /// 复核给的原始反例（这两个字段曾在内置分支被硬写成 `None`）：服务端声明的校验信息
     /// 被静默丢掉，等于把校验降级成"只对长度"——`server.json` 是服务方写的，它说了算。
+    /// 现在内置清单也有 per-file sha256（①：两边都有时仍以服务侧为准，内置值不覆盖服务侧）。
     #[test]
     fn server_side_checksum_and_size_are_kept_when_the_url_comes_from_the_builtin_catalog() {
         let catalog = Catalog {
@@ -1097,7 +1130,11 @@ mod tests {
                 "m",
                 "downloadable",
                 "",
-                Some(pkg("M-GGUF/m.gguf", "https://builtin.example/m.gguf")),
+                Some(pkg_sha(
+                    "M-GGUF/m.gguf",
+                    "https://builtin.example/m.gguf",
+                    Some("builtinfilehash"),
+                )),
             )],
         };
         let mut s = entry("m", "", "/models/M-GGUF/m.gguf");
@@ -1110,13 +1147,64 @@ mod tests {
         assert_eq!(
             a.sha256.as_deref(),
             Some("deadbeef"),
-            "服务侧 sha256 不能被丢掉"
+            "服务侧 sha256 不能被丢掉，也不能被内置清单的 builtinfilehash 覆盖"
         );
         assert_eq!(a.size, Some(123), "服务侧 size 不能被丢掉");
     }
 
+    /// ②：服务侧 sha256 为空 → 用内置清单 per-file 的 sha256（不是 None）——
+    /// 校验不能静默退化成"只对长度"。
+    #[test]
+    fn builtin_file_sha256_is_the_fallback_when_the_server_writes_none() {
+        let builtin_sha = "a".repeat(64);
+        let catalog = Catalog {
+            models: vec![cat_model(
+                "m",
+                "downloadable",
+                "",
+                Some(pkg_sha(
+                    "M-GGUF/m.gguf",
+                    "https://builtin.example/m.gguf",
+                    Some(builtin_sha.as_str()),
+                )),
+            )],
+        };
+        let rows = plan_rows(
+            &[entry("m", "", "/models/M-GGUF/m.gguf")],
+            Ok(&catalog),
+            Path::new("/models"),
+        );
+        let a = rows[0].action.as_ref().expect("内置清单有就该有入口");
+        assert_eq!(a.origin, Origin::Builtin);
+        assert_eq!(
+            a.sha256.as_deref(),
+            Some(builtin_sha.as_str()),
+            "服务侧没写 sha256 时必须用内置清单 per-file 的值兜底"
+        );
+    }
+
+    /// ③：两边都没有 sha256 → `None`（只按大小校验，行为与之前一致）。
+    #[test]
+    fn no_sha256_on_either_side_yields_none_size_only_check() {
+        let catalog = Catalog {
+            models: vec![cat_model(
+                "m",
+                "downloadable",
+                "",
+                Some(pkg("M-GGUF/m.gguf", "https://builtin.example/m.gguf")),
+            )],
+        };
+        let mut s = entry("m", "", "/models/M-GGUF/m.gguf");
+        s.size = Some(9); // 大小校验依据还在，只是没有哈希
+        let rows = plan_rows(&[s], Ok(&catalog), Path::new("/models"));
+        let a = rows[0].action.as_ref().expect("内置清单有就该有入口");
+        assert_eq!(a.sha256, None, "两边都没有哈希就该如实 None");
+        assert_eq!(a.size, Some(9));
+    }
+
     /// 三个字段**各自**独立回落（不搞"要么全用服务、要么全用内置"）：
-    /// url 有服务侧的用服务侧的，没有才用内置；sha256 / size 各自"服务侧非空即用"。
+    /// url 有服务侧的用服务侧的，没有才用内置；sha256 / size 各自"服务侧非空即用"，
+    /// sha256 服务侧为空时用内置 per-file 的兜底。
     #[test]
     fn url_checksum_and_size_fall_back_field_by_field() {
         const BUILTIN: &str = "https://builtin.example/m.gguf";
@@ -1125,7 +1213,7 @@ mod tests {
                 "m",
                 "downloadable",
                 "",
-                Some(pkg("M-GGUF/m.gguf", BUILTIN)),
+                Some(pkg_sha("M-GGUF/m.gguf", BUILTIN, Some("builtinsha"))),
             )],
         };
         /// 服务清单侧给了什么、期望最终算出什么（字段名写清楚，别用嵌套元组——
@@ -1157,22 +1245,22 @@ mod tests {
                 want_sha256: Some("cafe"),
                 want_size: Some(9),
             },
-            // 服务什么都没给：全用内置（内置没有校验信息 → None）
+            // 服务什么都没给：url 用内置，sha256 用内置 per-file 的兜底
             Case {
                 server_url: "",
                 server_sha256: "",
                 server_size: None,
                 want_url: BUILTIN,
-                want_sha256: None,
+                want_sha256: Some("builtinsha"),
                 want_size: None,
             },
-            // 服务只给了 size：size 用服务，sha 仍然是 None（不能凭 size 编一个 sha）
+            // 服务只给了 size：size 用服务，sha256 仍用内置（不因服务侧空而退成 None）
             Case {
                 server_url: "",
                 server_sha256: "",
                 server_size: Some(7),
                 want_url: BUILTIN,
-                want_sha256: None,
+                want_sha256: Some("builtinsha"),
                 want_size: Some(7),
             },
         ];
@@ -1347,6 +1435,25 @@ mod tests {
             );
             assert!(pkg.files.len() == 1, "{}：本批只给单文件包下载入口", m.id);
         }
+
+        // 本批验收点：真实清单的 9 条下载入口全部带 per-file sha256（64 位十六进制）——
+        // 缺失 = 那条下载会静默退化成"只对长度"（同大小的旧权重查不出来）。
+        let entries: Vec<&Package> = c.models.iter().filter_map(|m| m.entry.as_ref()).collect();
+        assert_eq!(entries.len(), 9, "随包清单的下载入口数量变了，同步本用例");
+        for pkg in entries {
+            let sha = pkg.files[0].sha256.as_deref().unwrap_or("");
+            assert_eq!(
+                sha.len(),
+                64,
+                "{}：per-file sha256 缺失或不是 64 位",
+                pkg.id
+            );
+            assert!(
+                sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}：sha256 必须是十六进制：{sha}",
+                pkg.id
+            );
+        }
     }
 
     /// 真实 14 个产品模型的规划结果：**9 个有入口、5 个如实标没有源**。
@@ -1401,6 +1508,13 @@ mod tests {
                 "yue2",
             ],
             "5 个如实标没有源"
+        );
+        // 9 条入口都必须带 sha256（内置清单 per-file 兜底）——没带的那条会静默退化成只对长度
+        assert!(
+            rows.iter()
+                .filter(|r| r.action.is_some())
+                .all(|r| r.action.as_ref().is_some_and(|a| a.sha256.is_some())),
+            "9 条下载入口都必须带 sha256"
         );
     }
 
@@ -1609,9 +1723,11 @@ mod tests {
         multi.files = vec![
             PackageFile {
                 url: Some("https://example.com/a.json".into()),
+                sha256: None,
             },
             PackageFile {
                 url: Some("https://example.com/b.safetensors".into()),
+                sha256: None,
             },
         ];
         model.packages.push(multi);
