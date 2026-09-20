@@ -52,6 +52,10 @@ VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 [ -n "${VERSION}" ] || { echo "❌ 读不到 Cargo.toml 里的 version" >&2; exit 1; }
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
 
+# 许可门禁：LICENSE 全文到位、且与各 Cargo.toml 的 license 元数据一致（缺失/不一致即红）。
+# 放在构建前：许可不对就不该产出可分发的包，别等打完 DMG 才发现。
+packaging/check_license.sh
+
 echo "== [1/6] release 构建（静态 ONNX Runtime，见文件头说明）=="
 LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo build --release --bin "${BIN_NAME}"
 # 用 cargo 自己报的 target 目录，不靠猜：CARGO_TARGET_DIR 与 .cargo/config.toml 都会影响它

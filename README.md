@@ -135,6 +135,22 @@ cargo test -p aw-core -- --ignored  # 需要本机服务在线的真实 e2e
 （`AW_UI_STATE` 的演示态全是 `#[cfg(debug_assertions)]` 门控的；反过来 debug 版里这条
 grep 应该 > 0 —— 否则说明这条检查没有鉴别力。）
 
+## 许可 / License
+
+**本仓库（自研层）全仓统一 [Apache-2.0](LICENSE)**，SPDX 标识 `Apache-2.0`，与上游
+[audio.cpp](https://github.com/0xShug0/audio.cpp) 一致（定稿依据见 [CHARTER.md](CHARTER.md) §11）。
+许可证全文见仓库根 [`LICENSE`](LICENSE)；根 crate 与每个 workspace member（当前 `crates/aw-core`）
+的 `Cargo.toml` `license` 字段、本小节、CHARTER §11 口径一致。发版脚本
+（`release.sh` / `package.sh` → [`packaging/check_license.sh`](packaging/check_license.sh)）
+断言「LICENSE 存在且与 Cargo.toml 元数据一致」，**缺失或不一致即失败**。
+
+适用范围：仓库内自研内容——`src/`、`ui/`、`crates/`、`tools/`、`config/`、`packaging/`、
+`tests/`、文档与脚本。以下两类第三方内容**不在**本许可的授权范围内：
+
+- 随包推理引擎 `audiocpp_server`：来自上游 audio.cpp（Apache-2.0），按 `engine-lock.json`
+  取件的预编译产物，其许可以上游为准；
+- 模型权重：**不随发行版分发**，属另一件事，见下面「许可红线」。
+
 ## 许可红线
 
 **只做模型下载器，不打包权重。** 部分模型（如非商用许可）不能随发行版分发——这是产品形态的硬约束，见 CHARTER 第 5 节。
