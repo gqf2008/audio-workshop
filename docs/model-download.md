@@ -29,19 +29,22 @@
 `config/model-downloads.json`：
 
 ```sh
-python3 tools/gen_model_downloads.py                 # 离线生成：体积沿用盘上已有的值
+python3 tools/gen_model_downloads.py                 # 离线生成：体积/哈希沿用盘上已有的值
 python3 tools/gen_model_downloads.py --fetch-sizes   # 联网补体积后生成
+python3 tools/gen_model_downloads.py --fetch-hashes  # 联网补哈希后生成
+python3 tools/gen_model_downloads.py --fetch-hashes --fetch-sizes
 python3 tools/gen_model_downloads.py --check         # 与上游比对，不一致退出 1（不联网）
 ```
 
-- **默认离线**：`sha256` 一律留空（生成不下载权重、不算哈希）；每个文件的 `bytes`
-  **沿用盘上清单里已有的值**（按 URL 对齐），没有就 `null`——不填 0、不拿别的档推算。
-  跑完会打印"这次没联网，N 条沿用清单里已有的值"。
+- **默认离线**：`sha256` / `bytes` 都**沿用盘上清单里已有的值**（按 URL 对齐），没有就
+  `null`——不填 0、不算哈希、不拿别的档推算。跑完会打印"这次没联网，N 条沿用清单里已有的值"。
 - `--fetch-sizes` 联网对每个文件发 `HTTP HEAD`，把**最终落点**的 `Content-Length` 写进
   `files[].bytes`；包级 `packages[].bytes` 是文件之和，**任一文件未知就是 `null`**。
-- `--check` 与 `--fetch-sizes` 互斥（校验不联网）。
+- `--fetch-hashes` 联网对每个 `huggingface_snapshot` 文件查 HF tree API（见 §1.3），把
+  LFS 真 sha256 写进 `files[].sha256`；可与 `--fetch-sizes` 组合。
+- `--check` 与 `--fetch-sizes` / `--fetch-hashes` 互斥（校验不联网）。
 - **逐字节稳定**：固定键序 + 固定缩进 + 行尾换行；同一份输入跑两次 `diff` 为空。
-  实测：联网跑两次产物逐字节相同；离线就地重生成与联网产物**逐字节相同**（体积沿用了回来）。
+  实测：联网跑两次产物逐字节相同；离线就地重生成与联网产物**逐字节相同**（体积/哈希沿用了回来）。
 
 ### 1.2 映射规则：**按落点，不按 family**
 
@@ -68,7 +71,7 @@ python3 tools/gen_model_downloads.py --check         # 与上游比对，不一�
 - 匹配不上 / 上游包没有公开下载源（`kind: unsupported`，如 `audio8-asr` 是
   CC-BY-NC-4.0 需本地转换）→ `status = "no-source"`，界面显示原因，**不猜地址**。
 
-### 1.3 体积（`bytes`）是怎么取的
+### 1.3 体积与哈希（`bytes` / `sha256`）是怎么取的
 
 **只认最终 2xx 那一跳的头。** HF 的 `/resolve/` 端点先回 302，那一跳的 `content-length`
 是**跳转响应体**的长度（实测 1038 B）——照着"HEAD 一下取 Content-Length"写，每个模型的
@@ -79,6 +82,19 @@ python3 tools/gen_model_downloads.py --check         # 与上游比对，不一�
 取不到（404 / 401 / 没有 `Content-Length` / 超时 / 跳转成环）一律写 `null` 并把原因打到
 stderr，**不填 0、不拿别的档累加、不猜**。不可下载的包（gated / 上游不支持）**根本不去探**：
 gated 仓库匿名 HEAD 必然 401，白跑一趟还会在日志里制造"取体积失败"的噪音。
+
+**哈希（`sha256`）**：`--fetch-hashes` 对每个 `huggingface_snapshot` 文件查 HF tree API
+（`GET https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=1`），按 `path`
+对齐取 `lfs.oid`——那是 LFS 真 sha256（64 位十六进制）。非 LFS 文件（存在 git 里的小文件）
+只有 git blob 的 sha1（40 位），**不是权重哈希**，不许拿来冒充；取不到（HTTP 错误 /
+树里没有这个路径 / 非 LFS / LFS 条目缺 oid）一律写 `null` 并把原因打到 stderr，
+不拿别的档推算、不算本地文件。`modelscope_snapshot` 不取哈希（没有 LFS oid 概念），
+同样写 `null` 并说明原因。同一 `(repo, revision)` 一次生成只请求一次（进程内缓存，含失败）。
+默认离线时 `sha256` 与 `bytes` 一样**沿用盘上清单里已有的值**（按 URL 对齐）。
+
+**为什么必须哈希**（`LESSON_同名同大小的模型权重可能是旧版本须比对上游哈希`）：
+上游 HF repo 整体重传时新旧文件**字节数完全相同**、只有 sha256 不同——"大小对得上"完全不能
+证明是同一版本，被替换/投毒也无法检出。所以哈希是校验口径，大小只是辅助。
 
 **辅助权重**（`session_options`，如 `qwen3_asr.forced_aligner_model_path`）也会折成
 `aux_bytes` + `aux_files`：它们常常是**另一个 family** 的包，按落点在全部 spec 里反查
@@ -152,7 +168,8 @@ P7 给每个模型加了三个可选字段：
 ```
 
 - **`url` 缺失**：退到内置下载清单；内置清单也没有 → 该行显示「没有下载源」+ 原因，**不给按钮**。
-- **`sha256` 缺失**：退化成按大小校验（见 §3）。
+- **`sha256` 缺失**：回落到内置清单 per-file 的 sha256（就是这条 url 指向文件的上游 LFS
+  哈希）；两边都没有 → 退化成按大小校验（见 §3），行的 `detail` 里会如实带「仅校验大小」。
 - **`size` 缺失**：按响应的 `Content-Length` 校验。
 
 ## 2. 下载到哪 + 落点校验
@@ -197,6 +214,10 @@ P7 给每个模型加了三个可选字段：
 
 `path` 指目录（gen 类模型，如 `Stable-Audio-3-Small-Music-GGUF`）时，文件落在这个目录里
 **不算冲突**。没写 `path` 就没有可比的声明，不报。
+
+没有 sha256 的入口（服务侧没写、内置清单也没取到）会在行的 `detail` 里如实带
+「仅校验大小」——不许假装有哈希。真实清单重生成后 9 条入口都带哈希，这条基本不可达；
+留着是给"服务侧给了 url、两边都没 sha"的兜底形态一个诚实的说法。
 
 > 注意：下载只是把权重放到模型目录。要让 `audiocpp_server` 加载它，清单里的 `path` 得指向这个文件
 > （或服务侧重新扫描）；本批不做"下载完自动改服务清单"。
@@ -305,6 +326,9 @@ P7 给每个模型加了三个可选字段：
   不能填 0 / 404 与 401 如实报状态 / 超时要报超时；另有 `package_bytes` 任一文件未知即 `null`、
   `aux_local_path` 的三类落点、`read_existing_sizes` 覆盖 `packages[].files` 与 `aux_files`，
   以及"离线重生成与盘上逐字节一致"的端到端用例。
+  哈希解析（离线纯函数，三种夹具）：LFS 条目取 `lfs.oid`（**不是**外层 git blob 的 sha1）/
+  非 LFS 条目如实 None + 原因 / LFS 条目缺 oid 如实 None + 原因；tree 按 `path` 对齐、
+  找不到路径如实报；`read_existing_hashes` 按 URL 对齐只收非空 sha256。
   跑法：`python3 tools/tests/test_gen_model_downloads.py`。
 - 档位与推荐（`src/model_sources.rs`）：估算公式**逐位复现三个真机 503 数字**；多档取预算内
   最大档、不是入口档时点明按钮取哪档；全都装不下 / 体积未知 / 内存未知 / 只有一档各有用例，
@@ -315,6 +339,9 @@ P7 给每个模型加了三个可选字段：
   **服务清单带 url 时以服务为准**、**gated / 没有源不给入口**、**内置清单读不出来 ≠ 没有源**、
   **映射歧义**（同一个 `audio8_tts` family 下 0.6B 有包、0.1B 没有；`index_tts2` 选 2.5 而非
   2.0；`qwen3_asr` 选 0.6B 而非 1.7B；`stable_audio` 选 small-music 而非 medium）。
+  sha256 字段级回落三条各有用例：①服务侧有 sha 用之（内置值不覆盖）；②服务侧为空用内置
+  per-file 的兜底；③两边都没有 → `None`（只按大小校验，行为不变）；打进二进制的那份真实
+  清单在用例里钉住"9 条入口全部带 64 位十六进制 per-file sha256"。
   另有落点校验（清单 path 在模型目录外 → 报冲突；path 指目录 → 不报）。
   默认模型目录推导（`model_root_from_paths`）另有 5 条用例：多条 / 单条 / 空 / 相对路径 / 跨根，
   外加"显式设置优先"一条；跨卷那条注入假 volume（一台机器上造不出第二个文件系统）。
@@ -332,8 +359,8 @@ P7 给每个模型加了三个可选字段：
   按推荐档装需要用户自己把清单 `path` 指过去（见 §1.4 末）。
 - **只给单文件包下载入口**：多文件包（safetensors 等）不在本批范围，所以它们也不进档位列表。
 - **下载完自动改服务清单 / 重启服务**：下载只是把文件放到模型目录（见 §2 的落点校验）。
-- `size` / `sha256` 内置清单里**没有**（生成不联网），所以校验退化成按 `Content-Length` 核大小；
-  要强校验只能由 `server.json` 显式给 `sha256`。
+- 内置清单的包级 `bytes` **不参与校验**（那是界面估算口径）；没给 sha256 的条目按服务侧
+  `size` 或响应 `Content-Length` 核大小。
 - **多源竞速 / 自动测速选源**：只做"用户指定一个镜像前缀"，不做自动挑源。
 - 断点下载没有"定时重试 / 弱网重试"。
 - **下载完自动改服务清单 / 重启服务**。
