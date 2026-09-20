@@ -194,16 +194,43 @@ bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文�
 # 1) 本地（macOS）：打包 + 签名 + 公证 + 装订
 ./release.sh                       # 引擎已随包；公证 profile: audio-workshop-notary
 
-# 2) 三平台构建 + 打包（CI，dry-run 不带发布）
-gh workflow run release --repo gqf2008/audio-workshop --ref main -f publish=false
+# 2) 改版本号并让锁文件跟上（改了版本号必须重编一次）
+#    Cargo.toml: version = "X.Y.Z" → cargo build --release → 提交推 main
 
-# 3) 打 tag → 触发正式发布（会创建 GitHub Release 并附三平台产物）
+# 3) 打 tag → 触发正式发布（CI 建三平台产物并创建 Release）
 git tag -a vX.Y.Z -m "音频作坊 vX.Y.Z"
 git push github vX.Y.Z
 
-# 4) 核实"检查更新"链路
+# 4) **把 Release 里的 macOS 资产换成上一步本地公证过的那份**（CI 那份是 ad-hoc）
+gh release upload vX.Y.Z dist/AudioWorkshop-X.Y.Z.dmg --clobber \
+  --repo gqf2008/audio-workshop
+
+# 5) 核实"检查更新"链路（会真打 GitHub API，输出里应能看到新 tag 与 sha256/size）
 cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
 ```
+
+### 为什么第 4 步不能省：CI 的 macOS 产物**没有签名**
+
+CI 的 macOS job 只跑 `./package.sh`，而签名身份与公证凭据都是机器级的秘密（Keychain 里、
+不在 CI）——所以那边出的是 **ad-hoc 签名**的 DMG，`gh release download` 下来实测：
+
+```
+spctl -a -t open --context context:primary-signature -v AudioWorkshop-X.Y.Z.dmg
+→ rejected / source=no usable signature
+```
+
+用户拿到的就是 Gatekeeper 直接拦下的包。`gh release upload --clobber` 用本地
+`./release.sh` 的产物（已签名 + 公证 + 装订）覆盖同一个资产名即可，覆盖后复查：
+
+```sh
+gh release download vX.Y.Z -p "*.dmg" -D /tmp/rel -R gqf2008/audio-workshop --clobber
+spctl -a -t open --context context:primary-signature -v /tmp/rel/AudioWorkshop-X.Y.Z.dmg  # 期望 accepted / Notarized Developer ID
+xcrun stapler validate /tmp/rel/AudioWorkshop-X.Y.Z.dmg                                  # 期望 The validate action worked!
+```
+
+v0.1.4 发布时实测就是这条：CI 资产 `rejected`，覆盖后 `accepted (source=Notarized Developer ID)`。
+Windows/Linux 资产由 CI 直接出没问题（Windows 侧另有 `tools/check_windows_icon.py` 的
+图标 + GUI 子系统断言兜底）。
 
 ### 这一块踩过的坑
 
