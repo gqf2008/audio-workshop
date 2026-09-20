@@ -26,7 +26,7 @@
 
 模型的能力/硬要求（哪个引擎必须给参考音频、哪个变体不可用）由 `config/models.schema.yaml` 声明，经**两条路**投递到 App：`server.json`（显式、优先级高）与上面那份随包能力清单（兜底）。所以**不需要**先跑 `audio_config.py render --write` 才有提示；详见 `docs/model-capabilities.md`。
 
-引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0），当前为**独立仓库 checkout（v0.7.3）**，submodule 化待落；适配只写在本仓库的薄层。
+引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0，本仓库适配基于 fork `gqf2008/audio.cpp`）。随包版本**以 [`engine-lock.json`](engine-lock.json) 为准（当前 `v0.8.2-metalbf16`）**：发布包按它校验 sha256 后取预编译 `audiocpp_server`，用户下载即用；源码 checkout 的 **submodule 化待落**（在那之前"锁版本"不靠 checkout 上的 tag，靠这个锁文件）；适配只写在本仓库的薄层。
 
 ## 快速开始
 
