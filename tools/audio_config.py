@@ -31,7 +31,8 @@ except ImportError:
 
 # ── 配置加载 ────────────────────────────────────────────────────────────
 def load(path=CFG_DEFAULT):
-    cfg = yaml.safe_load(open(path, encoding="utf-8"))
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
     runtime = cfg.setdefault("runtime", {})
     root = resolve_models_root(runtime.get("models_root", ""))
     runtime["models_root"] = root
