@@ -25,8 +25,10 @@
 > ⑤ "出片 ≤20 分钟"改为条件式"出片 ≤ 纯合成时间 ×1.2，M0 实测后定标"（§2 步骤 4、§4.3、§5.3；CHARTER §2 同步）；
 > ⑥ 清单闭合：稿件导入进 §3.2 落点、语速/停顿归属写明、`PixelSearchBox` 去留、R4 展开项与 §3.2 展开行统一、顶栏 `[BGM]` 灰置（§3.1~§3.3、§5.1）；
 > ⑦ CHARTER §7「快 2.8×」按 RTF 更正（ace-step 每单位音频更慢，不是更快）；
-> ⑧ 引擎改为"独立仓库 checkout（当前 v0.7.3），submodule 化待落"（§5.2；CHARTER §6/§8；README 同句）；
+> ⑧ 引擎改为"独立仓库 checkout，submodule 化待落"（§5.2；CHARTER §6/§8；README 同句）；
 > ⑨ 小口径清理：changelog 条数、CHARTER §5 项数、CHARTER §10 判据分母、"方差"→"波动范围"。
+>
+> **v0.3.1 修订（2026-09-20，文档口径同步批次）**：引擎版本口径统一为「**以 `engine-lock.json` 为准（当前 `v0.8.2-metalbf16`）**，随包预编译取件（sha256 校验）」；§5.2 同步，README / CHARTER 同句。
 
 ---
 
@@ -302,7 +304,7 @@ CHARTER 第 5 节的边界在这里变成可被 UI 直接引用的条目。"开�
 | `tools/audio_config.py` | 配置层引用实现：渲染 `server.json`、文本兜底（规范化 + 词典）、按场景执行 | **文本层的算法必须以此为准**（`normalize()` / `verbalize()` / `apply_dictionary()`）；Rust 侧要么调它、要么逐条对齐并写等价测试，不允许两份实现各写各的 |
 | `tools/audio_dub.py` | 配音链路参考实现：切句、逐句合成、拼装、单句重录、`project.json` 结构、落盘不变式（`write_atomic` / 拼装前校验——**`fix/text-layer-and-dataloss` 实现，随本轮合并进入 main**） | **Rust 状态机的行为基线**：`project.json` 的字段（`sentences[].text/spoken/seed/wav/duration/start/status`）直接沿用，保证 CLI 与界面能开同一个工程；M1 加 `id` 时两边同步 |
 | `tools/audio_eval.py` | 评估台：可懂度/耗时/峰值内存 + 回归对比（TRICKY 用例集含"数字-紧凑"无空格形态——用例由 `fix/text-layer-and-dataloss` 补入、`fix/eval-tn-convergence` 收进默认 `--texts`） | 产品**不重复实现评估**；界面上"质量自检"按钮就是调它；每次换配置/换量化档后跑一遍 |
-| `audio.cpp`（**独立仓库 checkout，当前 v0.7.3**） | 引擎与服务（`audiocpp_server`，`127.0.0.1:8080`） | 适配只写在本仓库薄层，滞后上游 1~2 版；**submodule 化待落**（本仓库当前既无 `.gitmodules` 也无 `external/`，引擎是本机另一处 checkout）；上游接口变了改我们这层 |
+| `audio.cpp`（**随包预编译取件，版本以 `engine-lock.json` 为准：当前 `v0.8.2-metalbf16`**） | 引擎与服务（`audiocpp_server`，`127.0.0.1:8080`） | 适配只写在本仓库薄层，滞后上游 1~2 版；**源码 checkout 的 submodule 化待落**（本仓库当前既无 `.gitmodules` 也无 `external/`）；随包引擎按锁文件校验 sha256 取件，不靠 checkout tag；上游接口变了改我们这层 |
 | 上游文本规范化 | 模型侧 TN（`engine` 策略） | 模型已接 TN 的（如 index-tts2）**不重复处理**，避免双重转换 —— 这由配置的 `text_overrides.normalization` 决定，不写死在代码里 |
 
 **总边界一句话**：Python 工具 = 开源层（可被任何人脚本化、可被评估、可被替换）；Rust 桌面 App = 产品本体（把配置层与链路的决策变成按钮，并承担付费能力）。两者共享同一份配置与同一个 `project.json`，**不共享状态**。

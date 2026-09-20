@@ -35,7 +35,7 @@
 时间戳（`BUILD_NUMBER=42` 可覆盖，必须是单调递增的字符串）。
 
 **为什么不写死在 Info.plist 里**：写死必然漂移 —— 改了 `Cargo.toml` 忘了改 plist，
-就会出现「关于本机显示 0.1.0、自动更新却按 0.2.0 比」这种最难查的错。
+就会出现「关于本机显示 0.1.0、检查更新却按 0.2.0 比」这种最难查的错。
 
 ## 凭据在哪
 
@@ -62,19 +62,22 @@ xcrun notarytool history --keychain-profile audio-workshop-notary
 
 ### 1. `disable-library-validation` 是必须的
 
-人声分离走 `ort` → ONNX Runtime，链接的是 homebrew 的动态库。开了 hardened runtime 后，
-macOS 拒绝加载**不是本 Team ID 签的**库：
+人声分离走 `ort` → ONNX Runtime。**动态链接泄漏时期**（把 homebrew 的 dylib 链进发布包）开了
+hardened runtime 后，macOS 拒绝加载**不是本 Team ID 签的**库：
 
 ```
 dyld: Library not loaded: /opt/homebrew/opt/onnxruntime/lib/libonnxruntime.1.dylib
 Reason: mapping process and mapped file (non-platform) have different Team IDs
 ```
 
-debug 版没签名，所以这个问题**只在打包后才暴露**。见 `packaging/entitlements.plist`。
+debug 版没签名，所以这个问题**只在打包后才暴露**。见 `packaging/entitlements.plist`
+（`disable-library-validation` 保留在 entitlements 里作防御）。
 
-**这带来一个必须写清的前提**：当前发行版**要求目标机装有 onnxruntime**
-（`brew install onnxruntime`）。把它连同依赖的 ~90 个 homebrew dylib 一起塞进 `.app`
-是更大的工程（要逐个 re-sign、升级 onnxruntime 就得重来），暂不做。
+**这个 dyld 报错已是历史**：现在发布包强制**静态链接**——`package.sh` 强制
+`LIBONNXRUNTIME_NO_PKG_CONFIG=1` 并用 otool 做硬门禁（出现任何非系统库直接红），CI 的
+macOS job 对 `.app` 里的两个二进制同样断言（见下文「两个必须记住的前提」第 2 条）。
+**目标机不再需要安装 onnxruntime**（不用 `brew install`，也没有那 ~90 个 homebrew dylib
+要逐个 re-sign 的问题）。
 
 ### 2. DMG 要单独公证一次，而且在 `.app` 装订之后重建
 
@@ -99,15 +102,16 @@ spctl -a -t open (DMG)           → accepted (source=Notarized Developer ID)
 
 ## 已知限制（别按"能发给所有人"理解）
 
-- **只有 macOS 包**。Windows/Linux 安装包没有（M3 未达「第二个平台可自用」，见
-  `docs/m3-platform-status.md`）。
-- **目标机需要 onnxruntime**（见上文第 1 点）。
-- **自动更新已端到端验过**（2026-09-18）：仓库 public（匿名 API 200）+ 第一个正式 Release
-  `v0.1.0`（资产 `AudioWorkshop-0.1.0.dmg`）→ `releases/latest` 实测 **200**。
-  真链路用例 `real_default_manifest_is_parseable` 拿到过 tag/url/**sha256**/**size**（见 `docs/update.md`）。
+- **三平台产物自 v0.1.4 起发布**：macOS `.dmg`、`linux-x64.tar.gz`、`windows-x64.zip` +
+  `windows-x64-setup.exe`（v0.1.4 Release 的资产实测即这四类，见下文「各平台的产物形态」；
+  平台移植过程见 `docs/m3-platform-status.md`）。
+- **目标机不需要安装 onnxruntime**：人声分离的 ONNX Runtime 已静态链接进包（见上文第 1 点）。
+- **检查更新（发现新版本 + 打开发布页）已端到端验过**（2026-09-18）：仓库 public（匿名 API 200）+
+  正式 Release → `releases/latest` 实测 **200**。真链路用例 `real_default_manifest_is_parseable`
+  拿到过 tag/url/**sha256**/**size**（见 `docs/update.md`）；**自动下载/静默安装不在 v1**。
 - **未做公证后的"全新机器"验证**：本机验证覆盖了签名/公证/装订/启动，但没有在
-  一台没装过 homebrew 的干净机器上试过（那台机器大概率会因为缺 onnxruntime 起不来）。
-- **只有一个正式 Release**（`v0.1.0`）。版本化流程见下面一节；`v0.1.1` 起沿用同一套步骤。
+  一台干净机器上试过。
+- **当前正式 Release 是 `v0.1.4`**（`v0.1.0` 起沿用同一套步骤，见下面一节）。
 
 ## 怎么发一个版本
 
@@ -185,8 +189,10 @@ bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文�
    一个模型都没有时，壳如实显示"没有服务"，不假装能跑。
 2. **人声分离的 ONNX Runtime 走静态链接**（`LIBONNXRUNTIME_NO_PKG_CONFIG=1`）。
    `ort-sys` 的 build.rs 是"pkg-config 优先 → 失败才下载官方预编译包"，开发机装了
-   homebrew onnxruntime 时会静默把它链进发布包 → 用户必须自己 `brew install`。
-   `package.sh` / `package_linux.sh` 里有硬门禁：出现任何非系统库直接红。
+   homebrew onnxruntime 时会静默把它链进发布包 → 用户机器一启动就 dyld 报错、得自己
+   `brew install` 才能跑（强制这个环境变量就是为了拦这条漏链）。
+   `package.sh` / `packaging/package_linux.sh` 里有硬门禁（otool / ldd）：出现任何非系统库直接红；
+   CI 的 macOS job 同样断言。（README 的「发行包现状」与上文「两个容易踩的点」第 1 点同口径。）
 
 ## 三平台发布流程
 

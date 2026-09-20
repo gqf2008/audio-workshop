@@ -26,7 +26,7 @@
 
 模型的能力/硬要求（哪个引擎必须给参考音频、哪个变体不可用）由 `config/models.schema.yaml` 声明，经**两条路**投递到 App：`server.json`（显式、优先级高）与上面那份随包能力清单（兜底）。所以**不需要**先跑 `audio_config.py render --write` 才有提示；详见 `docs/model-capabilities.md`。
 
-引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0），当前为**独立仓库 checkout（v0.7.3）**，submodule 化待落；适配只写在本仓库的薄层。
+引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0，本仓库适配基于 fork `gqf2008/audio.cpp`）。随包版本**以 [`engine-lock.json`](engine-lock.json) 为准（当前 `v0.8.2-metalbf16`）**：发布包按它校验 sha256 后取预编译 `audiocpp_server`，用户下载即用；源码 checkout 的 **submodule 化待落**（在那之前"锁版本"不靠 checkout 上的 tag，靠这个锁文件）；适配只写在本仓库的薄层。
 
 ## 快速开始
 
@@ -110,9 +110,15 @@ python3 tools/model_fetch.py audio8-tts          # 从上游源拉权重（幂�
 单独公证且在 `.app` 装订之后重建 —— 这两条不做的话，产物要么一启动就 dyld 报错、
 要么 Gatekeeper 直接拒。
 
-**当前发行版的前提**：目标机需装有 onnxruntime（人声分离后端）；只有 macOS 包。
-自动更新这条链路**已通并验过**：v0.1.0 已发布，`releases/latest` 实测 200
-（见 [docs/update.md](docs/update.md) 的真链路用例）。发版步骤见
+**发行包现状**：人声分离的 ONNX Runtime 已**静态链接**进包，目标机**不需要安装**
+（`package.sh` 强制 `LIBONNXRUNTIME_NO_PKG_CONFIG=1` + otool 硬门禁，CI 的 macOS job 同样断言；
+见 [docs/release.md](docs/release.md#两个必须记住的前提) 的静态链接条款）。v0.1.4 的 Release
+已发**三平台产物**：macOS `.dmg`、`linux-x64.tar.gz`、`windows-x64.zip` +
+`windows-x64-setup.exe`（见 [docs/release.md](docs/release.md#各平台的产物形态)）。
+
+检查更新（发现新版本 + 打开发布页）这条链路**已通并验过**：v0.1.0 已发布，`releases/latest` 实测 200
+（见 [docs/update.md](docs/update.md) 的真链路用例）；**自动下载/静默安装不在 v1**
+（见 [docs/update.md](docs/update.md#明确不做边界)）。发版步骤见
 [docs/release.md](docs/release.md#怎么发一个版本)。
 
 ## 本地验证
