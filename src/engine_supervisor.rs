@@ -222,6 +222,9 @@ pub const ENGINE_MONITOR_ARG: &str = "--engine-monitor";
 /// `dead_code` 报错（2026-09-19 CI 的 windows gate 实测）。
 #[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
+    // SAFETY: `kill` 在这里只发信号 0（探测），不终止任何进程；`pid` 已由 `pid > 0`
+    // 守卫排除掉 0（进程组广播）/负值（进程组/信号 0 边界语义），因此最坏情况是
+    // 对一个已不存在的 pid 探测（返回 -1/ESRCH），没有可被利用的副作用。
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
@@ -236,6 +239,9 @@ pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
     if process_alive(shell_pid) {
         return false;
     }
+    // SAFETY: `engine_pid` 由 `monitor_entry` 侧的 `parse_monitor_args` 保证是正整数
+    // （不合法根本进不到这里），且它是壳侧 `spawn` 出来的引擎进程 pid，不可能是
+    // 0（进程组广播）或负值；SIGTERM 发给引擎自身，不会外溢到别的进程。
     unsafe {
         libc::kill(engine_pid, libc::SIGTERM);
     }
@@ -243,6 +249,9 @@ pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
     // 这一步只是尽量让它有机会自己释放端口/显存。
     std::thread::sleep(Duration::from_secs(1));
     if process_alive(engine_pid) {
+        // SAFETY: 同上——`engine_pid` 是已校验的正整数、指向自己拉起的引擎；
+        // 这是监视语义的最后一步（TERM 宽限后仍未退出才 SIGKILL），
+        // 只作用于那一个 pid，不会波及其它进程。
         unsafe {
             libc::kill(engine_pid, libc::SIGKILL);
         }
@@ -647,6 +656,8 @@ mod tests {
         let pid = c.id() as i32;
         sup.child = Some(c);
         assert!(sup.is_running(), "活着的子进程应报运行中");
+        // SAFETY: `pid` 是本测试自己 spawn 的 sleep 子进程（活着的），SIGKILL
+        // 只作用于它；杀掉它正是本用例的目的（验证句柄清理），不会波及其它进程。
         unsafe { libc::kill(pid, libc::SIGKILL) };
         // 等它真的退出
         let deadline = Instant::now() + Duration::from_secs(3);
