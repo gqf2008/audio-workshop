@@ -1,4 +1,4 @@
-# Work-unit board for audio-workshop (docs/D1_COLLAB_DESIGN.md §8).
+# Work-unit board for audio-workshop（D1 协同记账的看板投影；设计见 walgit 侧 D1_COLLAB_DESIGN.md §8，不在本仓库）。
 # Cards move when a signed `status` entry is appended to the thread; this file
 # only declares the deterministic projection into lanes.
 
