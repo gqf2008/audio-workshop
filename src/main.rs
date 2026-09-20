@@ -2598,30 +2598,94 @@ fn spawn_update_check(msg_tx: Sender<WorkerMsg>, url: String, current: String) {
 /// 地址来自外部清单，不能把 `file://` / 自定义 scheme 丢给系统打开器
 /// （`open` 会把它们当本地路径/协议处理）。判据走 `update::is_http_url`——
 /// **不要在别处再写一遍前缀判断**（两份实现必然漂移）。
+///
+/// 三平台语义（与 docs/update.md 的安全边界同源）：
+///   · macOS/Linux：直接 `open` / `xdg-open`，URL 按 argv 参数传，不经 shell；
+///   · Windows：`ShellExecuteW`（见 `open_external_url_windows`），**不经 cmd**——
+///     cmd.exe /C 会对整条命令行再做一次元字符解析，URL 里的 `&` 会被当成第二条命令。
+/// 清单 URL 是**不可信输入**：除 http(s) 前缀外，含控制字符（`\n`/`\r`/`\0` 等）的
+/// 地址也不是合法 URL，一并拒绝。
 fn open_external_url(url: &str) -> Result<(), String> {
-    if !update::is_http_url(url) {
-        return Err(
-            "发布页地址不是 http(s)：为了不让系统打开本地路径/自定义协议，这次不打开".into(),
-        );
+    if !release_url_is_openable(url) {
+        if !update::is_http_url(url) {
+            return Err(
+                "发布页地址不是 http(s)：为了不让系统打开本地路径/自定义协议，这次不打开".into(),
+            );
+        }
+        return Err(format!(
+            "发布页地址带控制字符（\\n/\\r/\\0 等），不是合法 URL，这次不打开：{:?}",
+            url.trim()
+        ));
     }
     let url = url.trim();
-    #[cfg(target_os = "macos")]
-    let (program, args): (&str, Vec<&str>) = ("open", vec![url]);
-    #[cfg(target_os = "windows")]
-    let (program, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (program, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
 
-    let out = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("没能拉起系统浏览器（{program}: {e}）——发布页：{url}"))?;
-    if out.status.success() {
+    #[cfg(target_os = "windows")]
+    return open_external_url_windows(url);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let (program, args): (&str, Vec<&str>) = ("open", vec![url]);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let (program, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
+
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("没能拉起系统浏览器（{program}: {e}）——发布页：{url}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "系统浏览器没打开（{program} 退出码 {:?}）——发布页：{url}",
+                out.status.code()
+            ))
+        }
+    }
+}
+
+/// 发布页地址能不能交给系统打开器：http(s) 前缀（`update::is_http_url`，唯一判据）
+/// 且不含控制字符（`\n`/`\r`/`\0` 等）。
+///
+/// 控制字符不是合法 URL 的一部分，也不该流进打开器参数/错误文案；
+/// 这是打开动作的**唯一入口判据**，别处不许再写一遍（同一语义两份实现必然漂移）。
+fn release_url_is_openable(url: &str) -> bool {
+    update::is_http_url(url) && !url.trim().chars().any(char::is_control)
+}
+
+/// Windows 侧打开外部链接：`ShellExecuteW` 直接交给 Shell，**不经 cmd**。
+///
+/// 为什么不能走 cmd：`cmd.exe /C` 收到的是整条命令行，会再做一遍自己的元字符解析；
+/// `std::process::Command` 的 argv 转义在 cmd 这一层不成立（`&` 不触发引号），
+/// 于是 `https://x/?a=1&b=2` 会先打开页面、再把 `b=2` 当命令执行——命令注入 +
+/// 常见 URL 截断。`ShellExecuteW` 的 URL 是独立参数，由 Shell 按 scheme 分发给
+/// 默认浏览器，不做 shell 解析。
+///
+/// 返回值语义：>32 为成功（HINSTANCE），<=32 是 SE_ERR_* 错误码。
+#[cfg(target_os = "windows")]
+fn open_external_url_windows(url: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    // UTF-16 + 显式 NUL 结尾；`1` = SW_SHOWNORMAL（常规窗口打开）。
+    let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` 是 NUL 结尾的 UTF-16 缓冲，`as_ptr()` 得到的指针在本次调用
+    // 期间有效且不会被改写；其余参数（父窗口/动作/参数/工作目录）都是 null 指针或
+    // 字面量，不涉及解引用。ShellExecuteW 本身设计为可跨线程调用。
+    let ret = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    } as isize;
+    if ret > 32 {
         Ok(())
     } else {
         Err(format!(
-            "系统浏览器没打开（{program} 退出码 {:?}）——发布页：{url}",
-            out.status.code()
+            "系统浏览器没打开（ShellExecuteW 错误码 {ret}）——发布页：{url}。\
+             地址若不是 http(s) 会被 `update::is_http_url` 直接拒绝，请核对清单里的发布页地址"
         ))
     }
 }
@@ -17898,6 +17962,72 @@ mod tests {
             assert!(
                 !src.contains(gone),
                 "{gone}… 已被 picker 模块取代，不该复活"
+            );
+        }
+    }
+
+    /// Windows 打开外部 URL 不得再经 cmd/start：cmd.exe /C 会把 URL 里的 `&` 等
+    /// 元字符解析成第二条命令（命令注入 + 常见 URL 截断）。只允许 `ShellExecuteW`
+    /// （`open_external_url_windows`）。
+    ///
+    /// 阳性对照（实测过）：把 Windows 分支临时写回
+    /// `("cmd", vec!["/C", "start", "", url])` → 这条立刻红。
+    #[test]
+    fn windows_url_opener_must_not_go_through_cmd() {
+        let src = production_source();
+        for forbidden in ["Command::new(\"cmd\")", "\"cmd\"", "vec![\"/C\", \"start\""] {
+            assert!(
+                !src.contains(forbidden),
+                "main.rs 生产代码里出现 {forbidden}——Windows 打开发布页必须走 \
+                 ShellExecuteW（open_external_url_windows），不得经 cmd"
+            );
+        }
+    }
+
+    /// 打开发布页的 URL 校验反向用例：空串、非 http(s)、含控制字符（`\n`/`\r`/`\0`）
+    /// 都必须在**拉起系统打开器之前**被拒绝。这些输入全在进程拉起之前被拒，
+    /// 所以测试里可以放心直调 `open_external_url`（绝不会真的开浏览器）。
+    ///
+    /// 阳性对照（实测过）：删掉 `release_url_is_openable` 里的控制字符检查后，
+    /// `https://example.com/a\nb` 会带着换行穿过校验 → 这条立刻红。
+    #[test]
+    fn open_external_url_rejects_malformed_urls_before_launching() {
+        for bad in [
+            "",
+            "   ",
+            "ftp://example.com/a",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "//example.com/a",
+            "https://example.com/a\nb",
+            "https://example.com/a\rb",
+            "https://example.com/a\u{0}b",
+            "https://example.com/a\tb",
+        ] {
+            assert!(
+                !release_url_is_openable(bad),
+                "校验必须拒绝（纯判据，不触达任何进程拉起）：{bad:?}"
+            );
+            assert!(
+                open_external_url(bad).is_err(),
+                "必须拒绝（且不能拉起任何进程）：{bad:?}"
+            );
+        }
+    }
+
+    /// 合法 http(s) 且无控制字符的地址应通过校验；`&` 是合法 URL 字符，
+    /// 在 ShellExecuteW 路径上不得被误拒（cmd 路线里它才是元字符）。
+    #[test]
+    fn release_url_validation_accepts_clean_http_urls() {
+        for ok in [
+            "https://example.com/releases/v0.2.0",
+            "http://example.com/x?a=1&b=2",
+            "  https://example.com/  ",
+            "https://github.com/gqf2008/audio-workshop/releases/latest",
+        ] {
+            assert!(
+                release_url_is_openable(ok),
+                "合法发布页地址应通过校验：{ok:?}"
             );
         }
     }
