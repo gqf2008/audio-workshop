@@ -176,8 +176,85 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(gen.read_existing_sizes(Path("/nonexistent/x.json")), {})
 
 
+class HashParserTests(unittest.TestCase):
+    """HF tree API 条目 → lfs.oid 的解析（离线纯函数；夹具三种形状 + 路径对齐）。"""
+
+    OID = "aa" * 32  # 64 位十六进制，LFS 真 sha256 的形状
+
+    def test_lfs_file_takes_the_lfs_oid(self):
+        """LFS 有 oid：取 `lfs.oid`（不是外层 git blob 的 `oid`——那是 40 位 sha1）。"""
+        entry = {
+            "type": "file",
+            "path": "A-GGUF/a.gguf",
+            "size": 5,
+            "oid": "88323167996cf04679994d4ac6cec053b78aa21b",  # git blob sha1，不是权重哈希
+            "lfs": {"oid": self.OID, "size": 5, "pointerSize": 135},
+        }
+        self.assertEqual(gen.lfs_oid(entry), (self.OID, None))
+
+    def test_non_lfs_file_has_no_lfs_oid(self):
+        """非 LFS（存在 git 里的小文件）：不得拿外层 `oid`（sha1）冒充 sha256。"""
+        entry = {
+            "type": "file",
+            "path": ".gitattributes",
+            "size": 6407,
+            "oid": "3e0a4dc2e653d6f3ca06fee7626722e8c7283491",
+        }
+        sha, why = gen.lfs_oid(entry)
+        self.assertIsNone(sha)
+        self.assertIn("非 LFS", why)
+
+    def test_lfs_entry_without_oid_is_reported(self):
+        """LFS 条目缺 oid：如实 None + 原因，不猜。"""
+        entry = {"type": "file", "path": "B-GGUF/b.gguf", "lfs": {"size": 5}}
+        sha, why = gen.lfs_oid(entry)
+        self.assertIsNone(sha)
+        self.assertIn("缺 oid", why)
+
+    def test_tree_lookup_aligns_by_path_and_reports_missing(self):
+        """tree 按 `path` 对齐；找不到路径时如实报（不拿别的档推算）。"""
+        fetcher = gen.HfTreeFetcher()
+        fetcher._cache[("r", "main")] = (
+            {"A-GGUF/a.gguf": {"lfs": {"oid": self.OID}}},
+            None,
+        )
+        self.assertEqual(fetcher.hash_for("r", "main", "A-GGUF/a.gguf"), (self.OID, None))
+        sha, why = fetcher.hash_for("r", "main", "A-GGUF/missing.gguf")
+        self.assertIsNone(sha)
+        self.assertIn("没有这个路径", why)
+        # tree 本身取不到：原因是那次取回的失败原因（如 HTTP 401），原样带上
+        fetcher._cache[("gated", "main")] = (None, "HTTP 401")
+        sha, why = fetcher.hash_for("gated", "main", "x.gguf")
+        self.assertIsNone(sha)
+        self.assertEqual(why, "HTTP 401")
+
+    def test_read_existing_hashes_covers_package_files(self):
+        """离线重生成的哈希沿用：按 URL 对齐、只收 packages[].files 的非空 sha256。"""
+        payload = {
+            "models": [
+                {
+                    "packages": [
+                        {"files": [
+                            {"url": "u1", "sha256": "a" * 64},
+                            {"url": "u2", "sha256": None},
+                            {"url": "u3", "sha256": "  "},
+                        ]}
+                    ],
+                    "aux_files": [{"url": "u4", "bytes": 1}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(gen.render(payload), encoding="utf-8")
+            hashes = gen.read_existing_hashes(path)
+        self.assertEqual(hashes, {"u1": "a" * 64})
+        # 文件不存在 / 坏 JSON 都不能抛
+        self.assertEqual(gen.read_existing_hashes(Path("/nonexistent/x.json")), {})
+
+
 class OfflineRoundTripTests(unittest.TestCase):
-    """离线重生成必须**沿用盘上已有的体积**（否则每次离线跑都会把体积抹掉）。"""
+    """离线重生成必须**沿用盘上已有的体积与哈希**（否则每次离线跑都会把它们抹掉）。"""
 
     @classmethod
     def setUpClass(cls):
@@ -188,7 +265,7 @@ class OfflineRoundTripTests(unittest.TestCase):
         if not upstream or not (Path(upstream) / "model_specs").is_dir():
             raise unittest.SkipTest("本机没有上游 audio.cpp checkout，跳过端到端用例")
 
-    def test_offline_regen_keeps_existing_sizes_byte_for_byte(self):
+    def test_offline_regen_keeps_existing_sizes_and_hashes_byte_for_byte(self):
         committed = gen.OUT_PATH
         if not committed.is_file():
             self.skipTest("没有已提交的清单可对照")
@@ -197,11 +274,19 @@ class OfflineRoundTripTests(unittest.TestCase):
             copy.write_bytes(committed.read_bytes())
             specs = gen.load_specs(Path(gen.find_upstream()) / "model_specs")
             sizes = gen.read_existing_sizes(copy)
-            text = gen.render(gen.build(gen.load_schema(), specs, sizes.get))
+            hashes = gen.read_existing_hashes(copy)
+            text = gen.render(
+                gen.build(
+                    gen.load_schema(),
+                    specs,
+                    sizes.get,
+                    lambda download, remote, url: hashes.get(url),
+                )
+            )
             self.assertEqual(
                 text,
                 committed.read_text(encoding="utf-8"),
-                "离线（沿用已有体积）重生成的产物应与盘上逐字节一致",
+                "离线（沿用已有体积/哈希）重生成的产物应与盘上逐字节一致",
             )
 
 

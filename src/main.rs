@@ -3090,6 +3090,12 @@ fn download_row_for(
     // 来源 + 落点提醒都要写在行上：否则用户看不出"权重是哪来的"，也看不出
     // "下完了服务为什么还是加载不了"。
     let mut detail = format!("{} · {}", m.origin.label(), base);
+    // 没有 sha256 的条目必须如实说：校验只对大小（同大小的旧权重查不出来）。
+    // 真实清单重生成后每一条都带哈希，这条基本不可达；留着是给"服务侧给了 url、
+    // 两边都没 sha"的兜底形态一个诚实的说法，不许假装有哈希。
+    if m.sha256.is_none() {
+        detail.push_str(" · 仅校验大小");
+    }
     if let Some(conflict) = &m.conflict {
         detail.push_str(" · ⚠ ");
         detail.push_str(conflict);
