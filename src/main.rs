@@ -17899,6 +17899,10 @@ mod tests {
     }
 
     fn production_source() -> String {
+        // 本守卫族的扫描范围 = main.rs 一个文件（`include_str!("main.rs")` 只读本文件）：
+        // engine_supervisor.rs / picker.rs / update.rs 等模块都不在范围内。
+        // **打开器 `open_external_url*` 若移出本文件，必须同步把这里扩成扫对应文件
+        // 或整个 src/，否则这些守卫会失明**（2026-09-20 审查 M2）。
         let src = src_lf(include_str!("main.rs"));
         let cut = src
             .find("\n#[cfg(test)]\nmod tests {")
@@ -17970,14 +17974,26 @@ mod tests {
     /// 元字符解析成第二条命令（命令注入 + 常见 URL 截断）。只允许 `ShellExecuteW`
     /// （`open_external_url_windows`）。
     ///
+    /// 匹配**大小写不敏感**且覆盖 `cmd.exe` 形态：Windows 上 `cmd`/`CMD`/
+    /// `cmd.exe`/`CMD.EXE` 是同一个注入面，只钉小写 `"cmd"` 的精确串会被
+    /// 大小写变体绕过（2026-09-20 审查 M1）。
+    ///
     /// 阳性对照（实测过）：把 Windows 分支临时写回
     /// `("cmd", vec!["/C", "start", "", url])` → 这条立刻红。
     #[test]
     fn windows_url_opener_must_not_go_through_cmd() {
         let src = production_source();
-        for forbidden in ["Command::new(\"cmd\")", "\"cmd\"", "vec![\"/C\", \"start\""] {
+        // 先统一小写再匹配，一次拦住大小写变体；`"cmd.exe"` 是 `"cmd"` 的
+        // 显式可执行名形态，两者都要钉死。
+        let lower = src.to_lowercase();
+        for forbidden in [
+            "command::new(\"cmd",
+            "\"cmd.exe\"",
+            "\"cmd\"",
+            "vec![\"/c\", \"start\"",
+        ] {
             assert!(
-                !src.contains(forbidden),
+                !lower.contains(forbidden),
                 "main.rs 生产代码里出现 {forbidden}——Windows 打开发布页必须走 \
                  ShellExecuteW（open_external_url_windows），不得经 cmd"
             );
