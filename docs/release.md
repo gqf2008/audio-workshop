@@ -35,7 +35,7 @@
 时间戳（`BUILD_NUMBER=42` 可覆盖，必须是单调递增的字符串）。
 
 **为什么不写死在 Info.plist 里**：写死必然漂移 —— 改了 `Cargo.toml` 忘了改 plist，
-就会出现「关于本机显示 0.1.0、自动更新却按 0.2.0 比」这种最难查的错。
+就会出现「关于本机显示 0.1.0、检查更新却按 0.2.0 比」这种最难查的错。
 
 ## 凭据在哪
 
@@ -189,9 +189,10 @@ bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文�
    一个模型都没有时，壳如实显示"没有服务"，不假装能跑。
 2. **人声分离的 ONNX Runtime 走静态链接**（`LIBONNXRUNTIME_NO_PKG_CONFIG=1`）。
    `ort-sys` 的 build.rs 是"pkg-config 优先 → 失败才下载官方预编译包"，开发机装了
-   homebrew onnxruntime 时会静默把它链进发布包 → 用户必须自己 `brew install`。
-   `package.sh` / `package_linux.sh` 里有硬门禁：出现任何非系统库直接红；CI 的 macOS job
-   同样断言。（README 的「发行包现状」与上文「两个容易踩的点」第 1 点同口径。）
+   homebrew onnxruntime 时会静默把它链进发布包 → 用户机器一启动就 dyld 报错、得自己
+   `brew install` 才能跑（强制这个环境变量就是为了拦这条漏链）。
+   `package.sh` / `packaging/package_linux.sh` 里有硬门禁（otool / ldd）：出现任何非系统库直接红；
+   CI 的 macOS job 同样断言。（README 的「发行包现状」与上文「两个容易踩的点」第 1 点同口径。）
 
 ## 三平台发布流程
 
