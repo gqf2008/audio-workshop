@@ -289,10 +289,17 @@ pub fn monitor_entry(args: &[String]) -> bool {
     }
     match parse_monitor_args(args) {
         Ok((shell_pid, engine_pid)) => run_monitor(shell_pid, engine_pid),
-        Err(why) => eprintln!(
-            "{why}。用法：audio-workshop {ENGINE_MONITOR_ARG} <壳pid> <引擎pid>\
-             （两个都要是正整数）——本次不进入监视，直接退出"
-        ),
+        Err(why) => {
+            eprintln!(
+                "{why}。用法：audio-workshop {ENGINE_MONITOR_ARG} <壳pid> <引擎pid>\
+                 （两个都要是正整数）——本次不进入监视，直接退出"
+            );
+            // 非法参数必须**非零退出**（issue 范围第 3 条）：返回 0 会让壳侧把
+            // 「参数坏了」误判成「监视正常结束」。与 `run_monitor` 里的
+            // `std::process::exit(0)` 同一风格——直接终止进程，不走返回值。
+            // 回归测试在 tests/engine_monitor_cli.rs（spawn 真二进制断言 exit=2）。
+            std::process::exit(2);
+        }
     }
     true
 }
@@ -307,6 +314,11 @@ pub fn monitor_entry(args: &[String]) -> bool {
 /// 纯函数：不碰进程、不发信号，单测可以放心直调（见 tests 里的
 /// `monitor_args_require_two_positive_pids`——修复前旧实现把缺参解析成 (0,0)，
 /// 那组用例应红）。
+///
+/// 多余参数静默忽略（`--engine-monitor 12 34 junk` → `Ok((12, 34))`）——有意的
+/// 取舍：两个 pid 已经校验成正整数、后续既不拼命令也不落 shell，多余的尾巴既不
+/// 改变监视语义、也不构成新的注入面，不值得为它多一条拒绝路径（2026-09-20
+/// 审查 M3）。
 pub fn parse_monitor_args(args: &[String]) -> Result<(i32, i32), String> {
     let Some(pos) = args.iter().position(|a| a == ENGINE_MONITOR_ARG) else {
         return Err(format!("没有找到 {ENGINE_MONITOR_ARG} 参数"));
