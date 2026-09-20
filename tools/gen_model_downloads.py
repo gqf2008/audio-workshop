@@ -51,20 +51,34 @@ P7 的下载队列（串行 / 断点续传 / 校验后提交）已经能跑，�
 - **只认最终 2xx 那跳的头**：HF 的 `/resolve/` 先回 302，那一跳的 `content-length` 是
   *跳转响应体*的长度（实测 1038 B）——拿它当权重体积会得到"每个模型都是 1 KB"这种
   看起来正常、实际全错的数字（脚本自己跟跳转，且**不把 HEAD 降级成 GET**）。
-- `sha256` 仍然一律留空（生成不下载权重、不算哈希）。
 - **辅助权重**（`session_options`，如 `qwen3_asr.forced_aligner_model_path`）也会折成
   `aux_bytes`：它们常常是**另一个 family** 的包，按落点在全部 spec 里反查；查不到就把键名
   记进 `aux_unresolved`，不做无根据的估算。
 
+## 哈希（sha256）从哪来
+- **默认离线**：不联网。每个文件的 `sha256` **沿用盘上清单里已有的值**（按 URL 对齐），
+  没有就留 `null`——不填假值、不拿别的档推算、不算本地文件。
+- `--fetch-hashes`：联网对每个 `huggingface_snapshot` 文件查 HF tree API
+  （`GET /api/models/{repo}/tree/{revision}?recursive=1`），按 `path` 对齐取 `lfs.oid`——
+  那是 LFS 真 sha256（64 位十六进制）。**非 LFS 文件只有 git blob 的 sha1（40 位），
+  不是权重哈希，不许拿来冒充**；取不到（HTTP 错误 / 树里没有这个路径 / 非 LFS /
+  LFS 条目缺 oid）一律 `null`，失败原因在跑完的汇总里逐条打印。
+  `modelscope_snapshot` 不取哈希（没有 LFS oid 概念），同样写 `null` 并说明原因。
+  同一 `(repo, revision)` 一次生成只请求一次（进程内缓存，含失败）。
+- `--fetch-hashes` 可与 `--fetch-sizes` 组合；两者都与 `--check` 互斥（`--check` 不联网）。
+
 ## 稳定输出
 - 键序固定（`sort_keys`）+ 固定缩进 + 行尾换行 → 同输入两次运行逐字节相同。
-- `--check` 只重算不写盘（**也不联网**：体积沿用盘上已有的值），与盘上的文件比对；
-  不一致退出 1（发现"改了 spec 忘了重生成"）。`--check` 与 `--fetch-sizes` 互斥。
+- `--check` 只重算不写盘（**也不联网**：体积/哈希沿用盘上已有的值），与盘上的文件比对；
+  不一致退出 1（发现"改了 spec 忘了重生成"）。`--check` 与 `--fetch-sizes` / `--fetch-hashes`
+  互斥。
 
 用法:
-  python3 tools/gen_model_downloads.py                 # 离线生成（体积沿用盘上已有值）
-  python3 tools/gen_model_downloads.py --fetch-sizes   # 联网补体积后生成
-  python3 tools/gen_model_downloads.py --check         # 校验已提交的清单是否与上游一致
+  python3 tools/gen_model_downloads.py                        # 离线生成（体积/哈希沿用盘上已有值）
+  python3 tools/gen_model_downloads.py --fetch-sizes          # 联网补体积后生成
+  python3 tools/gen_model_downloads.py --fetch-hashes         # 联网补哈希后生成
+  python3 tools/gen_model_downloads.py --fetch-hashes --fetch-sizes
+  python3 tools/gen_model_downloads.py --check                # 校验已提交的清单是否与上游一致
   AUDIOCPP_DIR=/path/to/audio.cpp python3 tools/gen_model_downloads.py
 """
 
@@ -89,6 +103,7 @@ SCHEMA_PATH = REPO_ROOT / "config" / "models.schema.yaml"
 OUT_PATH = REPO_ROOT / "config" / "model-downloads.json"
 
 HF_ENDPOINT = "https://huggingface.co"
+HF_API_ENDPOINT = "https://huggingface.co/api"
 MS_ENDPOINT = "https://www.modelscope.cn"
 DOWNLOADABLE_KINDS = ("huggingface_snapshot", "modelscope_snapshot")
 # 同目录多个量化档、且产品没声明 precision_preference 时的兜底顺序：
@@ -185,12 +200,17 @@ def package_bytes(files: list):
     return total
 
 
-def package_view(spec: dict, package: dict, size_of, *, want_sizes=None) -> dict:
+def package_view(
+    spec: dict, package: dict, size_of, *, want_sizes=None, want_hashes=None, hash_of=None
+) -> dict:
     """一个包的投影。
 
     `want_sizes`：这个包要不要去向 `size_of` 要体积。默认 = "可下载才要" ——
     不可下载的包（gated / 上游不支持）匿名 HEAD 必然 401，白跑还会在日志里制造噪音。
     辅助权重（`resolve_aux`）显式传 `True`：它们不是产品模型，但估算要用。
+    `want_hashes` / `hash_of`：同上，问的是 HF tree API 的 `lfs.oid`（真 sha256）。
+    辅助权重不传 `hash_of`：它们的哈希不在产物里（`aux_files` 只有 url/bytes），
+    应用也不拿它们做下载校验。
     """
     download = merged_download(spec, package)
     kind = str(download.get("kind") or "")
@@ -205,12 +225,14 @@ def package_view(spec: dict, package: dict, size_of, *, want_sizes=None) -> dict
         and all(urls)
     )
     fetch = downloadable if want_sizes is None else want_sizes
+    fetch_hash = downloadable if want_hashes is None else want_hashes
     files = [
         {
             "remote_path": remote,
             "url": url,
             # 取不到就是 None：调用方只管填值，不编造
             "bytes": size_of(url) if (fetch and url) else None,
+            "sha256": hash_of(download, remote, url) if (fetch_hash and url and hash_of) else None,
         }
         for remote, url in zip(package.get("files") or [], urls)
     ]
@@ -315,6 +337,30 @@ def head_content_length(url, *, timeout=SIZE_TIMEOUT_SECONDS, opener=None):
     return None, f"跳转超过 {SIZE_MAX_HOPS} 跳"
 
 
+def read_existing_hashes(path) -> dict:
+    """盘上清单里的 `URL → sha256`：离线生成时"哈希沿用已有的值"就靠它。
+
+    与 `read_existing_sizes` 一样按 URL 对齐；`aux_files` 里没有 sha256 字段，
+    所以这里只看 `models[].packages[].files`。
+    """
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    hashes = {}
+
+    def remember(entries):
+        for entry in entries or []:
+            url, sha = entry.get("url"), entry.get("sha256")
+            if url and isinstance(sha, str) and sha.strip():
+                hashes[url] = sha.strip()
+
+    for model in payload.get("models") or []:
+        for package in model.get("packages") or []:
+            remember(package.get("files"))
+    return hashes
+
+
 def read_existing_sizes(path) -> dict:
     """盘上清单里的 `URL → bytes`：离线生成时"体积沿用已有的值"就靠它。"""
     try:
@@ -336,6 +382,81 @@ def read_existing_sizes(path) -> dict:
         # 单列一份，离线重生成时才有地方把它的体积沿用回来。
         remember(model.get("aux_files"))
     return sizes
+
+
+# ---------------------------------------------------------------------------
+# 哈希：HF tree API 的 lfs.oid（LFS 真 sha256）
+# ---------------------------------------------------------------------------
+TREE_TIMEOUT_SECONDS = 30.0
+TREE_UA = "audio-workshop-gen-model-downloads/1.0 (hashes)"
+
+
+def lfs_oid(entry: dict):
+    """tree API 一个文件条目 → `(sha256 | None, 原因 | None)`。
+
+    只有 `lfs.oid` 是 LFS 真 sha256（64 位十六进制）。非 LFS 文件（存在 git 里的小文件）
+    只有 git blob 的 `oid`（40 位 sha1）——**那不是权重哈希**，拿它冒充 sha256 会让
+    校验对着错误的期望值跑，所以：没有 `lfs` 对象 / `lfs` 里没有 `oid` 一律 None + 原因。
+    """
+    lfs = entry.get("lfs")
+    if not isinstance(lfs, dict):
+        return None, "非 LFS 文件（没有 lfs.oid）"
+    oid = lfs.get("oid")
+    if not isinstance(oid, str) or not oid.strip():
+        return None, "LFS 条目缺 oid"
+    return oid.strip(), None
+
+
+class HfTreeFetcher:
+    """按 (repo, revision) 缓存 HF tree API 的取回结果（含失败）。
+
+    同一次生成里同一 repo@revision 只会请求一次；失败也缓存（重试也不会换一个答案，
+    不在这台机器上打 HF 的限流）。
+    """
+
+    def __init__(self):
+        self._cache = {}
+        self._opener = urllib.request.build_opener()
+
+    def hash_for(self, repo: str, revision: str, remote: str):
+        """`remote`（spec 里的远端相对路径）→ `(sha256 | None, 原因 | None)`。"""
+        key = (repo, revision)
+        if key not in self._cache:
+            self._cache[key] = self._fetch(repo, revision)
+        by_path, reason = self._cache[key]
+        if by_path is None:
+            return None, reason
+        entry = by_path.get(remote) or by_path.get(remote.lstrip("/"))
+        if entry is None:
+            return None, f"tree 里没有这个路径（{repo}@{revision}）"
+        return lfs_oid(entry)
+
+    def _fetch(self, repo: str, revision: str):
+        url = (
+            f"{HF_API_ENDPOINT}/models/{quote(repo, safe='/')}/tree/"
+            f"{quote(revision, safe='')}?recursive=1"
+        )
+        request = urllib.request.Request(url, headers={"User-Agent": TREE_UA})
+        try:
+            with self._opener.open(request, timeout=TREE_TIMEOUT_SECONDS) as response:
+                if response.status != 200:
+                    return None, f"HTTP {response.status}"
+                payload = json.load(response)
+        except urllib.error.HTTPError as error:
+            code = error.code
+            error.close()
+            return None, f"HTTP {code}"
+        except Exception as error:  # noqa: BLE001 —— 网络层任何异常都如实记原因
+            return None, type(error).__name__
+        if not isinstance(payload, list):
+            return None, "tree API 没回数组"
+        by_path = {}
+        for entry in payload:
+            if isinstance(entry, dict) and entry.get("type") == "file":
+                path = entry.get("path")
+                if isinstance(path, str) and path:
+                    by_path[path] = entry
+        return by_path, None
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +559,7 @@ def build_model(
     model_id: str,
     specs: dict,
     size_of,
+    hash_of=None,
     by_path=None,
     by_dir=None,
 ) -> dict:
@@ -466,7 +588,9 @@ def build_model(
             "aux_files": aux_files,
         }
 
-    packages = [package_view(spec, p, size_of) for p in spec.get("packages") or []]
+    packages = [
+        package_view(spec, p, size_of, hash_of=hash_of) for p in spec.get("packages") or []
+    ]
     candidates = [p for p in packages if p["downloadable"]]
     if not candidates:
         reasons = sorted({p["reason"] for p in packages if p["reason"]})
@@ -506,7 +630,7 @@ def build_model(
     }
 
 
-def build(schema: dict, specs: dict, size_of) -> dict:
+def build(schema: dict, specs: dict, size_of, hash_of=None) -> dict:
     by_path, by_dir = package_local_index(specs)
     models = []
     for model_id in sorted(schema.get("models") or {}):
@@ -516,6 +640,7 @@ def build(schema: dict, specs: dict, size_of) -> dict:
                 model_id,
                 specs,
                 size_of,
+                hash_of=hash_of,
                 by_path=by_path,
                 by_dir=by_dir,
             )
@@ -537,8 +662,8 @@ def build(schema: dict, specs: dict, size_of) -> dict:
             "spec_count": len(specs),
             "schema": "config/models.schema.yaml",
             "note": (
-                "由生成脚本产出，勿手改；sha256 一律留空（生成不下载权重）；"
-                "bytes 来自 HTTP HEAD，取不到就是 null（不填 0、不拿别的档推算）"
+                "由生成脚本产出，勿手改；sha256 来自 HF tree API 的 lfs.oid（--fetch-hashes），"
+                "bytes 来自 HTTP HEAD（--fetch-sizes）；取不到就是 null（不填 0、不拿别的档推算）"
             ),
         },
         "models": models,
@@ -558,10 +683,17 @@ def main() -> int:
         action="store_true",
         help="联网对每个文件发 HTTP HEAD 取真实体积（默认离线：沿用盘上清单里已有的值）",
     )
+    ap.add_argument(
+        "--fetch-hashes",
+        action="store_true",
+        help="联网对每个 HF 文件查 tree API 取 LFS 真 sha256（默认离线：沿用盘上清单里已有的值）",
+    )
     ap.add_argument("--out", default=str(OUT_PATH), help=f"输出路径（默认 {OUT_PATH}）")
     a = ap.parse_args()
-    if a.check and a.fetch_sizes:
-        sys.exit("--check 不联网（体积沿用盘上已有值），不能和 --fetch-sizes 一起用")
+    if a.check and (a.fetch_sizes or a.fetch_hashes):
+        sys.exit(
+            "--check 不联网（体积/哈希沿用盘上已有值），不能和 --fetch-sizes / --fetch-hashes 一起用"
+        )
 
     upstream = find_upstream()
     specs_dir = Path(upstream) / "model_specs"
@@ -606,7 +738,44 @@ def main() -> int:
                 kept[url] = size
             return size
 
-    text = render(build(schema, specs, size_of))
+    if a.fetch_hashes:
+        # 按 (repo, revision) 缓存 tree API 的取回结果：同一次生成里同一仓库只请求一次。
+        fetcher = HfTreeFetcher()
+        fetched_hashes, failed_hashes = {}, {}
+
+        def hash_of(download, remote, url):
+            if not url:
+                return None
+            kind = str(download.get("kind") or "")
+            if kind != "huggingface_snapshot":
+                failed_hashes[url] = (
+                    f"{kind or '未知 kind'}：只对 huggingface_snapshot 取 LFS oid，不猜"
+                )
+                return None
+            sha, why = fetcher.hash_for(
+                str(download.get("repo") or ""), package_revision(download), remote
+            )
+            if sha is None:
+                failed_hashes[url] = why
+            else:
+                fetched_hashes[url] = sha
+            return sha
+
+    else:
+        existing_hashes = read_existing_hashes(out)
+        kept_hashes, missing_hashes = {}, []
+
+        def hash_of(download, remote, url):
+            if not url:
+                return None
+            sha = existing_hashes.get(url)
+            if sha is None:
+                missing_hashes.append(url)
+            else:
+                kept_hashes[url] = sha
+            return sha
+
+    text = render(build(schema, specs, size_of, hash_of))
 
     if a.check:
         current = out.read_text(encoding="utf-8") if out.exists() else ""
@@ -636,6 +805,25 @@ def main() -> int:
             print(f"  null ← {failed[url]}  {url}", file=sys.stderr)
     else:
         print(f"体积：**这次没联网**，{len(kept)} 条沿用清单里已有的值；{len(set(missing))} 条清单里没有 → null")
+    if a.fetch_hashes:
+        nulls = sum(
+            1
+            for m in payload["models"]
+            for p in m["packages"]
+            for f in p["files"]
+            if f["sha256"] is None
+        )
+        print(
+            f"哈希：{len(fetched_hashes)} 条取到、{len(failed_hashes)} 条取不到；"
+            f"产物里共 {nulls} 条为 null（含不可下载的包，那些根本没去探）"
+        )
+        for url in sorted(failed_hashes):
+            print(f"  null ← {failed_hashes[url]}  {url}", file=sys.stderr)
+    else:
+        print(
+            f"哈希：**这次没联网**，{len(kept_hashes)} 条沿用清单里已有的值；"
+            f"{len(set(missing_hashes))} 条清单里没有 → null"
+        )
     return 0
 
 

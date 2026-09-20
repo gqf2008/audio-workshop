@@ -13,6 +13,7 @@
           {
             "bytes": 6185460032,
             "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
+            "sha256": "cd7bf272588f548d4a253f57483132ef0f8f54a549f26471b09caa72c654270b",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
           }
         ],
@@ -42,6 +43,7 @@
             {
               "bytes": 6185460032,
               "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf",
+              "sha256": "cd7bf272588f548d4a253f57483132ef0f8f54a549f26471b09caa72c654270b",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-q8_0.gguf"
             }
           ],
@@ -67,6 +69,7 @@
             {
               "bytes": 10090398272,
               "remote_path": "ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf",
+              "sha256": "93974239a29a1a821b3cc1b1ca7e1c6229b1a900a0e44a1a9770bb2271d2be5f",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/turbo/ace-step-1.5-turbo-bf16.gguf"
             }
           ],
@@ -92,6 +95,7 @@
             {
               "bytes": 6185458880,
               "remote_path": "ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf",
+              "sha256": "76133710055859477303c21b34f8462d8f9995ee8959e7eca96b09a4db84d5ba",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/base/ace-step-1.5-base-q8_0.gguf"
             }
           ],
@@ -117,6 +121,7 @@
             {
               "bytes": 10090397120,
               "remote_path": "ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf",
+              "sha256": "aa4b0f27122bb93a8da18f82515674ed18c59f985316355b208e48a335b77cf4",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/base/ace-step-1.5-base-bf16.gguf"
             }
           ],
@@ -142,6 +147,7 @@
             {
               "bytes": 15277379424,
               "remote_path": "ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf",
+              "sha256": "9529c24b3b929c701b34d0eee3686c76084b99e993539802f95ed171e954ff65",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf"
             }
           ],
@@ -167,6 +173,7 @@
             {
               "bytes": 15277585088,
               "remote_path": "ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf",
+              "sha256": "7237581eb690c5a35c8b6d17cfa2249069503455561cb31a8127b714aa9c1d84",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-sft/ace-step-1.5-xl-sft-bf16.gguf"
             }
           ],
@@ -192,6 +199,7 @@
             {
               "bytes": 10710565056,
               "remote_path": "ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf",
+              "sha256": "60ddf6d4ebec685c89fb451af8a7983aca65c58baa6aa6e5e25d168b4b7613f8",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf"
             }
           ],
@@ -217,6 +225,7 @@
             {
               "bytes": 10710562816,
               "remote_path": "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf",
+              "sha256": "e33cc4507844073d6f34c29e7ea5d1468e3eea9313dab00363cc9c4b001b1604",
               "url": "https://huggingface.co/CaptainArni/audio.cpp-gguf/resolve/main/ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf"
             }
           ],
@@ -256,6 +265,7 @@
             {
               "bytes": null,
               "remote_path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf",
+              "sha256": null,
               "url": null
             }
           ],
@@ -281,6 +291,7 @@
             {
               "bytes": null,
               "remote_path": "Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-f16.gguf",
+              "sha256": null,
               "url": null
             }
           ],
@@ -306,41 +317,49 @@
             {
               "bytes": 6163,
               "remote_path": "config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/config.json"
             },
             {
               "bytes": 147,
               "remote_path": "generation_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/generation_config.json"
             },
             {
               "bytes": 434,
               "remote_path": "preprocessor_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/preprocessor_config.json"
             },
             {
               "bytes": 11419524,
               "remote_path": "tokenizer.json",
+              "sha256": "64ecaabc85a9272a8099f8aa7c097ce3a4c65a79bafbfd1450add736938ae45b",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/tokenizer.json"
             },
             {
               "bytes": 2234,
               "remote_path": "tokenizer_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/tokenizer_config.json"
             },
             {
               "bytes": 2776833,
               "remote_path": "vocab.json",
+              "sha256": null,
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/vocab.json"
             },
             {
               "bytes": 1671853,
               "remote_path": "merges.txt",
+              "sha256": null,
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/merges.txt"
             },
             {
               "bytes": 648031000,
               "remote_path": "model.safetensors",
+              "sha256": "971d17f64ef5f193fca567fa3e9dc063c4eede97faabb11c0c6abf0b92b23ca4",
               "url": "https://huggingface.co/Audio8/Audio8-ASR-0.1B/resolve/main/model.safetensors"
             }
           ],
@@ -382,6 +401,7 @@
           {
             "bytes": 1429545312,
             "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+            "sha256": "7fa4d2ce5ef37a0a2526cad814bb271b1255d50681297ba56407c6307148652f",
             "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
           }
         ],
@@ -411,6 +431,7 @@
             {
               "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "sha256": "7fa4d2ce5ef37a0a2526cad814bb271b1255d50681297ba56407c6307148652f",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
           ],
@@ -450,6 +471,7 @@
             {
               "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "sha256": "7fa4d2ce5ef37a0a2526cad814bb271b1255d50681297ba56407c6307148652f",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
           ],
@@ -489,6 +511,7 @@
             {
               "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "sha256": "7fa4d2ce5ef37a0a2526cad814bb271b1255d50681297ba56407c6307148652f",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
           ],
@@ -523,6 +546,7 @@
           {
             "bytes": 1429545312,
             "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+            "sha256": "7fa4d2ce5ef37a0a2526cad814bb271b1255d50681297ba56407c6307148652f",
             "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
           }
         ],
@@ -552,6 +576,7 @@
             {
               "bytes": 1429545312,
               "remote_path": "audio8-tts-preview-0.6b-q8_0.gguf",
+              "sha256": "7fa4d2ce5ef37a0a2526cad814bb271b1255d50681297ba56407c6307148652f",
               "url": "https://huggingface.co/js-byte/Audio8-TTS-Preview-0.6b-GGUF/resolve/main/audio8-tts-preview-0.6b-q8_0.gguf"
             }
           ],
@@ -586,6 +611,7 @@
           {
             "bytes": 1045334432,
             "remote_path": "fun-asr-nano-2512-q8_0.gguf",
+            "sha256": "4d727357574b079b7f43336b2930f39da086ca02f5d8d50872090b4c1c3d5e0a",
             "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-q8_0.gguf"
           }
         ],
@@ -615,6 +641,7 @@
             {
               "bytes": 1045334432,
               "remote_path": "fun-asr-nano-2512-q8_0.gguf",
+              "sha256": "4d727357574b079b7f43336b2930f39da086ca02f5d8d50872090b4c1c3d5e0a",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-q8_0.gguf"
             }
           ],
@@ -640,6 +667,7 @@
             {
               "bytes": 1675708832,
               "remote_path": "fun-asr-nano-2512-f16.gguf",
+              "sha256": "3d906c3ccfed07efef88ff53d6cc94b788b9d2edf1492a5679d041b43e98c5be",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-GGUF/resolve/ce72677f84900f0dc57f498ace253bfb3c9155b6/fun-asr-nano-2512-f16.gguf"
             }
           ],
@@ -665,36 +693,43 @@
             {
               "bytes": 536,
               "remote_path": "chat_template.jinja",
+              "sha256": null,
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/chat_template.jinja"
             },
             {
               "bytes": 2327,
               "remote_path": "config.json",
+              "sha256": null,
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/config.json"
             },
             {
               "bytes": 210,
               "remote_path": "generation_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/generation_config.json"
             },
             {
               "bytes": 1659778184,
               "remote_path": "model.safetensors",
+              "sha256": "335ca3e74917f1156690400e2c344350112950165789cf78ce3d0a367affd821",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/model.safetensors"
             },
             {
               "bytes": 482,
               "remote_path": "processor_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/processor_config.json"
             },
             {
               "bytes": 11422650,
               "remote_path": "tokenizer.json",
+              "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506",
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/tokenizer.json"
             },
             {
               "bytes": 737,
               "remote_path": "tokenizer_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf/resolve/854d88f94205cd17d2afdb24332130d86fbe654a/tokenizer_config.json"
             }
           ],
@@ -735,6 +770,7 @@
           {
             "bytes": 3502955328,
             "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
+            "sha256": "5e827b2072042e4a1b21ccf24a5cb4f71cb1011403067a0a9b039311d8b38628",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
           }
         ],
@@ -764,6 +800,7 @@
             {
               "bytes": 3633888608,
               "remote_path": "IndexTTS2-GGUF/index-tts2-q8_0.gguf",
+              "sha256": "f9be73ac5b6cbdc5f603f04dcb6c9fe37b3a301a365a1ea8d580d3ef7ba22e8e",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-q8_0.gguf"
             }
           ],
@@ -789,6 +826,7 @@
             {
               "bytes": 4646898304,
               "remote_path": "IndexTTS2-GGUF/index-tts2-f16.gguf",
+              "sha256": "0f7b95d3d32e18bf9352912a7b21a0bd4a8406853a0aaa2c9180f77389c21523",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-f16.gguf"
             }
           ],
@@ -814,6 +852,7 @@
             {
               "bytes": 8084552000,
               "remote_path": "IndexTTS2-GGUF/index-tts2-orig.gguf",
+              "sha256": "c96cb948339b7169b7240f43dbd42ad6354ae3d0a22465e292ec8e090c338e16",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2-GGUF/index-tts2-orig.gguf"
             }
           ],
@@ -839,16 +878,19 @@
             {
               "bytes": 2882,
               "remote_path": "config.yaml",
+              "sha256": null,
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/config.yaml"
             },
             {
               "bytes": 475997,
               "remote_path": "bpe.model",
+              "sha256": "b2a5ce8090d32da3642cc4f81fdc996376bc6dd3f4cd5e3d165f71120d9f2bc8",
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/bpe.model"
             },
             {
               "bytes": 3484477924,
               "remote_path": "gpt.safetensors",
+              "sha256": "b7fe532dd49e9b4536ca108ac71869c23d94091cec8494b9ef87d4bdf63adb47",
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/gpt.safetensors"
             }
           ],
@@ -876,6 +918,7 @@
             {
               "bytes": 3502955328,
               "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf",
+              "sha256": "5e827b2072042e4a1b21ccf24a5cb4f71cb1011403067a0a9b039311d8b38628",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf"
             }
           ],
@@ -901,6 +944,7 @@
             {
               "bytes": 4547355072,
               "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-f16.gguf",
+              "sha256": "87bed9b82fc8f22119a1a1042332091016c28e37f29b0e93343ccdbfa76ef66a",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-f16.gguf"
             }
           ],
@@ -926,6 +970,7 @@
             {
               "bytes": 7885093440,
               "remote_path": "IndexTTS2.5-GGUF/index-tts2_5-orig.gguf",
+              "sha256": "2c736df55a306155df4e607f49fe963cf2192fc2193ad449a4bdffb15e52b93a",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/IndexTTS2.5-GGUF/index-tts2_5-orig.gguf"
             }
           ],
@@ -967,6 +1012,7 @@
           {
             "bytes": 1151272416,
             "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+            "sha256": "6c44ec2fb4cee513892d7863c1fcc3ea6b699ffa4d899b0ef4ab19956d9544f7",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
           }
         ],
@@ -996,6 +1042,7 @@
             {
               "bytes": 2473010048,
               "remote_path": "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf",
+              "sha256": "da4fc2ac7f24dee784d1684eb1f35836cdbf559519452ae11777670734c0a4f8",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-q8_0.gguf"
             }
           ],
@@ -1021,6 +1068,7 @@
             {
               "bytes": 4087653248,
               "remote_path": "Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf",
+              "sha256": "f12537d4ea56df4e1dcca64a902e0b37fb1111f8ef7fc8e554fd00110be047d0",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-1.7B-GGUF/qwen3-asr-1.7b-f16.gguf"
             }
           ],
@@ -1046,6 +1094,7 @@
             {
               "bytes": 1151272416,
               "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+              "sha256": "6c44ec2fb4cee513892d7863c1fcc3ea6b699ffa4d899b0ef4ab19956d9544f7",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf"
             }
           ],
@@ -1071,6 +1120,7 @@
             {
               "bytes": 1880642016,
               "remote_path": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf",
+              "sha256": "5472337d26df8e58fdfabc3ae58a149fbb200578c576b4c660f2985c07da1736",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-f16.gguf"
             }
           ],
@@ -1096,31 +1146,37 @@
             {
               "bytes": 2399,
               "remote_path": "config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/config.json"
             },
             {
               "bytes": 165,
               "remote_path": "generation_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/generation_config.json"
             },
             {
               "bytes": 4076193080,
               "remote_path": "model.safetensors",
+              "sha256": "2db53c7d81bd9b8cbc6a074e89be2c968a0d373fb4ee68bb1b1e14f7042dfee1",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/model.safetensors"
             },
             {
               "bytes": 487,
               "remote_path": "processor_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/processor_config.json"
             },
             {
               "bytes": 998,
               "remote_path": "tokenizer_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/tokenizer_config.json"
             },
             {
               "bytes": 11429653,
               "remote_path": "tokenizer.json",
+              "sha256": "fe1fad59be22a41ee293363fcf95fdedbc7c93f3b49270b1d2e18bd1399a7a05",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf/resolve/main/tokenizer.json"
             }
           ],
@@ -1151,26 +1207,31 @@
             {
               "bytes": 6193,
               "remote_path": "config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/config.json"
             },
             {
               "bytes": 142,
               "remote_path": "generation_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/generation_config.json"
             },
             {
               "bytes": 1876091704,
               "remote_path": "model.safetensors",
+              "sha256": "79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b8353840323ea",
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/model.safetensors"
             },
             {
               "bytes": 330,
               "remote_path": "preprocessor_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/preprocessor_config.json"
             },
             {
               "bytes": 12487,
               "remote_path": "tokenizer_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main/tokenizer_config.json"
             }
           ],
@@ -1201,14 +1262,15 @@
       "aux_files": [],
       "aux_unresolved": [],
       "entry": {
-        "bytes": null,
+        "bytes": 2816988960,
         "default": false,
         "display_name": "Qwen3 TTS 12Hz 1.7B VoiceDesign Q8_0 GGUF",
         "downloadable": true,
         "files": [
           {
-            "bytes": null,
+            "bytes": 2816988960,
             "remote_path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+            "sha256": "1bcef9a8c021072fca40e00498e00af9091fbe6d3ae4f87567cfee885d6c7554",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf"
           }
         ],
@@ -1230,14 +1292,15 @@
       "note": "落点精确匹配：qwen3_tts_1_7b_voicedesign_q8_0",
       "packages": [
         {
-          "bytes": null,
+          "bytes": 2695175104,
           "default": true,
           "display_name": "Qwen3 TTS 12Hz 1.7B Base Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 2695175104,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf",
+              "sha256": "b55e06c7890d43c208d15aed8b4ed3f18215f295e47d5960e061b15bff338ab0",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf"
             }
           ],
@@ -1255,14 +1318,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-Base-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 4203158464,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B Base BF16 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 4203158464,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-bf16.gguf",
+              "sha256": "f5cf4c37b969335e0ffb657119e52025e26192553119590d59fa17b8d36e8b29",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-bf16.gguf"
             }
           ],
@@ -1280,14 +1344,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-Base-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 4544273280,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B Base Original-Dtype GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 4544273280,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-orig.gguf",
+              "sha256": "7ab774d56ab9ed9ee7d0ae50917798cda23c7bcc11eaa6c3a4ae32068718b1c1",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-orig.gguf"
             }
           ],
@@ -1305,14 +1370,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-Base-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 2817044064,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B CustomVoice Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 2817044064,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf",
+              "sha256": "3cfaac8e9f13554f6daea3c5e0c53fede71ef5500cbaae7445e5fc3a5bb12e72",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf"
             }
           ],
@@ -1330,14 +1396,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 4179144352,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B CustomVoice BF16 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 4179144352,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-bf16.gguf",
+              "sha256": "ef55652c7aa919dc5eeb7967c782a17a6f5d9a8b775337376a4678d37e71a11c",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-bf16.gguf"
             }
           ],
@@ -1355,14 +1422,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 2816988960,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B VoiceDesign Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 2816988960,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+              "sha256": "1bcef9a8c021072fca40e00498e00af9091fbe6d3ae4f87567cfee885d6c7554",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf"
             }
           ],
@@ -1380,14 +1448,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 4179089248,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B VoiceDesign BF16 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 4179089248,
               "remote_path": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-bf16.gguf",
+              "sha256": "f4cebcd68023a2db7c3fc8d52d1d28eafb22d4e3b7a64e12c4f946a300536f86",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-bf16.gguf"
             }
           ],
@@ -1405,14 +1474,15 @@
           "target_directory": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 1991211136,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 0.6B Base Q8_0 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 1991211136,
               "remote_path": "Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf",
+              "sha256": "771420bd20ff5f35407b4fa9cf9c5461e153800d3d772ef51c9febc0a520855d",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf"
             }
           ],
@@ -1430,14 +1500,15 @@
           "target_directory": "Qwen3-TTS-12Hz-0.6B-Base-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 2516154496,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 0.6B Base BF16 GGUF",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 2516154496,
               "remote_path": "Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-bf16.gguf",
+              "sha256": "97d418048b07b5b267628da955b27db4c57b353ded8089de01a469b474255b8d",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-bf16.gguf"
             }
           ],
@@ -1455,39 +1526,45 @@
           "target_directory": "Qwen3-TTS-12Hz-0.6B-Base-GGUF"
         },
         {
-          "bytes": null,
+          "bytes": 4539721255,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B Base Safetensors",
           "downloadable": true,
           "files": [
             {
-              "bytes": null,
+              "bytes": 4494,
               "remote_path": "config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/config.json"
             },
             {
-              "bytes": null,
+              "bytes": 245,
               "remote_path": "generation_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/generation_config.json"
             },
             {
-              "bytes": null,
+              "bytes": 3857413744,
               "remote_path": "model.safetensors",
+              "sha256": "38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c",
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/model.safetensors"
             },
             {
-              "bytes": null,
+              "bytes": 2336,
               "remote_path": "speech_tokenizer/config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/speech_tokenizer/config.json"
             },
             {
-              "bytes": null,
+              "bytes": 682293092,
               "remote_path": "speech_tokenizer/model.safetensors",
+              "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/speech_tokenizer/model.safetensors"
             },
             {
-              "bytes": null,
+              "bytes": 7344,
               "remote_path": "tokenizer_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/tokenizer_config.json"
             }
           ],
@@ -1540,6 +1617,7 @@
           {
             "bytes": 175662720,
             "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
+            "sha256": "4fa6a3e30c4a1c6cc1da455268806edc93432ca1e1b5b6923e942be8e6e479ff",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
           }
         ],
@@ -1569,6 +1647,7 @@
             {
               "bytes": 175662720,
               "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf",
+              "sha256": "4fa6a3e30c4a1c6cc1da455268806edc93432ca1e1b5b6923e942be8e6e479ff",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-q8_0.gguf"
             }
           ],
@@ -1594,6 +1673,7 @@
             {
               "bytes": 247915232,
               "remote_path": "Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf",
+              "sha256": "8efaa8e23f0e9733988c87e1b71196a6daffe6381b9249641acc40ed6a297864",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Sortformer-Diar-4spk-v1-GGUF/sortformer-diar-4spk-v1-f16.gguf"
             }
           ],
@@ -1619,16 +1699,19 @@
             {
               "bytes": 2096,
               "remote_path": "config.json",
+              "sha256": null,
               "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/config.json"
             },
             {
               "bytes": 494206256,
               "remote_path": "model.safetensors",
+              "sha256": "e8abcc5f3a82ff23134c98a37f70fef3f159611f394bb191a0ad0a6f4b052974",
               "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/model.safetensors"
             },
             {
               "bytes": 413,
               "remote_path": "processor_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/processor_config.json"
             }
           ],
@@ -1665,6 +1748,7 @@
           {
             "bytes": 1683570752,
             "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf",
+            "sha256": "89bb22db5fa68ab8f1d90af0a9f88121977c945bdb99a57c96b1e88fa34bf1c8",
             "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
           }
         ],
@@ -1694,6 +1778,7 @@
             {
               "bytes": 3582595584,
               "remote_path": "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf",
+              "sha256": "262c8259cfeac055258d28bfc126bcafb5c776fac44165222b186270f99b07ca",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-q8_0.gguf"
             }
           ],
@@ -1719,6 +1804,7 @@
             {
               "bytes": 5834360000,
               "remote_path": "Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf",
+              "sha256": "d701796858eb54347ade9e80240a58d4eccf1890a9ccff3ed3b0640be5273a23",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Medium-GGUF/stable-audio-3-medium-f16.gguf"
             }
           ],
@@ -1744,6 +1830,7 @@
             {
               "bytes": 1683570752,
               "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf",
+              "sha256": "89bb22db5fa68ab8f1d90af0a9f88121977c945bdb99a57c96b1e88fa34bf1c8",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-q8_0.gguf"
             }
           ],
@@ -1769,6 +1856,7 @@
             {
               "bytes": 2358467232,
               "remote_path": "Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf",
+              "sha256": "66f36741c19f9ca08e7239f89253141fe08a1f88de92f4459385ad80fc1c0e23",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-Music-GGUF/stable-audio-3-small-music-f16.gguf"
             }
           ],
@@ -1794,6 +1882,7 @@
             {
               "bytes": 1683570688,
               "remote_path": "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf",
+              "sha256": "5bb1ec653134e63dac46264e336ae198a2590195fc996fcd0605021215e9b26f",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-q8_0.gguf"
             }
           ],
@@ -1819,6 +1908,7 @@
             {
               "bytes": 2358467168,
               "remote_path": "Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf",
+              "sha256": "0d8948b947f137c163983f060973d80e9bb699ea11c303327cd7005402f93918",
               "url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Stable-Audio-3-Small-SFX-GGUF/stable-audio-3-small-sfx-f16.gguf"
             }
           ],
@@ -1844,11 +1934,13 @@
             {
               "bytes": null,
               "remote_path": "model_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/stabilityai/stable-audio-3-medium/resolve/main/model_config.json"
             },
             {
               "bytes": null,
               "remote_path": "model.safetensors",
+              "sha256": null,
               "url": "https://huggingface.co/stabilityai/stable-audio-3-medium/resolve/main/model.safetensors"
             }
           ],
@@ -1875,11 +1967,13 @@
             {
               "bytes": null,
               "remote_path": "model_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/resolve/main/model_config.json"
             },
             {
               "bytes": null,
               "remote_path": "model.safetensors",
+              "sha256": null,
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/resolve/main/model.safetensors"
             }
           ],
@@ -1906,11 +2000,13 @@
             {
               "bytes": null,
               "remote_path": "model_config.json",
+              "sha256": null,
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/resolve/main/model_config.json"
             },
             {
               "bytes": null,
               "remote_path": "model.safetensors",
+              "sha256": null,
               "url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/resolve/main/model.safetensors"
             }
           ],
@@ -1952,7 +2048,7 @@
   ],
   "source": {
     "generated_by": "tools/gen_model_downloads.py",
-    "note": "由生成脚本产出，勿手改；sha256 一律留空（生成不下载权重）；bytes 来自 HTTP HEAD，取不到就是 null（不填 0、不拿别的档推算）",
+    "note": "由生成脚本产出，勿手改；sha256 来自 HF tree API 的 lfs.oid（--fetch-hashes），bytes 来自 HTTP HEAD（--fetch-sizes）；取不到就是 null（不填 0、不拿别的档推算）",
     "schema": "config/models.schema.yaml",
     "spec_count": 72,
     "specs": "model_specs/*.json"
