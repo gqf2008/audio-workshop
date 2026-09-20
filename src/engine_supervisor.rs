@@ -222,6 +222,9 @@ pub const ENGINE_MONITOR_ARG: &str = "--engine-monitor";
 /// `dead_code` 报错（2026-09-19 CI 的 windows gate 实测）。
 #[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
+    // SAFETY: `kill` 在这里只发信号 0（探测），不终止任何进程；`pid` 已由 `pid > 0`
+    // 守卫排除掉 0（进程组广播）/负值（进程组/信号 0 边界语义），因此最坏情况是
+    // 对一个已不存在的 pid 探测（返回 -1/ESRCH），没有可被利用的副作用。
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
@@ -236,6 +239,9 @@ pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
     if process_alive(shell_pid) {
         return false;
     }
+    // SAFETY: `engine_pid` 由 `monitor_entry` 侧的 `parse_monitor_args` 保证是正整数
+    // （不合法根本进不到这里），且它是壳侧 `spawn` 出来的引擎进程 pid，不可能是
+    // 0（进程组广播）或负值；SIGTERM 发给引擎自身，不会外溢到别的进程。
     unsafe {
         libc::kill(engine_pid, libc::SIGTERM);
     }
@@ -243,6 +249,9 @@ pub fn monitor_once(shell_pid: i32, engine_pid: i32) -> bool {
     // 这一步只是尽量让它有机会自己释放端口/显存。
     std::thread::sleep(Duration::from_secs(1));
     if process_alive(engine_pid) {
+        // SAFETY: 同上——`engine_pid` 是已校验的正整数、指向自己拉起的引擎；
+        // 这是监视语义的最后一步（TERM 宽限后仍未退出才 SIGKILL），
+        // 只作用于那一个 pid，不会波及其它进程。
         unsafe {
             libc::kill(engine_pid, libc::SIGKILL);
         }
@@ -275,19 +284,61 @@ pub fn run_monitor(shell_pid: i32, engine_pid: i32) {
 /// `main` 最开头判这一条：本次运行是监护线程而不是正常启动。
 /// 返回 true 表示"已处理完，调用方应直接退出"。
 pub fn monitor_entry(args: &[String]) -> bool {
-    let Some(pos) = args.iter().position(|a| a == ENGINE_MONITOR_ARG) else {
+    if !args.iter().any(|a| a == ENGINE_MONITOR_ARG) {
         return false;
-    };
-    let shell_pid = args
-        .get(pos + 1)
-        .and_then(|p| p.parse::<i32>().ok())
-        .unwrap_or(0);
-    let engine_pid = args
-        .get(pos + 2)
-        .and_then(|p| p.parse::<i32>().ok())
-        .unwrap_or(0);
-    run_monitor(shell_pid, engine_pid);
+    }
+    match parse_monitor_args(args) {
+        Ok((shell_pid, engine_pid)) => run_monitor(shell_pid, engine_pid),
+        Err(why) => {
+            eprintln!(
+                "{why}。用法：audio-workshop {ENGINE_MONITOR_ARG} <壳pid> <引擎pid>\
+                 （两个都要是正整数）——本次不进入监视，直接退出"
+            );
+            // 非法参数必须**非零退出**（issue 范围第 3 条）：返回 0 会让壳侧把
+            // 「参数坏了」误判成「监视正常结束」。与 `run_monitor` 里的
+            // `std::process::exit(0)` 同一风格——直接终止进程，不走返回值。
+            // 回归测试在 tests/engine_monitor_cli.rs（spawn 真二进制断言 exit=2）。
+            std::process::exit(2);
+        }
+    }
     true
+}
+
+/// 把 `--engine-monitor` 后面的两个参数解析成 `(壳pid, 引擎pid)`。
+///
+/// 两个都必须显式给出、且都是**正整数**：缺参数被折成 0 时会一路流到
+/// `kill(0, SIGTERM)`——POSIX 的 pid 0 是"向调用者所在进程组广播"，
+/// 同 shell 里的其它进程会一起收到信号（2026-09-20 审查，见 LESSON）。
+/// 不合法就整条拒绝，调用方**绝不**带着解析结果继续进监视循环。
+///
+/// 纯函数：不碰进程、不发信号，单测可以放心直调（见 tests 里的
+/// `monitor_args_require_two_positive_pids`——修复前旧实现把缺参解析成 (0,0)，
+/// 那组用例应红）。
+///
+/// 多余参数静默忽略（`--engine-monitor 12 34 junk` → `Ok((12, 34))`）——有意的
+/// 取舍：两个 pid 已经校验成正整数、后续既不拼命令也不落 shell，多余的尾巴既不
+/// 改变监视语义、也不构成新的注入面，不值得为它多一条拒绝路径（2026-09-20
+/// 审查 M3）。
+pub fn parse_monitor_args(args: &[String]) -> Result<(i32, i32), String> {
+    let Some(pos) = args.iter().position(|a| a == ENGINE_MONITOR_ARG) else {
+        return Err(format!("没有找到 {ENGINE_MONITOR_ARG} 参数"));
+    };
+    let (raw_shell, raw_engine) = args
+        .get(pos + 1)
+        .zip(args.get(pos + 2))
+        .ok_or("缺少 壳pid/引擎pid 两个参数".to_string())?;
+    let shell_pid: i32 = raw_shell
+        .parse()
+        .map_err(|_| format!("壳pid 不是数字：{raw_shell:?}"))?;
+    let engine_pid: i32 = raw_engine
+        .parse()
+        .map_err(|_| format!("引擎pid 不是数字：{raw_engine:?}"))?;
+    if shell_pid <= 0 || engine_pid <= 0 {
+        return Err(format!(
+            "pid 必须是正整数，收到 壳pid={shell_pid} 引擎pid={engine_pid}"
+        ));
+    }
+    Ok((shell_pid, engine_pid))
 }
 
 /// 重启节流：两次自动拉起之间至少间隔这么久。
@@ -565,6 +616,44 @@ mod tests {
         }
     }
 
+    /// 参数解析必须是严格纯函数：缺参数 / 0 / 负数 / 非数字都必须 Err，
+    /// 而不是像修复前那样折成 (0,0) 流进监视循环——(0,0) 会走到
+    /// `kill(0, SIGTERM)`，向调用者**整个进程组**广播（POSIX pid 0 语义）。
+    ///
+    /// **只测解析、绝不碰 `run_monitor`**：它会 `std::process::exit`，
+    /// 而且合法 pid 会真的去发信号——本组用例不许构造任何会进入监视循环的调用。
+    ///
+    /// 阳性对照（实测过）：把 `parse_monitor_args` 退回旧实现的
+    /// `unwrap_or(0)` 折叠，缺参用例会得到 Ok((0,0)) → 本组用例立刻红。
+    #[test]
+    fn monitor_args_require_two_positive_pids() {
+        let arg = ENGINE_MONITOR_ARG;
+        let args = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for bad in [
+            args(&[]),
+            args(&[arg]),
+            args(&[arg, "123"]),
+            args(&[arg, "0", "456"]),
+            args(&[arg, "123", "0"]),
+            args(&[arg, "-1", "456"]),
+            args(&[arg, "123", "-7"]),
+            args(&[arg, "abc", "456"]),
+            args(&[arg, "123", "xyz"]),
+            args(&[arg, "", "456"]),
+        ] {
+            assert!(
+                parse_monitor_args(&bad).is_err(),
+                "必须拒绝参数：{bad:?}——缺参/0/负数/非数字都不许进监视循环"
+            );
+        }
+        // 合法形状：flag 后紧跟两个正整数
+        let ok = parse_monitor_args(&args(&[arg, "12", "34"])).unwrap();
+        assert_eq!(ok, (12, 34));
+        // flag 前面还有参数也找得到（真实命令行：exe 路径在最前，位置不固定）
+        let ok2 = parse_monitor_args(&args(&["audio-workshop", "9", arg, "12", "34"])).unwrap();
+        assert_eq!(ok2, (12, 34));
+    }
+
     /// 子进程已经退出时 `is_running` 必须返回 false 并清掉句柄，否则崩了的引擎永远
     /// 不会被重拉（句柄还在 → 被当成"正在运行"）。
     #[cfg(unix)]
@@ -579,6 +668,8 @@ mod tests {
         let pid = c.id() as i32;
         sup.child = Some(c);
         assert!(sup.is_running(), "活着的子进程应报运行中");
+        // SAFETY: `pid` 是本测试自己 spawn 的 sleep 子进程（活着的），SIGKILL
+        // 只作用于它；杀掉它正是本用例的目的（验证句柄清理），不会波及其它进程。
         unsafe { libc::kill(pid, libc::SIGKILL) };
         // 等它真的退出
         let deadline = Instant::now() + Duration::from_secs(3);

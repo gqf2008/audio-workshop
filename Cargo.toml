@@ -37,6 +37,17 @@ dirs = "6"
 # 0.11.1 会走非 dlopen 的根导入并在 Linux 编译失败（CI E0432）。
 fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
 
+# Windows 打开外部链接走 ShellExecuteW（见 open_external_url_windows）：**不经 cmd**——
+# cmd.exe /C 会把 URL 里的 `&` 等元字符再解析成第二条命令（命令注入 + 常见 URL 截断）。
+# 版本对齐 Cargo.lock 里已有的 0.61.2（ureq 的 mio/schannel 已拉同一份），不新增重复版本；
+# **门控在 target 上**，macOS/Linux 构建完全不拉这个依赖。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
+
 [build-dependencies]
 slint-build = "1.18"
 # build.rs 需要 slint_pixel::library_paths() 注册 `@slint_pixel` 库路径。

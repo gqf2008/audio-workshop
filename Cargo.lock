@@ -484,6 +484,7 @@ dependencies = [
  "slint-build",
  "slint-pixel",
  "ureq 2.12.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

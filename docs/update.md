@@ -107,9 +107,18 @@ prerelease 时它照样 404，上面那条用例会红，所以发版别发成 d
 
 ## 安全边界：发布页只认 http(s)
 
-清单是**外部输入**。「打开发布页」交给系统打开器时，地址先过 `update::is_http_url`
+**清单是外部输入**（默认 GitHub API，也支持自建/内网镜像），清单里的 URL 是不可信输入。
+「打开发布页」交给系统打开器时，地址先过 `update::is_http_url`
 （**唯一一处判据**：清单校验、拉取、打开三处都走它）。`file://`、`/tmp/x`、自定义 scheme 一律拒绝——
 否则一个被改过的清单就能让应用去打开本地路径/任意协议。
+
+三平台打开器语义（`src/main.rs::open_external_url`，与这里的边界同源）：
+
+- **macOS / Linux**：直接 `open` / `xdg-open`，URL 按 argv 参数传，不经 shell；
+- **Windows**：`ShellExecuteW` 直接交给 Shell，**不经 cmd**——`cmd.exe /C` 会把 URL 里的
+  `&` 等元字符再解析一遍（`https://x/?a=1&b=2` 会把 `b=2` 当命令执行，命令注入 + 常见 URL
+  截断），argv 级别的转义在 cmd 这一层不成立。
+- 除 http(s) 前缀外，含控制字符（`\n`/`\r`/`\0` 等）的地址也不是合法 URL，一并拒绝。
 
 ## 明确不做（边界）
 
