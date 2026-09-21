@@ -13,7 +13,7 @@
 - 关键决策先更新 `docs/` 对应文档再写代码，契约不漂移。
 
 ## 协作与记账（walgit 协同层）
-本仓库 origin 为本机 walgit（`http://127.0.0.1:8081/gqf2008/verba-ime.git`）。开发协作的 issue / PR / 评审 / 合并 / 收尾一律走 walgit 的 D1 协同层（`refs/collab/*` 追加式签名条目），**不使用 GitHub / `gh`**：
+本仓库 origin 为本机 walgit（`http://127.0.0.1:8081/gqf2008/audio-workshop.git`，以 `git remote get-url origin` 实测为准）。开发协作的 issue / PR / 评审 / 合并 / 收尾一律走 walgit 的 D1 协同层（`refs/collab/*` 追加式签名条目），**不使用 GitHub / `gh`**：
 
 - 开线程 `issue`（`--parent ""`）→ 认领 `comment`（owner/worktree/branch）+ `status: in-progress` → 交补丁 `patch --base refs/heads/main --head refs/heads/<branch>` → 评审 `review`（decision/agent/note）→ 合并 `merge_result` → 收尾 `status: closed`。
 - `--parent` 必须取上一条命令返回的 oid；`--key` 传路径不传内容；**不得用别人的 key 代签**。
