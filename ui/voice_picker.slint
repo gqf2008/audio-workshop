@@ -93,8 +93,8 @@ export component VoicePanel inherits Rectangle {
     in property <string> engine-label: "";
     // 参考音频路径：空=内置，非空=克隆。唯一状态来源。
     in-out property <string> reference-path: "";
-    // 参考音频里**实际念的内容**。服务端（audio8-tts / index-tts2）要求它与
-    // 参考音频成对下发——只给路径会 500。它也是音色的一部分：改文本 = 换音色。
+    // 参考音频里**实际念的内容**。文本是否必填**按引擎**：audio8-tts 等克隆路径要求
+    // 与参考音频成对下发（只给路径会 500）；index-tts2 不要文本（只给 voice_ref 就 200）。
     in-out property <string> reference-text: "";
     // 自动转写的状态（"正在转写…" / "已填入，请核对" / 失败原因）
     in property <string> reference-text-status: "";
@@ -104,6 +104,9 @@ export component VoicePanel inherits Rectangle {
     // 当前引擎是否硬要求参考音（index-tts2）：true 时内置默认音色行不可用，
     // 文案也说清"必须提供参考音频"——不再对任何引擎都写"免参考音，开箱可用"。
     in property <bool> engine-requires-voice-ref: false;
+    // 当前引擎的克隆路径是否硬要求参考文本（audio8-tts：只给 voice_ref 就 500；
+    // index-tts2：不要，可选）。占位文案、必填提示、红色告警都由它驱动。
+    in property <bool> engine-requires-reference-text: false;
 
     callback edited();
     callback clear-reference();
@@ -222,8 +225,8 @@ export component VoicePanel inherits Rectangle {
             }
         }
 
-        // 参考音频的文本：与参考音频**成对**（缺它服务端每句都 500）。
-        // 只在克隆态出现——用内置音色时这里没有意义，摆出来只是噪音。
+        // 参考音频的文本：与参考音频**按引擎成对**（audio8-tts 缺它服务端每句都 500；
+        // index-tts2 可选）。只在克隆态出现——用内置音色时这里没有意义，摆出来只是噪音。
         if root.cloning : VerticalLayout {
             spacing: 6px;
             HorizontalLayout {
@@ -241,7 +244,9 @@ export component VoicePanel inherits Rectangle {
                     // （复核指出；按钮早就按 !transcribing 灰掉了，输入框漏了这一条）
                     enabled: !root.busy && !root.transcribing;
                     text <=> root.reference-text;
-                    placeholder: "这段参考音频里实际念的内容（服务端要求与音频成对）";
+                    placeholder: root.engine-requires-reference-text
+                        ? "必填：这段参考音频里实际念的内容（该引擎要求，可点「自动转写」）"
+                        : "可选：这段参考音频里实际念的内容（建议点「自动转写」）";
                     edited => { root.reference-text-edited(); }
                 }
                 PixelButton {
@@ -254,7 +259,9 @@ export component VoicePanel inherits Rectangle {
             }
             if root.reference-text-status != "" : Text {
                 text: root.reference-text-status;
-                color: root.reference-text == "" ? PixelTheme.danger : PixelTheme.dim;
+                // 红色告警只属于"必填引擎缺文本"这一种情况：可选引擎的转写状态/失败
+                // 提示只是过程信息，不吓人（不靠颜色之外单独承载信息）。
+                color: root.engine-requires-reference-text && root.reference-text == "" ? PixelTheme.danger : PixelTheme.dim;
                 font-size: 11px;
                 wrap: word-wrap;
             }

@@ -8,10 +8,12 @@
 > 方向只会**更保守**——服务端缺省是 `offline`，随包清单说 `streaming` 时 App 选择把该模型
 > 从可选引擎里藏起来；不会反过来放出服务端会拒的引擎。
 
-这几个字段决定界面上的三件事：
+这几个字段决定界面上的几件事：
 
 - 哪些模型**不出现在**可选引擎里（`product_excluded`：选了会静默产出听不懂的音频）；
 - 哪个引擎**必须**给参考音频才能开工（`requires.voice_ref`：不给就 500）；
+- 哪个引擎的**克隆路径必须**给参考文本（`requires.reference_text`：audio8-tts 只给
+  voice_ref 就 500；index-tts2 显式 false —— 只给 voice_ref 就 200）；
 - 引擎行下面那句**只读的已知问题**（`known_issues`）。
 
 ## 两条投递路径（同一份 schema）
@@ -80,10 +82,10 @@ python3 tools/tests/test_gen_model_capabilities.py # 7 条：投影不漏键 / �
 **现在**
 
 ```text
-  [0] audio8-tts  · 要求参考音=false · 默认选中=true
+  [0] audio8-tts  · 要求参考音=false · 要求参考文本=true · 默认选中=true
       known_issues="数字/电话/金额读法不稳定，必须依赖 text.normalization；…"
       开工判据：Ready
-  [1] index-tts2  · 要求参考音=true · 默认选中=false
+  [1] index-tts2  · 要求参考音=true · 要求参考文本=false · 默认选中=false
       known_issues="不接 voice_ref 会直接报错，需在 UI 层强制选音色"
       开工判据：EngineNeedsReference   ← 主按钮禁用 + 内置音色行置灰 + 点名原因
   [不出现在下拉] audio8-tts-01b        · product_excluded=true  · mode="offline"
@@ -99,6 +101,10 @@ python3 tools/tests/test_gen_model_capabilities.py # 7 条：投影不漏键 / �
 
 `EngineNeedsReference` 就是界面上的：内置默认音色行置灰、主按钮禁用、提示
 「这个引擎必须提供参考音频（不能只用内置音色）」。改前这里会放行，用户点下去才逐句吃 500。
+
+`requires.reference_text` 只约束"填了参考音"的情形（audio8-tts 的内置音色不需要文本）：
+选中 audio8-tts 又填了参考音、参考文本为空时，界面显示「audio8-tts 要求参考文本：
+点『自动转写』…或换用不要求参考文本的引擎（如 index-tts2）」，提交与试听都在**发请求前**拦下。
 
 ## 回归与阳性对照
 

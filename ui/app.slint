@@ -191,6 +191,7 @@ export component MainWindow inherits Window {
     in property <bool> reference-exists: false;
     // 引擎能力（Rust 侧唯一判据的投影，界面只消费，不重拼条件）：
     in property <bool> engine-requires-voice-ref: false;  // 该引擎硬要求参考音
+    in property <bool> engine-requires-reference-text: false;  // 克隆路径硬要求参考文本
     in property <string> engine-note: "";                 // 硬要求 + known_issues 的只读说明
     // 「能不能开工」由 Rust 的 voice_readiness 判一次：主按钮 / 内置音色行 / 阻断提示共用
     in property <bool> dub-voice-ready: false;
@@ -228,8 +229,8 @@ export component MainWindow inherits Window {
 
     // 音色设计 Tab
     in-out property <string> voice-ref-path: "";
-    /// 参考音频的**文本**：服务端要求与参考音频成对下发（只给路径会 500）；
-    /// 它同时是音色的一部分——改文本就等于换音色，旧音频要作废重录。
+    /// 参考音频的**文本**：是否必填**按引擎**（audio8-tts 等要求成对下发、只给路径会 500；
+    /// index-tts2 不要文本）；它同时是音色的一部分——改文本就等于换音色，旧音频要作废重录。
     in-out property <string> voice-ref-text: "";
     in property <string> voice-ref-text-status: "";
     in property <bool> voice-ref-text-busy: false;
@@ -475,6 +476,7 @@ export component MainWindow inherits Window {
                     voice-hint: root.voice-hint;
                     voice-ready: root.dub-voice-ready;
                     engine-requires-voice-ref: root.engine-requires-voice-ref;
+                    engine-requires-reference-text: root.engine-requires-reference-text;
                     engine-note: root.engine-note;
 
                     // 配音页内的高级参数（默认收起，不在抽屉里）

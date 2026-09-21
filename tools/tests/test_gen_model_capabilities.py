@@ -67,8 +67,9 @@ class ProjectionTest(unittest.TestCase):
             self.assertIsInstance(m["role"], str)
             self.assertIsInstance(m["known_issues"], list)
             if m["requires"] is not None:
-                self.assertEqual(
-                    set(m["requires"]), {"voice_ref"}, f"{m['id']} 的 requires 只有 voice_ref 一项"
+                self.assertTrue(
+                    set(m["requires"]) <= {"voice_ref", "reference_text"},
+                    f"{m['id']} 的 requires 出现未登记键 {set(m['requires']) - {'voice_ref', 'reference_text'}}",
                 )
 
     def test_defaults_match_what_the_server_would_omit(self):
@@ -95,6 +96,14 @@ class ProjectionTest(unittest.TestCase):
         self.assertTrue(
             by_id["index-tts2"]["requires"] and by_id["index-tts2"]["requires"]["voice_ref"],
             "index-tts2 必须随包带上「硬要求参考音」",
+        )
+        self.assertFalse(
+            by_id["index-tts2"]["requires"]["reference_text"],
+            "index-tts2 不要求参考文本，必须显式声明 false",
+        )
+        self.assertTrue(
+            by_id["audio8-tts"]["requires"]["reference_text"],
+            "audio8-tts 克隆路径必须参考文本，要随包带上（否则界面上不拦）",
         )
         self.assertEqual(by_id["audio8-tts-stream"]["mode"], "streaming", "流式专用必须随包标出")
 
