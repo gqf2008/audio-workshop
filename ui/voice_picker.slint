@@ -121,6 +121,10 @@ export component VoicePanel inherits Rectangle {
     callback library-apply(string);
     callback library-export(string);
     callback library-import();
+    // 选一个/多个音频文件直接入库（多选）；与「导入…」（导出包目录）是两个入口
+    callback library-add-audio();
+    // 参考音频行的「选择…」：文件框单选，结果与手填路径同一套语义
+    callback reference-pick();
 
     property <bool> cloning: root.reference-path != "";
 
@@ -196,6 +200,13 @@ export component VoicePanel inherits Rectangle {
                 text <=> root.reference-path;
                 placeholder: "参考音频路径，如 ~/Documents/ref.wav";
                 edited => { root.edited(); }
+            }
+            PixelButton {
+                width: 70px;
+                text: "选择…";
+                Tooltip { text: @markdown("从系统文件框选一段参考音频（5–30 秒干净人声）"); }
+                enabled: !root.busy;
+                clicked => { root.reference-pick(); }
             }
             PixelButton {
                 width: 64px;
@@ -299,6 +310,14 @@ export component VoicePanel inherits Rectangle {
                 overflow: elide;
             }
             PixelButton {
+                width: 110px;
+                size: "small";
+                text: "添加音频…";
+                Tooltip { text: @markdown("选一个或多个音频，按文件名入库，不动当前工程音色"); }
+                enabled: !root.busy;
+                clicked => { root.library-add-audio(); }
+            }
+            PixelButton {
                 width: 104px;
                 size: "small";
                 text: "导入…";
@@ -333,7 +352,7 @@ export component VoicePanel inherits Rectangle {
         }
 
         if root.library-rows.length == 0 : Text {
-            text: "音色库还是空的：选好参考音频、起个名字，点「存入音色库」。";
+            text: "音色库还是空的：点「添加音频…」把音频文件按文件名入库，或选好参考音频、起个名字点「存入音色库」。";
             color: PixelTheme.dim;
             font-size: 11px;
             wrap: word-wrap;

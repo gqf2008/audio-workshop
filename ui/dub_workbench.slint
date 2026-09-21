@@ -657,6 +657,8 @@ export component DubWorkbench inherits Rectangle {
     callback library-apply(string);
     callback library-export(string);
     callback library-import();
+    callback library-add-audio();
+    callback reference-pick();
     /// 工程版本（P3）：留档 / 对比 / 回滚
     in property <[VersionRow]> version-rows: [];
     in property <string> version-status: "还没有留档";
@@ -842,6 +844,8 @@ export component DubWorkbench inherits Rectangle {
                             library-apply(name) => { root.library-apply(name); }
                             library-export(name) => { root.library-export(name); }
                             library-import => { root.library-import(); }
+                            library-add-audio => { root.library-add-audio(); }
+                            reference-pick => { root.reference-pick(); }
                         }
 
                         // 块体：稿件（清空并入输入域右上角，不单占一行）

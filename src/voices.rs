@@ -325,6 +325,67 @@ pub fn import_from(
     add_from_file(root, &name, &src, &entry.note, now_ms, sanitize)
 }
 
+/// 批量收音频进音色库的结果。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioImportReport {
+    /// 成功入库的音色数（与库内已有条目同名时按覆盖语义，仍算成功）
+    pub imported: usize,
+    /// 失败的文件数（单个坏文件不中断整批）
+    pub failed: usize,
+    /// 第一个失败的可执行原因（同批失败通常同源，报一个就够状态行用）
+    pub first_error: Option<String>,
+}
+
+/// 批量把音频文件直接收进音色库（「添加音频…」按钮的落库逻辑）。
+///
+/// 名字 = 文件主干（trim 后为空回退「导入的音色」），note 为空。
+///
+/// 覆盖语义与单条保存一致，只有一点不同：**同一批内重名**（忽略大小写，与库语义
+/// 同一口径）自动加 `-2` / `-3` 后缀——否则 `a.wav` 与 `a.mp3` 同批选进来，后者会
+/// 静默覆盖前者；与库内已有条目同名仍按库语义覆盖（不加后缀）。
+///
+/// 单个坏文件（不存在 / 空文件 / 不支持扩展名）不中断整批：它的原因收进
+/// `first_error`，其余文件照常入库。
+pub fn import_audio_files(
+    root: &Path,
+    files: &[PathBuf],
+    now_ms: u64,
+    sanitize: impl Fn(&str) -> String,
+) -> AudioImportReport {
+    let mut report = AudioImportReport::default();
+    // 本批已经用掉的名字（忽略大小写）；只有**成功入库**的名字才占位：
+    // 前一个同名文件失败时，后一个仍该用原名（库里根本没有那条）
+    let mut used: Vec<String> = Vec::new();
+    for src in files {
+        let base = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("导入的音色")
+            .to_string();
+        let mut name = base.clone();
+        let mut n = 2u32;
+        while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+            name = format!("{base}-{n}");
+            n += 1;
+        }
+        match add_from_file(root, &name, src, "", now_ms, &sanitize) {
+            Ok(_) => {
+                used.push(name);
+                report.imported += 1;
+            }
+            Err(e) => {
+                report.failed += 1;
+                if report.first_error.is_none() {
+                    report.first_error = Some(e);
+                }
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +554,153 @@ mod tests {
             std::fs::read(audio_path(&other, index.get("跨机音色").unwrap())).unwrap(),
             std::fs::read(&src).unwrap(),
             "导入后音频应与导出前一致"
+        );
+    }
+
+    /// 「添加音频…」批量入库：多个文件按主干命名全部成功，且库里是各自副本。
+    #[test]
+    fn batch_import_adds_all_files_by_their_stem_names() {
+        let root = temp_dir("batch-all");
+        let a = root.join("口播甲.wav");
+        let b = root.join("口播乙.wav");
+        write_wav(&a, 100);
+        write_wav(&b, 200);
+
+        let report = import_audio_files(&root, &[a.clone(), b.clone()], 1, sanitize);
+        assert_eq!(report.imported, 2, "两个好文件都该入库");
+        assert_eq!(report.failed, 0);
+        assert!(report.first_error.is_none());
+
+        let index = load(&root).unwrap();
+        assert_eq!(index.voices.len(), 2);
+        assert_eq!(index.get("口播甲").unwrap().note, "", "批量入库不带备注");
+        assert_eq!(
+            std::fs::read(audio_path(&root, index.get("口播甲").unwrap())).unwrap(),
+            std::fs::read(&a).unwrap(),
+            "库里应是选进来的那份音频的副本"
+        );
+        assert_eq!(
+            std::fs::read(audio_path(&root, index.get("口播乙").unwrap())).unwrap(),
+            std::fs::read(&b).unwrap()
+        );
+    }
+
+    /// 同一批内重名（主干相同、大小写也算）自动加 -2 / -3 后缀：不能同批静默覆盖。
+    #[test]
+    fn batch_import_same_stem_gets_numeric_suffix_instead_of_overwriting() {
+        let root = temp_dir("batch-dup");
+        let a = root.join("同一段.wav");
+        let b = root.join("同一段.mp3");
+        write_wav(&a, 1);
+        std::fs::write(&b, b"mp3-bytes").unwrap();
+        let c = root.join("third/同一段.wav");
+        std::fs::create_dir_all(c.parent().unwrap()).unwrap();
+        write_wav(&c, 3);
+
+        let report = import_audio_files(&root, &[a, b, c], 1, sanitize);
+        assert_eq!(report.imported, 3);
+        assert_eq!(report.failed, 0);
+        let index = load(&root).unwrap();
+        let mut names: Vec<&str> = index.voices.iter().map(|v| v.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["同一段", "同一段-2", "同一段-3"],
+            "同批重名要加后缀"
+        );
+        assert_eq!(index.voices.len(), 3);
+        // 三条各写各的文件，没有互相覆盖
+        let files: std::collections::HashSet<&String> =
+            index.voices.iter().map(|v| &v.file).collect();
+        assert_eq!(files.len(), 3, "同批重名不能落到同一个库内文件");
+
+        // 大小写不同也算同名（库语义忽略大小写）
+        let root2 = temp_dir("batch-case");
+        let up = root2.join("Case.wav");
+        let low = root2.join("case.mp3");
+        write_wav(&up, 10);
+        std::fs::write(&low, b"mp3").unwrap();
+        let report = import_audio_files(&root2, &[up, low], 1, sanitize);
+        assert_eq!(report.imported, 2);
+        let mut names: Vec<String> = load(&root2)
+            .unwrap()
+            .voices
+            .iter()
+            .map(|v| v.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Case", "case-2"]);
+    }
+
+    /// 单个坏文件（不存在 / 空文件 / 不支持扩展名）只记失败，不中断整批，
+    /// 第一个失败原因原样透出。
+    #[test]
+    fn batch_import_bad_file_fails_alone_without_aborting_the_batch() {
+        let root = temp_dir("batch-bad");
+        let good = root.join("好的.wav");
+        write_wav(&good, 5);
+        let missing = root.join("没有.wav");
+        let empty = root.join("空.wav");
+        std::fs::write(&empty, b"").unwrap();
+        let bad_ext = root.join("说明.txt");
+        std::fs::write(&bad_ext, b"not audio").unwrap();
+
+        let report =
+            import_audio_files(&root, &[good.clone(), missing, empty, bad_ext], 1, sanitize);
+        assert_eq!(report.imported, 1, "坏文件不该拖垮整批");
+        assert_eq!(report.failed, 3);
+        let first = report.first_error.expect("要留第一个失败原因");
+        assert!(first.contains("不存在"), "{first}");
+
+        let index = load(&root).unwrap();
+        assert_eq!(index.voices.len(), 1);
+        assert_eq!(
+            std::fs::read(audio_path(&root, index.get("好的").unwrap())).unwrap(),
+            std::fs::read(&good).unwrap(),
+            "好文件照常入库"
+        );
+    }
+
+    /// 主干是空白（如文件名「 .wav」）时回退「导入的音色」；同批再来一个则加后缀。
+    #[test]
+    fn batch_import_empty_stem_falls_back_to_imported_voice_name() {
+        let root = temp_dir("batch-nostem");
+        let a = root.join(" .wav");
+        write_wav(&a, 7);
+        let b = root.join(" .mp3");
+        std::fs::write(&b, b"mp3").unwrap();
+
+        let report = import_audio_files(&root, &[a, b], 1, sanitize);
+        assert_eq!(report.imported, 2);
+        assert_eq!(report.failed, 0);
+        let index = load(&root).unwrap();
+        assert_eq!(index.voices.len(), 2);
+        assert!(index.get("导入的音色").is_some(), "空主干要回退固定名字");
+        assert!(
+            index.get("导入的音色-2").is_some(),
+            "第二个空主干同批重名，加后缀"
+        );
+    }
+
+    /// 与库内已有条目同名仍按库语义覆盖（不加后缀）：批量入口不改变覆盖口径。
+    #[test]
+    fn batch_import_keeps_library_overwrite_semantics_for_existing_names() {
+        let root = temp_dir("batch-overwrite");
+        let pre = root.join("pre.wav");
+        write_wav(&pre, 11);
+        add_from_file(&root, "已有", &pre, "旧备注", 1, sanitize).unwrap();
+
+        let src = root.join("已有.wav");
+        write_wav(&src, 22);
+        let report = import_audio_files(&root, std::slice::from_ref(&src), 2, sanitize);
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.failed, 0);
+        let index = load(&root).unwrap();
+        assert_eq!(index.voices.len(), 1, "库内同名覆盖，不加后缀");
+        assert_eq!(
+            std::fs::read(audio_path(&root, index.get("已有").unwrap())).unwrap(),
+            std::fs::read(&src).unwrap(),
+            "覆盖后库里应是新音频"
         );
     }
 

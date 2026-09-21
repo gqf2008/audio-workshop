@@ -411,6 +411,14 @@ enum Msg {
     VoiceImportDirPicked {
         pick: picker::Outcome<String>,
     },
+    /// 「添加音频…」选完的音频文件（多选，按文件名直接入库；三态）
+    VoiceFilesPicked {
+        pick: picker::Outcome<Vec<PathBuf>>,
+    },
+    /// 参考音频行「选择…」选完的文件（单选；结果与手填路径同一套作废语义）
+    ReferenceAudioPicked {
+        pick: picker::Outcome<String>,
+    },
     /// 批量：系统文件框选完的多篇稿件（三态；取消与"选择器不可用"分开）
     BatchScriptsPicked {
         pick: picker::Outcome<Vec<PathBuf>>,
@@ -1129,6 +1137,26 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
             let _ = msg.send(WorkerMsg {
                 revision: 0,
                 msg: Msg::VoiceImportDirPicked { pick },
+            });
+        });
+    });
+
+    // 添加音频…：选一个/多个音频文件按文件名直接入库（不动当前工程音色）
+    let weak = ui.as_weak();
+    let msg = ctx.msg_tx.clone();
+    ui.on_library_add_audio(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_status_text("正在打开文件选择框（选要加入音色库的音频，可多选）…".into());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let pick = picker::pick_files(
+                "选择要加入音色库的音频",
+                "音频",
+                &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
+            );
+            let _ = msg.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::VoiceFilesPicked { pick },
             });
         });
     });
@@ -8220,20 +8248,29 @@ fn wire_engine_changes(ui: &MainWindow, cmd_tx: &Sender<Cmd>, state: &Rc<UiState
     let state2 = state.clone();
     ui.on_voice_ref_changed(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_running() || ui.get_busy() {
-            ui.set_status_text("任务进行中：参考音暂不可改".into());
-            return;
-        }
-        // 路径字段是 in-out 绑定，回调触发时 Slint 已经把它改成新值了 ——
-        // 拿不到旧值做比较，所以**任何编辑都让文本作废**：
-        // 文本属于原来那段音频，留着就会静默拿它去条件新音频（见 `keeps_reference_text`）。
-        clear_reference_text(&ui);
-        invalidate_worker_project(&tx2, &state2);
-        reset_bgm(&ui, &state2);
-        ui.set_has_result(false);
-        refresh_voice_labels(&ui);
-        ui.set_status_text("参考音已变更：请重新开始合成，旧工程音频暂不可导出".into());
+        apply_voice_ref_change(&ui, &tx2, &state2);
     });
+}
+
+/// 换参考音频后的统一作废语义：手改路径（`on_voice_ref_changed`）与参考音频行的
+/// 「选择…」文件框两条路共用这一份正文——同一语义两份实现必然漂移。
+///
+/// 运行中/忙时与手工编辑一样拒绝（「任务进行中：参考音暂不可改」）；
+/// 放行则：清参考文本 + 作废工程/BGM/成品 + 刷新音色标签 + 状态行。
+fn apply_voice_ref_change(ui: &MainWindow, tx: &Sender<Cmd>, state: &Rc<UiState>) {
+    if ui.get_running() || ui.get_busy() {
+        ui.set_status_text("任务进行中：参考音暂不可改".into());
+        return;
+    }
+    // 路径字段是 in-out 绑定，回调触发时 Slint 已经把它改成新值了 ——
+    // 拿不到旧值做比较，所以**任何编辑都让文本作废**：
+    // 文本属于原来那段音频，留着就会静默拿它去条件新音频（见 `keeps_reference_text`）。
+    clear_reference_text(ui);
+    invalidate_worker_project(tx, state);
+    reset_bgm(ui, state);
+    ui.set_has_result(false);
+    refresh_voice_labels(ui);
+    ui.set_status_text("参考音已变更：请重新开始合成，旧工程音频暂不可导出".into());
 }
 
 /// 配音页内「音色」区：试听当前音色、清除参考音（切回内置音色）。
@@ -8311,6 +8348,30 @@ fn wire_voice_panel(
         ui.set_has_result(false);
         refresh_voice_labels(&ui);
         ui.set_status_text("已切回内置默认音色：请重新开始合成".into());
+    });
+
+    // ── 参考音频「选择…」：文件框单选。结果与手改路径**同一条**作废语义 ──
+    let weak = ui.as_weak();
+    let msg_pick = msg_tx.clone();
+    ui.on_reference_pick(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_running() || ui.get_busy() {
+            ui.set_status_text("任务进行中：参考音暂不可改".into());
+            return;
+        }
+        ui.set_status_text("正在打开文件选择框（选 5–30 秒干净人声）…".into());
+        let msg_pick = msg_pick.clone();
+        std::thread::spawn(move || {
+            let pick = picker::pick_file(
+                "选择参考音频（5–30 秒干净人声）",
+                "音频",
+                &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
+            );
+            let _ = msg_pick.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::ReferenceAudioPicked { pick },
+            });
+        });
     });
 
     // ── 参考音频的文本：与参考音一样是音色的一部分（服务端拿它做条件）──
@@ -9628,6 +9689,11 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BackupDirPicked { .. }
         | Msg::BackupDone { .. }
         | Msg::VoiceImportDirPicked { .. }
+        // 音色库「添加音频…」：来自系统文件框（后台线程、revision 0），
+        // 与工程版本无关——被过滤掉就是「点完没反应」
+        | Msg::VoiceFilesPicked { .. }
+        // 参考音频「选择…」同理：文件框结果，与工程版本无关
+        | Msg::ReferenceAudioPicked { .. }
         // 参考音转写：来自后台线程，与稿件版本无关（转的是参考音，不是稿子）
         | Msg::ReferenceTranscribed { .. }
         // 文本描述生成音色：来自 worker，但只合成一句试听文本、不碰当前工程，
@@ -9998,6 +10064,28 @@ fn tick(
                         ui.set_status_text("自动转写失败：手动填写参考音频的文本即可继续".into());
                     }
                 }
+            }
+            Msg::ReferenceAudioPicked { pick } => {
+                let path = match pick {
+                    picker::Outcome::Picked(p) => p,
+                    picker::Outcome::Cancelled => {
+                        ui.set_status_text("取消了选择参考音频".into());
+                        return;
+                    }
+                    picker::Outcome::Unavailable(trouble) => {
+                        ui.set_status_text(format!("没能选择参考音频：{}", trouble.note()).into());
+                        return;
+                    }
+                };
+                // 选完那一刻可能有任务跑起来了：与手工编辑同一条拒绝语义，
+                // **先拒后改**——不能先把路径改掉再拒（会留下改了音色却不作废的残局）
+                if ui.get_running() || ui.get_busy() {
+                    ui.set_status_text("任务进行中：参考音暂不可改".into());
+                    return;
+                }
+                // 与手改路径同一语义：写路径（换音频时连带清参考文本）+ 作废工程/BGM/成品
+                set_voice_ref(ui, &path);
+                apply_voice_ref_change(ui, cmd_tx, state);
             }
             Msg::VoicePreviewFailed { label, error } => {
                 ui.set_busy(false);
@@ -10434,6 +10522,35 @@ fn tick(
                     }
                     Err(e) => ui.set_status_text(e.into()),
                 }
+            }
+            Msg::VoiceFilesPicked { pick } => {
+                let paths = match pick {
+                    picker::Outcome::Picked(paths) => paths,
+                    picker::Outcome::Cancelled => {
+                        ui.set_status_text("取消了添加音频".into());
+                        return;
+                    }
+                    picker::Outcome::Unavailable(trouble) => {
+                        ui.set_status_text(format!("没能添加音频：{}", trouble.note()).into());
+                        return;
+                    }
+                };
+                if paths.is_empty() {
+                    ui.set_status_text("没有选到音频文件".into());
+                    return;
+                }
+                // 逐个按文件名入库：单文件失败不中断整批（失败原因在 report 里）
+                let report =
+                    voices::import_audio_files(&voices_root(), &paths, now_ms(), file_stem);
+                refresh_voice_library(ui);
+                let mut note = format!("已加入 {} 个音色（同名会覆盖）", report.imported);
+                if report.failed > 0 {
+                    match &report.first_error {
+                        Some(e) => note.push_str(&format!("；失败 {} 个：{e}", report.failed)),
+                        None => note.push_str(&format!("；失败 {} 个", report.failed)),
+                    }
+                }
+                ui.set_status_text(note.into());
             }
             Msg::BatchScriptsPicked { pick } => {
                 let paths = match pick {
@@ -15548,6 +15665,104 @@ mod tests {
         }
     }
 
+    /// 音色库「添加音频…」的消息来自系统文件框（后台线程、revision 0），
+    /// 与工程版本无关：不在名单里就会被版本过滤静默丢掉，
+    /// 界面停在「正在打开文件选择框…」。
+    #[test]
+    fn voice_files_picked_survives_revision_changes() {
+        let msgs = vec![
+            Msg::VoiceFilesPicked {
+                pick: picker::Outcome::Picked(vec![PathBuf::from("/tmp/甲.wav")]),
+            },
+            // 取消也要能回来：否则状态行停在「正在打开文件选择框…」
+            Msg::VoiceFilesPicked {
+                pick: picker::Outcome::Cancelled,
+            },
+        ];
+        let names = ["VoiceFilesPicked(Picked)", "VoiceFilesPicked(Cancelled)"];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
+    /// 参考音频「选择…」的消息同理：文件框结果（后台线程、revision 0），
+    /// 被版本过滤掉就是「选完没反应」。
+    #[test]
+    fn reference_audio_picked_survives_revision_changes() {
+        let msgs = vec![
+            Msg::ReferenceAudioPicked {
+                pick: picker::Outcome::Picked("/tmp/参考.wav".into()),
+            },
+            Msg::ReferenceAudioPicked {
+                pick: picker::Outcome::Cancelled,
+            },
+        ];
+        let names = [
+            "ReferenceAudioPicked(Picked)",
+            "ReferenceAudioPicked(Cancelled)",
+        ];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
+    /// 换参考音频的作废语义只该有一份正文：手改路径的回调与文件框结果都走
+    /// `apply_voice_ref_change`——把作废逻辑抄两份必然漂移（复核的历史教训）。
+    ///
+    /// 源码级守卫：`on_voice_ref_changed` 回调体里不许再直接写 invalidate/reset，
+    /// 必须调用共享函数；文件框结果也同一函数。
+    #[test]
+    fn reference_pick_uses_the_same_invalidation_path_as_manual_edit() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("fn apply_voice_ref_change("),
+            "共享作废函数必须在"
+        );
+        let at = src.find("fn apply_voice_ref_change(").unwrap();
+        let body = &src[at..(at + 700).min(src.len())];
+        for step in [
+            "clear_reference_text(",
+            "invalidate_worker_project(",
+            "reset_bgm(",
+            "set_has_result(false)",
+            "refresh_voice_labels(",
+        ] {
+            assert!(body.contains(step), "作废语义缺一步（{step}）：{body}");
+        }
+        assert!(
+            body.contains("任务进行中：参考音暂不可改"),
+            "共享函数要带与手工编辑同一条拒绝：{body}"
+        );
+        // 回调体调用共享函数，而不是自己再写一遍
+        let cb = src.find("ui.on_voice_ref_changed(move").unwrap();
+        let cb_body = &src[cb..(cb + 300).min(src.len())];
+        assert!(
+            cb_body.contains("apply_voice_ref_change("),
+            "手改路径的回调必须走共享函数：{cb_body}"
+        );
+        assert!(
+            !cb_body.contains("invalidate_worker_project"),
+            "回调体不许再抄一遍作废：{cb_body}"
+        );
+        // 文件框结果也一样走共享函数
+        let pick = src.find("Msg::ReferenceAudioPicked { pick } =>").unwrap();
+        let pick_body = &src[pick..(pick + 1200).min(src.len())];
+        assert!(
+            pick_body.contains("set_voice_ref(") && pick_body.contains("apply_voice_ref_change("),
+            "文件框结果必须走 set_voice_ref + apply_voice_ref_change：{pick_body}"
+        );
+    }
+
     /// 备份的起跑守卫：连点、以及和别的写盘动作撞车，都要被挡住（复核的阻塞项 2）。
     #[test]
     fn backup_refusal_blocks_double_click_and_concurrent_writers() {
@@ -17924,7 +18139,7 @@ mod tests {
     ///
     /// 阳性对照（实测过）：把 `spawn_file_pick` 那处写回
     /// `let Some(path) = ... else { 已取消 }`（即两种"没选到"共用一条路），
-    /// `unavailable` 计数掉到 5、这条立刻红。
+    /// `unavailable` 计数比调用点少 1、这条立刻红。
     #[test]
     fn every_picker_call_site_handles_cancel_and_unavailable_separately() {
         let src = production_source();
@@ -17936,7 +18151,7 @@ mod tests {
         // （分支还在、文案却撒谎）→ 下面这一条立刻红。
         let notes = src.matches("trouble.note()").count();
         assert_eq!(
-            calls, 7,
+            calls, 9,
             "选择器调用点数量变了（{calls}）——加/删调用点时同步更新这条守卫"
         );
         assert_eq!(
