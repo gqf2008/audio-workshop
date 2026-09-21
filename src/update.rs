@@ -252,10 +252,7 @@ fn match_rank(name: &str, platform: Platform) -> Option<u8> {
 /// 挑不到就回落 `assets[0]`——资产命名/平台组合变了时，回落第一个比拿不到强
 /// （三平台都能挑到是常态；GitHub 的资产顺序不保证，首个往往是字母序第一的 Linux 包，
 /// 2026-09 实测 macOS 上旧代码因此把 Linux 包的体积显示给了用户）。
-fn pick_asset(
-    assets: &[serde_json::Value],
-    platform: Platform,
-) -> Option<&serde_json::Value> {
+fn pick_asset(assets: &[serde_json::Value], platform: Platform) -> Option<&serde_json::Value> {
     let matches = |asset: &serde_json::Value, rank: u8| -> bool {
         asset
             .get("name")
