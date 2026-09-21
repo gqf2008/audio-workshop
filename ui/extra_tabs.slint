@@ -17,6 +17,9 @@ export component VoiceDesignTab inherits Rectangle {
     /// index-tts2 不要文本）
     in-out property <string> reference-text: "";
     in property <string> reference-text-status: "";
+    /// 该引擎的克隆路径是否**必须**给参考文本（audio8-tts 要、index-tts2 不要）——
+    /// 与配音页共用同一份能力来源（app 透传），红色告警只属于「必填引擎缺文本」。
+    in property <bool> engine-requires-reference-text: false;
     in property <bool> transcribing: false;
     in property <bool> busy: false;
     /// 文本描述生成音色的输入：试听文本 + 音色描述
@@ -39,6 +42,7 @@ export component VoiceDesignTab inherits Rectangle {
     callback clear-reference();
     callback use-in-dubbing();
     callback reference-text-edited();
+    callback reference-pick();
     callback transcribe-reference();
     callback design-generate();
     callback design-use-in-dubbing();
@@ -109,12 +113,22 @@ export component VoiceDesignTab inherits Rectangle {
                             font-size: 12px;
                             wrap: word-wrap;
                         }
-                        PixelTextInput {
-                            width: 100%;
-                            enabled: !root.busy;
-                            text <=> root.reference-path;
-                            placeholder: "参考音频路径，如 ~/Documents/ref.wav";
-                            edited => { root.edited(); }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            PixelTextInput {
+                                horizontal-stretch: 1;
+                                enabled: !root.busy;
+                                text <=> root.reference-path;
+                                placeholder: "参考音频路径，如 ~/Documents/ref.wav";
+                                edited => { root.edited(); }
+                            }
+                            PixelButton {
+                                width: 84px;
+                                text: "选择…";
+                                Tooltip { text: @markdown("从系统文件框选一段参考音频（wav / mp3 / flac / m4a / ogg）"); }
+                                enabled: !root.busy;
+                                clicked => { root.reference-pick(); }
+                            }
                         }
                         HorizontalLayout {
                             spacing: 12px;
@@ -136,12 +150,14 @@ export component VoiceDesignTab inherits Rectangle {
                         }
                         if root.reference-text-status != "" : Text {
                             text: root.reference-text-status;
-                            color: root.reference-text == "" ? PixelTheme.danger : PixelTheme.dim;
+                            color: (root.engine-requires-reference-text && root.reference-text == "")
+                                ? PixelTheme.danger
+                                : PixelTheme.dim;
                             font-size: 11px;
                             wrap: word-wrap;
                         }
                         Text {
-                            text: "本版直接填路径（还没接系统文件框）。改完路径或文本都会把旧的合成结果标为旧版本，需重新生成。";
+                            text: "改完路径或文本都会把旧的合成结果标为旧版本，需重新生成；参考文本是否必填按引擎。";
                             color: PixelTheme.dim;
                             font-size: 11px;
                             wrap: word-wrap;

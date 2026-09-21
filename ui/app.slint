@@ -658,6 +658,7 @@ export component MainWindow inherits Window {
                     reference-path <=> root.voice-ref-path;
                     reference-text <=> root.voice-ref-text;
                     reference-text-status: root.voice-ref-text-status;
+                    engine-requires-reference-text: root.engine-requires-reference-text;
                     transcribing: root.voice-ref-text-busy;
                     busy: root.busy || root.running;
                     design-text <=> root.design-text;
@@ -673,6 +674,7 @@ export component MainWindow inherits Window {
                     design-ready: root.design-ready;
                     edited => { root.voice-ref-changed(); }
                     reference-text-edited => { root.voice-ref-text-changed(); }
+                    reference-pick => { root.reference-pick(); }
                     transcribe-reference => { root.transcribe-reference(); }
                     clear-reference => { root.clear-voice-reference(); }
                     use-in-dubbing => {

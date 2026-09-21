@@ -13041,6 +13041,25 @@ mod tests {
             wb.contains("engine-requires-reference-text: root.engine-requires-reference-text;"),
             "工作台要把能力透传给音色区"
         );
+        // 音色设计 Tab 与配音页共用 voice-ref 状态：红色告警与文件框也必须同口径。
+        let design = include_str!("../ui/extra_tabs.slint");
+        assert!(
+            design.contains("in property <bool> engine-requires-reference-text"),
+            "设计 Tab 要接收引擎要求（否则可选引擎缺文本也会标红）"
+        );
+        assert!(
+            design.contains("root.engine-requires-reference-text && root.reference-text == \"\""),
+            "设计 Tab 的红色告警也要按引擎要求"
+        );
+        assert!(
+            design.contains("callback reference-pick();")
+                && design.contains("root.reference-pick();"),
+            "设计 Tab 的参考音频要有系统文件框入口"
+        );
+        assert!(
+            app.contains("reference-pick => { root.reference-pick(); }"),
+            "app 要把文件框回调透传给设计 Tab"
+        );
     }
 
     /// `..` 与软链都要按**真实路径**算（LESSON：路径包含判定必须按真实路径）：
