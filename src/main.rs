@@ -13381,7 +13381,7 @@ mod tests {
     /// `keeps_reference_text` 决定要不要清文本）。谁再直接写这个属性，这条立刻红。
     #[test]
     fn reference_path_writes_go_through_the_helper_that_clears_the_text() {
-        let src = include_str!("main.rs");
+        let src = src_lf(include_str!("main.rs"));
         // 拼接构造 needle：否则这条用例自己的源码就会被算成一次命中
         let needle = concat!("ui.set_voice_ref_", "path(");
         let writes = src.matches(needle).count();
@@ -13392,8 +13392,7 @@ mod tests {
         );
 
         // 反向也要钉住：helper 本身必须真的清（不能只留个名字）
-        let at = src.find("fn set_voice_ref(").expect("set_voice_ref 必须在");
-        let body = &src[at..(at + 400).min(src.len())];
+        let body = source_window(&src, "fn set_voice_ref(", 400);
         assert!(
             body.contains("clear_reference_text(") && body.contains("keeps_reference_text("),
             "set_voice_ref 必须按 keeps_reference_text 判断、并真的清文本：{body}"
@@ -15723,13 +15722,14 @@ mod tests {
     /// 必须调用共享函数；文件框结果也同一函数。
     #[test]
     fn reference_pick_uses_the_same_invalidation_path_as_manual_edit() {
-        let src = include_str!("main.rs");
+        // src_lf + source_window：CRLF 检出下偏移与 LF 不同，且窗口末端可能落在
+        // 多字节中文字符中间（Windows CI 实测 panic），统一归一 + 收缩。
+        let src = src_lf(include_str!("main.rs"));
         assert!(
             src.contains("fn apply_voice_ref_change("),
             "共享作废函数必须在"
         );
-        let at = src.find("fn apply_voice_ref_change(").unwrap();
-        let body = &src[at..(at + 700).min(src.len())];
+        let body = source_window(&src, "fn apply_voice_ref_change(", 700);
         for step in [
             "clear_reference_text(",
             "invalidate_worker_project(",
@@ -15744,8 +15744,7 @@ mod tests {
             "共享函数要带与手工编辑同一条拒绝：{body}"
         );
         // 回调体调用共享函数，而不是自己再写一遍
-        let cb = src.find("ui.on_voice_ref_changed(move").unwrap();
-        let cb_body = &src[cb..(cb + 300).min(src.len())];
+        let cb_body = source_window(&src, "ui.on_voice_ref_changed(move", 300);
         assert!(
             cb_body.contains("apply_voice_ref_change("),
             "手改路径的回调必须走共享函数：{cb_body}"
@@ -15755,8 +15754,7 @@ mod tests {
             "回调体不许再抄一遍作废：{cb_body}"
         );
         // 文件框结果也一样走共享函数
-        let pick = src.find("Msg::ReferenceAudioPicked { pick } =>").unwrap();
-        let pick_body = &src[pick..(pick + 1200).min(src.len())];
+        let pick_body = source_window(&src, "Msg::ReferenceAudioPicked { pick } =>", 1200);
         assert!(
             pick_body.contains("set_voice_ref(") && pick_body.contains("apply_voice_ref_change("),
             "文件框结果必须走 set_voice_ref + apply_voice_ref_change：{pick_body}"
@@ -15828,11 +15826,12 @@ mod tests {
     /// 与 `tasks_in_flight` 各说各话。谁再把计数拼回 Slint，这条立刻红。
     #[test]
     fn backup_button_enabled_does_not_recompute_busyness_in_slint() {
-        let src = include_str!("../ui/dub_workbench.slint");
-        let at = src
-            .find("text: root.backup-running ? \"备份中…\" : \"一键备份…\";")
-            .expect("备份按钮的文案行必须在（改了就同步改这条用例）");
-        let button = &src[at..(at + 400).min(src.len())];
+        let src = src_lf(include_str!("../ui/dub_workbench.slint"));
+        let button = source_window(
+            &src,
+            "text: root.backup-running ? \"备份中…\" : \"一键备份…\";",
+            400,
+        );
         assert!(
             button.contains("enabled: !root.backup-blocked;"),
             "按钮的 enabled 必须直接吃 Rust 投影 backup-blocked：{button}"
@@ -15904,11 +15903,12 @@ mod tests {
     /// 两个按钮的 `enabled` 只能来自 Rust 投影，不许在 Slint 里另拼条件（源码级守卫）。
     #[test]
     fn update_buttons_enabled_do_not_recompute_in_slint() {
-        let src = include_str!("../ui/dub_workbench.slint");
-        let at = src
-            .find("text: root.update-running ? \"检查中…\" : \"检查更新\";")
-            .expect("检查更新按钮的文案行必须在（改了就同步改这条用例）");
-        let block = &src[at..(at + 500).min(src.len())];
+        let src = src_lf(include_str!("../ui/dub_workbench.slint"));
+        let block = source_window(
+            &src,
+            "text: root.update-running ? \"检查中…\" : \"检查更新\";",
+            500,
+        );
         assert!(
             block.contains("enabled: !root.update-blocked;"),
             "检查更新按钮的 enabled 必须直接吃 Rust 投影 update-blocked：{block}"
@@ -18119,6 +18119,26 @@ mod tests {
         s.replace("\r\n", "\n")
     }
 
+    /// 从 `needle` 处取长度约 `len` 的源码窗口。
+    ///
+    /// 两个 Windows 坑：`include_str!` 在 CRLF 检出下字节偏移与 LF 不同；窗口末端
+    /// `at + len` 还可能落在多字节中文字符中间（CI 35551806143 实测 panic：
+    /// end byte index is not a char boundary）。约定：调用方先 `src_lf` 归一（CRLF→LF），
+    /// 本函数再把末端收缩到 char boundary。找不到 needle 时 panic 出可读信息——
+    /// 守卫要能红，而不是静默扫错窗口。
+    fn source_window<'a>(src: &'a str, needle: &str, len: usize) -> &'a str {
+        let at = src.find(needle).unwrap_or_else(|| {
+            panic!(
+                "source_window：源码里找不到 needle `{needle}`（守卫锚点漂了，改源码须同步改用例）"
+            )
+        });
+        let mut end = (at + len).min(src.len());
+        while end > at && !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        &src[at..end]
+    }
+
     fn production_source() -> String {
         // 本守卫族的扫描范围 = main.rs 一个文件（`include_str!("main.rs")` 只读本文件）：
         // engine_supervisor.rs / picker.rs / update.rs 等模块都不在范围内。
@@ -18129,6 +18149,39 @@ mod tests {
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("测试模块的起点变了：守卫会退化成扫全文件（字面量自命中、断言恒真）");
         src[..cut].to_string()
+    }
+
+    /// `source_window` 自身的回归：CRLF + 多字节中文 + 窗口长度故意切在字符中间。
+    ///
+    /// 阳性对照：fixture 里 naive 的 `&src[at..(at + len).min(src.len())]` 末端落在
+    /// '条' 中间、必然 panic（Windows CI 35551806143 实测挂的就是这种）；helper 必须
+    /// 收缩到 char boundary 并返回合法 UTF-8 窗口。
+    #[test]
+    fn source_window_survives_crlf_and_mid_char_cut() {
+        let raw = "fn demo() {\r\n    // 音频条\r\n    let x = 1;\r\n}\r\n";
+        let src = src_lf(raw);
+        let needle = "音频";
+        let at = src.find(needle).expect("fixture 里 needle 必须在");
+        let len = 7; // needle 占 6 字节，+1 正好切进 '条'（3 字节）中间
+        let naive_end = (at + len).min(src.len());
+        assert!(
+            !src.is_char_boundary(naive_end),
+            "fixture 必须真的把末端切在多字节字符中间（否则阳性对照空转）"
+        );
+        let win = source_window(&src, needle, len);
+        assert_eq!(win, "音频", "末端必须收缩到 '条' 之前的 char boundary");
+        assert!(
+            src[at + win.len()..].starts_with('条'),
+            "窗口之后必须是完整字符：末端落在 char boundary 上"
+        );
+    }
+
+    /// 找不到 needle 时 helper 必须 panic 且带可读信息——守卫宁可红，不能静默扫错窗口。
+    #[test]
+    #[should_panic(expected = "找不到 needle")]
+    fn source_window_panics_with_readable_message_when_needle_missing() {
+        let src = src_lf("fn a() {}\r\nfn b() {}\r\n");
+        source_window(&src, "根本不存在的锚点", 40);
     }
 
     /// 选择器的三态必须在**每个调用点显式分流**：`Cancelled`（用户关窗）与
