@@ -1,0 +1,5 @@
+* text=auto
+*.rs text eol=lf
+*.slint text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
