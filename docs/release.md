@@ -118,21 +118,26 @@ spctl -a -t open (DMG)           → accepted (source=Notarized Developer ID)
 按这个顺序做，每一步都实测过（`v0.1.0` 就是这么发出去的）：
 
 ```sh
-# 1) 改版本号（Info.plist 与 DMG 文件名都从它来，见上文「版本号从哪来」）
+# 1) 改版本号并让锁文件跟上（Info.plist 与 DMG 文件名都从它来，见上文「版本号从哪来」）
 $EDITOR Cargo.toml            # version = "X.Y.Z"
-cargo build --release         # 让 Cargo.lock 跟上（改了版本号必须重编一次）
+cargo build --release         # 改了版本号必须重编一次，Cargo.lock 才会跟上
+git add Cargo.toml Cargo.lock && git commit -m "chore(release): X.Y.Z"
+git push origin main
 
 # 2) 打包 + 签名 + 公证 + 装订（.app 与 DMG 各一次公证）
+#    **必须在第 1 步之后**：release.sh 读 Cargo.toml 决定 DMG 文件名与 Info.plist 版本号
 ./release.sh                  # 需要 Keychain profile audio-workshop-notary
 
 # 3) 打 tag 并推到**两个**远端（walgit 与 GitHub）
+#    GitHub 的 tag 触发 release 流水线：三平台构建完成后**自动创建** Release
 git tag -a vX.Y.Z -m "音频作坊 vX.Y.Z"
 git push origin vX.Y.Z
 git push github vX.Y.Z
 
-# 4) 建 Release 并上传 DMG（资产名必须 ASCII，见下文「三个坑」）
-gh release create vX.Y.Z "dist/AudioWorkshop-X.Y.Z.dmg" \
-  --repo gqf2008/audio-workshop --title "音频作坊 vX.Y.Z（macOS）" --notes-file /tmp/notes.md
+# 4) **等 release 流水线绿**，再用第 2 步的本地公证 DMG 覆盖 CI 上传的那份
+#    （CI 没有签名凭据，它上传的 macOS DMG 未签名未公证；原因见「三平台发布流程」后的说明）
+gh release upload vX.Y.Z dist/AudioWorkshop-X.Y.Z.dmg --clobber \
+  --repo gqf2008/audio-workshop
 
 # 5) 核实「检查更新」这条链路真的通（会真打 GitHub API）
 cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
@@ -196,29 +201,16 @@ bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文�
 
 ## 三平台发布流程
 
-```sh
-# 1) 本地（macOS）：打包 + 签名 + 公证 + 装订
-./release.sh                       # 引擎已随包；公证 profile: audio-workshop-notary
-
-# 2) 改版本号并让锁文件跟上（改了版本号必须重编一次）
-#    Cargo.toml: version = "X.Y.Z" → cargo build --release → 提交推 main
-
-# 3) 打 tag → 触发正式发布（CI 建三平台产物并创建 Release）
-git tag -a vX.Y.Z -m "音频作坊 vX.Y.Z"
-git push github vX.Y.Z
-
-# 4) **把 Release 里的 macOS 资产换成上一步本地公证过的那份**（CI 那份是 ad-hoc）
-gh release upload vX.Y.Z dist/AudioWorkshop-X.Y.Z.dmg --clobber \
-  --repo gqf2008/audio-workshop
-
-# 5) 核实"检查更新"链路（会真打 GitHub API，输出里应能看到新 tag 与 sha256/size）
-cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
-```
+命令与顺序以「怎么发一个版本」为**唯一出处**（要改任何一步只改那一处）。本节曾经与它并存
+第二份命令块且互相矛盾——v0.1.5 就是照着漏掉第 4 步的那份发的，结果 macOS 资产未签名未公证
+（`codesign: not signed at all`、`spctl: rejected / source=no usable signature`）。本节只解释
+为什么第 4 步不能省：
 
 ### 为什么第 4 步不能省：CI 的 macOS 产物**没有签名**
 
 CI 的 macOS job 只跑 `./package.sh`，而签名身份与公证凭据都是机器级的秘密（Keychain 里、
-不在 CI）——所以那边出的是 **ad-hoc 签名**的 DMG，`gh release download` 下来实测：
+不在 CI）——那边上传的 DMG 实测 **not signed at all**（`.app` 只是 ad-hoc 签），
+`gh release download` 下来实测：
 
 ```
 spctl -a -t open --context context:primary-signature -v AudioWorkshop-X.Y.Z.dmg
@@ -235,6 +227,8 @@ xcrun stapler validate /tmp/rel/AudioWorkshop-X.Y.Z.dmg                         
 ```
 
 v0.1.4 发布时实测就是这条：CI 资产 `rejected`，覆盖后 `accepted (source=Notarized Developer ID)`。
+v0.1.5 则是**漏掉这条**的反例：Release 里的 DMG `not signed at all`、`stapler validate` 无票据，
+用户下载会被 Gatekeeper 拦——所以第 4 步不是可选项。
 Windows/Linux 资产由 CI 直接出没问题（Windows 侧另有 `tools/check_windows_icon.py` 的
 图标 + GUI 子系统断言兜底）。
 
