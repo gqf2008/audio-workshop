@@ -19,7 +19,7 @@ pub mod text_layer;
 pub use audio_client::{
     memory_shortfall, memory_shortfall_note, parse_insufficient_memory, Client, ClientError,
     InsufficientMemory, MemoryShortfall, VoiceClone, VoiceSource, DEFAULT_ASR_MODEL,
-    MISSING_REFERENCE_PATH, MISSING_REFERENCE_TEXT, SYNTH_REQUEST_OPTIONS,
+    MISSING_REFERENCE_PATH, SYNTH_REQUEST_OPTIONS,
 };
 pub use bgm::{
     assemble_bgm, bgm_artifacts_from_disk, bgm_only_artifacts, generate_segments,

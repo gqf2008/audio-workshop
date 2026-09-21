@@ -88,11 +88,15 @@ pub fn catalog() -> Result<&'static Catalog, &'static str> {
 // 服务端原文形状（高优先级来源）：Option 才能表达"没写"
 // ===========================================================================
 
-/// 后端硬要求。目前只有一项（`index-tts2` 必须给参考音频），但按 schema 的结构声明。
+/// 后端硬要求。按 schema 的结构声明：
+/// · `voice_ref`：index-tts2 必须给参考音频；
+/// · `reference_text`：audio8-tts 等克隆路径必须给参考文本（index-tts2 不要）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct Requires {
     #[serde(default)]
     pub voice_ref: bool,
+    #[serde(default)]
+    pub reference_text: bool,
 }
 
 /// `server.json` 里一条记录的**原始**能力字段：`None` = 服务端没写这一项。
@@ -139,6 +143,14 @@ impl Capability {
     /// 该引擎是否**必须**提供参考音频（index-tts2：不接 voice_ref 直接报错）。
     pub fn requires_voice_ref(&self) -> bool {
         self.requires.as_ref().is_some_and(|r| r.voice_ref)
+    }
+
+    /// 该引擎的**克隆路径**是否必须给参考文本（audio8-tts：只给 voice_ref 就 500；
+    /// index-tts2：不要文本，只给 voice_ref 就 200，真机实测）。
+    ///
+    /// 只约束"填了参考音"的情形：不填参考音走内置音色，与文本无关。
+    pub fn requires_reference_text(&self) -> bool {
+        self.requires.as_ref().is_some_and(|r| r.reference_text)
     }
 
     /// 已知缺陷的一句话只读说明（空 = 没登记）。
@@ -190,7 +202,11 @@ mod tests {
             product_excluded: true,
             mode: "streaming".into(),
             role: "streaming".into(),
-            requires: Some(Requires { voice_ref: true }),
+            // index-tts2 显式不要参考文本（只给 voice_ref 就 200，真机实测）
+            requires: Some(Requires {
+                voice_ref: true,
+                reference_text: false,
+            }),
             known_issues: vec!["不接 voice_ref 会直接报错".into()],
         }
     }
@@ -206,6 +222,21 @@ mod tests {
             index.requires.as_ref().is_some_and(|r| r.voice_ref),
             "index-tts2 的 requires.voice_ref 是产品层硬要求，必须随包带着 —— \
              丢了它，界面上就不会拦「该引擎必须提供参考音频」"
+        );
+        assert!(
+            !index.requires.as_ref().is_some_and(|r| r.reference_text),
+            "index-tts2 不要求参考文本（显式 false 也是产品口径，不能丢）"
+        );
+        // audio8-tts 克隆路径必须给参考文本：只给 voice_ref 就 500（真机实测）
+        let audio8 = resolve(&RawCaps::default(), cat.find("audio8-tts"));
+        assert!(
+            audio8.requires_reference_text(),
+            "audio8-tts 的 requires.reference_text 必须随包带着 —— \
+             丢了它，界面上就不会拦「该引擎要求参考文本」"
+        );
+        assert!(
+            !audio8.requires_voice_ref(),
+            "audio8-tts 的内置音色不需要参考音，requires.voice_ref 应为 false"
         );
         assert!(
             !index.known_issues.is_empty(),
@@ -233,6 +264,10 @@ mod tests {
         assert_eq!(c.mode, "streaming");
         assert_eq!(c.role, "streaming");
         assert!(c.requires_voice_ref(), "requires 必须回落");
+        assert!(
+            !c.requires_reference_text(),
+            "index-tts2 显式 false 的 reference_text 必须回落成 false（不拦不该拦的）"
+        );
         assert_eq!(c.known_issues_note(), "不接 voice_ref 会直接报错");
         assert!(c.is_streaming_only());
     }
@@ -267,13 +302,20 @@ mod tests {
     fn explicit_false_and_empty_are_still_explicit() {
         let server = RawCaps {
             product_excluded: Some(false),
-            requires: Some(Requires { voice_ref: false }),
+            requires: Some(Requires {
+                voice_ref: false,
+                reference_text: true,
+            }),
             known_issues: Some(Vec::new()),
             ..Default::default()
         };
         let c = resolve(&server, Some(&bundled()));
         assert!(!c.product_excluded, "显式 false 必须压过随包的 true");
         assert!(!c.requires_voice_ref(), "显式 false 必须压过随包的 true");
+        assert!(
+            c.requires_reference_text(),
+            "requires 是整条覆盖：服务端显式给了 reference_text: true 就以服务端为准"
+        );
         assert!(
             c.known_issues.is_empty(),
             "显式空数组必须压过随包的非空（否则用户删不掉随包登记的提示）"
@@ -291,6 +333,7 @@ mod tests {
         assert_eq!(c.mode, "");
         assert_eq!(c.role, "");
         assert!(!c.requires_voice_ref());
+        assert!(!c.requires_reference_text());
         assert!(c.known_issues_note().is_empty());
         assert!(!c.is_streaming_only(), "空 mode/role 不能被当成流式");
     }
@@ -330,7 +373,7 @@ mod tests {
                 "product_excluded": true,
                 "mode": "streaming",
                 "role": "scoring",
-                "requires": { "voice_ref": true },
+                "requires": { "voice_ref": true, "reference_text": true },
                 "known_issues": ["a", "b"]
             }]
         }"#;
@@ -346,21 +389,28 @@ mod tests {
             m.requires.as_ref().is_some_and(|r| r.voice_ref),
             "requires.voice_ref 漂移 → 界面不再拦「必须提供参考音频」"
         );
+        assert!(
+            m.requires.as_ref().is_some_and(|r| r.reference_text),
+            "requires.reference_text 漂移 → 界面不再拦「该引擎要求参考文本」"
+        );
         assert_eq!(
             m.known_issues,
             vec!["a", "b"],
             "known_issues 漂移 → 提示静默消失"
         );
-        // requires 的**内层**键名也要钉：只有 `voice_ref` 这个拼法算数。
-        // 换别的拼法必须表现为"没解析到"，不能被当成"有要求"（方向相反的一半）。
-        let wrong_key = r#"{"models":[{"id":"m","requires":{"voice_refX":true}}]}"#;
+        // requires 的**内层**键名也要钉：只有 `voice_ref` / `reference_text`
+        // 这两个拼法算数。换别的拼法必须表现为"没解析到"，不能被当成"有要求"
+        // （方向相反的一半）。
+        let wrong_key =
+            r#"{"models":[{"id":"m","requires":{"voice_refX":true,"reference_textX":true}}]}"#;
         let m: CatalogModel = serde_json::from_str::<Catalog>(wrong_key)
             .unwrap()
             .models
             .remove(0);
         assert!(
-            !m.requires.as_ref().is_some_and(|r| r.voice_ref),
-            "requires 的内层键名必须逐字是 voice_ref：写错要「没解析到」，不能凭空变成有要求"
+            !m.requires.as_ref().is_some_and(|r| r.voice_ref)
+                && !m.requires.as_ref().is_some_and(|r| r.reference_text),
+            "requires 的内层键名必须逐字是 voice_ref / reference_text：写错要「没解析到」，不能凭空变成有要求"
         );
     }
 

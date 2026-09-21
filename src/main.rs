@@ -114,8 +114,8 @@ enum Cmd {
         script: String,
         model: String,
         voice_ref: Option<String>,
-        /// 参考音频里实际念的内容。克隆音色**必须**与 `voice_ref` 成对下发，
-        /// 所以它和路径一样是"这次发什么请求"的一部分（见 `aw_core::VoiceClone`）。
+        /// 参考音频里实际念的内容。是否必填按引擎（audio8-tts 要、index-tts2 不要），
+        /// 成对时与 `voice_ref` 一起下发（见 `aw_core::VoiceClone`）。
         voice_ref_text: Option<String>,
         project_name: String,
         /// 句间静音（毫秒）：只影响拼装出来的时间轴，不影响逐句音频
@@ -178,7 +178,7 @@ enum Cmd {
         revision: u64,
         model: String,
         voice_ref: Option<String>,
-        /// 试听也必须成对：否则克隆音色的试听永远 500，用户按试听选音色会被误导
+        /// 试听走与成品同一次请求组装；缺文本时按引擎拦（audio8-tts 要、index-tts2 不要）
         voice_ref_text: Option<String>,
         text: String,
     },
@@ -1642,6 +1642,7 @@ fn tts_engine_voices(models: &[ServerModel]) -> Vec<Voice> {
             note: short_path(&m.path).into(),
             license: "仅自用".into(),
             requires_voice_ref: m.caps.requires_voice_ref(),
+            requires_reference_text: m.caps.requires_reference_text(),
             known_issues: m.caps.known_issues_note().into(),
         })
         .collect()
@@ -3589,8 +3590,9 @@ fn worker_loop(ctx: WorkerCtx) {
                         // `build_synth_request` + 同一份参数白名单）：否则试听听到的
                         // 语气/音色不是成品的那一条，用户按试听选音色会被误导。
                         //
-                        // 克隆同理**必须成对**：只发 voice_ref 的话试听永远 500，
-                        // 用户以为自己选的音色不行，其实是少发了 reference_text。
+                        // 克隆同理按引擎给文本：audio8-tts 只发 voice_ref 就 500，
+                        // index-tts2 不要文本（真机 200）。缺必填文本已在提交前拦
+                        // （on_preview_voice 的 readiness 守卫），这里不再撞 500。
                         let outcome = match voice_ref.as_deref() {
                             Some(path) => match aw_core::VoiceClone::new(
                                 path,
@@ -5127,14 +5129,39 @@ fn voice_input_from_ui(ui: &MainWindow) -> (Option<String>, Option<String>) {
     (path, text)
 }
 
-/// "克隆音色还差参考文本吗"——提交前的拦截判据。
+/// 「当前引擎要求参考文本」的提示：点名引擎 + 给两条出路。
 ///
-/// 真正的规则在 `aw_core::VoiceClone::new`（服务端要求路径与文本成对）；这里只是**提前问一次**，
-/// 不另写一份 trim 判断（两份迟早漂移）。返回 true = 该拦住。
-fn reference_text_missing(voice_ref: &Option<String>, voice_ref_text: &Option<String>) -> bool {
+/// 提交拦截与界面提示共用**同一个函数**（逐字一致，不另写一份，
+/// 见 `LESSON_同一语义两处实现必然漂移回显需与真实行为同源`）。
+/// 音频与文本成对是**按引擎**的要求，不再是全局硬要求（index-tts2 只给 voice_ref
+/// 就 200，真机实测）。
+fn reference_text_required_note(engine: &str) -> String {
+    format!(
+        "{engine} 要求参考文本：点「自动转写」把参考音频实际念的内容填上并核对，或换用不要求参考文本的引擎（如 index-tts2）。"
+    )
+}
+
+/// "选中引擎的克隆音色还差参考文本吗"——提交前的拦截判据。
+///
+/// **按选中引擎**判断：只有"该引擎 `requires.reference_text`（如 audio8-tts）&&
+/// 填了参考音 && 文本为空"才拦。可选引擎（index-tts2）直接放行。
+/// 返回 true = 该拦住。
+fn reference_text_missing(
+    engine_requires_text: bool,
+    voice_ref: &Option<String>,
+    voice_ref_text: &Option<String>,
+) -> bool {
+    if !engine_requires_text {
+        return false;
+    }
     match voice_ref.as_deref() {
         Some(path) => {
-            aw_core::VoiceClone::new(path, voice_ref_text.as_deref().unwrap_or_default()).is_err()
+            !path.trim().is_empty()
+                && voice_ref_text
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
         }
         None => false,
     }
@@ -5809,9 +5836,10 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
             );
             for (i, v) in voices.iter().enumerate() {
                 eprintln!(
-                    "  [{i}] {} · 要求参考音={} · 默认选中={} · known_issues={:?}",
+                    "  [{i}] {} · 要求参考音={} · 要求参考文本={} · 默认选中={} · known_issues={:?}",
                     v.name,
                     v.requires_voice_ref,
+                    v.requires_reference_text,
                     i as i32 == dflt,
                     v.known_issues
                 );
@@ -7613,9 +7641,11 @@ fn wire_batch(
         };
         let model = v.name.to_string();
         let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
-        // 与单篇同一条前置拦截：批量里 10 篇 × N 句全红是最坏的失败形态
-        if reference_text_missing(&voice_ref, &voice_ref_text) {
-            ui.set_batch_summary(aw_core::MISSING_REFERENCE_TEXT.into());
+        // 与单篇同一条前置拦截：批量里 10 篇 × N 句全红是最坏的失败形态。
+        // 按**当前引擎**判断：只有它要求参考文本（如 audio8-tts）且填了参考音
+        // 且文本为空才拦；可选引擎（index-tts2）放行。
+        if reference_text_missing(v.requires_reference_text, &voice_ref, &voice_ref_text) {
+            ui.set_batch_summary(reference_text_required_note(&model).into());
             return;
         }
 
@@ -8308,6 +8338,12 @@ fn wire_voice_panel(
         };
         let model = v.name.to_string();
         let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
+        // 与合成同一条按引擎守卫：audio8-tts 克隆缺文本在**发请求前**拦（试听也是
+        // 一次真实请求，不拦就会拿服务端那句看不懂的 500 当试听结果）。
+        if reference_text_missing(v.requires_reference_text, &voice_ref, &voice_ref_text) {
+            ui.set_status_text(reference_text_required_note(&model).into());
+            return;
+        }
         let what = if voice_ref.is_some() {
             "克隆音色"
         } else {
@@ -8662,6 +8698,11 @@ fn wire_run(
             ui.set_status_text("没有可用音色：检查 server.json / audiocpp_server".into());
             return;
         }
+        // 引擎能力与模型名取同一行（避免"文案看 A、能力看 B"）
+        let requires_text = selected_voice(&ui)
+            .as_ref()
+            .map(|v| v.requires_reference_text)
+            .unwrap_or(false);
         // 续作语义：已合成句保持原样（worker 跳过 done 句），其余重跑。
         // 若界面上已经有失败句，这一次明确走「只重跑失败句」，不把 pending
         // 或 done 混进去。
@@ -8691,9 +8732,10 @@ fn wire_run(
         }
         // 克隆音色缺参考文本：**发起前**拦住。发出去的话每一句都会撞同一个 500
         // （服务端原文用户看不懂，而且 N 句 = N 条一模一样的失败）。
-        // 文案与 `Project::synthesize` 的前置拦截**同一份常量**，不另写一句话。
-        if reference_text_missing(&voice_ref, &voice_ref_text) {
-            ui.set_status_text(aw_core::MISSING_REFERENCE_TEXT.into());
+        // 按**当前引擎**判断（audio8-tts 要、index-tts2 不要），文案与界面提示
+        // 同一份 `reference_text_required_note`。
+        if reference_text_missing(requires_text, &voice_ref, &voice_ref_text) {
+            ui.set_status_text(reference_text_required_note(&model_name).into());
             return;
         }
         reset_bgm(&ui, &state1);
@@ -11211,36 +11253,36 @@ enum VoiceReadiness {
     ReferenceMissing,
     /// 该引擎**必须**提供参考音（index-tts2：不接 voice_ref 直接报错）。
     EngineNeedsReference,
-    /// 给了参考音，但还差它的文本：服务端要求 `voice_ref` 与 `reference_text`
-    /// **成对**（真机实测只给路径 → HTTP 500）。
+    /// 给了参考音，但还差它的文本：**当前引擎**要求 `voice_ref` 与 `reference_text`
+    /// 成对（audio8-tts 真机实测只给路径 → HTTP 500；index-tts2 不需要）。
     ReferenceTextMissing,
 }
 
 impl VoiceReadiness {
     /// 阻断原因（`Ready` 时为空串）。只留当前最重要的一条。
-    fn note(self) -> &'static str {
+    fn note(self, engine: &str) -> String {
         match self {
-            Self::Ready => "",
-            Self::NoEngine => "没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型",
-            Self::ReferenceMissing => "参考音频不存在或不可读：修正路径后再开始配音",
+            Self::Ready => String::new(),
+            Self::NoEngine => "没有可用引擎：先在本机 audio.cpp 服务里配置 tts 模型".into(),
+            Self::ReferenceMissing => "参考音频不存在或不可读：修正路径后再开始配音".into(),
             Self::EngineNeedsReference => {
                 "这个引擎必须提供参考音频（不能只用内置音色）：在下面填一段参考 wav 再开始配音"
+                    .into()
             }
-            // 与提交处那次拦截**同一个常量**：界面提示与真正拦住用户的话逐字一致，
+            // 与提交处那次拦截**同一个函数**：界面提示与真正拦住用户的话逐字一致，
             // 不另写一句（见 LESSON_同一语义两处实现必然漂移）。
-            Self::ReferenceTextMissing => aw_core::MISSING_REFERENCE_TEXT,
+            Self::ReferenceTextMissing => reference_text_required_note(engine),
         }
     }
 }
 
-/// 判据入口：引擎行（可选）+ 参考音路径 / 是否可读 → 能不能开工。
 /// 判据入口：引擎行（可选）+ 参考音路径 / 是否可读 / 参考文本 → 能不能开工。
 ///
 /// 四条规则合成**一个**结论，覆盖两组批次各自的语义：
 /// ① 引擎硬要求参考音（audio-workshop 的 `requires.voice_ref`）；
-/// ② 参考音与文本必须成对（voice-clone 批次）。
-/// 文本那条**转调** `reference_text_missing`（它又转调 `aw_core::VoiceClone`），
-/// 不在这里另写一份 trim 判断 —— 两份判据迟早漂移。
+/// ② 引擎硬要求参考文本（`requires.reference_text`，只约束填了参考音的情形）。
+/// 文本那条**转调** `reference_text_missing`（与提交处同一份 trim 判断），
+/// 不在这里另写一份 —— 两份判据迟早漂移。
 fn voice_readiness(
     engine: Option<&Voice>,
     ref_path: &str,
@@ -11258,7 +11300,11 @@ fn voice_readiness(
         return VoiceReadiness::EngineNeedsReference;
     }
     let as_opt = |v: &str| non_empty(v.to_string());
-    if reference_text_missing(&as_opt(path), &as_opt(ref_text)) {
+    if reference_text_missing(
+        engine.requires_reference_text,
+        &as_opt(path),
+        &as_opt(ref_text),
+    ) {
         return VoiceReadiness::ReferenceTextMissing;
     }
     VoiceReadiness::Ready
@@ -11275,6 +11321,9 @@ fn engine_note(engine: Option<&Voice>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if v.requires_voice_ref {
         parts.push("该引擎必须提供参考音频（不接 voice_ref 会直接报错）".to_string());
+    }
+    if v.requires_reference_text {
+        parts.push("克隆音色时参考文本必填（可点「自动转写」填上）".to_string());
     }
     if !v.known_issues.is_empty() {
         parts.push(format!("已知问题：{}", v.known_issues));
@@ -11318,13 +11367,21 @@ fn refresh_voice_labels(ui: &MainWindow) {
 
     // 判据算一次，UI 只消费：主按钮可用性 / 内置音色行 / 阻断提示同一份结论。
     // 参考文本那条规则由 `voice_readiness` 内部转调 main 的 `reference_text_missing`
-    // 与 `aw_core`，这里不另写一份 trim 判断（见 LESSON_同一语义两处实现必然漂移）。
+    // （与提交处同一份 trim 判断），这里不另写一份（见 LESSON_同一语义两处实现必然漂移）。
     let readiness = voice_readiness(engine_row.as_ref(), &ref_trimmed, exists, &ref_text_trimmed);
     let requires_ref = engine_row.as_ref().is_some_and(|v| v.requires_voice_ref);
+    let requires_text = engine_row
+        .as_ref()
+        .is_some_and(|v| v.requires_reference_text);
+    let engine_name = engine_row
+        .as_ref()
+        .map(|v| v.name.to_string())
+        .unwrap_or_default();
     ui.set_engine_requires_voice_ref(requires_ref);
+    ui.set_engine_requires_reference_text(requires_text);
     ui.set_engine_note(engine_note(engine_row.as_ref()).into());
     ui.set_dub_voice_ready(readiness == VoiceReadiness::Ready);
-    ui.set_voice_hint(readiness.note().into());
+    ui.set_voice_hint(readiness.note(&engine_name).into());
 }
 
 fn selected_model(ui: &MainWindow) -> String {
@@ -11337,6 +11394,16 @@ fn selected_model(ui: &MainWindow) -> String {
         .row_data(idx)
         .map(|v| v.name.to_string())
         .unwrap_or_default()
+}
+
+/// 选中引擎行：模型名与能力（是否要求参考文本等）都从**同一行**取，
+/// 避免"文案看 A、能力看 B"（见 `LESSON_同一语义两处实现必然漂移`）。
+fn selected_voice(ui: &MainWindow) -> Option<Voice> {
+    let index = ui.get_voice_index();
+    if index < 0 {
+        return None;
+    }
+    ui.get_voices().row_data(index as usize)
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -12392,12 +12459,17 @@ mod tests {
             "index-tts2",
             "tts",
             Capability {
-                requires: Some(Requires { voice_ref: true }),
+                // index-tts2：必须参考音、**不要求**参考文本（真机：只给 voice_ref 就 200）
+                requires: Some(Requires {
+                    voice_ref: true,
+                    reference_text: false,
+                }),
                 ..Default::default()
             },
         );
         let v = voice_of(&needs_ref);
         assert!(v.requires_voice_ref, "能力要跟着行走到判据里");
+        assert!(!v.requires_reference_text, "index-tts2 不要求参考文本");
 
         assert_eq!(
             voice_readiness(Some(&v), "", false, ""),
@@ -12405,7 +12477,7 @@ mod tests {
         );
         assert!(
             VoiceReadiness::EngineNeedsReference
-                .note()
+                .note("index-tts2")
                 .contains("必须提供参考音频"),
             "阻断提示要说清是这个引擎的硬要求"
         );
@@ -12414,36 +12486,71 @@ mod tests {
             voice_readiness(Some(&v), "/tmp/ref.wav", false, "念的内容"),
             VoiceReadiness::ReferenceMissing
         );
-        // 参考音存在但**没文本**：服务端要求成对，照样要拦（voice-clone 批次的语义）
+        // 参考音存在但没文本：index-tts2 **不要求**文本 → 放行（改前全局硬要求拦错）
         assert_eq!(
             voice_readiness(Some(&v), "/tmp/ref.wav", true, ""),
-            VoiceReadiness::ReferenceTextMissing
+            VoiceReadiness::Ready
         );
-        // 提示语必须是提交处真正拦住用户的那一句（同一个常量，不另写一份）
-        assert_eq!(
-            VoiceReadiness::ReferenceTextMissing.note(),
-            aw_core::MISSING_REFERENCE_TEXT,
-            "界面提示与提交拦截必须逐字一致"
-        );
-        // 路径 + 文本都给全 → 才能开工
+        // 路径 + 文本都给全 → 照样开工
         assert_eq!(
             voice_readiness(Some(&v), "/tmp/ref.wav", true, "念的内容"),
             VoiceReadiness::Ready
         );
 
-        // 反例：不吃参考音的引擎，空参考音就该能开工（过滤器不能顺手把正常引擎也禁了）
-        let plain = voice_of(&sm("audio8-tts", "tts"));
+        // 反例：audio8-tts 的克隆路径要求参考文本（只给 voice_ref 就 500，真机实测）；
+        // 内置音色不给 voice_ref，不拦。
+        let needs_text = voice_of(&sm_with_caps(
+            "audio8-tts",
+            "tts",
+            Capability {
+                requires: Some(Requires {
+                    voice_ref: false,
+                    reference_text: true,
+                }),
+                ..Default::default()
+            },
+        ));
+        assert!(!needs_text.requires_voice_ref);
+        assert!(needs_text.requires_reference_text, "能力要跟着行走到判据里");
+        assert_eq!(
+            voice_readiness(Some(&needs_text), "", false, ""),
+            VoiceReadiness::Ready,
+            "audio8-tts 的内置音色不需要参考音/文本"
+        );
+        assert_eq!(
+            voice_readiness(Some(&needs_text), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::ReferenceTextMissing,
+            "audio8-tts 给了参考音却缺文本 → 发请求前拦（不出现逐句 500）"
+        );
+        // 提示语与提交处真正拦住用户的那一句**同源**（同一个函数，不另写一份）
+        assert_eq!(
+            VoiceReadiness::ReferenceTextMissing.note("audio8-tts"),
+            reference_text_required_note("audio8-tts"),
+            "界面提示与提交拦截必须逐字一致"
+        );
+        assert!(
+            VoiceReadiness::ReferenceTextMissing
+                .note("audio8-tts")
+                .contains("自动转写"),
+            "提示要点名引擎并给「自动转写」这条出路"
+        );
+        assert_eq!(
+            voice_readiness(Some(&needs_text), "/tmp/ref.wav", true, "念的内容"),
+            VoiceReadiness::Ready
+        );
+
+        // 反例：不吃参考音/文本的引擎，空参考音就该能开工（过滤器不能顺手把正常引擎也禁了）
+        let plain = voice_of(&sm("plain-tts", "tts"));
         assert!(!plain.requires_voice_ref);
+        assert!(!plain.requires_reference_text);
         assert_eq!(
             voice_readiness(Some(&plain), "", false, ""),
             VoiceReadiness::Ready
         );
-        // 但"给了参考音却忘了文本"这条与引擎无关：走克隆就得成对，
-        // 否则服务端每句 500（这是 voice-clone 批次的原始症状）
+        // "给了参考音却忘了文本"对不要求文本的引擎**不拦**（按引擎，不是全局）
         assert_eq!(
             voice_readiness(Some(&plain), "/tmp/ref.wav", true, ""),
-            VoiceReadiness::ReferenceTextMissing,
-            "不要求参考音的引擎，用户主动给了参考音也必须给文本"
+            VoiceReadiness::Ready
         );
         // 一个引擎都没有
         assert_eq!(
@@ -12459,7 +12566,10 @@ mod tests {
             "index-tts2",
             "tts",
             Capability {
-                requires: Some(Requires { voice_ref: true }),
+                requires: Some(Requires {
+                    voice_ref: true,
+                    reference_text: false,
+                }),
                 known_issues: vec!["不接 voice_ref 会直接报错".into()],
                 ..Default::default()
             },
@@ -12467,8 +12577,22 @@ mod tests {
         let note = engine_note(Some(&voice_of(&m)));
         assert!(note.contains("必须提供参考音频"), "{note}");
         assert!(note.contains("不接 voice_ref 会直接报错"), "{note}");
+        // 需要参考文本的引擎要点名（audio8-tts 克隆路径只给 voice_ref 就 500）
+        let needs_text = sm_with_caps(
+            "audio8-tts",
+            "tts",
+            Capability {
+                requires: Some(Requires {
+                    voice_ref: false,
+                    reference_text: true,
+                }),
+                ..Default::default()
+            },
+        );
+        let note = engine_note(Some(&voice_of(&needs_text)));
+        assert!(note.contains("参考文本必填"), "{note}");
         // 干净引擎没有说明行（不能给所有引擎加噪声）
-        assert_eq!(engine_note(Some(&voice_of(&sm("audio8-tts", "tts")))), "");
+        assert_eq!(engine_note(Some(&voice_of(&sm("plain-tts", "tts")))), "");
         assert_eq!(engine_note(None), "");
     }
 
@@ -12484,7 +12608,10 @@ mod tests {
                 "index-tts2",
                 "tts",
                 Capability {
-                    requires: Some(Requires { voice_ref: true }),
+                    requires: Some(Requires {
+                        voice_ref: true,
+                        reference_text: false,
+                    }),
                     ..Default::default()
                 },
             )
@@ -12743,11 +12870,32 @@ mod tests {
             "随包的 known_issues 要上屏：{note}"
         );
 
-        // 不吃参考音的引擎不能被顺带禁掉
-        assert!(!cfg.models[1].caps.requires_voice_ref());
+        // 不吃参考音的引擎不能被顺带禁掉；它的克隆路径**要求参考文本**（audio8-tts）
+        let audio8 = &cfg.models[1];
+        assert!(!audio8.caps.requires_voice_ref());
+        assert!(
+            audio8.caps.requires_reference_text(),
+            "服务端没写 requires → audio8-tts 的 requires.reference_text 也要回落随包清单"
+        );
         assert_eq!(
-            voice_readiness(Some(&voice_of(&cfg.models[1])), "", false, ""),
-            VoiceReadiness::Ready
+            voice_readiness(Some(&voice_of(audio8)), "", false, ""),
+            VoiceReadiness::Ready,
+            "audio8-tts 内置音色（没给 voice_ref）不需要参考文本"
+        );
+        assert_eq!(
+            voice_readiness(Some(&voice_of(audio8)), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::ReferenceTextMissing,
+            "audio8-tts 克隆缺文本要在发请求前拦（随包清单的 requires.reference_text 生效）"
+        );
+        // index-tts2 不要求参考文本：给了参考音 + 无文本也放行
+        assert!(
+            !index.caps.requires_reference_text(),
+            "index-tts2 显式 reference_text=false 要回落（真机：只给 voice_ref 就 200）"
+        );
+        assert_eq!(
+            voice_readiness(Some(&v), "/tmp/ref.wav", true, ""),
+            VoiceReadiness::Ready,
+            "index-tts2 缺文本不拦（改前全局硬要求会在这里冤枉用户）"
         );
     }
 
@@ -12857,6 +13005,41 @@ mod tests {
         assert!(
             picker.contains("该引擎必须提供参考音频，不能用内置音色"),
             "文案要说清是引擎的硬要求"
+        );
+    }
+
+    /// 源码级守卫：参考文本的占位/提示/红色告警都按**引擎要求**驱动，
+    /// 不再写死"服务端要求与音频成对"（index-tts2 就不要文本，真机 200）。
+    ///
+    /// 阳性对照：把 placeholder 改回常量文案 / 把告警颜色改回
+    /// `reference-text == ""` → 本用例红。
+    #[test]
+    fn reference_text_ui_is_driven_by_engine_requirement() {
+        let picker = include_str!("../ui/voice_picker.slint");
+        assert!(
+            picker.contains("in property <bool> engine-requires-reference-text"),
+            "音色区要接收『是否要求参考文本』能力"
+        );
+        assert!(
+            picker.contains("placeholder: root.engine-requires-reference-text"),
+            "占位文案要按引擎要求分支（必填 vs 可选）"
+        );
+        assert!(
+            picker.contains(
+                "color: root.engine-requires-reference-text && root.reference-text == \"\""
+            ),
+            "红色告警只属于『必填引擎缺文本』，可选引擎的转写状态不吓人"
+        );
+        // 透传链：app → dub_workbench → voice_picker，缺一段能力就上不了屏
+        let app = include_str!("../ui/app.slint");
+        assert!(
+            app.contains("engine-requires-reference-text: root.engine-requires-reference-text;"),
+            "app 要把能力透传给工作台"
+        );
+        let wb = include_str!("../ui/dub_workbench.slint");
+        assert!(
+            wb.contains("engine-requires-reference-text: root.engine-requires-reference-text;"),
+            "工作台要把能力透传给音色区"
         );
     }
 
@@ -13259,27 +13442,40 @@ mod tests {
     // ── 音色克隆：参考文本是音色的一部分（招牌功能 D11）────────────────────
     //
     // 背景（真机）：audio8-tts 收到 voice_ref 却收不到 reference_text 会 HTTP 500，
-    // 修复前每一句都那样。这里钉住三条"改回去就红"的判据。
+    // index-tts2 只给 voice_ref 就 200 —— 参考文本是**按引擎**的要求。
+    // 这里钉住"改回去就红"的判据：只有 requires.reference_text 的引擎在
+    // "克隆态 + 缺文本"时才拦。
 
-    /// 拦截判据只在"克隆态 + 缺文本"时为真；内置音色不受影响。
+    /// 拦截判据**按引擎**：要求文本的引擎在"克隆态 + 缺文本"时才为真；
+    /// 不要求文本的引擎与内置音色都不拦。
     #[test]
-    fn reference_text_missing_only_fires_for_clone_without_text() {
+    fn reference_text_missing_only_fires_for_required_engine_clone_without_text() {
         let path = Some("/x/我的声线.wav".to_string());
+        // audio8-tts（requires.reference_text = true）
         assert!(
-            reference_text_missing(&path, &None),
-            "克隆态没填文本 → 必须拦住（否则 N 句各撞一次 500）"
+            reference_text_missing(true, &path, &None),
+            "必填引擎的克隆态没填文本 → 必须拦住（否则 N 句各撞一次 500）"
         );
         assert!(
-            reference_text_missing(&path, &Some("   ".to_string())),
+            reference_text_missing(true, &path, &Some("   ".to_string())),
             "纯空白不算填了"
         );
         assert!(
-            !reference_text_missing(&path, &Some("实际念的内容".to_string())),
+            !reference_text_missing(true, &path, &Some("实际念的内容".to_string())),
             "填了就该放行"
         );
         assert!(
-            !reference_text_missing(&None, &None),
-            "内置音色不需要参考文本"
+            !reference_text_missing(true, &None, &None),
+            "必填引擎的内置音色（没给 voice_ref）不需要参考文本"
+        );
+        // index-tts2（requires.reference_text = false）：给了参考音也不要求文本
+        assert!(
+            !reference_text_missing(false, &path, &None),
+            "可选引擎不该被拦（真机：只给 voice_ref 就 200）"
+        );
+        assert!(
+            !reference_text_missing(false, &None, &None),
+            "可选引擎的内置音色也不需要参考文本"
         );
     }
 

@@ -612,6 +612,7 @@ export component DubWorkbench inherits Rectangle {
     in property <string> voice-hint: "";
     // 引擎能力（Rust 侧投影）：硬要求参考音 / 只读的 known_issues 说明
     in property <bool> engine-requires-voice-ref: false;
+    in property <bool> engine-requires-reference-text: false;
     in property <string> engine-note: "";
     in property <bool> voice-ready: false;
 
@@ -627,7 +628,8 @@ export component DubWorkbench inherits Rectangle {
     // ── 音色区（页内展开，与「高级」同款；换音色 ≠ 换模型）──
     in property <string> engine-label: "";
     in-out property <string> voice-ref-path: "";
-    /// 参考音频的文本：服务端要求与参考音频成对（缺它每句都 500）；改它 = 换音色
+    /// 参考音频的文本：是否必填**按引擎**（audio8-tts 等要求成对、缺它每句都 500；
+    /// index-tts2 不要）；改它 = 换音色
     in-out property <string> voice-ref-text: "";
     in property <string> voice-ref-text-status: "";
     in property <bool> voice-ref-text-busy: false;
@@ -822,6 +824,7 @@ export component DubWorkbench inherits Rectangle {
                             voice-label: root.voice-label;
                             engine-label: root.engine-label;
                             engine-requires-voice-ref: root.engine-requires-voice-ref;
+                            engine-requires-reference-text: root.engine-requires-reference-text;
                             reference-path <=> root.voice-ref-path;
                             reference-text <=> root.voice-ref-text;
                             reference-text-status: root.voice-ref-text-status;

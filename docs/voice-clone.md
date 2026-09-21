@@ -5,29 +5,36 @@
 「音色克隆」= 拿一段干净人声做参考，让 TTS 用**那个声音**念你的稿子。
 配音页「换音色 → 参考音频」、以及「音色设计」Tab，填的都是这同一份输入。
 
-## 服务端的硬要求：音频与文本**成对**
+## 参考文本是**按引擎**的要求（不是全局硬要求）
 
-本机 audio.cpp 的 TTS 模型（`audio8-tts` 等）在收到 `voice_ref`（参考音频路径）时，
-**必须同时**收到 `reference_text`——即这段参考音频里**实际念的内容**。少了它服务端直接拒绝：
+本机 audio.cpp 的 TTS 模型逐模型声明要不要参考文本（上游 `model_specs/*.json` 的
+`options.request`）：
 
-```
-HTTP 500 Audio8 TTS prepare with inline reference audio requires reference_text option
-```
+| 引擎 | 只给 `voice_ref`、不给 `reference_text` | 结论 |
+|---|---|---|
+| audio8-tts / audio8-tts-01b / -stream 变体 | HTTP 500 `Audio8 TTS prepare with inline reference audio requires reference_text option` | **必填**：克隆路径要求音频与文本成对 |
+| index-tts2 | **HTTP 200**，正常出音频 | **可选**：不需要参考文本 |
+| f5 / glm / breeze（上游 spec） | spec 声明 `reference_text`（部分标 `required: true`） | 按 spec 必填 |
+| qwen3-tts（vdes 音色设计） | 不走克隆路径 | 不适用 |
 
-真机三连（同 seed、同文本、参考音 = 示例工程的 `stems/*_vocals.wav`）：
+真机三连（同一条 8s 参考音频、同 seed、同文本）：
 
-| 请求 | 结果 |
-|---|---|
-| 不带 `voice_ref` | 200（内置音色） |
-| 带 `voice_ref`，不带 `reference_text` | **500**（上面那条） |
-| 带 `voice_ref` + `reference_text` | 200，**音色确实不同**（产物 sha256 与字节数都变） |
+| 请求 | audio8-tts | index-tts2 |
+|---|---|---|
+| 不带 `voice_ref` | 200（内置音色） | 500（该引擎必须参考音） |
+| 带 `voice_ref`，不带 `reference_text` | **500**（上面那条） | **200**，正常出音频 |
+| 带 `voice_ref` + `reference_text` | 200，**音色确实不同**（产物 sha256 与字节数都变） | 200 |
 
-修复前 `synth` 只发 `voice_ref`，于是**每一句都 500**、整轮配音全红——而界面上连
-「参考文本」这个输入框都没有。现在：
+修复前 `synth` 只发 `voice_ref`，而界面上没有「参考文本」输入框 —— audio8-tts 用户
+**每一句都 500**、整轮配音全红。现在：
 
-- `aw_core::VoiceClone` 把两者**绑成一个类型**，`synth` 无法只收到路径；
-- 文本为空时在**发起前**就拦住（一次可执行的提示，而不是 N 句一样的失败）；
-- UI 有「参考文本」输入框 + 「自动转写」按钮。
+- 引擎要求按**能力清单**声明（`config/models.schema.yaml` 的 `requires.reference_text`，
+  随包进 `config/model-capabilities.json`，服务端显式值优先）；
+- `aw_core::VoiceClone` 只守"路径非空"这个类型不变式；空文本由 `build_synth_request`
+  **连字段都不发**（发空串与"没给"不是一回事）；
+- 文本必填的引擎（audio8-tts 等）在**发起前**就拦住（一次点名的提示：点「自动转写」
+  或换不要求文本的引擎）；可选引擎（index-tts2）直接提交；
+- UI 有「参考文本」输入框 + 「自动转写」按钮，占位/必填提示/红色告警都按选中引擎显示。
 
 ## 参考文本从哪来
 

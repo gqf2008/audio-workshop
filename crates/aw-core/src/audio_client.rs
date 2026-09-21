@@ -212,34 +212,30 @@ impl std::fmt::Display for ClientError {
     }
 }
 
-/// `voice_ref` 给了但参考文本为空时的**前置拦截**文案。
-///
-/// 服务端原文 `Audio8 TTS prepare with inline reference audio requires reference_text option`
-/// 用户看不懂，而且是在**每一句**上重复撞出来的（N 句 = N 条一样的 500）。
-/// 这里一次说清"缺什么 / 去哪填 / 怎么免手填"。
 /// 调用了克隆但没给参考音频路径时的**前置拦截**文案。
 ///
 /// 正常 UI 走不到（路径为空就是内置音色、不会走 `VoiceClone`），但 `VoiceClone::new`
 /// 是公开入口，类型自己的不变式该自己守。
+///
+/// 参考**文本**这里不再拦：文本是否必须由**引擎**决定（audio8-tts 等要、
+/// index-tts2 不要），aw-core 不知道引擎 —— 拦截与文案由 main 侧按能力清单
+/// （`requires.reference_text`）做，不留两份判据。
 pub const MISSING_REFERENCE_PATH: &str = concat!(
     "调用了参考音频克隆，但没有给参考音频路径。",
     "内置音色不需要参考音；要克隆就先在「参考音频」里填一段干净的 5–30 秒人声。",
 );
 
-pub const MISSING_REFERENCE_TEXT: &str = concat!(
-    "参考音频已选，但缺少它的文本（reference_text）。",
-    "克隆音色时服务端要求音频与文本成对：请在「参考音频的文本」里填这段音频实际念的内容，",
-    "或点「自动转写」让 ASR 填好、确认无误后再开始。",
-);
-
-/// 参考音频克隆的**成对**输入：`voice_ref`（音频路径）+ `reference_text`
-/// （这段音频实际念的内容）。服务端（audio8-tts / index-tts2）要求两者同时给，
-/// 只给路径必然失败（真机：HTTP 500
-/// `Audio8 TTS prepare with inline reference audio requires reference_text option`）。
+/// 参考音频克隆的输入：`voice_ref`（音频路径）+ **可选** `reference_text`
+/// （这段音频实际念的内容）。
+///
+/// 文本是不是必填**按引擎**（上游 model_specs 逐模型声明 `options.request`）：
+/// · audio8-tts / f5 / glm / breeze 等克隆路径缺文本 → HTTP 500；
+/// · index-tts2 / qwen3-tts 不要文本，只发 voice_ref → HTTP 200（真机实测）。
+/// 这里只保证**路径非空**；"该引擎要不要文本"是 main 侧能力清单
+/// （`requires.reference_text`）的事，不在这里写死。
 ///
 /// 为什么是结构体而不是两个相邻的 `Option<&str>` 参数：两个同类型参数挨在一起，
 /// 传反了编译器不会拦（见 `LESSON_同类型参数批量插入会静默错位`）。
-/// 字段私有 + `new()` 校验 ⇒ "只给路径不给文本"在**类型上**不可表达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceClone<'a> {
     path: &'a str,
@@ -247,20 +243,16 @@ pub struct VoiceClone<'a> {
 }
 
 impl<'a> VoiceClone<'a> {
-    /// 唯一构造入口：路径或文本为空白即 `Err`（不是 `None`，也不是"悄悄发个空串"）。
+    /// 唯一构造入口：路径为空白即 `Err`（不是 `None`，也不是"悄悄发个空串"）。
     ///
-    /// 空串发过去服务端照样报错，只是换了个看不懂的说法；在**发起前**拦住，
+    /// 空路径发过去是 `voice_ref: ""`，与"没给"不是一回事；在**发起前**拦住，
     /// 用户拿到的是一次可执行的提示，而不是 N 句 `error:`。
     ///
-    /// 路径也要校验：只校文本的话，"空路径 + 有文本"会通过，然后发出
-    /// `voice_ref: ""` —— 与这个类型自称的"成对"不一致（复核指出；
-    /// 当前 UI 走不到，但类型不变式不该依赖 UI 恰好拦得住）。
+    /// 文本**允许为空**：index-tts2 等引擎不要求文本。空文本由
+    /// `build_synth_request` 连字段都不发；该不该拦留给 main 侧按引擎判断。
     pub fn new(path: &'a str, reference_text: &'a str) -> Result<Self, ClientError> {
         if path.trim().is_empty() {
             return Err(ClientError::Local(MISSING_REFERENCE_PATH.into()));
-        }
-        if reference_text.trim().is_empty() {
-            return Err(ClientError::Local(MISSING_REFERENCE_TEXT.into()));
         }
         Ok(Self {
             path,
@@ -273,7 +265,8 @@ impl<'a> VoiceClone<'a> {
         self.path
     }
 
-    /// 参考音频里实际念的内容（原样透传，**不 trim**：服务端要的是真实文本）。
+    /// 参考音频里实际念的内容（原样透传，**不 trim**：服务端要的是真实文本；
+    /// 可以为空 —— 引擎不要求时调用方就不该发这个字段）。
     pub fn reference_text(self) -> &'a str {
         self.reference_text
     }
@@ -289,7 +282,8 @@ impl<'a> VoiceClone<'a> {
 pub enum VoiceSource<'a> {
     /// 模型内置默认音色：不带 voice_ref / reference_text / instruction。
     BuiltIn,
-    /// 参考音频克隆：`voice_ref` + `reference_text` 顶层成对下发。
+    /// 参考音频克隆：`voice_ref` 顶层必发，`reference_text` **非空才发**
+    /// （audio8-tts 等引擎要求成对；index-tts2 不要求，见 [`VoiceClone`]）。
     Clone(VoiceClone<'a>),
     /// 文本描述生成音色：`options.instruction = "<描述>"`（服务端任务 `vdes`）。
     Design(&'a str),
@@ -339,9 +333,12 @@ fn build_synth_request(text: &str, seed: Option<u64>, source: VoiceSource<'_>) -
     }
     let mut request = json!({ "text": text, "options": Value::Object(options) });
     if let VoiceSource::Clone(c) = source {
-        // 两行必须同进同出：只发 voice_ref 就是那个"每句都 500"的老 bug（见 VoiceClone）。
         request["voice_ref"] = json!(c.path());
-        request["reference_text"] = json!(c.reference_text());
+        // 参考文本**按引擎可选**：空文本连字段都不发（发空串与"没给"不是一回事，
+        // audio8-tts 会拒；index-tts2 只给 voice_ref 就 200，真机实测）。
+        if !c.reference_text().trim().is_empty() {
+            request["reference_text"] = json!(c.reference_text());
+        }
     }
     request
 }
@@ -368,9 +365,9 @@ impl Client {
     /// [`VoiceSource::Design`] 这一个受类型约束的入口会写它；常规 TTS 引擎发过去
     /// **不报错、直接忽略**，从调用点看不出来（见 `SYNTH_REQUEST_OPTIONS`）。
     ///
-    /// `source` 决定音色形态：内置不带克隆字段；克隆**成对**发 `voice_ref` +
-    /// `reference_text`（服务端硬要求两者同时给，见 [`VoiceClone`]）；设计只发
-    /// `options.instruction`。
+    /// `source` 决定音色形态：内置不带克隆字段；克隆发 `voice_ref`、
+    /// 参考文本**非空才发** `reference_text`（是否必填由引擎决定，见
+    /// [`VoiceClone`]）；设计只发 `options.instruction`。
     pub fn synth(
         &self,
         model: &str,
@@ -600,6 +597,28 @@ mod tests {
             "audio.cpp 的请求键是 instruction，不是 voice_design"
         );
         assert!(!options.contains_key("style"), "越白名单的键一律丢弃");
+    }
+
+    /// 参考文本按引擎可选：空文本**连字段都不发**（index-tts2 等引擎只收 voice_ref
+    /// 就 200，真机实测）；非空照发且不 trim。
+    ///
+    /// 阳性对照：把 `build_synth_request` 里的空文本分支删掉 → 第一条断言红
+    /// （空文本又变成必发字段）。
+    #[test]
+    fn clone_without_reference_text_omits_the_field() {
+        for blank in ["", "   ", "\t\n"] {
+            let clone = VoiceClone::new("/tmp/ref.wav", blank).expect("空文本必须放行");
+            let body = build_synth_request("你好。", None, VoiceSource::Clone(clone));
+            assert_eq!(body["voice_ref"], json!("/tmp/ref.wav"));
+            assert!(
+                !body.to_string().contains("reference_text"),
+                "空文本不该发 reference_text 字段：{body}"
+            );
+        }
+        // 非空照发、原样不 trim（服务端要的是真实文本）
+        let with_text = VoiceClone::new("/tmp/ref.wav", " 实际念的内容 ").unwrap();
+        let body = build_synth_request("你好。", None, VoiceSource::Clone(with_text));
+        assert_eq!(body["reference_text"], json!(" 实际念的内容 "));
     }
 
     /// 组装出来的请求体逐键核对白名单——**不是**拿单个 helper 自证。

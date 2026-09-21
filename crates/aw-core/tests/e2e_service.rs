@@ -206,17 +206,20 @@ fn bgm_pipeline_end_to_end() {
     );
 }
 
-/// 音色克隆真机：`voice_ref` **必须**与 `reference_text` 成对下发。
+/// 音色克隆真机：`reference_text` **按引擎**要求（audio8-tts 要、index-tts2 不要）。
 ///
-/// 锚定的是那个"招牌功能 100% 跑不通"的缺陷：修复前 `synth` 只发 `voice_ref`，
-/// audio8-tts 直接 500 —— 用户按 README 做克隆，每一句都失败。
-/// 这里用真服务跑三个对照：
+/// 锚定两个真机事实：
+/// · audio8-tts 只给 `voice_ref` → HTTP 500（修复前 `synth` 只发 voice_ref，
+///   用户按 README 做克隆每一句都失败）；
+/// · index-tts2 只给 `voice_ref` → **HTTP 200**（全局硬要求会冤枉 index-tts2 用户）。
+/// 这里用真服务跑四个对照：
 ///   ① 内置音色（`synth` 不传 clone）→ 200，作为"换了音色"的基准产物；
-///   ② **裸 HTTP** 只给 `voice_ref`、不给 `reference_text`（复刻修复前的报文，
-///      `Client::synth` 现在不可能这么调）→ 期望**失败**；
-///   ③ 成对给（走 `Client::synth`）→ 期望 200，且产物与 ① **不同**。
+///   ② **裸 HTTP** audio8-tts 只给 `voice_ref`、不给 `reference_text`
+///      （复刻修复前的报文）→ 期望**失败**；
+///   ③ **裸 HTTP** index-tts2 只给 `voice_ref` → 期望 **200**（文本可选）；
+///   ④ 成对给（走 `Client::synth`）→ 期望 200，且产物与 ① **不同**。
 #[test]
-#[ignore = "需要本机 audiocpp_server + audio8-tts；用 -- --ignored 显式跑"]
+#[ignore = "需要本机 audiocpp_server + audio8-tts + index-tts2；用 -- --ignored 显式跑"]
 fn voice_clone_reference_text_end_to_end() {
     let base = env_or("AW_SERVER", "http://127.0.0.1:8080");
     let model = env_or("AW_TTS_MODEL", "audio8-tts");
@@ -243,7 +246,7 @@ fn voice_clone_reference_text_end_to_end() {
         .synth(&model, text, Some(831001), VoiceSource::BuiltIn)
         .unwrap_or_else(|e| panic!("内置音色合成失败（{model}）：{e}"));
 
-    // ② 裸 HTTP 负对照：只给 voice_ref。修复前 `synth` 发的就是这个报文，
+    // ② 裸 HTTP 负对照：audio8-tts 只给 voice_ref。修复前 `synth` 发的就是这个报文，
     // 服务端 500 `requires reference_text option`（真机实测）。
     let request = serde_json::json!({
         "model": model,
@@ -257,10 +260,31 @@ fn voice_clone_reference_text_end_to_end() {
         Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
         Err(e) => panic!("裸 HTTP 负对照的传输层失败（不该发生）：{e}"),
     };
-    eprintln!("  只给 voice_ref（裸 HTTP）: HTTP={code} {body}");
+    eprintln!("  audio8-tts 只给 voice_ref（裸 HTTP）: HTTP={code} {body}");
     assert_ne!(
         code, 200,
-        "只给 voice_ref 必须失败（服务端要求 reference_text 成对）"
+        "audio8-tts 只给 voice_ref 必须失败（该引擎要求 reference_text）"
+    );
+
+    // ②b 同一形状、换引擎：index-tts2 只给 voice_ref **不要**文本 → 200。
+    // 这条钉的是"参考文本按引擎要求，不是全局硬要求"。
+    let index_model = env_or("AW_INDEX_MODEL", "index-tts2");
+    let request = serde_json::json!({
+        "model": index_model,
+        "request": { "text": text, "voice_ref": reference },
+    });
+    let resp = ureq::post(&format!("{base}/v1/tasks/run"))
+        .timeout(std::time::Duration::from_secs(180))
+        .send_json(request);
+    let (code, body) = match resp {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+        Err(e) => panic!("index-tts2 裸 HTTP 的传输层失败（不该发生）：{e}"),
+    };
+    eprintln!("  index-tts2 只给 voice_ref（裸 HTTP）: HTTP={code}");
+    assert_eq!(
+        code, 200,
+        "index-tts2 只给 voice_ref 必须 200（参考文本按引擎要求，不是全局）：{body}"
     );
 
     // ③ 成对克隆：走真正的代码路径

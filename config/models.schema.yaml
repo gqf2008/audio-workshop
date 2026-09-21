@@ -65,6 +65,10 @@ models:
     precision_preference: [q8_0, q4_0]      # 按机器显存挑，缺档则降级
     text_overrides:
       normalization: enforce                # 本模型不接 TN → 配置层强制先做
+    # 克隆路径（给了 voice_ref）必须同时给 reference_text：只给路径服务端 500
+    # `Audio8 TTS prepare with inline reference audio requires reference_text option`（真机实测）。
+    # 内置音色（不给 voice_ref）不需要文本 —— 所以这里只声明 reference_text，不声明 voice_ref。
+    requires: { reference_text: true }
     # 故意不给 request_defaults：audio8_tts 的 spec（options.request）里没有 instruction
     # 这个旋钮——它只归 VoiceDesign（qwen3_tts 的 vdes 路径）使用。写在这里会渲染成
     # 服务端不认的键，让"我们有语气控制"看起来像真的（真机实测改 instruction 输出字节相同）。
@@ -77,7 +81,8 @@ models:
     family: index_tts2
     task: tts
     path: ${models_root}/IndexTTS2.5-GGUF/index-tts2_5-q8_0.gguf
-    requires: { voice_ref: true }           # 服务端硬要求，缺则 500
+    # 必须给参考音频；参考文本**不要求**（只给 voice_ref 就 200，真机实测）
+    requires: { voice_ref: true, reference_text: false }
     text_overrides:
       normalization: engine                 # 上游已接 → 不重复处理（避免双重转换）
     request_defaults: { duration_factor: 1.0 }
@@ -152,6 +157,7 @@ models:
     task: tts
     path: ${models_root}/Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf
     product_excluded: true
+    requires: { reference_text: true }      # 与 audio8-tts 同一 family：克隆必给文本
     known_issues:
       - "可懂度 0~3%、时长在 0.37~9.89s 乱跳（2026-09-15 实测），当前不可用"
       - "PR #444 修的就是这条 0.1B(Falcon-H1) 链路 —— 合入后复跑 audio-eval 即可验证"
@@ -162,6 +168,7 @@ models:
     mode: streaming
     path: ${models_root}/Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf
     role: streaming                       # 走 /v1/audio/speech/live，离线批量与评估不适用
+    requires: { reference_text: true }    # 同 family：克隆必给文本
 
   audio8-tts-01b-stream:
     family: audio8_tts
@@ -170,6 +177,7 @@ models:
     path: ${models_root}/Audio8-TTS-Preview-0.1B-GGUF/audio8-tts-preview-0.1b-q8_0.gguf
     role: streaming
     product_excluded: true
+    requires: { reference_text: true }    # 同 family：克隆必给文本
 
 # ── 5. 覆盖优先级（从低到高，后者覆盖前者）──────────────────────────────
 #   runtime 默认 < models.<id> < scenarios.<scene> < 用户 UI 选择 < dictionary(user)

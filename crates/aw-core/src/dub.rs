@@ -142,8 +142,9 @@ pub struct Project {
     /// 下一次会保守重录并按新内容写入。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_ref_hash: Option<String>,
-    /// 参考音频里**实际念的内容**。服务端要求它与 `voice_ref` 成对（只给路径必然 500，
-    /// 真机复现过），所以它和 `voice_ref` 一样是"这句该发什么请求"的一部分：
+    /// 参考音频里**实际念的内容**。是否必填按引擎：audio8-tts 等克隆路径要求它与
+    /// `voice_ref` 成对（只给路径必然 500，真机复现过）；index-tts2 等不要，可为空。
+    /// 所以它和 `voice_ref` 一样是"这句该发什么请求"的一部分：
     /// 它变了 ⇒ 音色变了 ⇒ 旧音频不能复用（与 `voice_ref_hash` 同类，见 `voice_ref_matches`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_ref_text: Option<String>,
@@ -244,8 +245,9 @@ impl Project {
         mut on_progress: impl FnMut(usize, &str),
     ) -> Result<usize, ClientError> {
         std::fs::create_dir_all(dir.join("sentences")).ok();
-        // 前置拦截：克隆音色必须成对给出音频与文本。放在**循环之前**——放在循环里会让
-        // 每一句都重复撞同一个错误，用户看到的是 N 条一模一样的 `error:`。
+        // 前置拦截只拦路径（VoiceClone 的类型不变式）；文本是否必填由**引擎**决定，
+        // aw-core 不知道引擎 —— 按引擎的那道拦在 main 侧（`requires.reference_text`），
+        // 放在循环之前是为了不让 N 句各撞一次同一个错误。
         // 唯一判据在 `VoiceClone::new`，这里只是提前调用它（不另写一份 trim 判断）。
         let source = match self.voice_ref.as_deref() {
             Some(path) => VoiceSource::Clone(VoiceClone::new(

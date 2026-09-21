@@ -8,7 +8,9 @@
       ],
       "mode": "offline",
       "product_excluded": false,
-      "requires": null,
+      "requires": {
+        "reference_text": true
+      },
       "role": ""
     },
     {
@@ -19,6 +21,7 @@
       "mode": "offline",
       "product_excluded": false,
       "requires": {
+        "reference_text": false,
         "voice_ref": true
       },
       "role": ""
@@ -112,7 +115,9 @@
       ],
       "mode": "offline",
       "product_excluded": true,
-      "requires": null,
+      "requires": {
+        "reference_text": true
+      },
       "role": ""
     },
     {
@@ -120,7 +125,9 @@
       "known_issues": [],
       "mode": "streaming",
       "product_excluded": false,
-      "requires": null,
+      "requires": {
+        "reference_text": true
+      },
       "role": "streaming"
     },
     {
@@ -128,7 +135,9 @@
       "known_issues": [],
       "mode": "streaming",
       "product_excluded": true,
-      "requires": null,
+      "requires": {
+        "reference_text": true
+      },
       "role": "streaming"
     }
   ],
