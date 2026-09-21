@@ -8,6 +8,9 @@
 //!
 //! 1. **GitHub releases/latest API**（默认地址就是它）：
 //!    `{ "tag_name": "v0.2.0", "body": "…", "html_url": "…", "assets": [ … ] }`
+//!    `assets` 是多平台安装包数组（顺序不保证）：`sha256`/`size` 按**当前平台**挑一个
+//!    资产取（macOS `.dmg` / Windows `-setup.exe` 或 `.zip` / Linux `.tar.gz`），
+//!    挑不到回落第一个（见 [`pick_asset`]）。
 //! 2. **自建/内网镜像清单**（给局域网与镜像留的口子，见设置里的「清单地址」）：
 //!    `{ "version": "0.2.0", "notes": "…", "url": "https://…", "sha256": "…", "size": 123 }`
 //!
@@ -131,9 +134,10 @@ pub fn parse_release(json: &str) -> Result<Release, String> {
     require_http_url(&url)?;
     let notes = optional_string_field(obj, notes_key)?.unwrap_or_default();
 
-    // 安装包信息：GitHub 放在 assets[0]（digest 形如 "sha256:…"），自建清单是顶层字段。
+    // 安装包信息：GitHub 从 assets 里**按当前平台挑**（macOS→.dmg、Windows→-setup.exe/zip、
+    // Linux→.tar.gz，挑不到回落 assets[0]；digest 形如 "sha256:…"），自建清单是顶层字段。
     let (sha256, size) = if github {
-        first_asset_info(obj)
+        asset_info(obj, Platform::current())
     } else {
         (
             optional_string_field(obj, "sha256")?
@@ -201,15 +205,81 @@ fn optional_u64_field(
     }
 }
 
-/// GitHub Release 的 `assets[0]`：返回（sha256, size）。资产缺 `digest`（GitHub 只在较新
-/// 的 Release 上给）时 sha256 为 `None`，不为它编造值。
-fn first_asset_info(
+/// 运行平台：决定从 GitHub 资产里挑哪一个安装包（与发行包命名的后缀一致）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    Macos,
+    Windows,
+    Linux,
+}
+
+impl Platform {
+    /// 当前编译目标平台。三平台之外的目标一律按 Linux 规则挑（`.tar.gz`），
+    /// 挑不到仍会回落 `assets[0]`。
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Platform::Macos
+        } else if cfg!(target_os = "windows") {
+            Platform::Windows
+        } else {
+            Platform::Linux
+        }
+    }
+}
+
+/// 资产名按平台打分：0 = 首选（macOS `.dmg` / Windows `-setup.exe` / Linux `.tar.gz`），
+/// 1 = 次选（Windows 的 `.zip` 绿色版），不匹配 = `None`。后缀比对**大小写不敏感**；
+/// 名字缺失/不是字符串 = 不匹配（交给回落逻辑）。
+fn match_rank(name: &str, platform: Platform) -> Option<u8> {
+    let lower = name.to_lowercase();
+    match platform {
+        Platform::Macos => lower.ends_with(".dmg").then_some(0),
+        Platform::Linux => lower.ends_with(".tar.gz").then_some(0),
+        Platform::Windows => {
+            if lower.ends_with("-setup.exe") {
+                Some(0)
+            } else if lower.ends_with(".zip") {
+                Some(1)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// 从 GitHub 资产数组里**按平台挑**安装包（0 分优先，同分取靠前的）：
+/// macOS → `.dmg`；Windows → 优先 `-setup.exe`，其次 `.zip`；Linux → `.tar.gz`。
+/// 挑不到就回落 `assets[0]`——资产命名/平台组合变了时，回落第一个比拿不到强
+/// （三平台都能挑到是常态；GitHub 的资产顺序不保证，首个往往是字母序第一的 Linux 包，
+/// 2026-09 实测 macOS 上旧代码因此把 Linux 包的体积显示给了用户）。
+fn pick_asset(
+    assets: &[serde_json::Value],
+    platform: Platform,
+) -> Option<&serde_json::Value> {
+    let matches = |asset: &serde_json::Value, rank: u8| -> bool {
+        asset
+            .get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|name| match_rank(name, platform) == Some(rank))
+    };
+    assets
+        .iter()
+        .find(|a| matches(a, 0))
+        .or_else(|| assets.iter().find(|a| matches(a, 1)))
+        .or_else(|| assets.first())
+}
+
+/// GitHub Release 的安装包信息：按 `platform` 从 `assets` 里挑（规则见 [`pick_asset`]），
+/// 返回被挑中资产的（sha256, size）。资产缺 `digest`（GitHub 只在较新的 Release 上给）
+/// 时 sha256 为 `None`，不为它编造值；`assets` 缺失/空/挑不到 → `(None, None)`。
+fn asset_info(
     obj: &serde_json::Map<String, serde_json::Value>,
+    platform: Platform,
 ) -> (Option<String>, Option<u64>) {
     let Some(asset) = obj
         .get("assets")
         .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
+        .and_then(|a| pick_asset(a, platform))
     else {
         return (None, None);
     };
@@ -686,6 +756,156 @@ mod tests {
         assert!(r.url.starts_with("https://github.com/"));
         assert_eq!(r.sha256.as_deref(), Some("deadbeef"));
         assert_eq!(r.size, Some(4096));
+    }
+
+    // ── pick_asset / asset_info（按平台挑资产）──────────────────────────
+
+    /// 真实形状的四资产数组：v0.1.7 Release 实测的资产（名字/体积/digest 前缀），
+    /// 按字母序排——第一个正是 Linux 包（旧代码固定取 assets[0]，macOS 上显示的
+    /// 就是它的体积 49139933，而不是 dmg 的 31399122）。
+    fn four_assets() -> &'static str {
+        r#"[
+            {"name":"AudioWorkshop-0.1.7-linux-x64.tar.gz","size":49139933,"digest":"sha256:dd17","browser_download_url":"https://e.com/lin"},
+            {"name":"AudioWorkshop-0.1.7.dmg","size":31399122,"digest":"sha256:4ecb","browser_download_url":"https://e.com/dmg"},
+            {"name":"AudioWorkshop-0.1.7-windows-x64-setup.exe","size":20846919,"digest":"sha256:53c7","browser_download_url":"https://e.com/setup"},
+            {"name":"AudioWorkshop-0.1.7-windows-x64.zip","size":29665032,"digest":"sha256:3b1f","browser_download_url":"https://e.com/zip"}
+        ]"#
+    }
+
+    fn manifest_with_assets(assets_json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(&format!(
+            r#"{{"tag_name":"v0.1.7","body":"b","html_url":"https://github.com/gqf2008/audio-workshop/releases/tag/v0.1.7","assets":{assets_json}}}"#
+        ))
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn picks_the_right_asset_for_each_platform() {
+        let obj = manifest_with_assets(four_assets());
+        let assets = obj.get("assets").unwrap().as_array().unwrap();
+        for (platform, want_name, want_sha, want_size) in [
+            (
+                Platform::Macos,
+                "AudioWorkshop-0.1.7.dmg",
+                "4ecb",
+                31399122u64,
+            ),
+            (
+                Platform::Linux,
+                "AudioWorkshop-0.1.7-linux-x64.tar.gz",
+                "dd17",
+                49139933,
+            ),
+            (
+                Platform::Windows,
+                "AudioWorkshop-0.1.7-windows-x64-setup.exe",
+                "53c7",
+                20846919,
+            ),
+        ] {
+            let picked = pick_asset(assets, platform).expect("四资产里三平台都该挑得到");
+            assert_eq!(
+                picked["name"].as_str(),
+                Some(want_name),
+                "{platform:?} 挑错资产"
+            );
+            let (sha, size) = asset_info(&obj, platform);
+            assert_eq!(sha.as_deref(), Some(want_sha), "{platform:?} sha 不对");
+            assert_eq!(size, Some(want_size), "{platform:?} size 不对");
+        }
+    }
+
+    #[test]
+    fn windows_prefers_setup_exe_even_when_zip_comes_first() {
+        // 资产顺序不保证（API 实测不总按字母序）：zip 排前面时也要优先挑安装器
+        let obj = manifest_with_assets(
+            r#"[
+                {"name":"AudioWorkshop-0.1.7-windows-x64.zip","size":29665032,"digest":"sha256:3b1f"},
+                {"name":"AudioWorkshop-0.1.7-windows-x64-setup.exe","size":20846919,"digest":"sha256:53c7"}
+            ]"#,
+        );
+        let (sha, size) = asset_info(&obj, Platform::Windows);
+        assert_eq!(sha.as_deref(), Some("53c7"), "zip 在前也要挑 -setup.exe");
+        assert_eq!(size, Some(20846919));
+    }
+
+    #[test]
+    fn windows_falls_back_to_zip_without_setup_exe() {
+        let obj = manifest_with_assets(
+            r#"[
+                {"name":"AudioWorkshop-0.1.7-linux-x64.tar.gz","size":1,"digest":"sha256:a"},
+                {"name":"AudioWorkshop-0.1.7-windows-x64.zip","size":29665032,"digest":"sha256:3b1f"}
+            ]"#,
+        );
+        let (sha, size) = asset_info(&obj, Platform::Windows);
+        assert_eq!(sha.as_deref(), Some("3b1f"));
+        assert_eq!(size, Some(29665032));
+    }
+
+    #[test]
+    fn suffix_matching_is_case_insensitive() {
+        let obj = manifest_with_assets(
+            r#"[
+                {"name":"AudioWorkshop-0.1.7-LINUX-X64.TAR.GZ","size":1,"digest":"sha256:a"},
+                {"name":"AudioWorkshop-0.1.7.DMG","size":31399122,"digest":"sha256:4ecb"},
+                {"name":"AudioWorkshop-0.1.7-Windows-X64-Setup.EXE","size":20846919,"digest":"sha256:53c7"}
+            ]"#,
+        );
+        assert_eq!(asset_info(&obj, Platform::Macos).1, Some(31399122));
+        assert_eq!(asset_info(&obj, Platform::Linux).1, Some(1));
+        assert_eq!(asset_info(&obj, Platform::Windows).1, Some(20846919));
+    }
+
+    #[test]
+    fn no_matching_asset_falls_back_to_first() {
+        let obj = manifest_with_assets(
+            r#"[
+                {"name":"AudioWorkshop-0.1.7-macos.pkg","size":111,"digest":"sha256:pkg"},
+                {"name":"AudioWorkshop-0.1.7-src.tar.bz2","size":222,"digest":"sha256:src"}
+            ]"#,
+        );
+        // 没有任何 .dmg：回落 assets[0]
+        let (sha, size) = asset_info(&obj, Platform::Macos);
+        assert_eq!(sha.as_deref(), Some("pkg"));
+        assert_eq!(size, Some(111));
+        assert_eq!(
+            pick_asset(
+                obj.get("assets").unwrap().as_array().unwrap(),
+                Platform::Linux
+            )
+            .unwrap()["name"],
+            "AudioWorkshop-0.1.7-macos.pkg",
+            "挑不到必须回落第一个"
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_assets_yield_none() {
+        assert_eq!(
+            asset_info(&manifest_with_assets(r#"[]"#), Platform::Macos),
+            (None, None)
+        );
+        let obj = serde_json::from_str::<serde_json::Value>(
+            r#"{"tag_name":"v0.1.7","body":"b","html_url":"https://e.com/r"}"#,
+        )
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(asset_info(&obj, Platform::Macos), (None, None));
+    }
+
+    #[test]
+    fn missing_digest_still_yields_size() {
+        let obj = manifest_with_assets(
+            r#"[{"name":"AudioWorkshop-0.1.7.dmg","size":31399122,"browser_download_url":"https://e.com/dmg"}]"#,
+        );
+        let (sha, size) = asset_info(&obj, Platform::Macos);
+        assert_eq!(sha, None, "digest 缺失不能编造 sha");
+        assert_eq!(size, Some(31399122), "size 独立于 digest，照取");
     }
 
     #[test]
