@@ -1,10 +1,16 @@
-//! 音色克隆的**成对下发**与前置拦截（招牌功能 D11）。
+//! 音色克隆的**按引擎可选参考文本**与前置拦截（招牌功能 D11）。
 //!
-//! 真机事实（issue 里贴过原始输出）：`audio8-tts` 只收 `voice_ref` 不收
-//! `reference_text` 会 HTTP 500 —— 而这正是修复前的行为，用户按 README 做克隆
-//! **每一句都失败**。所以这里钉的是两件事：
-//!   ① 两个字段必须**同时**出现在请求体里（去掉任一行都该红）；
-//!   ② 缺文本时**在发起前**就拦住（而不是让 N 句各撞一次同一个 500）。
+//! 真机事实（issue 里贴过原始输出）：同一段 8s 参考音频只发 `voice_ref`：
+//! · `audio8-tts` → HTTP 500
+//!   `Audio8 TTS prepare with inline reference audio requires reference_text option`
+//! · `index-tts2` → **HTTP 200**，正常出音频
+//! 即参考文本是**按引擎**的要求，不是全局硬要求。这里钉的是两件事：
+//!   ① 文本非空时两个字段**同时**出现在请求体里；空文本时**连字段都不发**
+//!      （发空串与"没给"不是一回事）；
+//!   ② 路径为空仍在**发起前**就拦住（类型不变式）；"该引擎要不要文本"的拦截
+//!      在 main 侧按 `requires.reference_text` 做（aw-core 不知道引擎）。
+//!      audio8-tts 必填时发请求前拦 → 不出现逐句 500；index-tts2 放行且请求体
+//!      不带该字段。
 
 mod support;
 
@@ -57,28 +63,41 @@ fn clone_sends_reference_text_paired_with_voice_ref() {
     );
     assert!(
         b.contains(r#""reference_text":"这是一段参考音频。""#),
-        "必须带 reference_text（服务端要求成对）：{b}"
+        "非空文本必须发 reference_text（audio8-tts 等引擎要求成对）：{b}"
     );
 }
 
 #[test]
-fn clone_without_reference_text_is_refused_before_any_request() {
-    // 空白（含纯空格）一律拒绝：不是 None，也不是"悄悄发个空串"
+fn clone_without_reference_text_is_allowed_and_sends_voice_ref_only() {
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
+
+    // 空白（含纯空格）一律放行：index-tts2 等引擎只收 voice_ref 就 200（真机实测）
     for blank in ["", "   ", "\t\n"] {
-        let err = VoiceClone::new("/tmp/ref.wav", blank).unwrap_err();
-        let msg = err.to_string();
+        let clone = VoiceClone::new("/tmp/ref.wav", blank).expect("空文本必须放行");
+        client(&mock.base)
+            .synth("index-tts2", "你好。", Some(1), VoiceSource::Clone(clone))
+            .unwrap();
+    }
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 3);
+    for b in &bodies {
         assert!(
-            msg.contains("reference_text") && msg.contains("自动转写"),
-            "提示要说清缺什么、去哪填：{msg}"
+            b.contains(r#""voice_ref":"/tmp/ref.wav""#),
+            "必须带 voice_ref：{b}"
+        );
+        assert!(
+            !b.contains("reference_text"),
+            "空文本连字段都不该发（发空串与没给不是一回事）：{b}"
         );
     }
-    // 非空白就通过（不 trim 内容，服务端要的是真实文本）
+
+    // 非空白就发（不 trim 内容，服务端要的是真实文本）
     let c = VoiceClone::new("/tmp/ref.wav", " 你好 ").unwrap();
     assert_eq!(c.reference_text(), " 你好 ");
     assert_eq!(c.path(), "/tmp/ref.wav");
 
-    // 路径也要校验：只校文本的话"空路径 + 有文本"会过，然后发出 voice_ref: ""
-    // —— 与这个类型自称的"成对"不一致（复核指出；UI 走不到，但类型不变式该自己守）
+    // 路径仍要校验："空路径 + 有/无文本"都不许过，否则发出 voice_ref: ""
     for blank in ["", "   ", "\t"] {
         let err = VoiceClone::new(blank, "有文本").unwrap_err();
         assert!(
@@ -89,30 +108,25 @@ fn clone_without_reference_text_is_refused_before_any_request() {
 }
 
 #[test]
-fn project_synthesize_refuses_clone_without_text_before_touching_the_network() {
-    let mock = support::Mock::start(vec![(200, "{}".into())]);
+fn project_without_reference_text_sends_voice_ref_only_on_every_sentence() {
+    // index-tts2：参考文本可选 —— 只发 voice_ref，每句都该正常出音频。
+    // 改前这里是"一个请求都不发 + 整轮 Err"（全局硬要求，用户被冤枉拦下）。
+    let wav = support::tiny_wav(&[0i16; 800]);
+    let mock = support::Mock::start(vec![(200, support::audio_response(&wav))]);
     let dir = temp_dir("no-text");
 
     let mut prj = project(Some("/tmp/ref.wav"), None);
-    let err = prj
+    let failed = prj
         .synthesize(&client(&mock.base), &dir, None, |_, _| {})
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(
-        mock.hit_count(),
-        0,
-        "缺参考文本时一个请求都不该发出去（发了就是 N 句各撞一次 500）"
-    );
-    assert!(
-        err.to_string().contains("reference_text"),
-        "错误要说清缺什么：{err}"
-    );
-    // 前置拦截在循环之前 ⇒ 没有句子被标成 done/error（用户改完文本直接重跑即可）
-    assert!(
-        prj.sentences.iter().all(|s| s.status == "pending"),
-        "拦截时不该动句状态：{:?}",
-        prj.sentences.iter().map(|s| &s.status).collect::<Vec<_>>()
-    );
+    assert_eq!(failed, 0, "缺文本的 index-tts2 克隆必须放行");
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 2, "两句各一次请求");
+    for b in &bodies {
+        assert!(b.contains(r#""voice_ref":"/tmp/ref.wav""#), "{b}");
+        assert!(!b.contains("reference_text"), "空文本不该发该字段：{b}");
+    }
 }
 
 #[test]
