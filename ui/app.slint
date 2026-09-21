@@ -256,6 +256,7 @@ export component MainWindow inherits Window {
     callback library-apply(string);
     callback library-export(string);
     callback library-import();
+    callback library-add-audio();
 
     // ── 模型下载器（P7）：清单里带 url 的可下载模型 + 串行下载队列 ──
     in-out property <string> download-mirror: "";
@@ -563,6 +564,7 @@ export component MainWindow inherits Window {
                     library-apply(name) => { root.library-apply(name); }
                     library-export(name) => { root.library-export(name); }
                     library-import => { root.library-import(); }
+                    library-add-audio => { root.library-add-audio(); }
                     new-voice => {
                         root.scene = 4;
                         root.scene-changed(4);

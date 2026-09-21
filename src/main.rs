@@ -411,6 +411,10 @@ enum Msg {
     VoiceImportDirPicked {
         pick: picker::Outcome<String>,
     },
+    /// 「添加音频…」选完的音频文件（多选，按文件名直接入库；三态）
+    VoiceFilesPicked {
+        pick: picker::Outcome<Vec<PathBuf>>,
+    },
     /// 批量：系统文件框选完的多篇稿件（三态；取消与"选择器不可用"分开）
     BatchScriptsPicked {
         pick: picker::Outcome<Vec<PathBuf>>,
@@ -1129,6 +1133,26 @@ fn wire_voice_library(ui: &MainWindow, ctx: &VoiceLibraryCtx, state: &Rc<UiState
             let _ = msg.send(WorkerMsg {
                 revision: 0,
                 msg: Msg::VoiceImportDirPicked { pick },
+            });
+        });
+    });
+
+    // 添加音频…：选一个/多个音频文件按文件名直接入库（不动当前工程音色）
+    let weak = ui.as_weak();
+    let msg = ctx.msg_tx.clone();
+    ui.on_library_add_audio(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_status_text("正在打开文件选择框（选要加入音色库的音频，可多选）…".into());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            let pick = picker::pick_files(
+                "选择要加入音色库的音频",
+                "音频",
+                &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
+            );
+            let _ = msg.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::VoiceFilesPicked { pick },
             });
         });
     });
@@ -9628,6 +9652,9 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         | Msg::BackupDirPicked { .. }
         | Msg::BackupDone { .. }
         | Msg::VoiceImportDirPicked { .. }
+        // 音色库「添加音频…」：来自系统文件框（后台线程、revision 0），
+        // 与工程版本无关——被过滤掉就是「点完没反应」
+        | Msg::VoiceFilesPicked { .. }
         // 参考音转写：来自后台线程，与稿件版本无关（转的是参考音，不是稿子）
         | Msg::ReferenceTranscribed { .. }
         // 文本描述生成音色：来自 worker，但只合成一句试听文本、不碰当前工程，
@@ -10434,6 +10461,35 @@ fn tick(
                     }
                     Err(e) => ui.set_status_text(e.into()),
                 }
+            }
+            Msg::VoiceFilesPicked { pick } => {
+                let paths = match pick {
+                    picker::Outcome::Picked(paths) => paths,
+                    picker::Outcome::Cancelled => {
+                        ui.set_status_text("取消了添加音频".into());
+                        return;
+                    }
+                    picker::Outcome::Unavailable(trouble) => {
+                        ui.set_status_text(format!("没能添加音频：{}", trouble.note()).into());
+                        return;
+                    }
+                };
+                if paths.is_empty() {
+                    ui.set_status_text("没有选到音频文件".into());
+                    return;
+                }
+                // 逐个按文件名入库：单文件失败不中断整批（失败原因在 report 里）
+                let report =
+                    voices::import_audio_files(&voices_root(), &paths, now_ms(), file_stem);
+                refresh_voice_library(ui);
+                let mut note = format!("已加入 {} 个音色（同名会覆盖）", report.imported);
+                if report.failed > 0 {
+                    match &report.first_error {
+                        Some(e) => note.push_str(&format!("；失败 {} 个：{e}", report.failed)),
+                        None => note.push_str(&format!("；失败 {} 个", report.failed)),
+                    }
+                }
+                ui.set_status_text(note.into());
             }
             Msg::BatchScriptsPicked { pick } => {
                 let paths = match pick {
@@ -15548,6 +15604,31 @@ mod tests {
         }
     }
 
+    /// 音色库「添加音频…」的消息来自系统文件框（后台线程、revision 0），
+    /// 与工程版本无关：不在名单里就会被版本过滤静默丢掉，
+    /// 界面停在「正在打开文件选择框…」。
+    #[test]
+    fn voice_files_picked_survives_revision_changes() {
+        let msgs = vec![
+            Msg::VoiceFilesPicked {
+                pick: picker::Outcome::Picked(vec![PathBuf::from("/tmp/甲.wav")]),
+            },
+            // 取消也要能回来：否则状态行停在「正在打开文件选择框…」
+            Msg::VoiceFilesPicked {
+                pick: picker::Outcome::Cancelled,
+            },
+        ];
+        let names = ["VoiceFilesPicked(Picked)", "VoiceFilesPicked(Cancelled)"];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
     /// 备份的起跑守卫：连点、以及和别的写盘动作撞车，都要被挡住（复核的阻塞项 2）。
     #[test]
     fn backup_refusal_blocks_double_click_and_concurrent_writers() {
@@ -17924,7 +18005,7 @@ mod tests {
     ///
     /// 阳性对照（实测过）：把 `spawn_file_pick` 那处写回
     /// `let Some(path) = ... else { 已取消 }`（即两种"没选到"共用一条路），
-    /// `unavailable` 计数掉到 5、这条立刻红。
+    /// `unavailable` 计数比调用点少 1、这条立刻红。
     #[test]
     fn every_picker_call_site_handles_cancel_and_unavailable_separately() {
         let src = production_source();
@@ -17936,7 +18017,7 @@ mod tests {
         // （分支还在、文案却撒谎）→ 下面这一条立刻红。
         let notes = src.matches("trouble.note()").count();
         assert_eq!(
-            calls, 7,
+            calls, 8,
             "选择器调用点数量变了（{calls}）——加/删调用点时同步更新这条守卫"
         );
         assert_eq!(
