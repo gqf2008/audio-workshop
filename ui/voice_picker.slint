@@ -123,6 +123,8 @@ export component VoicePanel inherits Rectangle {
     callback library-import();
     // 选一个/多个音频文件直接入库（多选）；与「导入…」（导出包目录）是两个入口
     callback library-add-audio();
+    // 参考音频行的「选择…」：文件框单选，结果与手填路径同一套语义
+    callback reference-pick();
 
     property <bool> cloning: root.reference-path != "";
 
@@ -198,6 +200,13 @@ export component VoicePanel inherits Rectangle {
                 text <=> root.reference-path;
                 placeholder: "参考音频路径，如 ~/Documents/ref.wav";
                 edited => { root.edited(); }
+            }
+            PixelButton {
+                width: 70px;
+                text: "选择…";
+                Tooltip { text: @markdown("从系统文件框选一段参考音频（5–30 秒干净人声）"); }
+                enabled: !root.busy;
+                clicked => { root.reference-pick(); }
             }
             PixelButton {
                 width: 64px;
