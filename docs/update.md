@@ -30,7 +30,10 @@
 ```jsonc
 // 1. GitHub releases/latest（默认）
 { "tag_name": "v0.2.0", "body": "更新说明", "html_url": "https://github.com/…/releases/tag/v0.2.0",
-  "assets": [ { "name": "….dmg", "size": 50331648, "digest": "sha256:…" } ] }
+  "assets": [ { "name": "AudioWorkshop-0.2.0-linux-x64.tar.gz", "size": …, "digest": "sha256:…" },
+              { "name": "AudioWorkshop-0.2.0.dmg", "size": …, "digest": "sha256:…" },
+              { "name": "AudioWorkshop-0.2.0-windows-x64-setup.exe", "size": …, "digest": "sha256:…" },
+              { "name": "AudioWorkshop-0.2.0-windows-x64.zip", "size": …, "digest": "sha256:…" } ] }
 
 // 2. 自建/内网镜像清单
 { "version": "0.2.0", "notes": "更新说明", "url": "https://…/releases/0.2.0",
@@ -44,6 +47,12 @@
 缺承重字段 / 字段类型不对 / 顶层不是对象 / 根本不是 JSON —— 一律给
 **指名道姓 + 下一步**的错误（例：`发布清单缺少字段 url（顶层字段：tag_name, body）——这个地址可能不是发布清单`）。
 **绝不在这些情况下说「已是最新」**：把"没读到"伪装成"没有新版"是这一类功能最危险的静默失败。
+
+**GitHub 形状的 `assets` 是多平台资产数组**（顺序不保证，字母序第一个往往是 Linux 包）。
+展示用的 `sha256` / `size` 取的是**按当前平台挑中的那个资产**：macOS → 名字以 `.dmg` 结尾
+（大小写不敏感）、Windows → 优先 `-setup.exe`、其次 `.zip`、Linux → `.tar.gz`；
+**挑不到就回落第一个资产**（实现 `src/update.rs::pick_asset`，单测把三平台各挑一遍）。
+所以 macOS 上状态行显示的是 dmg 的体积，而不是排第一的 Linux 包的体积。
 
 ## 版本比对
 
