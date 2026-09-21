@@ -10873,6 +10873,86 @@ fn stem_of(ui: &MainWindow) -> String {
 // 试听
 // ===========================================================================
 
+/// 「试听全篇」的播放计划（纯函数，`docs/streaming-preview.md` §3 Phase 1）。
+///
+/// 成品（final.wav 存在）优先；没有成品时按工程 index 排序，只取「已合成」的
+/// **连续前缀**——遇到第一句未完成（待合成/合成中/失败）即停，不静默跳过空洞。
+/// `duration` 与 `paths` 在同一趟遍历里产生（成品=其时长、前缀=各句时长之和），
+/// 调用方直接喂 `playing_total`，不用再各自算一遍总时长（两份实现会漂移）。
+struct ListenPlan {
+    /// 按播放顺序排列的 wav：成品只有 1 个；前缀播放有 k 个；空前缀为空
+    paths: Vec<PathBuf>,
+    /// 状态行文案（成品 / 缺口 / 空前缀 / 全完成 各有固定措辞）
+    note: String,
+    /// 本次连播总时长（秒）
+    duration: f32,
+}
+
+/// 成品（final.wav 存在）→ 只播成品；否则按工程 index 取已完成句的连续前缀。
+///
+/// `running` 只改文案不改计划：运行中点「试听全篇」同样只播已完成句，
+/// 播到第一句未完成为止（计划里本来就没有空洞后面的句子）。
+fn listen_plan(
+    rows: &[Sentence],
+    dir: &Path,
+    assembled: Option<&AssembledInfo>,
+    running: bool,
+) -> ListenPlan {
+    if let Some(info) = assembled {
+        if info.wav.is_file() {
+            return ListenPlan {
+                paths: vec![info.wav.clone()],
+                note: "试听全篇成品".to_string(),
+                duration: info.duration as f32,
+            };
+        }
+    }
+    // 质检排序只影响屏幕顺序；试听计划必须回到工程时间顺序。
+    let mut sorted: Vec<&Sentence> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.index);
+    // 连续前缀：从第 1 句起逐句都要「已合成」；第一句未完成即停，
+    // 空洞后面的完成句不算（不静默跳过——见单测 listen_plan_stops_at_first_hole）。
+    let mut paths = Vec::new();
+    let mut duration = 0.0_f32;
+    for row in &sorted {
+        if row.status.as_str() != "已合成" {
+            break;
+        }
+        let Ok(index) = usize::try_from(row.index) else {
+            break;
+        };
+        paths.push(dir.join(format!("sentences/{index:03}.wav")));
+        duration += row.duration;
+    }
+    let k = paths.len();
+    let note = if running {
+        if k == 0 {
+            "合成中：还没有已合成的句子，等第 1 句完成再试听".to_string()
+        } else {
+            match sorted.get(k) {
+                // 下一句（第 k+1 句）还没合成：用它的展示句号（no 是 1 基「第 N 句」）
+                Some(next) => format!("合成中：连播已完成的 {k} 句；第 {} 句还没合成", next.no),
+                // 全部完成却仍在 running（RunDone 未到）：保持全完成的原文案
+                None => format!("试听全篇（{k} 句连播，未拼间隙）"),
+            }
+        }
+    } else if k == 0 {
+        "还没有已合成的句子".to_string()
+    } else if k < sorted.len() {
+        format!(
+            "试听全篇（已完成的 {k} 句连播；第 {} 句未合成）",
+            sorted[k].no
+        )
+    } else {
+        format!("试听全篇（{k} 句连播，未拼间隙）")
+    };
+    ListenPlan {
+        paths,
+        note,
+        duration,
+    }
+}
+
 /// 逐句试听：播 sentences/NNN.wav，播放头按该句时长推进。
 fn play_sentence(
     ui: &MainWindow,
@@ -10912,7 +10992,10 @@ fn play_sentence(
     }
 }
 
-/// 全篇试听：有成品播 final.wav，否则按工程顺序播全部已合成句。
+/// 全篇试听：有成品播 final.wav，否则按工程顺序连播已完成句的连续前缀。
+///
+/// 成品优先 / 连续前缀 / 文案都在 `listen_plan` 纯函数里；这里只做界面交互：
+/// 拿计划 → 空计划只说明不播 → `play_many` 连播 → 播放头总时长。
 fn play_all(
     ui: &MainWindow,
     rows: &Rc<VecModel<Sentence>>,
@@ -10920,51 +11003,28 @@ fn play_all(
     state: &Rc<UiState>,
 ) {
     let assembled = state.assembled.borrow();
-    if let Some(info) = assembled.as_ref() {
-        if info.wav.is_file() {
-            match player.play_wav(&info.wav) {
-                Ok(()) => {
-                    state.playing_total.set(info.duration as f32);
-                    ui.set_playing(true);
-                    ui.set_status_text("试听全篇成品".into());
-                }
-                Err(e) => ui.set_status_text(e.into()),
-            }
-            return;
-        }
-    }
-    drop(assembled);
-    let Some(dir) = state.project_dir.borrow().clone() else {
+    let has_final = assembled.as_ref().is_some_and(|i| i.wav.is_file());
+    if !has_final && state.project_dir.borrow().is_none() {
         ui.set_status_text("先跑一次合成".into());
         return;
-    };
-    // 质检排序只影响屏幕顺序；全篇试听必须回到工程时间顺序。
-    let mut done: Vec<(usize, f32)> = (0..rows.row_count())
-        .filter_map(|i| {
-            rows.row_data(i)
-                .filter(|r| r.status.as_str() == "已合成")
-                .and_then(|r| {
-                    usize::try_from(r.index)
-                        .ok()
-                        .map(|index| (index, r.duration))
-                })
-        })
+    }
+    // 成品分支不依赖工程目录（final.wav 是绝对路径）；没有成品时 dir 必为 Some（上面拦过）。
+    let dir = state.project_dir.borrow().clone().unwrap_or_default();
+    let row_vec: Vec<Sentence> = (0..rows.row_count())
+        .filter_map(|i| rows.row_data(i))
         .collect();
-    done.sort_by_key(|(index, _)| *index);
-    if done.is_empty() {
-        ui.set_status_text("还没有已合成的句子".into());
+    let plan = listen_plan(&row_vec, &dir, assembled.as_ref(), ui.get_running());
+    drop(assembled);
+    if plan.paths.is_empty() {
+        // 还没有可播的句子（运行中/空闲都适用）：只给说明，不启动播放器
+        ui.set_status_text(plan.note.into());
         return;
     }
-    let paths: Vec<PathBuf> = done
-        .iter()
-        .map(|(index, _)| dir.join(format!("sentences/{index:03}.wav")))
-        .collect();
-    match player.play_many(&paths) {
+    match player.play_many(&plan.paths) {
         Ok(()) => {
-            let total: f32 = done.iter().map(|(_, d)| d).sum();
-            state.playing_total.set(total.max(0.01));
+            state.playing_total.set(plan.duration.max(0.01));
             ui.set_playing(true);
-            ui.set_status_text(format!("试听全篇（{} 句连播，未拼间隙）", done.len()).into());
+            ui.set_status_text(plan.note.into());
         }
         Err(e) => ui.set_status_text(e.into()),
     }
@@ -16330,6 +16390,134 @@ mod tests {
             qa_sorted: false,
             qa_scroll_y: 0.0,
         }
+    }
+
+    // ---------- 边合成边校听：全篇试听计划（listen_plan，streaming-preview §3 Phase 1） ----------
+
+    /// listen_plan 用例的行构造：与 test_sentence_row 同源，只是状态可指定。
+    fn plan_row(index: usize, status: &str) -> Sentence {
+        let mut row = test_sentence_row(index);
+        row.status = status.into();
+        row
+    }
+
+    /// 工程里的逐句 wav 路径（与 listen_plan 的拼法一致）。
+    fn sentence_wav(dir: &Path, index: usize) -> PathBuf {
+        dir.join(format!("sentences/{index:03}.wav"))
+    }
+
+    /// 运行中、前缀非空：只连播已完成的前缀，文案点明下一句还没合成。
+    #[test]
+    fn listen_plan_running_plays_completed_prefix_only() {
+        let dir = temp_dir("listen-running-prefix");
+        let rows = vec![
+            plan_row(0, "已合成"),
+            plan_row(1, "已合成"),
+            plan_row(2, "合成中"),
+            plan_row(3, "待合成"),
+        ];
+        let plan = listen_plan(&rows, &dir, None, true);
+        assert_eq!(
+            plan.paths,
+            vec![sentence_wav(&dir, 0), sentence_wav(&dir, 1)],
+            "只播已完成的连续前缀"
+        );
+        assert_eq!(plan.duration, 2.0);
+        let note = &plan.note;
+        assert!(note.contains("合成中"), "{note}");
+        assert!(note.contains("连播已完成的 2 句"), "{note}");
+        assert!(note.contains("第 3 句还没合成"), "{note}");
+    }
+
+    /// 运行中、前缀空：还没有可播的句子，等第 1 句完成；第 2 句完成也不能跳着播。
+    #[test]
+    fn listen_plan_running_with_empty_prefix_explains_wait() {
+        let dir = temp_dir("listen-running-empty");
+        let rows = vec![plan_row(0, "待合成"), plan_row(1, "已合成")];
+        let plan = listen_plan(&rows, &dir, None, true);
+        assert!(plan.paths.is_empty(), "空前缀：paths 必须为空");
+        let note = &plan.note;
+        assert!(note.contains("还没有已合成的句子"), "{note}");
+        assert!(note.contains("等第 1 句完成再试听"), "{note}");
+    }
+
+    /// 连续前缀遇到空洞即停（独立断言）：1 完成、2 未完成、3 完成 → 只播第 1 句。
+    #[test]
+    fn listen_plan_stops_at_first_hole_instead_of_skipping() {
+        let dir = temp_dir("listen-hole");
+        let rows = vec![
+            plan_row(0, "已合成"),
+            plan_row(1, "待合成"),
+            plan_row(2, "已合成"),
+        ];
+        let plan = listen_plan(&rows, &dir, None, false);
+        assert_eq!(
+            plan.paths,
+            vec![sentence_wav(&dir, 0)],
+            "空洞后面的完成句不得入队（不静默跳过）"
+        );
+        assert_eq!(plan.duration, 1.0);
+        let note = &plan.note;
+        assert!(note.contains("已完成的 1 句连播"), "{note}");
+        assert!(note.contains("第 2 句未合成"), "{note}");
+    }
+
+    /// 空闲、全部完成：保持原文案；乱序屏幕行也要回到工程 index 顺序。
+    #[test]
+    fn listen_plan_idle_all_done_keeps_original_note_and_sorts_by_index() {
+        let dir = temp_dir("listen-all-done");
+        // 质检排序会把屏幕行排乱：计划必须按工程 index 复原
+        let rows = vec![
+            plan_row(2, "已合成"),
+            plan_row(0, "已合成"),
+            plan_row(1, "已合成"),
+        ];
+        let plan = listen_plan(&rows, &dir, None, false);
+        assert_eq!(
+            plan.paths,
+            vec![
+                sentence_wav(&dir, 0),
+                sentence_wav(&dir, 1),
+                sentence_wav(&dir, 2),
+            ]
+        );
+        assert_eq!(plan.duration, 3.0);
+        assert_eq!(plan.note, "试听全篇（3 句连播，未拼间隙）");
+    }
+
+    /// 成品 final.wav 存在：只播成品、原文案「试听全篇成品」，句子行一概不看。
+    #[test]
+    fn listen_plan_prefers_existing_final_wav() {
+        let dir = temp_dir("listen-assembled");
+        let final_wav = dir.join("out/final.wav");
+        std::fs::create_dir_all(final_wav.parent().unwrap()).unwrap();
+        std::fs::write(&final_wav, b"x").unwrap();
+        let assembled = AssembledInfo {
+            wav: final_wav.clone(),
+            duration: 12.5,
+        };
+        let rows = vec![plan_row(0, "待合成")];
+        let plan = listen_plan(&rows, &dir, Some(&assembled), false);
+        assert_eq!(plan.paths, vec![final_wav]);
+        assert_eq!(plan.duration, 12.5);
+        assert_eq!(plan.note, "试听全篇成品");
+    }
+
+    /// 成品记录还在但 final.wav 不在磁盘：不算成品，回落到前缀计划。
+    #[test]
+    fn listen_plan_missing_final_wav_falls_back_to_prefix() {
+        let dir = temp_dir("listen-assembled-missing");
+        let assembled = AssembledInfo {
+            wav: dir.join("out/final.wav"), // 不落盘
+            duration: 12.5,
+        };
+        let rows = vec![plan_row(0, "已合成"), plan_row(1, "已合成")];
+        let plan = listen_plan(&rows, &dir, Some(&assembled), false);
+        assert_eq!(
+            plan.paths,
+            vec![sentence_wav(&dir, 0), sentence_wav(&dir, 1)]
+        );
+        assert_eq!(plan.note, "试听全篇（2 句连播，未拼间隙）");
     }
 
     /// 排序只重排 UI 行，最差在前；恢复时必须回到工程真实 index 顺序。
