@@ -8786,21 +8786,21 @@ fn wire_run(
             ui.set_status_text(note.into());
             return;
         }
-        ui.set_status_text(
-            if retry_failed {
-                format!(
-                    "继续合成 · {model_name} · 只重跑 {failed_count} 句失败句（不重跑已完成的句子）"
-                )
-            } else if resume {
-                format!(
-                    "继续合成 · {model_name} · 已完成的 {} 句自动跳过",
-                    ui.get_done_count()
-                )
-            } else {
-                format!("合成中 · {model_name}")
-            }
-            .into(),
-        );
+        let mut note = if retry_failed {
+            format!(
+                "继续合成 · {model_name} · 只重跑 {failed_count} 句失败句（不重跑已完成的句子）"
+            )
+        } else if resume {
+            format!(
+                "继续合成 · {model_name} · 已完成的 {} 句自动跳过",
+                ui.get_done_count()
+            )
+        } else {
+            format!("合成中 · {model_name}")
+        };
+        // 边合成边校听（streaming-preview §3 变更点 1）：运行中已完成句随时可点行内「试听」
+        note.push_str("（已完成的句子可随时点「试听」）");
+        ui.set_status_text(note.into());
     });
 
     let weak = ui.as_weak();
