@@ -27,6 +27,10 @@ ENTITLEMENTS="packaging/entitlements.plist"
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 DMG="dist/${ARTIFACT_NAME}-${VERSION}.dmg"
 
+# 许可门禁（断言实现只有 packaging/check_license.sh 一份；package.sh 也会跑它）。
+# 发版是对外行为：LICENSE 缺失、或与 Cargo.toml 元数据不一致，在这里就红。
+packaging/check_license.sh
+
 ./package.sh
 
 [ -d "${APP}" ] || { echo "❌ 缺少 ${APP}" >&2; exit 1; }
