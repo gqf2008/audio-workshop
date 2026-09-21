@@ -12,8 +12,8 @@
 ## 2. 真机探测结论（决定性）
 
 权威对象是**随包引擎 v0.8.2-metalbf16**（`audio.cpp 0.8.2-metalbf16 git: 5356843`），
-独立端口 18082 只挂 `audio8-tts-stream` 探测；本机 8080 上另有用户开发版引擎
-（`e83e9537 breeze-bf16-metal`）作对照，行为同类。原始产物见 §5。
+独立端口 18082 只挂 `audio8-tts-stream` 探测。本机 8080 上另跑着用户开发版引擎
+（`e83e9537 breeze-bf16-metal`）——仅单次观察、未带时间戳复现，**不作为本文证据**。
 
 ### 2.1 契约（读 v0.8.2 源码 + 实测）
 
@@ -34,17 +34,22 @@ POST /v1/audio/speech/live?model=<id>&input=<text>&sample_rate=24000
 
 | 用例 | 结果 |
 |---|---|
-| SSE，短句 | 200 → **1 个 delta（整段 6.4s 音频）** → `{"type":"error",…,"message":"live streaming response did not observe input end"}`；**没有 done timing** |
-| SSE，长句（6 句） | 200 → 19.4s 后直接 `error: live streaming response did not observe input end`，**0 个 delta** |
+| SSE，短句 | 200 → **1 个 delta（单次采样 217,088B ≈ 4.5s @24kHz）** → `{"type":"error",…,"message":"live streaming response did not observe input end"}`；done 必被吞 |
+| SSE，长句（6 句） | 200 → 19.4s 后 **1 个 delta（单次采样 679,936B ≈ 14.2s）** + 同一条 error；done 必被吞 |
 | audio，短句 | 3.74s 全部 PCM 一次到达（213,006B ≈ 4.44s 音频）：**first_arrival == total** |
 | audio，长句 | 26.33s 全部 PCM 一次到达（1,384,463B ≈ 28.8s 音频）：**first_arrival == total** |
+
+> 表中的字节/时长是**单次采样**：同一段文本的生成帧数会漂（复测 36~76 帧），字节与时长随之变；
+> 不变的结论是「一次到达、非渐进」。时间与帧数可从 `engine.log` 的
+> `audio8_tts.ar_generate_ms` + `audio8_tts.codec_decode_ms` / `generated.frames` 核对。
 
 ### 2.3 结论
 
 1. **v0.8.2 的 live 输出不是渐进的**：短句/长句都是整段生成完才一次写出，首发延迟 ≈ 离线整句合成时间。
    「首句提前出声」在当前引擎上**不成立**。
-2. **SSE 分支在 TTS 场景有 bug**：`input_end` 只在模型读 PCM 输入时被观测（TTS 不消费音频输入），
-   末尾必报 `did not observe input end`，且可能吞掉 done 事件。修需上游（见 §4）。
+2. **SSE 分支在 TTS 场景有 bug**：`input_end` 只在模型读 PCM 输入时被观测（TTS 不消费音频输入）；按
+   源码控制流（error 只在写出过 delta 后才可达）**末尾必报 `did not observe input end`、done 必被吞**，
+   delta 本身会到达（≥1 个）。修需上游（见 §4）。
 3. `stream_format=audio` 是当前唯一可用形态（不报错），但没有渐进收益。
 4. **真正可行的是复用现有逐句离线管线**：`/v1/tasks/run` 已经逐句合成、逐句落盘
    `sentences/NNN.wav`，并逐句回传 `Msg::Sentence`；代码核实 `play_sentence`（`src/main.rs`）
@@ -58,8 +63,10 @@ POST /v1/audio/speech/live?model=<id>&input=<text>&sample_rate=24000
 
 ```
 worker: 逐句 /v1/tasks/run → sentences/NNN.wav 落盘 → 逐句 Msg::Sentence 回传
-UI:     行状态滚动更新（已合成）；行内「试听」→ play_sentence（只查「已合成 + wav 在」）
-        「重录」enabled: !busy（运行中禁用，保持）；全篇试听 play_all（成品优先，否则按已合成句顺序播）
+UI:     行状态滚动更新（已合成）；行内「试听」→ play_sentence（只查「已合成 + wav 在」，无 running 守卫）
+        「重录」enabled: !busy——只挡 busy 类操作；合成 running 时按钮**可点**，由回调守卫
+        （src/main.rs 重录回调）拒绝并给「有任务正在进行」提示
+        全篇试听 play_all（成品优先，否则按已合成句顺序播）
 ```
 
 变更点（按最小改动排序）：
@@ -70,7 +77,9 @@ UI:     行状态滚动更新（已合成）；行内「试听」→ play_senten
    （不静默跳过、不排队等它）。
 3. **互不干扰**：试听/连播不触发停止、不清任务；停止合成不杀正在播放的音频（反之亦然），
    两种状态在状态行分别可见。
-4. **选择与进度解耦**：合成中点击某行只影响选中/试听，不改 worker 的目标句；「重录」运行中仍禁用。
+4. **选择与进度解耦**：合成中点击某行只影响选中/试听，不改 worker 的目标句；「重录」运行中
+   不生效（现状：按钮可点、回调守卫拒绝并提示；若要更明确，可选把 `enabled` 也绑 `running`——
+   列为一致性改进，不改动拦截语义）。
 
 验收（Phase 1）：
 
@@ -78,7 +87,7 @@ UI:     行状态滚动更新（已合成）；行内「试听」→ play_senten
   运行中连播只包含已完成句且到未完成句停下；停止与播放互不改变对方状态。
 - 真机：5 分钟稿跑到第 3 句时，第 1 句点「试听」能出声；连播到未完成句停下并有说明；
   合成结束后「全篇试听」仍优先播 `final.wav`。
-- 不回归：`重录` 运行中禁用、停止语义、导出/质检判据不变。
+- 不回归：`重录` 运行中不生效（回调守卫，当前行为）、停止语义、导出/质检判据不变。
 
 ## 4. Phase 2 候选（需要上游/更多设计，不在本批）
 
@@ -96,10 +105,53 @@ UI:     行状态滚动更新（已合成）；行内「试听」→ play_senten
 ```bash
 # 独立起随包引擎（不碰用户在跑的 8080 服务）
 cd /Volumes/DataExt/tmp/aw-stream && ./run-eng.sh        # 端口 18082，只挂 audio8-tts-stream
-python3 probe.py cold|warm|long|audio                    # http.client 版探针
-# 原始 socket 版（能看到 SSE 的 error 事件与第一字节时刻）
-#   见 FINDINGS.md 里的命令与 raw-sse.txt / probe2.sse
+# 跑完按实际进程停（run-eng.sh 不维护 pid 文件）：pkill -f 'port 18082' 或 kill <pid>
 ```
 
-产物：`/Volumes/DataExt/tmp/aw-stream/FINDINGS.md`、`raw-sse.txt`、`probe2.sse`、`probe.py`、
-`engine.log`（含 `audio8_tts.ar_generate_ms` / `codec_decode_ms` 的真实耗时）。
+原始 socket 复现（**能拿到时间戳与 error 事件**；注意 SSE 的 delta 是超长单行，必须**跨 recv 续行缓冲**，否则永远解析不出 delta——初版 `probe.py` 就栽在这里）：
+
+```python
+import socket, urllib.parse, time, json, base64
+
+def raw(path_query, sample_rate=24000):
+    req = (b'POST ' + path_query + b' HTTP/1.1\r\nHost: 127.0.0.1:18082\r\n'
+           b'Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n'
+           b'Connection: close\r\n\r\n0\r\n\r\n')
+    s = socket.create_connection(('127.0.0.1', 18082), timeout=600)
+    t0 = time.time(); s.sendall(req)
+    raw = b''; marks = []
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        raw += b; marks.append((round(time.time() - t0, 3), len(b)))
+    t_close = time.time() - t0
+    body = raw.split(b'\r\n\r\n', 1)[1] if b'\r\n\r\n' in raw else b''
+    return body, marks, t_close
+
+def sse_events(body):
+    evs, buf = [], b''
+    for b in [body]:                      # 演示：调用方应逐 recv 喂，这里一次性喂
+        buf += b
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1)
+            line = line.strip()
+            if not line.startswith(b'data:'): continue
+            p = line[5:].strip()
+            if p == b'[DONE]': evs.append(('DONE',)); continue
+            try: ev = json.loads(p)
+            except Exception: continue
+            if ev.get('type') == 'speech.audio.delta':
+                evs.append(('delta', len(base64.b64decode(ev['audio'])) // (2 * 24000)))
+            elif ev.get('type') == 'error':
+                evs.append(('error', ev['error']['message']))
+    return evs
+
+q = urllib.parse.urlencode({'model': 'audio8-tts-stream', 'input': '你好，这是流式测试。',
+                            'sample_rate': '24000', 'stream_format': 'sse'}).encode()
+body, marks, t = raw(b'/v1/audio/speech/live?' + q)
+print('total=%.2fs first_arrival=%s' % (t, marks[0][0] if marks else None))
+print(sse_events(body))
+```
+
+产物（本机 scratch，仅作对照）：`/Volumes/DataExt/tmp/aw-stream/` 下 `FINDINGS.md`、
+`raw-sse.txt`（含 delta + error 的原始响应）、`engine.log`。
