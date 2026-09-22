@@ -49,6 +49,7 @@ mod templates;
 mod update;
 mod versions;
 mod voices;
+mod win_child;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -13650,6 +13651,40 @@ mod tests {
             .expect("必须写旁车（ASR 不是前提）");
         assert!(long.starts_with(&paired), "兜底必须是原文前缀：{paired}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows 控制台子进程一律走 `win_child::hidden_command`：GUI 子系统直接
+    /// CreateProcess 控制台程序会给用户弹一个黑窗（2026-09-22 用户实测：文件对话框）。
+    /// 阳性对照：把任一处改回裸 `Command::new(...)` → 本条对应断言转红。
+    #[test]
+    fn windows_console_children_go_through_hidden_command() {
+        let picker = include_str!("picker.rs");
+        assert!(picker.contains("hidden_command(spec.program)"));
+        assert!(
+            !picker.contains("Command::new(spec.program)"),
+            "picker 不许裸起子进程（Windows 会弹控制台）"
+        );
+        let backup = include_str!("backup.rs");
+        assert!(backup.contains("hidden_command(\"powershell\")"));
+        assert!(!backup.contains("Command::new(\"powershell\")"));
+        let eng = include_str!("engine_supervisor.rs");
+        assert!(eng.contains("hidden_command(&bin)"));
+        assert!(!eng.contains("Command::new(&bin)"));
+        let mem = include_str!("model_sources.rs");
+        assert!(mem.contains("hidden_command(\"powershell\")"));
+        assert!(!mem.contains("Command::new(\"powershell\")"));
+        // helper 自身必须真的加标志（唯一常量来源）
+        let helper = include_str!("win_child.rs");
+        assert!(helper.contains("CREATE_NO_WINDOW"));
+        assert!(helper.contains("creation_flags(CREATE_NO_WINDOW)"));
+        // main.rs 生产源码里不许出现裸的 Windows 控制台程序名
+        let src = production_source();
+        for program in ["powershell", "cmd", "wmic"] {
+            assert!(
+                !src.contains(&format!("Command::new(\"{program}\")")),
+                "main.rs 里 Command::new(\"{program}\") 会在 Windows 弹控制台"
+            );
+        }
     }
 
     /// 句柄检查必须走 `take_live_supervisor`（单一取锁）：旧的内联写法

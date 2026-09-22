@@ -27,6 +27,7 @@
 | 工程状态是「已合成」但句子 wav 丢了（**拼装时会先逐句预校验，所以这条在拼装里也必须命中**） | `句子音频丢失：sentences/007.wav（工程里这句状态是「已合成」）。请重录该句，或把工程目录恢复回来。完整路径：<绝对路径>` | `sentence_read_note` + 测试 `missing_sentence_wav_says_which_file_is_gone`、**走真实 `assemble` 路径**的 `assemble_reports_which_sentence_wav_is_missing` |
 | `project.json` 读不了（截断 / 半截 JSON / 权限） | 启动时与开跑时都明确报 `工程文件损坏：没有自动重建，也没有覆盖它——请把 project.json 改名或移走后重开…完整路径：<路径>。解析错误：…`；**开跑会中止，不覆盖现场** | `Project::load_if_present` + 测试 `load_if_present_separates_missing_from_corrupt_project`、main 侧 `corrupt_project_aborts_the_run_and_keeps_the_file` |
 | `project.json` 不存在 | 照旧按全新工程从零开始（这一条是回归守卫，不能被上面那条误伤） | 同上两条测试 |
+| Windows 上起控制台子进程（文件对话框的 `powershell`、备份取日期、随包引擎、物理内存探测） | **不弹控制台窗口**（GUI 子系统直接 CreateProcess 控制台程序会弹黑窗；2026-09-22 用户真机：打开文件选择对话框就弹控制台） | `src/win_child.rs::hidden_command`（`CREATE_NO_WINDOW` 唯一入口）+ 源码守卫 `windows_console_children_go_through_hidden_command`；真机复验由 Windows 用户确认（CI 只保证构建） |
 
 **文案顺序是有意的**：状态栏与任务中心的行都是 `overflow: elide`，长文案会被截尾。
 所以每条错误都按「发生了什么 → 该做什么 → 完整路径」排：被截断时丢掉的是路径尾巴，

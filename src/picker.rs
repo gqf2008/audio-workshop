@@ -314,7 +314,9 @@ enum Run {
 
 /// 起一次选择器。**只有这一处碰 `process::Command`**。
 fn run(spec: &Spec) -> Run {
-    match std::process::Command::new(spec.program)
+    // Windows 必须走 hidden_command：GUI 子系统直接起 powershell 会弹控制台窗口
+    // （2026-09-22 用户真机：打开文件选择对话框就弹黑窗）。
+    match crate::win_child::hidden_command(spec.program)
         .args(&spec.args)
         .output()
     {

@@ -18,7 +18,10 @@
 //! （见 `LESSON_运行时可写数据严禁落安装目录或应用包内.md`）。
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
+// `Command` 只有测试用（生产路径一律走 `crate::win_child::hidden_command`）。
+#[cfg(test)]
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// 拉起结果：调用方据此决定要不要提示用户。
@@ -508,7 +511,9 @@ impl EngineSupervisor {
             Ok(f) => f,
             Err(e) => return StartOutcome::Failed(format!("日志句柄复制失败：{e}")),
         };
-        let mut cmd = Command::new(&bin);
+        // 引擎是控制台程序：GUI 壳直接起它会在 Windows 弹一个常驻黑窗，
+        // 统一走 win_child（CREATE_NO_WINDOW 的唯一来源）。
+        let mut cmd = crate::win_child::hidden_command(&bin);
         cmd.arg("--config")
             .arg(&cfg_path)
             .arg("--host")
@@ -531,7 +536,7 @@ impl EngineSupervisor {
         self.child = Some(child);
         // 壳侧监视进程：壳被强杀时由它收掉引擎（见 run_monitor 的说明）。
         if let Ok(exe) = std::env::current_exe() {
-            let mut mon = Command::new(exe);
+            let mut mon = crate::win_child::hidden_command(exe);
             mon.arg(ENGINE_MONITOR_ARG)
                 .arg(std::process::id().to_string())
                 .arg(engine_pid.to_string())
@@ -797,7 +802,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn monitor_reaps_a_child_after_the_shell_is_gone() {
-        use std::process::Command;
         // 假引擎：活得比测试久
         let mut fake = Command::new("sleep")
             .arg("30")

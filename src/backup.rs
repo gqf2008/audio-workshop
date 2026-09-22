@@ -281,7 +281,8 @@ fn local_stamp_from_system() -> Option<String> {
 
 #[cfg(windows)]
 fn local_stamp_from_system() -> Option<String> {
-    let out = std::process::Command::new("powershell")
+    // 不弹控制台：统一走 win_child（`CREATE_NO_WINDOW` 的唯一来源）。
+    let out = crate::win_child::hidden_command("powershell")
         .args(["-NoProfile", "-Command", "Get-Date -Format yyyyMMdd-HHmmss"])
         .output()
         .ok()?;
