@@ -392,6 +392,26 @@ pub fn autostart_allowed(now: Instant) -> bool {
     }
 }
 
+/// 句柄槽的检查与清理：**单一取锁**。返回 true = 槽里有一个活着的托管引擎（调用方直接复用）。
+///
+/// 为什么必须抽成函数：内联写法
+/// `if let Some(sup) = SLOT.lock()...as_mut() { ...; *SLOT.lock()... = None; }`
+/// 里第一把**临时 MutexGuard 会活到 if-let 结束**，块内第二次 lock 同一把锁是
+/// **同线程重入 → 永久死锁**；而且恰好只在「引擎已崩溃、要丢死句柄重拉」这条
+/// 自愈关键分支上触发（2026-09-22 独立复评实测；回归测试见
+/// `take_live_supervisor_clears_dead_handle_without_deadlock`）。
+pub fn take_live_supervisor(slot: &std::sync::Mutex<Option<EngineSupervisor>>) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(sup) = guard.as_mut() {
+        if sup.is_running() {
+            return true;
+        }
+    }
+    // 没有句柄 / 句柄对应的引擎已退出：清掉（清 None 也无害），让调用方去重拉
+    *guard = None;
+    false
+}
+
 /// 测试用：清掉重启节流的记账（节流是全局状态，并行测试的先后顺序不该决定
 /// 某条用例能不能走到"真的尝试"那一步）。只在 cfg(test) 编译。
 #[cfg(test)]
@@ -917,5 +937,44 @@ mod tests {
         assert_eq!(got[0].id, id);
         assert_eq!(got[0].family, family_from_spec(&spec));
         assert_eq!(got[0].path, abs.display().to_string());
+    }
+
+    /// 崩溃分支回归：死句柄必须被清掉，而且**不能死锁**。
+    ///
+    /// 反例（2026-09-22 复评）：句柄检查内联 `if let Some(sup) = slot.lock()...as_mut()`
+    /// 后在块内 `*slot.lock()... = None` —— 第一把临时守卫活到 if-let 结束，
+    /// 第二次 lock 是同线程重入，永久阻塞；这条分支正是「引擎崩溃后自愈」的必经路。
+    #[test]
+    fn take_live_supervisor_clears_dead_handle_without_deadlock() {
+        use std::sync::{mpsc, Arc, Mutex};
+        // 活句柄：保留并返回 true
+        let alive = Command::new("sleep").arg("30").spawn().unwrap();
+        let slot = Arc::new(Mutex::new(Some(EngineSupervisor::with_child_for_test(
+            alive,
+        ))));
+        assert!(take_live_supervisor(&slot), "活着的托管引擎应返回 true");
+        assert!(slot.lock().unwrap().is_some(), "活句柄不得被清");
+
+        // 死句柄：清掉、返回 false，且不得阻塞（watchdog 2s）
+        let mut dead = Command::new("sleep").arg("30").spawn().unwrap();
+        dead.kill().unwrap();
+        dead.wait().unwrap();
+        *slot.lock().unwrap() = Some(EngineSupervisor::with_child_for_test(dead));
+        let (tx, rx) = mpsc::channel();
+        {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(take_live_supervisor(&slot));
+            });
+        }
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(false) => {}
+            Ok(true) => panic!("死句柄不该返回 true"),
+            Err(_) => panic!("take_live_supervisor 在死句柄上阻塞：同线程重入死锁"),
+        }
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "死句柄必须被清掉，否则挡住重拉"
+        );
     }
 }

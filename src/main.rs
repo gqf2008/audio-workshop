@@ -2268,16 +2268,12 @@ fn engine_data_dir() -> PathBuf {
 fn ensure_engine_serving() -> engine_supervisor::StartOutcome {
     // 手动路径（启动、下载完成后）不受节流：那是用户明确动作之后的一次尝试。
     // 崩溃自愈的节流在 `ensure_engine_serving_throttled` 里。
-    if let Some(sup) = ENGINE_SUPERVISOR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-    {
-        if sup.is_running() {
-            return engine_supervisor::StartOutcome::Started;
-        }
-        // 走到了这里说明引擎已经退出：把死句柄丢掉再往下重拉
-        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // 句柄检查/清理走单一取锁的 helper：内联写法（在 if-let 里对锁守卫取 `as_mut`
+    // 后又在块内二次 lock）的**临时守卫会活到 if-let 结束**，同线程重入会**死锁**；
+    // 而且只在「引擎已崩溃」这条自愈关键分支触发（2026-09-22 独立复评实测），
+    // 见 `engine_supervisor::take_live_supervisor` 的注释与回归测试。
+    if engine_supervisor::take_live_supervisor(&ENGINE_SUPERVISOR) {
+        return engine_supervisor::StartOutcome::Started;
     }
     let (base, explicit) = server_base_for_engine();
     let cat = match model_sources::catalog() {
@@ -5009,8 +5005,12 @@ fn migrate_overlong_voice_ref(
     if prepared.path == Path::new(&path) {
         return Ok(None);
     }
-    project.voice_ref = Some(prepared.path.to_string_lossy().into_owned());
-    project.voice_ref_hash = Some(sha256_file(&prepared.path)?);
+    // 先把新 hash 算出来再一次性改两个字段：hash 读失败时内存态不能先变成新路径
+    // （否则会留下「内存已迁移、磁盘没迁移」两套状态；2026-09-22 复评 M2）。
+    let new_path = prepared.path.to_string_lossy().into_owned();
+    let new_hash = sha256_file(&prepared.path)?;
+    project.voice_ref = Some(new_path);
+    project.voice_ref_hash = Some(new_hash);
     project
         .save(dir)
         .map_err(|e| format!("工程落盘失败: {e}"))?;
@@ -8633,11 +8633,20 @@ fn wire_voice_panel(
             ui.set_status_text("任务进行中：参考音暂不可改".into());
             return;
         }
-        ui.set_status_text("正在打开文件选择框（选 5–15 秒干净人声）…".into());
+        ui.set_status_text(
+            format!(
+                "正在打开文件选择框（选 {} 干净人声）…",
+                aw_core::reference_range_label()
+            )
+            .into(),
+        );
         let msg_pick = msg_pick.clone();
         std::thread::spawn(move || {
             let pick = picker::pick_file(
-                "选择参考音频（5–15 秒干净人声）",
+                &format!(
+                    "选择参考音频（{} 干净人声）",
+                    aw_core::reference_range_label()
+                ),
                 "音频",
                 &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
             );
@@ -13449,6 +13458,63 @@ mod tests {
         assert!(
             app.contains("reference-pick => { root.reference-pick(); }"),
             "app 要把文件框回调透传给设计 Tab"
+        );
+    }
+
+    /// 句柄检查必须走 `take_live_supervisor`（单一取锁）：旧的内联写法
+    /// `if let Some(sup) = ENGINE_SUPERVISOR.lock()…as_mut()` 会在块内二次 lock，
+    /// 同线程重入**永久死锁**，且只在引擎已崩溃的自愈分支触发（2026-09-22 复评）。
+    #[test]
+    fn engine_supervisor_handle_check_is_single_lock() {
+        let src = production_source();
+        let body = source_window(&src, "fn ensure_engine_serving(", 1400);
+        assert!(
+            body.contains("take_live_supervisor(&ENGINE_SUPERVISOR)"),
+            "句柄检查必须用单一取锁的 helper：{body}"
+        );
+        assert!(
+            !body.contains("as_mut()"),
+            "不许再内联 as_mut()（块内二次 lock 会死锁）：{body}"
+        );
+    }
+
+    /// 引导文案的时长范围必须与 `REFERENCE_MAX_SECONDS` 一致：
+    /// 静态文案（slint / audio_client / docs）由本测试钉住，动态 prompt 必须由
+    /// `aw_core::reference_range_label()` 生成（2026-09-22 复评 M1）。
+    #[test]
+    fn reference_range_label_is_pinned_to_static_copy() {
+        let label = aw_core::reference_range_label();
+        for (file, text) in [
+            (
+                "crates/aw-core/src/audio_client.rs",
+                include_str!("../crates/aw-core/src/audio_client.rs"),
+            ),
+            (
+                "ui/voice_picker.slint",
+                include_str!("../ui/voice_picker.slint"),
+            ),
+            (
+                "ui/extra_tabs.slint",
+                include_str!("../ui/extra_tabs.slint"),
+            ),
+            (
+                "docs/voice-clone.md",
+                include_str!("../docs/voice-clone.md"),
+            ),
+        ] {
+            assert!(
+                text.contains(&label),
+                "{file} 的引导文案必须含 {label}（改 REFERENCE_MAX_SECONDS 时要同步这些静态字面量）"
+            );
+        }
+        let src = production_source();
+        assert!(
+            src.contains("aw_core::reference_range_label()"),
+            "main.rs 的动态 prompt 必须由 helper 生成"
+        );
+        assert!(
+            !src.contains("5–15 秒干净人声"),
+            "main.rs 不许硬编码范围字面量（改常量会漂移）"
         );
     }
 

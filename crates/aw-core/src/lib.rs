@@ -33,7 +33,7 @@ pub use dub::{
 };
 pub use eval::{diff_snippet, intelligibility, Intelligibility};
 pub use ref_audio::{
-    reference_duration_seconds, reference_over_limit, reference_too_long,
+    reference_duration_seconds, reference_over_limit, reference_range_label, reference_too_long,
     trim_reference_first_seconds, REFERENCE_MAX_SECONDS,
 };
 pub use separate::{
