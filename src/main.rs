@@ -353,6 +353,11 @@ enum Msg {
         ok: bool,
         detail: String,
     },
+    /// 托管引擎周期自愈的结果（后台线程发回；与工程版本无关）。
+    /// `note` = 有可报告结论时的状态行文案（None = 稳定态/无事发生）。
+    EngineSelfHeal {
+        note: Option<String>,
+    },
     /// 全局设置里「选择模型目录」的结果（三态：选到 / 用户取消 / 选择器不可用）
     ModelDirPicked {
         pick: picker::Outcome<String>,
@@ -2289,15 +2294,40 @@ fn ensure_engine_serving() -> engine_supervisor::StartOutcome {
 
 /// 崩溃自愈入口：健康检查发现连不上时调用。
 ///
-/// 与手动路径的区别只有一条 —— **带节流**：引擎一起就崩的情况下，不能每轮健康检查
-/// 都重启一次（那会变成重启风暴）。
-fn ensure_engine_serving_throttled() {
-    if !engine_supervisor::autostart_allowed(std::time::Instant::now()) {
-        return;
+/// 与手动路径（启动 / 下载完成后）的区别有两条：
+///   · **先探活**：服务在响应就直接返回 `None` —— 周期检查每约 30s 会来一次，
+///     不能让"引擎好好的"也去动状态行（不刷屏）；
+///   · **带节流**：引擎一起来就崩的情况下，不能每轮健康检查都重启一次
+///     （那会变成重启风暴）。
+///
+/// 返回 `Some(outcome)` = 本次真的做了一次拉起尝试；`None` = 健康在响应或节流挡住。
+fn ensure_engine_serving_throttled() -> Option<engine_supervisor::StartOutcome> {
+    let (base, _) = server_base_for_engine();
+    if engine_supervisor::healthy(&base) {
+        return None;
     }
-    if let engine_supervisor::StartOutcome::Failed(why) = ensure_engine_serving() {
+    if !engine_supervisor::autostart_allowed(std::time::Instant::now()) {
+        return None;
+    }
+    // 句柄还在但 /health 不响应 = 进程挂死：如实报 Failed，**不装成 Started**——
+    // 否则状态栏会说"已重新拉起"而进程根本没动过（强杀再重拉不在本批范围，
+    // 下一轮 30s 还会再问；"不刷屏"靠状态行结论去重兜着）。
+    if let Some(sup) = ENGINE_SUPERVISOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        if sup.is_running() {
+            return Some(engine_supervisor::StartOutcome::Failed(
+                "引擎进程还在但 /health 不响应（疑似挂死）：稍后会自动再试".into(),
+            ));
+        }
+    }
+    let outcome = ensure_engine_serving();
+    if let engine_supervisor::StartOutcome::Failed(why) = &outcome {
         eprintln!("随包引擎自愈失败：{why}");
     }
+    Some(outcome)
 }
 
 /// 重新读 /health 并刷新状态栏的后端标签（启动、测试连接、应用并重连后都调用）。
@@ -3458,9 +3488,9 @@ fn spawn_server_check(msg_tx: Sender<WorkerMsg>, revision: u64) {
                     (true, format!("已连接 {b}"))
                 } else {
                     // 连不上分两种：外部服务没起（我们不该管），或我们托管的引擎崩了
-                    // （该拉起来）。`ensure_engine_serving_throttled` 内部会按
-                    // "用户是否显式配了地址"重新判一遍，所以这里无脑调用是安全的。
-                    ensure_engine_serving_throttled();
+                    // （该拉起来）。内部会按"用户是否显式配了地址"重新判一遍，
+                    // 所以这里无脑调用是安全的；结果不用管——测试连接的回显只看连不连得上。
+                    let _ = ensure_engine_serving_throttled();
                     (false, format!("连不上 {b}：服务没起或端口不对"))
                 }
             }
@@ -4617,6 +4647,21 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
+                // 时长护栏：重录的 voice_ref 在**工程里**（UI 路径只是它当时的投影），
+                // 所以唯一可靠的拦截点在发起重录请求之前、按工程的 voice_ref 判。
+                // 超限不发起任何请求（发出去就会把引擎进程打死）。
+                if let Some(path) = project.voice_ref.as_deref() {
+                    if let Some(note) = reference_over_limit_note(path) {
+                        let _ = ctx.tx.send(WorkerMsg {
+                            revision,
+                            msg: Msg::RedoDone {
+                                index,
+                                error: Some(note),
+                            },
+                        });
+                        continue;
+                    }
+                }
                 let client = match make_client() {
                     Ok(c) => c,
                     Err(e) => {
@@ -5167,6 +5212,18 @@ fn reference_text_missing(
     }
 }
 
+/// 参考音频时长护栏（30s 硬上限）的**唯一入口**：超限返回可执行文案，读不出时长
+/// fail-open 放行（取舍见 `aw_core::ref_audio` 模块注释）。
+///
+/// 所有会发克隆请求的入口（开始合成 / 批量提交 / 单句重录 / 音色试听）都必须在
+/// **发起前**过它——192.9s 参考音实测让引擎申请 14,539 MiB Metal buffer 失败后
+/// 空指针 SIGSEGV，整个引擎进程死掉（用户 8080 引擎 2026-09-22 崩了两次）。
+/// 源码守卫 `every_clone_request_entrance_is_guarded_by_reference_limit` 钉住调用点，
+/// 加新入口必须同步加护栏。
+fn reference_over_limit_note(path: &str) -> Option<String> {
+    aw_core::reference_over_limit(Path::new(path))
+}
+
 // 8 个参数确实多，但每个都是调用方必须显式给出的决策（路径/稿子/引擎/音色两项/停顿/
 // 兜底/词典）。打包成配置结构体只是把同一串东西换个地方写，调用点反而更啰嗦——
 // 与 `Project::new` 的处理一致。
@@ -5371,6 +5428,15 @@ struct UiState {
     auto_normalize_seen: std::cell::Cell<bool>,
     /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
     last_task_refresh: std::cell::Cell<Option<Instant>>,
+    /// 服务地址是否来自用户显式配置（AW_SERVER / 全局设置）：周期自愈判据的输入。
+    /// 启动 / 应用设置 / 测试连接时刷新；显式 = 用户自己的服务，壳绝不碰它。
+    engine_explicit: std::cell::Cell<bool>,
+    /// 上次对托管引擎做周期自愈尝试的时刻（tick 每约 30s 问一次，纯判据在
+    /// `engine_supervisor::should_periodic_heal`）。
+    last_engine_heal: std::cell::Cell<Option<Instant>>,
+    /// 上次写进状态行的自愈结论：与上次相同就不再刷（"不刷屏"）；引擎恢复健康后
+    /// 清空，下一次故障才能再次提示。
+    last_engine_heal_note: RefCell<Option<String>>,
     /// 截图/演示态（`AW_UI_STATE=tasks`）。演示任务只是给任务中心摆样子、没有对应的
     /// worker 命令，所以**不能参与**"有没有任务在飞"的判断——否则演示态下点开始配音
     /// 会被这些假任务挡住（复核指出）。只有 debug 构建会置位。
@@ -5442,6 +5508,8 @@ fn main() -> Result<(), slint::PlatformError> {
         cancel,
         ..UiState::default()
     });
+    // 周期自愈的"显式地址恒跳过"判据输入：启动时先取一次，应用设置/测试连接后再刷新
+    state.engine_explicit.set(server_base_for_engine().1);
     {
         let stop = Arc::clone(&stop);
         let sep_stop = Arc::clone(&sep_stop);
@@ -5527,12 +5595,21 @@ fn main() -> Result<(), slint::PlatformError> {
         let rows = rows.clone();
         let msg_rx = Rc::new(RefCell::new(msg_rx));
         let cmd_tx_tick = cmd_tx.clone();
+        let msg_tx_tick = msg_tx_ui.clone();
         timer.start(
             TimerMode::Repeated,
             Duration::from_millis(TICK_MS),
             move || {
                 if let Some(ui) = weak.upgrade() {
-                    tick(&ui, &rows, &msg_rx, &player, &state, &cmd_tx_tick);
+                    tick(
+                        &ui,
+                        &rows,
+                        &msg_rx,
+                        &player,
+                        &state,
+                        &cmd_tx_tick,
+                        &msg_tx_tick,
+                    );
                 }
             },
         );
@@ -7648,6 +7725,14 @@ fn wire_batch(
             ui.set_batch_summary(reference_text_required_note(&model).into());
             return;
         }
+        // 时长护栏：批量每篇都会带同一份 voice_ref 发克隆请求，超 30s 一篇都
+        // 不能提交（拦一次顶 N 次引擎崩溃）。
+        if let Some(path) = voice_ref.as_deref() {
+            if let Some(note) = reference_over_limit_note(path) {
+                ui.set_batch_summary(note.into());
+                return;
+            }
+        }
 
         // 每条先登记成一条配音任务（排队中），worker 轮到它时用 TaskStarted 抬成运行中
         let mut items = Vec::new();
@@ -8344,6 +8429,13 @@ fn wire_voice_panel(
             ui.set_status_text(reference_text_required_note(&model).into());
             return;
         }
+        // 克隆态试听同样是一次真实克隆请求：时长护栏同一条，超 30s 不发起。
+        if let Some(path) = voice_ref.as_deref() {
+            if let Some(note) = reference_over_limit_note(path) {
+                ui.set_status_text(note.into());
+                return;
+            }
+        }
         let what = if voice_ref.is_some() {
             "克隆音色"
         } else {
@@ -8727,6 +8819,12 @@ fn wire_run(
                 ui.set_status_text(
                     format!("参考音频不存在或不可读：{path}（修正后再开始合成）").into(),
                 );
+                return;
+            }
+            // 时长护栏：超 30s 在**发请求前**拦下（不拦会把引擎进程打死，见
+            // `reference_over_limit_note` 的注释），不排任务、不发任何请求。
+            if let Some(note) = reference_over_limit_note(path) {
+                ui.set_status_text(note.into());
                 return;
             }
         }
@@ -9724,6 +9822,7 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         Msg::TaskStarted { .. }
         | Msg::TaskStage { .. }
         | Msg::ServerHealth { .. }
+        | Msg::EngineSelfHeal { .. }
         | Msg::ModelsUnloaded { .. }
         | Msg::ModelDirPicked { .. }
         // 备份：目录选择结果来自对话框，终态来自长 IO，两者都与工程版本无关；
@@ -9786,6 +9885,7 @@ fn tick(
     player: &Rc<player::Player>,
     state: &Rc<UiState>,
     cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
 ) {
     // ── 工作线程消息 ──
     let mut run_finished: Option<(usize, bool, usize, Option<String>)> = None;
@@ -10018,6 +10118,19 @@ fn tick(
                 ui.set_server_ok(ok);
                 // 服务刚被改地址 / 重启过时，后端可能从 metal 变 cuda，标签要跟着走
                 refresh_backend_label(ui);
+                // 地址判据也可能刚变（测试连接前用户改了 host/port）：自愈开关跟着刷新
+                state.engine_explicit.set(server_base_for_engine().1);
+            }
+            Msg::EngineSelfHeal { note } => {
+                // 只有结论与上次不同才写状态行：引擎稳定时不刷屏；引擎恢复后清空记录，
+                // 下一次故障才能再次提示。
+                let mut last_note = state.last_engine_heal_note.borrow_mut();
+                if note != *last_note {
+                    if let Some(n) = &note {
+                        ui.set_status_text(n.clone().into());
+                    }
+                    *last_note = note;
+                }
             }
             Msg::VoicePreview { wav, label } => {
                 ui.set_busy(false);
@@ -10849,6 +10962,40 @@ fn tick(
     // ── 音色设计「生成」能不能点 + 原因：同上，单点投影 ──
     refresh_design_action(ui, state);
 
+    // ── 托管引擎周期自愈（每约 30s 问一次；显式地址 = 用户自己的服务，恒跳过）──
+    // 判据是 engine_supervisor::should_periodic_heal 的纯函数（显式跳过 / 节流内
+    // 不重试 / 间隔外重试）。**重拉本身会阻塞（最坏等引擎 30s）**，所以只在 tick 里
+    // 决定“该问了”，真正的探测/拉起放在后台线程，结论经 Msg::EngineSelfHeal 回传，
+    // 绝不冻界面。192.9s 参考音把引擎打死之后，靠这里把服务拉回来。
+    let heal_now = Instant::now();
+    if engine_supervisor::should_periodic_heal(
+        state.engine_explicit.get(),
+        state.last_engine_heal.get(),
+        heal_now,
+    ) {
+        state.last_engine_heal.set(Some(heal_now));
+        let tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            let note = match ensure_engine_serving_throttled() {
+                Some(engine_supervisor::StartOutcome::Started) => {
+                    Some("随包引擎已重新拉起，服务已恢复".to_string())
+                }
+                Some(engine_supervisor::StartOutcome::Failed(why)) => {
+                    Some(format!("随包引擎自愈失败：{why}"))
+                }
+                // Reused（外部服务在响应）/ EngineMissing / NotConfigured 都是稳定态，
+                // 不写状态行（不刷屏）
+                Some(_) => None,
+                // 健康在响应 / 节流挡住：无事发生
+                None => None,
+            };
+            let _ = tx.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::EngineSelfHeal { note },
+            });
+        });
+    }
+
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
         ui.set_playing(false);
@@ -11171,6 +11318,8 @@ fn wire_global_settings(
         if let Ok(mut g) = settings().lock() {
             *g = next;
         }
+        // 服务地址改了，周期自愈的"显式地址恒跳过"判据输入要跟着刷新
+        st.engine_explicit.set(server_base_for_engine().1);
         apply_engine_discovery(&ui, Some((&tx, &st)));
         refresh_download_rows(&ui, &st);
         // 回显是**投影**：从刚落盘的那份设置算，不在这里拼第二份判断
@@ -11424,6 +11573,24 @@ fn refresh_voice_labels(ui: &MainWindow) {
     // 参考音可用性（决定试听 / 合成能不能开工）
     let exists = !ref_trimmed.is_empty() && Path::new(&ref_trimmed).is_file();
     ui.set_reference_exists(exists);
+
+    // 参考音频时长回显 + 30s 硬上限红色警告：文本与"是否超限"都在这里算好下发，
+    // slint 只显示不算（判据只有 aw_core::ref_audio 一份，别在 UI 里再造）。
+    // 读不出时长 = fail-open（只显示"读不出"，不拦）。
+    let (duration_text, over_limit) = match non_empty(ref_trimmed.clone()) {
+        Some(path) if Path::new(&path).is_file() => {
+            match aw_core::reference_duration_seconds(Path::new(&path)) {
+                Some(secs) => match aw_core::reference_too_long(secs) {
+                    Some(note) => (note, true),
+                    None => (format!("参考音频时长：{secs:.1} 秒"), false),
+                },
+                None => ("参考音频时长：读不出（不影响合成）".to_string(), false),
+            }
+        }
+        _ => ("".to_string(), false),
+    };
+    ui.set_reference_duration(duration_text.into());
+    ui.set_reference_over_limit(over_limit);
 
     // 判据算一次，UI 只消费：主按钮可用性 / 内置音色行 / 阻断提示同一份结论。
     // 参考文本那条规则由 `voice_readiness` 内部转调 main 的 `reference_text_missing`
@@ -15731,6 +15898,118 @@ mod tests {
         assert_eq!(cancel.len(), 0, "取走过的登记项不能留在表里（表要有界）");
     }
 
+    /// 单句重录的时长护栏在 worker 侧（按**工程的 voice_ref** 判——那是请求的
+    /// 真实来源，UI 路径只是它当时的投影）：超 30s 参考音 → RedoDone 带回可执行
+    /// 文案、**不发任何请求**（护栏在 make_client 之前，测试不需要服务端）。
+    ///
+    /// 阳性对照（实测过）：把 `Cmd::Redo` 分支里的护栏删掉，本用例收到的是
+    /// make_client 的"未发现服务"错误而不是时长文案，立刻红。
+    #[test]
+    fn redo_with_overlong_reference_is_blocked_before_any_request() {
+        let root = std::env::temp_dir().join(format!("aw-redo-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // 31s 真实 wav（8kHz 单声道 16bit 静音，约 0.5MB）：主 crate 没有 hound，
+        // RIFF 头手写（与 tiny_silent_wav 同一套路，时长字段 31s > 30s 上限）。
+        let ref_wav = root.join("ref-31s.wav");
+        {
+            let rate = 8_000u32;
+            let frames = 31 * rate;
+            let data_len = frames * 2;
+            let mut out = Vec::with_capacity(44 + data_len as usize);
+            out.extend_from_slice(b"RIFF");
+            out.extend_from_slice(&(36 + data_len).to_le_bytes());
+            out.extend_from_slice(b"WAVEfmt ");
+            out.extend_from_slice(&16u32.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&rate.to_le_bytes());
+            out.extend_from_slice(&(rate * 2).to_le_bytes());
+            out.extend_from_slice(&2u16.to_le_bytes());
+            out.extend_from_slice(&16u16.to_le_bytes());
+            out.extend_from_slice(b"data");
+            out.extend_from_slice(&data_len.to_le_bytes());
+            out.resize(44 + data_len as usize, 0);
+            std::fs::write(&ref_wav, &out).unwrap();
+        }
+        let project = saved_project("第一句。第二句。", Some(ref_wav.to_str().unwrap()));
+
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let worker_root = root.clone();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: worker_root,
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+        cmd_tx
+            .send(Cmd::OpenProject {
+                revision: 1,
+                dir: root.clone(),
+                project,
+            })
+            .unwrap();
+        cmd_tx
+            .send(Cmd::Redo {
+                revision: 1,
+                index: 0,
+            })
+            .unwrap();
+        let m = msg_rx.recv().expect("redo 应回报终态");
+        let Msg::RedoDone { index, error } = m.msg else {
+            panic!("应是 RedoDone")
+        };
+        assert_eq!(index, 0);
+        let err = error.expect("超限参考音必须被拦");
+        assert!(err.contains("31"), "文案要带实际秒数：{err}");
+        assert!(err.contains("裁到 30 秒内再合成"), "文案要带动作：{err}");
+        drop(cmd_tx);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 挂死引擎（进程活着但 /health 不响应）的自愈结论必须如实报 Failed，
+    /// 不装成 Started——否则状态栏会说"已重新拉起"而进程根本没动过。
+    /// 用 `sleep` 当"活着的假引擎"（不监听任何端口，healthy() 必然 false），
+    /// 句柄经 engine_supervisor 的 cfg(test) 注入缝塞进全局槽。
+    #[test]
+    fn throttled_heal_reports_hung_engine_as_failed_not_started() {
+        // 本机真跑着用户服务（默认 8080）时，探活会直接通过 → 探测到就如实跳过
+        // （detect-and-return，见 RULE_可达性 第 3 条）。
+        let (base, _) = server_base_for_engine();
+        if engine_supervisor::healthy(&base) {
+            eprintln!("跳过：{base} 上有真服务在响应，挂死场景没法构造");
+            return;
+        }
+        // 节流是全局状态：先清账，否则别的测试刚拉过一次就会把本条拦住
+        engine_supervisor::reset_autostart_for_test();
+        let sup = engine_supervisor::EngineSupervisor::with_child_for_test(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep 应可执行"),
+        );
+        {
+            let mut slot = ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(sup);
+        }
+        let outcome = ensure_engine_serving_throttled().expect("节流应放行本次尝试");
+        match outcome {
+            engine_supervisor::StartOutcome::Failed(why) => {
+                assert!(why.contains("不响应"), "要如实报挂死：{why}");
+            }
+            other => panic!("挂死引擎必须报 Failed，不能是 {other:?}"),
+        }
+        // 清槽即 Drop → stop() 收掉 sleep，不留孤儿进程
+        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// 整批停止：**每篇都要收到终态**，一篇都不能留在"排队中"。
     ///
     /// 提交那一刻 stop 位已经是 true，等价于"刚提交就按了停止"。worker 不能直接
@@ -15954,6 +16233,27 @@ mod tests {
             },
         ];
         let names = ["VoiceFilesPicked(Picked)", "VoiceFilesPicked(Cancelled)"];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
+    /// 引擎自愈的结论来自后台线程（revision 0、与工程版本无关）：
+    /// 不在不过滤名单里，改一次稿就会把「服务已恢复」静默丢掉。
+    #[test]
+    fn engine_self_heal_survives_revision_changes() {
+        let msgs = vec![
+            Msg::EngineSelfHeal {
+                note: Some("随包引擎已重新拉起，服务已恢复".into()),
+            },
+            Msg::EngineSelfHeal { note: None },
+        ];
+        let names = ["EngineSelfHeal(Some)", "EngineSelfHeal(None)"];
         assert_eq!(names.len(), msgs.len());
         for (i, msg) in msgs.into_iter().enumerate() {
             assert!(
@@ -18623,6 +18923,58 @@ mod tests {
             notes, calls,
             "有「选择器不可用」分支没把可执行说明（含安装/授权指引）交出去\
              （{notes} 处 trouble.note() vs {calls} 个调用点）"
+        );
+    }
+
+    /// 参考音频时长护栏必须盖住**每个**会发克隆请求的入口。
+    ///
+    /// 四个入口：开始合成（Cmd::Run 发送处）/ 批量提交（Cmd::RunBatch 发送处）/
+    /// 音色试听（Cmd::PreviewVoice 发送处）/ 单句重录（Cmd::Redo 的 worker 分支，
+    /// 唯一持有工程 voice_ref 的地方）。护栏 helper 定义 + 四个调用点 = 5 处出现。
+    ///
+    /// 阳性对照（实测过）：删掉任意一个入口的护栏 → 计数变 4 红；
+    /// 新加一个克隆请求入口而不同步加护栏 → 计数仍为 5 但发送点前的窗口扫不到
+    /// helper → 红。
+    #[test]
+    fn every_clone_request_entrance_is_guarded_by_reference_limit() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("reference_over_limit_note(").count(),
+            5,
+            "护栏 helper 定义 + 四个入口调用点；加/删入口必须同步加/删护栏"
+        );
+        for anchor in [
+            ".send(Cmd::Run {",
+            ".send(Cmd::RunBatch {",
+            ".send(Cmd::PreviewVoice {",
+        ] {
+            let at = src
+                .find(anchor)
+                .unwrap_or_else(|| panic!("找不到发送点 {anchor}"));
+            // 窗口起点收缩到 char boundary（与 source_window 同一原则：
+            // 裸字节切片会切进多字节字符，见 `LESSON_CRLF` 那条教训）
+            let mut start = at.saturating_sub(4096);
+            while start > 0 && !src.is_char_boundary(start) {
+                start -= 1;
+            }
+            let before = &src[start..at];
+            assert!(
+                before.contains("reference_over_limit_note("),
+                "{anchor} 之前必须已经过时长护栏（在发起前拦，不拦会把引擎进程打死）"
+            );
+        }
+        // Redo 的请求在 worker 侧按工程 voice_ref 发出：护栏必须在分支里、
+        // make_client 之前（那里才是不发任何请求的拦截点）。
+        let redo_at = src
+            .find("Cmd::Redo { revision, index } =>")
+            .expect("找不到 Redo 分支");
+        let client_at = src[redo_at..]
+            .find("make_client()")
+            .expect("Redo 分支里应有 make_client");
+        let arm = &src[redo_at..redo_at + client_at];
+        assert!(
+            arm.contains("reference_over_limit_note("),
+            "Cmd::Redo 分支必须在 make_client 之前过时长护栏"
         );
     }
 

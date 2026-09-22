@@ -781,11 +781,31 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 pub fn wav_duration(wav: &[u8]) -> Result<f64, ClientError> {
     let r = hound::WavReader::new(std::io::Cursor::new(wav))
         .map_err(|e| ClientError::Decode(e.to_string()))?;
+    wav_reader_duration(r)
+}
+
+/// 从 wav **文件**读时长（秒）：hound 只读 RIFF 头，不把样本读进内存。
+///
+/// 给参考音频时长护栏用（`ref_audio`）：那条护栏在 UI 线程、且每次刷新参考音
+/// 标签都会跑，整文件读进内存的话（193s 的 44.1kHz wav 约 17MB）逐键刷新会卡界面。
+pub fn wav_file_duration(path: &Path) -> Result<f64, ClientError> {
+    let r = hound::WavReader::open(path).map_err(|e| ClientError::Decode(e.to_string()))?;
+    wav_reader_duration(r)
+}
+
+/// 两种 wav 时长读取共用的一份口径：`hound::WavReader::duration()` 返回的**已经是
+/// 每声道帧数**（内部就是 `num_samples / channels`），这里不能再除一次 channels：
+/// 多除一次会让所有立体声 wav 的时长正好少一半。配音链路一直是单声道（除不除都一样），
+/// 歌曲成品 / 分离两轨是立体声——真机分离 e2e 才把这个错照出来。
+///
+/// 字节版与文件版都走这里，杜绝两份实现漂移（见 `LESSON_同一语义两处实现必然漂移`）。
+fn wav_reader_duration<R: std::io::Read + std::io::Seek>(
+    r: hound::WavReader<R>,
+) -> Result<f64, ClientError> {
     let spec = r.spec();
-    // `hound::WavReader::duration()` 返回的**已经是每声道帧数**（内部就是
-    // `num_samples / channels`），这里不能再除一次 channels：多除一次会让所有
-    // 立体声 wav 的时长正好少一半。配音链路一直是单声道（除不除都一样），
-    // 歌曲成品 / 分离两轨是立体声——真机分离 e2e 才把这个错照出来。
+    if spec.sample_rate == 0 {
+        return Err(ClientError::Decode("wav 采样率为 0".into()));
+    }
     let frames = r.duration() as f64;
     Ok(frames / spec.sample_rate as f64)
 }

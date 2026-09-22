@@ -193,9 +193,15 @@ pub fn render_server_config(
         "threads": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         "lazy_load": true,
         "models": entries,
+        // 内存三个钮与 config/models.schema.yaml §1 runtime.memory 逐条对齐：
+        //   max_loaded_models: 2   ↔ schema 第 17 行（创作者机器内存有限，比服务端默认更保守）
+        //   idle_unload_ms: 300000 ↔ schema 第 18 行
+        //   min_free_memory_mb: 1024 ↔ schema 第 19 行「低于此值拒绝加载，避免把用户机器拖死」
+        // 后者同时与 model_sources::DEFAULT_HEADROOM_BYTES（1024 MiB）同口径——写死后改
+        // schema 就会漂移，所以这里直接除 1 MiB 从常量推，只留一份真相。
         "max_loaded_models": 2,
         "idle_unload_ms": 300_000,
-        "min_free_memory_mb": 0,
+        "min_free_memory_mb": crate::model_sources::DEFAULT_HEADROOM_BYTES / (1024 * 1024),
     });
     serde_json::to_string_pretty(&cfg).unwrap_or_default()
 }
@@ -346,6 +352,31 @@ pub fn parse_monitor_args(args: &[String]) -> Result<(i32, i32), String> {
 /// 用来挡住"引擎一起来就崩"时的重启风暴 —— 没有它，健康检查线程会每轮都试一次。
 pub const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(20);
 
+/// 周期自愈的检查间隔：tick 每约 30s 问一次"要不要对托管引擎做一次带节流的自愈尝试"。
+///
+/// 与 [`RESTART_MIN_INTERVAL`] 是两层：这个 30s 决定**问不问**（tick 40ms 一轮，
+/// 不拦的话每轮都问）；问完之后真重拉还受 20s 的 [`autostart_allowed`] 节流。
+pub const PERIODIC_HEAL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 纯判据：tick 现在要不要对托管引擎做一次自愈尝试。
+///
+/// - 显式地址（用户自己配的 AW_SERVER/全局设置）→ **恒不尝试**：那是用户自己的
+///   服务，壳只托管自己拉起的那份，碰都不能碰；
+/// - 从未尝试过 → 尝试；
+/// - 上次尝试在 [`PERIODIC_HEAL_INTERVAL`] 内 → 不重复尝试；
+/// - 超过间隔 → 再尝试（是否真重拉由 [`autostart_allowed`] 的 20s 节流再拦一道）。
+///
+/// 纯函数：不碰进程、不发请求，只按 (explicit, 上次尝试时刻, now) 判，单测直调。
+pub fn should_periodic_heal(explicit: bool, last_attempt: Option<Instant>, now: Instant) -> bool {
+    if explicit {
+        return false;
+    }
+    match last_attempt {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= PERIODIC_HEAL_INTERVAL,
+    }
+}
+
 /// 上一次自动拉起的时刻（全局一份：自动拉起本来就只有一条路径）。
 static LAST_AUTOSTART: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
@@ -361,6 +392,13 @@ pub fn autostart_allowed(now: Instant) -> bool {
     }
 }
 
+/// 测试用：清掉重启节流的记账（节流是全局状态，并行测试的先后顺序不该决定
+/// 某条用例能不能走到"真的尝试"那一步）。只在 cfg(test) 编译。
+#[cfg(test)]
+pub(crate) fn reset_autostart_for_test() {
+    *LAST_AUTOSTART.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// 托管实例：持有子进程句柄，**只回收自己拉起的那一个**。
 #[derive(Debug, Default)]
 pub struct EngineSupervisor {
@@ -372,6 +410,16 @@ pub struct EngineSupervisor {
 impl EngineSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 测试用：包一个**已经活着的**假子进程句柄（例如 `sleep`），让监护语义
+    /// 在不需要真引擎的用例里也能被驱动。只在 cfg(test) 编译，不进产物。
+    #[cfg(test)]
+    pub(crate) fn with_child_for_test(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            monitor: None,
+        }
     }
 
     /// 托管的引擎还活着吗。子进程已退出（崩溃/被杀）时清掉句柄并返回 false，
@@ -584,6 +632,48 @@ mod tests {
         assert_eq!(v["models"][0]["family"], "audio8_tts");
         assert_eq!(v["models"][0]["task"], "tts");
         assert_eq!(v["models"][0]["mode"], "offline");
+        // 内存三个钮与 config/models.schema.yaml §1 runtime.memory 逐条对齐：
+        // min_free_memory_mb 与 DEFAULT_HEADROOM_BYTES 同口径（1024 MiB）。
+        // 修复前这里写死 0 = "随便吃内存"，与 schema/预检口径矛盾。
+        assert_eq!(
+            v["min_free_memory_mb"], 1024,
+            "必须与 schema 第 19 行同口径"
+        );
+        assert_eq!(v["max_loaded_models"], 2, "必须与 schema 第 17 行对齐");
+        assert_eq!(v["idle_unload_ms"], 300_000, "必须与 schema 第 18 行对齐");
+    }
+
+    /// 周期自愈判据三态：显式地址恒跳过、节流内不重试、间隔外重试。
+    #[test]
+    fn periodic_heal_skips_explicit_and_respects_interval() {
+        let t0 = Instant::now();
+        // 显式地址：无论上次何时、现在何时，都不尝试（那是用户自己的服务）
+        assert!(!should_periodic_heal(true, None, t0));
+        assert!(!should_periodic_heal(
+            true,
+            Some(t0),
+            t0 + Duration::from_secs(300)
+        ));
+        // 从未尝试过 → 尝试
+        assert!(should_periodic_heal(false, None, t0));
+        // 间隔内（29s）→ 不重试
+        assert!(!should_periodic_heal(
+            false,
+            Some(t0),
+            t0 + Duration::from_secs(29)
+        ));
+        // 正好满 30s → 重试（边界取 >=）
+        assert!(should_periodic_heal(
+            false,
+            Some(t0),
+            t0 + PERIODIC_HEAL_INTERVAL
+        ));
+        // 间隔外（31s）→ 重试
+        assert!(should_periodic_heal(
+            false,
+            Some(t0),
+            t0 + Duration::from_secs(31)
+        ));
     }
 
     /// 模型目录里没有已下载模型时，`managed_models` 必须为空 —— 调用方据此报
