@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "audio-workshop"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "aw-core",
  "dirs",
