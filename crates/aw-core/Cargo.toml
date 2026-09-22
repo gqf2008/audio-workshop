@@ -10,6 +10,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 hound = "3.5"
+# 裁剪副本文件名里的内容哈希（<slug>-<hash8(规范路径|size|mtime)>）：与主 crate 同一份 sha2 0.10。
+sha2 = "0.10"
 # 非 wav 输入的采样率探测（mp3/flac）：上游自己就用 symphonia 解码，这里复用它读头，
 # 不另造解码逻辑。特性与上游对齐（上游声明 ["mp3","wav"]，默认特性里已含 flac/wav）。
 symphonia = { version = "0.5", features = ["mp3"] }

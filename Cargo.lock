@@ -501,6 +501,7 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "stem-splitter-core",
  "symphonia",
  "ureq 2.12.1",

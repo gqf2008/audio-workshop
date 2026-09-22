@@ -222,7 +222,7 @@ impl std::fmt::Display for ClientError {
 /// （`requires.reference_text`）做，不留两份判据。
 pub const MISSING_REFERENCE_PATH: &str = concat!(
     "调用了参考音频克隆，但没有给参考音频路径。",
-    "内置音色不需要参考音；要克隆就先在「参考音频」里填一段干净的 5–30 秒人声。",
+    "内置音色不需要参考音；要克隆就先在「参考音频」里填一段干净的 5–15 秒人声。",
 );
 
 /// 参考音频克隆的输入：`voice_ref`（音频路径）+ **可选** `reference_text`
