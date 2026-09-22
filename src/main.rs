@@ -2289,15 +2289,26 @@ fn ensure_engine_serving() -> engine_supervisor::StartOutcome {
 
 /// 崩溃自愈入口：健康检查发现连不上时调用。
 ///
-/// 与手动路径的区别只有一条 —— **带节流**：引擎一起就崩的情况下，不能每轮健康检查
-/// 都重启一次（那会变成重启风暴）。
-fn ensure_engine_serving_throttled() {
-    if !engine_supervisor::autostart_allowed(std::time::Instant::now()) {
-        return;
+/// 与手动路径（启动 / 下载完成后）的区别有两条：
+///   · **先探活**：服务在响应就直接返回 `None` —— 周期检查每约 30s 会来一次，
+///     不能让"引擎好好的"也去动状态行（不刷屏）；
+///   · **带节流**：引擎一起来就崩的情况下，不能每轮健康检查都重启一次
+///     （那会变成重启风暴）。
+///
+/// 返回 `Some(outcome)` = 本次真的做了一次拉起尝试；`None` = 健康在响应或节流挡住。
+fn ensure_engine_serving_throttled() -> Option<engine_supervisor::StartOutcome> {
+    let (base, _) = server_base_for_engine();
+    if engine_supervisor::healthy(&base) {
+        return None;
     }
-    if let engine_supervisor::StartOutcome::Failed(why) = ensure_engine_serving() {
+    if !engine_supervisor::autostart_allowed(std::time::Instant::now()) {
+        return None;
+    }
+    let outcome = ensure_engine_serving();
+    if let engine_supervisor::StartOutcome::Failed(why) = &outcome {
         eprintln!("随包引擎自愈失败：{why}");
     }
+    Some(outcome)
 }
 
 /// 重新读 /health 并刷新状态栏的后端标签（启动、测试连接、应用并重连后都调用）。
@@ -3458,9 +3469,9 @@ fn spawn_server_check(msg_tx: Sender<WorkerMsg>, revision: u64) {
                     (true, format!("已连接 {b}"))
                 } else {
                     // 连不上分两种：外部服务没起（我们不该管），或我们托管的引擎崩了
-                    // （该拉起来）。`ensure_engine_serving_throttled` 内部会按
-                    // "用户是否显式配了地址"重新判一遍，所以这里无脑调用是安全的。
-                    ensure_engine_serving_throttled();
+                    // （该拉起来）。内部会按"用户是否显式配了地址"重新判一遍，
+                    // 所以这里无脑调用是安全的；结果不用管——测试连接的回显只看连不连得上。
+                    let _ = ensure_engine_serving_throttled();
                     (false, format!("连不上 {b}：服务没起或端口不对"))
                 }
             }
@@ -5398,6 +5409,15 @@ struct UiState {
     auto_normalize_seen: std::cell::Cell<bool>,
     /// 任务中心里"已排队 / 已运行 N"的上次刷新时刻：40ms 的 tick 不能每次都重建模型。
     last_task_refresh: std::cell::Cell<Option<Instant>>,
+    /// 服务地址是否来自用户显式配置（AW_SERVER / 全局设置）：周期自愈判据的输入。
+    /// 启动 / 应用设置 / 测试连接时刷新；显式 = 用户自己的服务，壳绝不碰它。
+    engine_explicit: std::cell::Cell<bool>,
+    /// 上次对托管引擎做周期自愈尝试的时刻（tick 每约 30s 问一次，纯判据在
+    /// `engine_supervisor::should_periodic_heal`）。
+    last_engine_heal: std::cell::Cell<Option<Instant>>,
+    /// 上次写进状态行的自愈结论：与上次相同就不再刷（"不刷屏"）；引擎恢复健康后
+    /// 清空，下一次故障才能再次提示。
+    last_engine_heal_note: RefCell<Option<String>>,
     /// 截图/演示态（`AW_UI_STATE=tasks`）。演示任务只是给任务中心摆样子、没有对应的
     /// worker 命令，所以**不能参与**"有没有任务在飞"的判断——否则演示态下点开始配音
     /// 会被这些假任务挡住（复核指出）。只有 debug 构建会置位。
@@ -5469,6 +5489,8 @@ fn main() -> Result<(), slint::PlatformError> {
         cancel,
         ..UiState::default()
     });
+    // 周期自愈的"显式地址恒跳过"判据输入：启动时先取一次，应用设置/测试连接后再刷新
+    state.engine_explicit.set(server_base_for_engine().1);
     {
         let stop = Arc::clone(&stop);
         let sep_stop = Arc::clone(&sep_stop);
@@ -10066,6 +10088,8 @@ fn tick(
                 ui.set_server_ok(ok);
                 // 服务刚被改地址 / 重启过时，后端可能从 metal 变 cuda，标签要跟着走
                 refresh_backend_label(ui);
+                // 地址判据也可能刚变（测试连接前用户改了 host/port）：自愈开关跟着刷新
+                state.engine_explicit.set(server_base_for_engine().1);
             }
             Msg::VoicePreview { wav, label } => {
                 ui.set_busy(false);
@@ -10897,6 +10921,42 @@ fn tick(
     // ── 音色设计「生成」能不能点 + 原因：同上，单点投影 ──
     refresh_design_action(ui, state);
 
+    // ── 托管引擎周期自愈（每约 30s 问一次；显式地址 = 用户自己的服务，恒跳过）──
+    // 判据是 engine_supervisor::should_periodic_heal 的纯函数（显式跳过 / 节流内
+    // 不重试 / 间隔外重试）；"是不是真的去重拉"由 ensure_engine_serving_throttled
+    // 先探活 + 20s 重启节流再拦一道。192.9s 参考音把引擎打死之后，靠这里把服务
+    // 拉回来，而不是让用户重启应用。
+    let heal_now = Instant::now();
+    if engine_supervisor::should_periodic_heal(
+        state.engine_explicit.get(),
+        state.last_engine_heal.get(),
+        heal_now,
+    ) {
+        state.last_engine_heal.set(Some(heal_now));
+        let note = match ensure_engine_serving_throttled() {
+            Some(engine_supervisor::StartOutcome::Started) => {
+                Some("随包引擎已重新拉起，服务已恢复".to_string())
+            }
+            Some(engine_supervisor::StartOutcome::Failed(why)) => {
+                Some(format!("随包引擎自愈失败：{why}"))
+            }
+            // Reused（外部服务在响应）/ EngineMissing / NotConfigured 都是稳定态，
+            // 不写状态行（不刷屏）
+            Some(_) => None,
+            // 健康在响应 / 节流挡住：无事发生
+            None => None,
+        };
+        // 只有结论与上次不同才写状态行：引擎稳定时不刷屏；引擎恢复后清空记录，
+        // 下一次故障才能再次提示。
+        let mut last_note = state.last_engine_heal_note.borrow_mut();
+        if note != *last_note {
+            if let Some(n) = &note {
+                ui.set_status_text(n.clone().into());
+            }
+            *last_note = note;
+        }
+    }
+
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
     if ui.get_playing() && !player.is_playing() {
         ui.set_playing(false);
@@ -11219,6 +11279,8 @@ fn wire_global_settings(
         if let Ok(mut g) = settings().lock() {
             *g = next;
         }
+        // 服务地址改了，周期自愈的"显式地址恒跳过"判据输入要跟着刷新
+        st.engine_explicit.set(server_base_for_engine().1);
         apply_engine_discovery(&ui, Some((&tx, &st)));
         refresh_download_rows(&ui, &st);
         // 回显是**投影**：从刚落盘的那份设置算，不在这里拼第二份判断

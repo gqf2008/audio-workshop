@@ -77,6 +77,44 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
   捕获 ENOSPC 并把该句标 `error: ENOSPC（需要 X MB）`、`cmd_assemble` 有写前空间检查，
   文案口径与本文件的 Rust 版对齐。
 
+## 3.5 参考音频时长护栏（2026-09-22 · thread cc-ai-audio-workshop-ref-audio-limit）
+
+> 本节记录**引擎进程被参考音频打死**的复现与护栏口径；数字来源：随包 v0.8.2-metalbf16
+> 真机实测，证据目录 `/Volumes/DataExt/tmp/aw-stream/repro-193s/`（ref20s.json/wav + engine.log）。
+
+### 复现
+
+- 输入：`~/Documents/音频作坊/voices/20260920陶雨欣录音-b02993a6.wav`（**192.9s**、
+  44.1kHz 单声道）作 `voice_ref` 发 audio8-tts 克隆请求；
+- 结果：`ggml_metal_buffer_init: error: failed to allocate buffer, size = 14539.00 MiB`
+  → SIGSEGV（崩溃栈：`ggml_metal_buffer_is_shared →
+  ggml_backend_metal_buffer_type_alloc_buffer → ggml_gallocr_reserve_n_impl →
+  audio8_tts codec encode_reference`），**进程死、端口消失**；用户 8080 引擎因此
+  崩了两次（2026-09-22 10:36、11:38）；
+- 对照：同文件裁到 **20s** → HTTP 200、11.3s 出音频；分配规模约 **75 MiB/参考秒**。
+
+### 上游问题（两条，与本批护栏无关，报给上游的最小修复清单）
+
+1. **参考时长 → 图尺寸的膨胀没有护栏**：192.9s 就要约 14.5GB，应在上游按参考时长
+   设上限（或显式报错），而不是由应用侧猜；
+2. **分配失败路径本身空指针**：`ggml_metal_buffer_is_shared` 在分配失败后访问空
+   buffer → SIGSEGV 打穿进程。应当返回**可捕获的分配错误**，让上层能把
+   "参考音太长/显存不足"变成 HTTP 错误，而不是杀进程。
+
+### 本批应用侧护栏（上游修好之前用户不能再踩）
+
+- `aw_core::ref_audio`：时长读取（wav 读 RIFF 头 / 非 wav symphonia 探测，
+  读不出 **fail-open**）+ 纯判据 `reference_too_long`（30s 硬上限，文案含实际秒数 +
+  「裁到 30 秒内再合成」+ 为什么）；
+- 四个会发克隆请求的入口（开始合成 / 批量提交 / 单句重录 / 音色试听）在**发起前**
+  拦，不发请求；UI 选中参考音频后显示时长、超限红色警告（配音页 + 音色设计 Tab）；
+- 单测：20s 放行 / 192.9s 拦截 / 读不出 fail-open / Redo 入口不发请求
+  （`aw_core` `ref_audio::tests` + main 的
+  `redo_with_overlong_reference_is_blocked_before_any_request`）；
+- 配套（同批 `fix(engine)`）：托管引擎周期健康检查 + 节流自愈（崩溃后 30s 内自动重拉，
+  显式地址不碰）；`server.json` 的 `min_free_memory_mb` 从 0 改为 1024
+  （与 schema §1 第 19 行同口径）。
+
 ## 4. 复现命令
 
 ```console
