@@ -101,6 +101,10 @@ export component VoicePanel inherits Rectangle {
     in property <bool> transcribing: false;
     in property <bool> busy: false;
     in property <bool> reference-exists: false;
+    // 参考音频时长回显 + 30s 硬上限红色警告：文本与"是否超限"都由 Rust 的
+    // refresh_voice_labels 算好下发（判据只有 aw-core 一份），这里只显示不算。
+    in property <string> reference-duration: "";
+    in property <bool> reference-over-limit: false;
     // 当前引擎是否硬要求参考音（index-tts2）：true 时内置默认音色行不可用，
     // 文案也说清"必须提供参考音频"——不再对任何引擎都写"免参考音，开箱可用"。
     in property <bool> engine-requires-voice-ref: false;
@@ -262,6 +266,14 @@ export component VoicePanel inherits Rectangle {
                 // 红色告警只属于"必填引擎缺文本"这一种情况：可选引擎的转写状态/失败
                 // 提示只是过程信息，不吓人（不靠颜色之外单独承载信息）。
                 color: root.engine-requires-reference-text && root.reference-text == "" ? PixelTheme.danger : PixelTheme.dim;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            if root.reference-duration != "" : Text {
+                // 时长回显；超 30s 硬上限时同一条文本就是可执行警告（红色），
+                // 内容由 Rust 侧用 aw-core 的唯一判据生成。
+                text: root.reference-duration;
+                color: root.reference-over-limit ? PixelTheme.danger : PixelTheme.dim;
                 font-size: 11px;
                 wrap: word-wrap;
             }

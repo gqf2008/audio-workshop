@@ -637,6 +637,9 @@ export component DubWorkbench inherits Rectangle {
     in-out property <int> voice-index: 0;
     callback engine-changed();
     in property <bool> reference-exists: false;
+    // 参考音频时长回显与 30s 硬上限红色警告（Rust 算好下发，本组件只显示）
+    in property <string> reference-duration: "";
+    in property <bool> reference-over-limit: false;
     in-out property <bool> show-voice: false;
 
     // ── 配音页内的高级参数（默认收起；各 Tab 独有的参数就放各自页面上）──
@@ -834,6 +837,8 @@ export component DubWorkbench inherits Rectangle {
                             // 批量在跑时也把音色区锁住：批量的 voice_ref 在提交那一刻就定格了
                             busy: root.running || root.busy || root.batch-running;
                             reference-exists: root.reference-exists;
+                            reference-duration: root.reference-duration;
+                            reference-over-limit: root.reference-over-limit;
                             edited => { root.voice-ref-changed(); }
                             clear-reference => { root.clear-reference(); }
                             preview => { root.audition-voice(); }

@@ -17,6 +17,9 @@ export component VoiceDesignTab inherits Rectangle {
     /// index-tts2 不要文本）
     in-out property <string> reference-text: "";
     in property <string> reference-text-status: "";
+    /// 参考音频时长回显与 30s 硬上限红色警告（Rust 算好下发，本 Tab 只显示不算）
+    in property <string> reference-duration: "";
+    in property <bool> reference-over-limit: false;
     /// 该引擎的克隆路径是否**必须**给参考文本（audio8-tts 要、index-tts2 不要）——
     /// 与配音页共用同一份能力来源（app 透传），红色告警只属于「必填引擎缺文本」。
     in property <bool> engine-requires-reference-text: false;
@@ -153,6 +156,14 @@ export component VoiceDesignTab inherits Rectangle {
                             color: (root.engine-requires-reference-text && root.reference-text == "")
                                 ? PixelTheme.danger
                                 : PixelTheme.dim;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if root.reference-duration != "" : Text {
+                            // 时长回显；超 30s 硬上限时同一条文本就是可执行警告（红色），
+                            // 内容由 Rust 侧用 aw-core 的唯一判据生成。
+                            text: root.reference-duration;
+                            color: root.reference-over-limit ? PixelTheme.danger : PixelTheme.dim;
                             font-size: 11px;
                             wrap: word-wrap;
                         }
