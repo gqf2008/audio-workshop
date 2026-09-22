@@ -503,16 +503,13 @@ fn platform_memory_probe() -> Option<String> {
 
 #[cfg(windows)]
 fn platform_memory_probe() -> Option<String> {
-    use std::os::windows::process::CommandExt as _;
-    // `CREATE_NO_WINDOW`：壳是 GUI 子系统（无控制台），起控制台子进程默认会**弹一个黑窗**。
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("powershell")
+    // 不弹控制台：统一走 win_child（`CREATE_NO_WINDOW` 的唯一来源）。
+    let out = crate::win_child::hidden_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
             "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
         ])
-        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     out.status
