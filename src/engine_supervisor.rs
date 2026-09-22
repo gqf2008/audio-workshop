@@ -392,6 +392,13 @@ pub fn autostart_allowed(now: Instant) -> bool {
     }
 }
 
+/// 测试用：清掉重启节流的记账（节流是全局状态，并行测试的先后顺序不该决定
+/// 某条用例能不能走到"真的尝试"那一步）。只在 cfg(test) 编译。
+#[cfg(test)]
+pub(crate) fn reset_autostart_for_test() {
+    *LAST_AUTOSTART.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// 托管实例：持有子进程句柄，**只回收自己拉起的那一个**。
 #[derive(Debug, Default)]
 pub struct EngineSupervisor {
@@ -403,6 +410,16 @@ pub struct EngineSupervisor {
 impl EngineSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 测试用：包一个**已经活着的**假子进程句柄（例如 `sleep`），让监护语义
+    /// 在不需要真引擎的用例里也能被驱动。只在 cfg(test) 编译，不进产物。
+    #[cfg(test)]
+    pub(crate) fn with_child_for_test(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            monitor: None,
+        }
     }
 
     /// 托管的引擎还活着吗。子进程已退出（崩溃/被杀）时清掉句柄并返回 false，

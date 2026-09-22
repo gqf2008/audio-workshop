@@ -2304,6 +2304,20 @@ fn ensure_engine_serving_throttled() -> Option<engine_supervisor::StartOutcome> 
     if !engine_supervisor::autostart_allowed(std::time::Instant::now()) {
         return None;
     }
+    // 句柄还在但 /health 不响应 = 进程挂死：如实报 Failed，**不装成 Started**——
+    // 否则状态栏会说"已重新拉起"而进程根本没动过（强杀再重拉不在本批范围，
+    // 下一轮 30s 还会再问；"不刷屏"靠状态行结论去重兜着）。
+    if let Some(sup) = ENGINE_SUPERVISOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        if sup.is_running() {
+            return Some(engine_supervisor::StartOutcome::Failed(
+                "引擎进程还在但 /health 不响应（疑似挂死）：稍后会自动再试".into(),
+            ));
+        }
+    }
     let outcome = ensure_engine_serving();
     if let engine_supervisor::StartOutcome::Failed(why) = &outcome {
         eprintln!("随包引擎自愈失败：{why}");
@@ -15933,6 +15947,42 @@ mod tests {
         drop(cmd_tx);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 挂死引擎（进程活着但 /health 不响应）的自愈结论必须如实报 Failed，
+    /// 不装成 Started——否则状态栏会说"已重新拉起"而进程根本没动过。
+    /// 用 `sleep` 当"活着的假引擎"（不监听任何端口，healthy() 必然 false），
+    /// 句柄经 engine_supervisor 的 cfg(test) 注入缝塞进全局槽。
+    #[test]
+    fn throttled_heal_reports_hung_engine_as_failed_not_started() {
+        // 本机真跑着用户服务（默认 8080）时，探活会直接通过 → 探测到就如实跳过
+        // （detect-and-return，见 RULE_可达性 第 3 条）。
+        let (base, _) = server_base_for_engine();
+        if engine_supervisor::healthy(&base) {
+            eprintln!("跳过：{base} 上有真服务在响应，挂死场景没法构造");
+            return;
+        }
+        // 节流是全局状态：先清账，否则别的测试刚拉过一次就会把本条拦住
+        engine_supervisor::reset_autostart_for_test();
+        let sup = engine_supervisor::EngineSupervisor::with_child_for_test(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep 应可执行"),
+        );
+        {
+            let mut slot = ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(sup);
+        }
+        let outcome = ensure_engine_serving_throttled().expect("节流应放行本次尝试");
+        match outcome {
+            engine_supervisor::StartOutcome::Failed(why) => {
+                assert!(why.contains("不响应"), "要如实报挂死：{why}");
+            }
+            other => panic!("挂死引擎必须报 Failed，不能是 {other:?}"),
+        }
+        // 清槽即 Drop → stop() 收掉 sleep，不留孤儿进程
+        *ENGINE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// 整批停止：**每篇都要收到终态**，一篇都不能留在"排队中"。
