@@ -5491,16 +5491,19 @@ fn load_resumable(
     // 用上面已经算好的哈希（少读一次参考音文件）
     project.voice_ref_hash = voice_ref_hash.clone();
     let reused = if let Some(saved) = saved.as_ref() {
-        // 与快路径同一条判据：开关变了就不能逐句继承（旧音频念的是另一套文本）
-        if settings_allow_reuse(
-            saved,
-            model,
-            &voice_ref,
-            &voice_ref_hash,
-            &voice_ref_text,
-            auto_normalize,
-            &dict_hash,
-        ) {
+        // 与快路径同一条判据（含旁车修复）：开关变了或文本配对被修过，就不能逐句继承
+        // ——快路径只管整体复用，旧 done wav 仍会从慢路径被拷回来（复评实测）。
+        if !text_repaired
+            && settings_allow_reuse(
+                saved,
+                model,
+                &voice_ref,
+                &voice_ref_hash,
+                &voice_ref_text,
+                auto_normalize,
+                &dict_hash,
+            )
+        {
             reuse_done_sentences(&mut project, saved, dir)?
         } else {
             0
@@ -13563,6 +13566,74 @@ mod tests {
             "本来就有旁车不得重复作废"
         );
         assert!(!reference_text_was_repaired(false, false));
+    }
+
+    /// 旁车修复后必须**同时**挡住慢路径的逐句继承：快路径跳过只是不再整体复用，
+    /// 慢路径 `reuse_done_sentences` 仍会把旧 done wav 拷回来（独立复评 reproduction
+    /// 实测 left=1/right=0）。
+    #[test]
+    fn text_repaired_invalidation_must_also_skip_slow_path_reuse() {
+        let dir = temp_dir("sidecar-invalidate");
+        let vt = voice_trimmed_dir();
+        std::fs::create_dir_all(&vt).unwrap();
+        let tag = format!("aw-test-{}-{}", std::process::id(), line!());
+        let copy = vt.join(format!("{tag}-10s.wav"));
+        std::fs::write(&copy, test_wav_bytes(10.0, None)).unwrap();
+        let sidecar = aw_core::ref_audio::reference_text_sidecar_path(&copy);
+        let _ = std::fs::remove_file(&sidecar); // 入参必须是「修复前无旁车」
+        let sentences_dir = dir.join("sentences");
+        std::fs::create_dir_all(&sentences_dir).unwrap();
+        std::fs::write(sentences_dir.join("000.wav"), b"old-mismatched-audio").unwrap();
+        let mut saved = saved_project("第一句。第二句。", Some(copy.to_str().unwrap()));
+        saved.voice_ref_text = Some("全文很长很长，比裁剪段多得多。".to_string());
+        saved.voice_ref_hash = Some(sha256_file(&copy).unwrap());
+        saved.sentences[0].status = "done".into();
+        saved.save(&dir).unwrap();
+
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            Some(copy.to_string_lossy().into_owned()),
+            Some("全文很长很长，比裁剪段多得多。".to_string()),
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .expect("应能加载");
+        assert_eq!(
+            loaded.reused, 0,
+            "旁车修复后旧音频必须作废（快慢两条路径都不许继承）"
+        );
+        assert!(
+            loaded.project.sentences.iter().all(|s| s.status != "done"),
+            "旁车修复后已合成句必须回到待合成"
+        );
+        let _ = std::fs::remove_file(&copy);
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 已迁移副本（≤15s 且在 `voice-trimmed/`）在加载时补旁车：这是 0.1.10 用户
+    /// 现有工程的唯一修复入口（它不会再触发裁剪，早返回路径必须也补旁车）。
+    #[test]
+    fn cached_trim_copy_in_trimmed_dir_gets_sidecar_without_retrim() {
+        let vt = voice_trimmed_dir();
+        std::fs::create_dir_all(&vt).unwrap();
+        let tag = format!("aw-test-{}-{}", std::process::id(), line!());
+        let copy = vt.join(format!("{tag}-10s.wav"));
+        std::fs::write(&copy, test_wav_bytes(10.0, None)).unwrap();
+        let sidecar = aw_core::ref_audio::reference_text_sidecar_path(&copy);
+        let _ = std::fs::remove_file(&sidecar);
+        let text = "很长的全文，比十秒能念下的内容多得多得多。";
+        let prepared = prepare_reference_for_clone(copy.to_str().unwrap(), Some(text)).unwrap();
+        assert_eq!(prepared.path, copy, "≤15s 的副本不该再裁");
+        assert!(
+            aw_core::ref_audio::paired_reference_text(&copy).is_some(),
+            "voice-trimmed/ 里的旧副本必须在加载时补旁车"
+        );
+        let _ = std::fs::remove_file(&copy);
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     /// 裁剪副本补旁车：即使没有 ASR（CI 无引擎/引擎不可用），估算兜底也必须落一个
