@@ -22,8 +22,14 @@ use sha2::{Digest, Sha256};
 ///
 /// 依据：UI 引导文案「5–15 秒干净人声」；15s × 约 75 MiB/参考秒 ≈ 1.1 GiB，
 /// 在常见机器上是安全规模（192.9s 实测要 14.5 GiB 直接把引擎进程打死）。
-/// 放宽/收紧只改这一个常量（判据文案与裁剪目标都由它生成）。
+/// 放宽/收紧只改这一个常量（判据文案与裁剪目标都由它生成）；UI/静态引导文案由
+/// `reference_range_label_is_pinned_to_static_copy` 守卫测试钉住——改常量必须同步那几处字面量。
 pub const REFERENCE_MAX_SECONDS: f64 = 15.0;
+
+/// UI 引导用的范围标签（如 `5–15 秒`）：数字由 [`REFERENCE_MAX_SECONDS`] 生成。
+pub fn reference_range_label() -> String {
+    format!("5–{:.0} 秒", REFERENCE_MAX_SECONDS)
+}
 
 /// 读参考音频的时长（秒）。读不出 → `None`（**fail-open**，取舍见下）。
 ///
