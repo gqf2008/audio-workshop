@@ -13515,6 +13515,22 @@ mod tests {
         );
     }
 
+    /// 裁剪副本补旁车：即使没有 ASR（CI 无引擎/引擎不可用），估算兜底也必须落一个
+    /// 旁车，否则「84 字音频 × 1077 字文本」的错配会原样留在请求里。
+    #[test]
+    fn trimmed_reference_text_sidecar_is_written_even_without_asr() {
+        let dir = std::env::temp_dir().join(format!("aw-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trimmed = dir.join("cached-15s.wav");
+        std::fs::write(&trimmed, b"x").unwrap();
+        let long = "一二三四五六七八九十".repeat(20); // 200 字
+        ensure_trimmed_reference_text_sidecar(&trimmed, 15.0, Some(&long));
+        let paired = aw_core::ref_audio::paired_reference_text(&trimmed)
+            .expect("必须写旁车（ASR 不是前提）");
+        assert!(long.starts_with(&paired), "兜底必须是原文前缀：{paired}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 句柄检查必须走 `take_live_supervisor`（单一取锁）：旧的内联写法
     /// `if let Some(sup) = ENGINE_SUPERVISOR.lock()…as_mut()` 会在块内二次 lock，
     /// 同线程重入**永久死锁**，且只在引擎已崩溃的自愈分支触发（2026-09-22 复评）。
