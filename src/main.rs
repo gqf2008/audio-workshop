@@ -5148,6 +5148,14 @@ fn effective_dict_hash(saved: &Project) -> String {
         .unwrap_or_else(|| dictionaries::fingerprint(&Default::default()))
 }
 
+/// 旁车修复判定：修复前缺失 + 修复后出现 = 需要作废旧音频（重录一遍）。
+///
+/// 拆成纯函数是为了可测：`load_resumable` 里的 `voice-trimmed/` 路径依赖应用数据目录，
+/// 不适合单测，这两条布尔才是真正的判据。
+fn reference_text_was_repaired(before_missing: bool, now_present: bool) -> bool {
+    before_missing && now_present
+}
+
 fn sentence_texts_match(project: &Project, script: &str) -> bool {
     project
         .sentences
@@ -5397,6 +5405,13 @@ fn load_resumable(
         None
     };
     let dict_hash = dictionaries::fingerprint(dict);
+    // 旁车修复快照（必须在任何 prepare 之前取）：0.1.10 只裁音频不同步文本，
+    // 这类工程的已合成音频是在「文本错配」下发出来的。旁车一旦补上，旧音频
+    // 必须整体作废重录一次，否则用户升级后仍听到旧错声音。
+    let input_sidecar_missing_before = voice_ref
+        .as_deref()
+        .map(|p| aw_core::ref_audio::paired_reference_text(Path::new(p)).is_none())
+        .unwrap_or(false);
     // ① 输入侧先收敛到 ≤15s：四个 UI 入口已 prepare 过，这里在 worker 侧再走一遍
     // 不是重复——覆盖直接调用方与旧工程输入，保证**进工程的 voice_ref 一定是
     // ≤15s 的路径**（超长→voice-trimmed 副本），并顺手在这算内容哈希。
@@ -5414,6 +5429,11 @@ fn load_resumable(
     // 损坏的工程在这里必须**中止**：`.ok()` 会把它当成"没有工程"，已合成句全变待合成，
     // 随后第一次落盘还会覆盖掉损坏文件（现场丢失）。见 Project::load_if_present。
     let mut saved = Project::load_if_present(dir)?;
+    let saved_sidecar_missing_before = saved
+        .as_ref()
+        .and_then(|p| p.voice_ref.as_deref())
+        .map(|p| aw_core::ref_audio::paired_reference_text(Path::new(p)).is_none())
+        .unwrap_or(false);
     // ② 旧工程显式迁移：工程里存的 voice_ref 仍可能是超长路径（旧上限 30s 或更早
     // 的无上限工程）——把该工程的 voice_ref 一次性迁移为裁剪副本（更新 voice_ref
     // 与新 voice_ref_hash 并落盘）。与输入同源时两者会裁出同一个副本名，
@@ -5421,18 +5441,32 @@ fn load_resumable(
     if let Some(saved) = saved.as_mut() {
         migrate_overlong_voice_ref(dir, saved)?;
     }
+    // 参考文本旁车此前缺失、现在已补上 ⇒ 旧音频用的是错配文本，必须重录一遍。
+    // 只影响这一次：重录后旁车已在，后续加载不再作废。
+    let text_repaired = reference_text_was_repaired(
+        input_sidecar_missing_before || saved_sidecar_missing_before,
+        [
+            voice_ref.as_deref(),
+            saved.as_ref().and_then(|p| p.voice_ref.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|p| aw_core::ref_audio::paired_reference_text(Path::new(p)).is_some()),
+    );
     if let Some(saved) = saved.as_ref() {
         // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
         // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
-        if settings_allow_reuse(
-            saved,
-            model,
-            &voice_ref,
-            &voice_ref_hash,
-            &voice_ref_text,
-            auto_normalize,
-            &dict_hash,
-        ) && sentence_texts_match(saved, script)
+        if !text_repaired
+            && settings_allow_reuse(
+                saved,
+                model,
+                &voice_ref,
+                &voice_ref_hash,
+                &voice_ref_text,
+                auto_normalize,
+                &dict_hash,
+            )
+            && sentence_texts_match(saved, script)
         {
             let mut project = saved.clone();
             if project.gap_ms != gap_ms {
@@ -13513,6 +13547,22 @@ mod tests {
             app.contains("reference-pick => { root.reference-pick(); }"),
             "app 要把文件框回调透传给设计 Tab"
         );
+    }
+
+    /// 旁车修复只在「修复前缺失 → 修复后出现」时作废旧音频；其他组合不动作
+    /// （不能借机清掉本来正常的工程音频）。
+    #[test]
+    fn reference_text_repair_only_invalidates_on_missing_to_present() {
+        assert!(reference_text_was_repaired(true, true));
+        assert!(
+            !reference_text_was_repaired(true, false),
+            "补不出旁车不能借机清音频"
+        );
+        assert!(
+            !reference_text_was_repaired(false, true),
+            "本来就有旁车不得重复作废"
+        );
+        assert!(!reference_text_was_repaired(false, false));
     }
 
     /// 裁剪副本补旁车：即使没有 ASR（CI 无引擎/引擎不可用），估算兜底也必须落一个
