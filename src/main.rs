@@ -353,6 +353,11 @@ enum Msg {
         ok: bool,
         detail: String,
     },
+    /// 托管引擎周期自愈的结果（后台线程发回；与工程版本无关）。
+    /// `note` = 有可报告结论时的状态行文案（None = 稳定态/无事发生）。
+    EngineSelfHeal {
+        note: Option<String>,
+    },
     /// 全局设置里「选择模型目录」的结果（三态：选到 / 用户取消 / 选择器不可用）
     ModelDirPicked {
         pick: picker::Outcome<String>,
@@ -5590,12 +5595,21 @@ fn main() -> Result<(), slint::PlatformError> {
         let rows = rows.clone();
         let msg_rx = Rc::new(RefCell::new(msg_rx));
         let cmd_tx_tick = cmd_tx.clone();
+        let msg_tx_tick = msg_tx_ui.clone();
         timer.start(
             TimerMode::Repeated,
             Duration::from_millis(TICK_MS),
             move || {
                 if let Some(ui) = weak.upgrade() {
-                    tick(&ui, &rows, &msg_rx, &player, &state, &cmd_tx_tick);
+                    tick(
+                        &ui,
+                        &rows,
+                        &msg_rx,
+                        &player,
+                        &state,
+                        &cmd_tx_tick,
+                        &msg_tx_tick,
+                    );
                 }
             },
         );
@@ -9808,6 +9822,7 @@ fn message_ignores_revision(msg: &Msg) -> bool {
         Msg::TaskStarted { .. }
         | Msg::TaskStage { .. }
         | Msg::ServerHealth { .. }
+        | Msg::EngineSelfHeal { .. }
         | Msg::ModelsUnloaded { .. }
         | Msg::ModelDirPicked { .. }
         // 备份：目录选择结果来自对话框，终态来自长 IO，两者都与工程版本无关；
@@ -9870,6 +9885,7 @@ fn tick(
     player: &Rc<player::Player>,
     state: &Rc<UiState>,
     cmd_tx: &Sender<Cmd>,
+    msg_tx: &Sender<WorkerMsg>,
 ) {
     // ── 工作线程消息 ──
     let mut run_finished: Option<(usize, bool, usize, Option<String>)> = None;
@@ -10104,6 +10120,17 @@ fn tick(
                 refresh_backend_label(ui);
                 // 地址判据也可能刚变（测试连接前用户改了 host/port）：自愈开关跟着刷新
                 state.engine_explicit.set(server_base_for_engine().1);
+            }
+            Msg::EngineSelfHeal { note } => {
+                // 只有结论与上次不同才写状态行：引擎稳定时不刷屏；引擎恢复后清空记录，
+                // 下一次故障才能再次提示。
+                let mut last_note = state.last_engine_heal_note.borrow_mut();
+                if note != *last_note {
+                    if let Some(n) = &note {
+                        ui.set_status_text(n.clone().into());
+                    }
+                    *last_note = note;
+                }
             }
             Msg::VoicePreview { wav, label } => {
                 ui.set_busy(false);
@@ -10937,9 +10964,9 @@ fn tick(
 
     // ── 托管引擎周期自愈（每约 30s 问一次；显式地址 = 用户自己的服务，恒跳过）──
     // 判据是 engine_supervisor::should_periodic_heal 的纯函数（显式跳过 / 节流内
-    // 不重试 / 间隔外重试）；"是不是真的去重拉"由 ensure_engine_serving_throttled
-    // 先探活 + 20s 重启节流再拦一道。192.9s 参考音把引擎打死之后，靠这里把服务
-    // 拉回来，而不是让用户重启应用。
+    // 不重试 / 间隔外重试）。**重拉本身会阻塞（最坏等引擎 30s）**，所以只在 tick 里
+    // 决定“该问了”，真正的探测/拉起放在后台线程，结论经 Msg::EngineSelfHeal 回传，
+    // 绝不冻界面。192.9s 参考音把引擎打死之后，靠这里把服务拉回来。
     let heal_now = Instant::now();
     if engine_supervisor::should_periodic_heal(
         state.engine_explicit.get(),
@@ -10947,28 +10974,26 @@ fn tick(
         heal_now,
     ) {
         state.last_engine_heal.set(Some(heal_now));
-        let note = match ensure_engine_serving_throttled() {
-            Some(engine_supervisor::StartOutcome::Started) => {
-                Some("随包引擎已重新拉起，服务已恢复".to_string())
-            }
-            Some(engine_supervisor::StartOutcome::Failed(why)) => {
-                Some(format!("随包引擎自愈失败：{why}"))
-            }
-            // Reused（外部服务在响应）/ EngineMissing / NotConfigured 都是稳定态，
-            // 不写状态行（不刷屏）
-            Some(_) => None,
-            // 健康在响应 / 节流挡住：无事发生
-            None => None,
-        };
-        // 只有结论与上次不同才写状态行：引擎稳定时不刷屏；引擎恢复后清空记录，
-        // 下一次故障才能再次提示。
-        let mut last_note = state.last_engine_heal_note.borrow_mut();
-        if note != *last_note {
-            if let Some(n) = &note {
-                ui.set_status_text(n.clone().into());
-            }
-            *last_note = note;
-        }
+        let tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            let note = match ensure_engine_serving_throttled() {
+                Some(engine_supervisor::StartOutcome::Started) => {
+                    Some("随包引擎已重新拉起，服务已恢复".to_string())
+                }
+                Some(engine_supervisor::StartOutcome::Failed(why)) => {
+                    Some(format!("随包引擎自愈失败：{why}"))
+                }
+                // Reused（外部服务在响应）/ EngineMissing / NotConfigured 都是稳定态，
+                // 不写状态行（不刷屏）
+                Some(_) => None,
+                // 健康在响应 / 节流挡住：无事发生
+                None => None,
+            };
+            let _ = tx.send(WorkerMsg {
+                revision: 0,
+                msg: Msg::EngineSelfHeal { note },
+            });
+        });
     }
 
     // ── 试听结束：rodio 队列播空 → 复位 playing ──
@@ -16208,6 +16233,27 @@ mod tests {
             },
         ];
         let names = ["VoiceFilesPicked(Picked)", "VoiceFilesPicked(Cancelled)"];
+        assert_eq!(names.len(), msgs.len());
+        for (i, msg) in msgs.into_iter().enumerate() {
+            assert!(
+                message_ignores_revision(&msg),
+                "{} 必须在不过滤名单里",
+                names[i]
+            );
+        }
+    }
+
+    /// 引擎自愈的结论来自后台线程（revision 0、与工程版本无关）：
+    /// 不在不过滤名单里，改一次稿就会把「服务已恢复」静默丢掉。
+    #[test]
+    fn engine_self_heal_survives_revision_changes() {
+        let msgs = vec![
+            Msg::EngineSelfHeal {
+                note: Some("随包引擎已重新拉起，服务已恢复".into()),
+            },
+            Msg::EngineSelfHeal { note: None },
+        ];
+        let names = ["EngineSelfHeal(Some)", "EngineSelfHeal(None)"];
         assert_eq!(names.len(), msgs.len());
         for (i, msg) in msgs.into_iter().enumerate() {
             assert!(
