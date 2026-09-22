@@ -412,6 +412,95 @@ fn decode_first_seconds_to_wav(src: &Path, max_seconds: f64, dest: &Path) -> Res
         .map_err(|e| crate::dub::hound_error_note(dest, 0, &e))
 }
 
+// ── 裁剪副本的「参考文本」旁车 ──
+
+/// 旁车文件后缀：`<trimmed>.wav.reftext.txt`。只对**裁剪副本**写，原文件永远没有。
+pub const REFERENCE_TEXT_SIDECAR_SUFFIX: &str = ".reftext.txt";
+
+/// 裁剪副本对应的参考文本旁车路径。
+pub fn reference_text_sidecar_path(trimmed: &Path) -> PathBuf {
+    let mut s = trimmed.as_os_str().to_owned();
+    s.push(REFERENCE_TEXT_SIDECAR_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// 读旁车里的参考文本；没有或为空 → `None`（调用方回退到用户文本）。
+pub fn paired_reference_text(trimmed: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(reference_text_sidecar_path(trimmed)).ok()?;
+    let text = raw.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// 原子写旁车（临时文件 + fsync + rename，与裁剪副本同一套写法）。
+pub fn write_reference_text_sidecar(trimmed: &Path, text: &str) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        // 空文本不落盘：旁车语义是「这段音频念的内容」，空等于没有。
+        return Ok(());
+    }
+    let dest = reference_text_sidecar_path(trimmed);
+    let tmp = temp_sibling_of(&dest);
+    let outcome = std::fs::write(&tmp, text)
+        .map_err(|e| format!("参考文本旁车落盘失败（{}）: {e}", dest.display()));
+    finish_atomic(&tmp, &dest, outcome).map(|_| ())
+}
+
+/// 估算语速上限（字/秒）：ASR 不可用时兼底截断用。中文旁白常见 4–6 字/秒，
+/// 取下界 5.0 宁短勿长（略短于实际只会丢掉最后几个字，强于把全文塞给引擎）。
+pub const ESTIMATED_CHARS_PER_SECOND: f64 = 5.0;
+
+/// 按字数上限截断参考文本（尽量停在句末标点；无标点时按字数硬截）。
+pub fn truncate_reference_text_to_chars(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    // 句末标点之后的位置（字节下标）；循环结束后是预算内最后一个句末标点。
+    let mut cut: Option<usize> = None;
+    for (idx, ch) in text.char_indices().take(max_chars) {
+        if matches!(ch, '。' | '！' | '？' | '!' | '?' | '…' | '；' | ';' | '\n') {
+            cut = Some(idx + ch.len_utf8());
+        }
+    }
+    let end = cut.unwrap_or_else(|| {
+        text.char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len())
+    });
+    text[..end].trim().to_string()
+}
+
+/// 比例截断：按「保留秒数 / 原时长」把用户文本截到近似长度。纯函数（零依赖兜底）。
+///
+/// 只用于 ASR 不可用时的兜底：同一段录音里语速大致均匀，按比例取前缀是最近似的匹配。
+pub fn proportional_reference_text(text: &str, kept_seconds: f64, full_seconds: f64) -> String {
+    let text = text.trim();
+    if text.is_empty() || !kept_seconds.is_finite() || !full_seconds.is_finite() {
+        return String::new();
+    }
+    if full_seconds <= 0.0 || kept_seconds <= 0.0 {
+        return String::new();
+    }
+    if kept_seconds >= full_seconds {
+        return text.to_string();
+    }
+    let budget = (text.chars().count() as f64 * (kept_seconds / full_seconds)).ceil() as usize;
+    truncate_reference_text_to_chars(text, budget.max(1))
+}
+
+/// 原时长不可知时（已迁移成裁剪副本的旧工程）按估算语速截断。
+pub fn estimated_reference_text(text: &str, seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return String::new();
+    }
+    let cap = (seconds * ESTIMATED_CHARS_PER_SECOND).ceil() as usize;
+    truncate_reference_text_to_chars(text, cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,5 +791,70 @@ mod tests {
         assert_ne!(refreshed, first, "源变了必须产新副本，不能复用陈旧副本");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旁车：写入→读回（trim 两端空白）；空白不覆盖已有内容；没写时是 None。
+    #[test]
+    fn reference_text_sidecar_roundtrip_and_empty_ignored() {
+        let dir = temp_dir("reftext-sidecar");
+        let trimmed = dir.join("a-15s.wav");
+        std::fs::write(&trimmed, b"RIFF").unwrap();
+        assert_eq!(
+            paired_reference_text(&trimmed),
+            None,
+            "没写旁车时必须是 None"
+        );
+        write_reference_text_sidecar(&trimmed, "  老板，您好。  ").unwrap();
+        assert_eq!(
+            paired_reference_text(&trimmed).as_deref(),
+            Some("老板，您好。"),
+            "旁车读回要 trim 两端空白"
+        );
+        write_reference_text_sidecar(&trimmed, "   ").unwrap();
+        assert_eq!(
+            paired_reference_text(&trimmed).as_deref(),
+            Some("老板，您好。"),
+            "空白文本不应该写盘/覆盖已有旁车"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 比例截断：能停在句末标点；无标点时按字数硬截且不劈多字节字符；
+    /// 保留时长 ≥ 全时长原样返回；非法/零时长返回空。
+    #[test]
+    fn proportional_reference_text_truncates_by_ratio() {
+        let text = "第一句话。第二句话。第三句话。第四句话。";
+        // 预算 = ceil(20 × 15/60) = 5 字 → 落在第一句句末
+        let got = proportional_reference_text(text, 15.0, 60.0);
+        assert!(text.starts_with(&got), "必须是原文前缀：{got}");
+        assert!(got.ends_with('。'), "应停在句末标点：{got}");
+        assert!(got.chars().count() < text.chars().count());
+
+        // 无标点：按字数硬截，且不劈多字节字符
+        let no_punct = "一二三四五六七八九十";
+        assert_eq!(
+            proportional_reference_text(no_punct, 5.0, 10.0),
+            "一二三四五"
+        );
+        // 保留时长 ≥ 全时长 → 原样
+        assert_eq!(proportional_reference_text(text, 200.0, 192.9), text);
+        // 非法输入 → 空
+        assert_eq!(proportional_reference_text(text, f64::NAN, 192.9), "");
+        assert_eq!(proportional_reference_text(text, 15.0, 0.0), "");
+    }
+
+    /// 估算兜底（原时长不可知）：按 5 字/秒 上限截断；短文本不动。
+    #[test]
+    fn estimated_reference_text_caps_by_speech_rate() {
+        let long = "一二三四五六七八九十".repeat(20); // 200 字
+        let got = estimated_reference_text(&long, 15.0); // 15 × 5 = 75 字
+        assert_eq!(got.chars().count(), 75);
+        let short = "老板，您好。";
+        assert_eq!(
+            estimated_reference_text(short, 15.0),
+            short,
+            "短文本不该被动"
+        );
+        assert_eq!(estimated_reference_text(long.as_str(), 0.0), "");
     }
 }

@@ -4951,7 +4951,10 @@ struct PreparedReference {
     note: Option<String>,
 }
 
-fn prepare_reference_for_clone(path: &str) -> Result<PreparedReference, String> {
+fn prepare_reference_for_clone(
+    path: &str,
+    reference_text: Option<&str>,
+) -> Result<PreparedReference, String> {
     let src = Path::new(path);
     let Some(secs) = aw_core::reference_duration_seconds(src) else {
         // 时长读不出 → 原样返回（fail-open：最坏结果与没有护栏一样，取舍见
@@ -4962,25 +4965,76 @@ fn prepare_reference_for_clone(path: &str) -> Result<PreparedReference, String> 
         });
     };
     if secs <= aw_core::REFERENCE_MAX_SECONDS {
+        // 已经是被 0.1.10 裁过的缓存副本（工程迁移后 voice_ref 就是它）：当时没有旁车，
+        // 而它不会再触发裁剪 → 必须在这里补上，否则「84 字音频 × 1077 字文本」的错配
+        // 会一直留着（用户实测的坏声音就是这么来的）。
+        if src.parent() == Some(voice_trimmed_dir().as_path()) {
+            ensure_trimmed_reference_text_sidecar(src, secs, reference_text);
+        }
         return Ok(PreparedReference {
             path: src.to_path_buf(),
             note: None,
         });
     }
     match aw_core::trim_reference_first_seconds(src, &voice_trimmed_dir(), aw_core::REFERENCE_MAX_SECONDS) {
-        Ok(trimmed) => Ok(PreparedReference {
-            path: trimmed,
-            note: Some(format!(
-                "参考音频 {secs:.1} 秒 → 将使用前 {:.0} 秒（原文件未改动）",
-                aw_core::REFERENCE_MAX_SECONDS
-            )),
-        }),
+        Ok(trimmed) => {
+            ensure_trimmed_reference_text_sidecar(&trimmed, secs, reference_text);
+            Ok(PreparedReference {
+                path: trimmed,
+                note: Some(format!(
+                    "参考音频 {secs:.1} 秒 → 将使用前 {:.0} 秒（参考文本已同步为对应片段，原文件未改动）",
+                    aw_core::REFERENCE_MAX_SECONDS
+                )),
+            })
+        }
         // 裁剪失败（解码/写盘失败）→ 退回红色拦截文案：15s 上限 + 手动处理建议，
         // 并说清「自动裁剪失败」的原因。
         Err(reason) => Err(format!(
             "参考音频 {secs:.1} 秒，超过 {:.0} 秒上限，自动取前 {:.0} 秒失败（{reason}）。请手动裁到 {:.0} 秒内再合成。",
             aw_core::REFERENCE_MAX_SECONDS, aw_core::REFERENCE_MAX_SECONDS, aw_core::REFERENCE_MAX_SECONDS
         )),
+    }
+}
+
+/// 裁剪副本的「参考文本」旁车：优先 ASR 转写裁剪段，失败退回按比例截断用户文本。
+///
+/// 为什么必须有：裁剪只改音频不改文本时，audio8-tts 会收到「84 字音频 + 1077 字
+/// 文本」的错配，克隆出完全不对的声音（v0.1.10 用户实测）。旁车只在裁剪时写，
+/// 请求组装（aw-core `build_synth_request`）自动优先读取，用户工程里的原文不动。
+fn ensure_trimmed_reference_text_sidecar(
+    trimmed: &Path,
+    full_secs: f64,
+    reference_text: Option<&str>,
+) {
+    if aw_core::ref_audio::paired_reference_text(trimmed).is_some() {
+        return;
+    }
+    let Some(user_text) = reference_text.map(str::trim).filter(|t| !t.is_empty()) else {
+        // 用户没给参考文本（如 index-tts2）：不造一个出来，按引擎原语义走
+        return;
+    };
+    // 1）ASR 真读一遍裁剪段（最贴音频内容）；引擎没有 ASR 模型/不可用 → None
+    let asr = make_client()
+        .ok()
+        .and_then(|c| c.asr(trimmed).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    // 2）兜底：同一段录音语速大致均匀，按保留比例截断用户文本（零依赖）；
+    //    原时长不可知（已迁移的缓存副本）时按估算语速截断。
+    let text = asr.unwrap_or_else(|| {
+        if full_secs > aw_core::REFERENCE_MAX_SECONDS {
+            aw_core::ref_audio::proportional_reference_text(
+                user_text,
+                aw_core::REFERENCE_MAX_SECONDS,
+                full_secs,
+            )
+        } else {
+            aw_core::ref_audio::estimated_reference_text(user_text, full_secs)
+        }
+    });
+    if let Err(e) = aw_core::ref_audio::write_reference_text_sidecar(trimmed, &text) {
+        // 旁车写不进去不阻塞克隆（最坏退回旧行为），但要留下诊断信息
+        eprintln!("参考文本旁车写入失败（不阻塞克隆）：{e}");
     }
 }
 
@@ -5001,7 +5055,7 @@ fn migrate_overlong_voice_ref(
     let Some(path) = project.voice_ref.clone() else {
         return Ok(None);
     };
-    let prepared = prepare_reference_for_clone(&path)?;
+    let prepared = prepare_reference_for_clone(&path, project.voice_ref_text.as_deref())?;
     if prepared.path == Path::new(&path) {
         return Ok(None);
     }
@@ -5092,6 +5146,14 @@ fn effective_dict_hash(saved: &Project) -> String {
         .dict_hash
         .clone()
         .unwrap_or_else(|| dictionaries::fingerprint(&Default::default()))
+}
+
+/// 旁车修复判定：修复前缺失 + 修复后出现 = 需要作废旧音频（重录一遍）。
+///
+/// 拆成纯函数是为了可测：`load_resumable` 里的 `voice-trimmed/` 路径依赖应用数据目录，
+/// 不适合单测，这两条布尔才是真正的判据。
+fn reference_text_was_repaired(before_missing: bool, now_present: bool) -> bool {
+    before_missing && now_present
 }
 
 fn sentence_texts_match(project: &Project, script: &str) -> bool {
@@ -5343,12 +5405,19 @@ fn load_resumable(
         None
     };
     let dict_hash = dictionaries::fingerprint(dict);
+    // 旁车修复快照（必须在任何 prepare 之前取）：0.1.10 只裁音频不同步文本，
+    // 这类工程的已合成音频是在「文本错配」下发出来的。旁车一旦补上，旧音频
+    // 必须整体作废重录一次，否则用户升级后仍听到旧错声音。
+    let input_sidecar_missing_before = voice_ref
+        .as_deref()
+        .map(|p| aw_core::ref_audio::paired_reference_text(Path::new(p)).is_none())
+        .unwrap_or(false);
     // ① 输入侧先收敛到 ≤15s：四个 UI 入口已 prepare 过，这里在 worker 侧再走一遍
     // 不是重复——覆盖直接调用方与旧工程输入，保证**进工程的 voice_ref 一定是
     // ≤15s 的路径**（超长→voice-trimmed 副本），并顺手在这算内容哈希。
     let (voice_ref, voice_ref_hash) = match voice_ref.as_deref() {
         Some(path) => {
-            let prepared = prepare_reference_for_clone(path)?;
+            let prepared = prepare_reference_for_clone(path, voice_ref_text.as_deref())?;
             let hash = sha256_file(&prepared.path)?;
             (
                 Some(prepared.path.to_string_lossy().into_owned()),
@@ -5360,6 +5429,11 @@ fn load_resumable(
     // 损坏的工程在这里必须**中止**：`.ok()` 会把它当成"没有工程"，已合成句全变待合成，
     // 随后第一次落盘还会覆盖掉损坏文件（现场丢失）。见 Project::load_if_present。
     let mut saved = Project::load_if_present(dir)?;
+    let saved_sidecar_missing_before = saved
+        .as_ref()
+        .and_then(|p| p.voice_ref.as_deref())
+        .map(|p| aw_core::ref_audio::paired_reference_text(Path::new(p)).is_none())
+        .unwrap_or(false);
     // ② 旧工程显式迁移：工程里存的 voice_ref 仍可能是超长路径（旧上限 30s 或更早
     // 的无上限工程）——把该工程的 voice_ref 一次性迁移为裁剪副本（更新 voice_ref
     // 与新 voice_ref_hash 并落盘）。与输入同源时两者会裁出同一个副本名，
@@ -5367,18 +5441,32 @@ fn load_resumable(
     if let Some(saved) = saved.as_mut() {
         migrate_overlong_voice_ref(dir, saved)?;
     }
+    // 参考文本旁车此前缺失、现在已补上 ⇒ 旧音频用的是错配文本，必须重录一遍。
+    // 只影响这一次：重录后旁车已在，后续加载不再作废。
+    let text_repaired = reference_text_was_repaired(
+        input_sidecar_missing_before || saved_sidecar_missing_before,
+        [
+            voice_ref.as_deref(),
+            saved.as_ref().and_then(|p| p.voice_ref.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|p| aw_core::ref_audio::paired_reference_text(Path::new(p)).is_some()),
+    );
     if let Some(saved) = saved.as_ref() {
         // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
         // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
-        if settings_allow_reuse(
-            saved,
-            model,
-            &voice_ref,
-            &voice_ref_hash,
-            &voice_ref_text,
-            auto_normalize,
-            &dict_hash,
-        ) && sentence_texts_match(saved, script)
+        if !text_repaired
+            && settings_allow_reuse(
+                saved,
+                model,
+                &voice_ref,
+                &voice_ref_hash,
+                &voice_ref_text,
+                auto_normalize,
+                &dict_hash,
+            )
+            && sentence_texts_match(saved, script)
         {
             let mut project = saved.clone();
             if project.gap_ms != gap_ms {
@@ -5403,16 +5491,19 @@ fn load_resumable(
     // 用上面已经算好的哈希（少读一次参考音文件）
     project.voice_ref_hash = voice_ref_hash.clone();
     let reused = if let Some(saved) = saved.as_ref() {
-        // 与快路径同一条判据：开关变了就不能逐句继承（旧音频念的是另一套文本）
-        if settings_allow_reuse(
-            saved,
-            model,
-            &voice_ref,
-            &voice_ref_hash,
-            &voice_ref_text,
-            auto_normalize,
-            &dict_hash,
-        ) {
+        // 与快路径同一条判据（含旁车修复）：开关变了或文本配对被修过，就不能逐句继承
+        // ——快路径只管整体复用，旧 done wav 仍会从慢路径被拷回来（复评实测）。
+        if !text_repaired
+            && settings_allow_reuse(
+                saved,
+                model,
+                &voice_ref,
+                &voice_ref_hash,
+                &voice_ref_text,
+                auto_normalize,
+                &dict_hash,
+            )
+        {
             reuse_done_sentences(&mut project, saved, dir)?
         } else {
             0
@@ -7844,7 +7935,7 @@ fn wire_batch(
         // 自动取前 15 秒（拦一次顶 N 次引擎崩溃），裁剪失败才红字拦截。
         let mut trim_note: Option<String> = None;
         let voice_ref = match voice_ref {
-            Some(path) => match prepare_reference_for_clone(&path) {
+            Some(path) => match prepare_reference_for_clone(&path, voice_ref_text.as_deref()) {
                 Ok(prepared) => {
                     trim_note = prepared.note;
                     Some(prepared.path.to_string_lossy().into_owned())
@@ -8563,7 +8654,7 @@ fn wire_voice_panel(
         // 自动取前 15 秒，裁剪失败才红字拦截（不发起）。
         let mut trim_note: Option<String> = None;
         let voice_ref = match voice_ref {
-            Some(path) => match prepare_reference_for_clone(&path) {
+            Some(path) => match prepare_reference_for_clone(&path, voice_ref_text.as_deref()) {
                 Ok(prepared) => {
                     trim_note = prepared.note;
                     Some(prepared.path.to_string_lossy().into_owned())
@@ -8981,7 +9072,7 @@ fn wire_run(
                     );
                     return;
                 }
-                match prepare_reference_for_clone(&path) {
+                match prepare_reference_for_clone(&path, voice_ref_text.as_deref()) {
                     Ok(prepared) => {
                         trim_note = prepared.note;
                         Some(prepared.path.to_string_lossy().into_owned())
@@ -13461,6 +13552,106 @@ mod tests {
         );
     }
 
+    /// 旁车修复只在「修复前缺失 → 修复后出现」时作废旧音频；其他组合不动作
+    /// （不能借机清掉本来正常的工程音频）。
+    #[test]
+    fn reference_text_repair_only_invalidates_on_missing_to_present() {
+        assert!(reference_text_was_repaired(true, true));
+        assert!(
+            !reference_text_was_repaired(true, false),
+            "补不出旁车不能借机清音频"
+        );
+        assert!(
+            !reference_text_was_repaired(false, true),
+            "本来就有旁车不得重复作废"
+        );
+        assert!(!reference_text_was_repaired(false, false));
+    }
+
+    /// 旁车修复后必须**同时**挡住慢路径的逐句继承：快路径跳过只是不再整体复用，
+    /// 慢路径 `reuse_done_sentences` 仍会把旧 done wav 拷回来（独立复评 reproduction
+    /// 实测 left=1/right=0）。
+    #[test]
+    fn text_repaired_invalidation_must_also_skip_slow_path_reuse() {
+        let dir = temp_dir("sidecar-invalidate");
+        let vt = voice_trimmed_dir();
+        std::fs::create_dir_all(&vt).unwrap();
+        let tag = format!("aw-test-{}-{}", std::process::id(), line!());
+        let copy = vt.join(format!("{tag}-10s.wav"));
+        std::fs::write(&copy, test_wav_bytes(10.0, None)).unwrap();
+        let sidecar = aw_core::ref_audio::reference_text_sidecar_path(&copy);
+        let _ = std::fs::remove_file(&sidecar); // 入参必须是「修复前无旁车」
+        let sentences_dir = dir.join("sentences");
+        std::fs::create_dir_all(&sentences_dir).unwrap();
+        std::fs::write(sentences_dir.join("000.wav"), b"old-mismatched-audio").unwrap();
+        let mut saved = saved_project("第一句。第二句。", Some(copy.to_str().unwrap()));
+        saved.voice_ref_text = Some("全文很长很长，比裁剪段多得多。".to_string());
+        saved.voice_ref_hash = Some(sha256_file(&copy).unwrap());
+        saved.sentences[0].status = "done".into();
+        saved.save(&dir).unwrap();
+
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            Some(copy.to_string_lossy().into_owned()),
+            Some("全文很长很长，比裁剪段多得多。".to_string()),
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .expect("应能加载");
+        assert_eq!(
+            loaded.reused, 0,
+            "旁车修复后旧音频必须作废（快慢两条路径都不许继承）"
+        );
+        assert!(
+            loaded.project.sentences.iter().all(|s| s.status != "done"),
+            "旁车修复后已合成句必须回到待合成"
+        );
+        let _ = std::fs::remove_file(&copy);
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 已迁移副本（≤15s 且在 `voice-trimmed/`）在加载时补旁车：这是 0.1.10 用户
+    /// 现有工程的唯一修复入口（它不会再触发裁剪，早返回路径必须也补旁车）。
+    #[test]
+    fn cached_trim_copy_in_trimmed_dir_gets_sidecar_without_retrim() {
+        let vt = voice_trimmed_dir();
+        std::fs::create_dir_all(&vt).unwrap();
+        let tag = format!("aw-test-{}-{}", std::process::id(), line!());
+        let copy = vt.join(format!("{tag}-10s.wav"));
+        std::fs::write(&copy, test_wav_bytes(10.0, None)).unwrap();
+        let sidecar = aw_core::ref_audio::reference_text_sidecar_path(&copy);
+        let _ = std::fs::remove_file(&sidecar);
+        let text = "很长的全文，比十秒能念下的内容多得多得多。";
+        let prepared = prepare_reference_for_clone(copy.to_str().unwrap(), Some(text)).unwrap();
+        assert_eq!(prepared.path, copy, "≤15s 的副本不该再裁");
+        assert!(
+            aw_core::ref_audio::paired_reference_text(&copy).is_some(),
+            "voice-trimmed/ 里的旧副本必须在加载时补旁车"
+        );
+        let _ = std::fs::remove_file(&copy);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// 裁剪副本补旁车：即使没有 ASR（CI 无引擎/引擎不可用），估算兜底也必须落一个
+    /// 旁车，否则「84 字音频 × 1077 字文本」的错配会原样留在请求里。
+    #[test]
+    fn trimmed_reference_text_sidecar_is_written_even_without_asr() {
+        let dir = std::env::temp_dir().join(format!("aw-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trimmed = dir.join("cached-15s.wav");
+        std::fs::write(&trimmed, b"x").unwrap();
+        let long = "一二三四五六七八九十".repeat(20); // 200 字
+        ensure_trimmed_reference_text_sidecar(&trimmed, 15.0, Some(&long));
+        let paired = aw_core::ref_audio::paired_reference_text(&trimmed)
+            .expect("必须写旁车（ASR 不是前提）");
+        assert!(long.starts_with(&paired), "兜底必须是原文前缀：{paired}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 句柄检查必须走 `take_live_supervisor`（单一取锁）：旧的内联写法
     /// `if let Some(sup) = ENGINE_SUPERVISOR.lock()…as_mut()` 会在块内二次 lock，
     /// 同线程重入**永久死锁**，且只在引擎已崩溃的自愈分支触发（2026-09-22 复评）。
@@ -16320,8 +16511,8 @@ mod tests {
         // 20s → 自动裁剪副本，原文件不动
         let ref20 = dir.join("ref-20s.wav");
         std::fs::write(&ref20, test_wav_bytes(20.0, None)).unwrap();
-        let prepared =
-            prepare_reference_for_clone(&ref20.to_string_lossy()).expect("20s 应能自动裁剪");
+        let prepared = prepare_reference_for_clone(&ref20.to_string_lossy(), Some("测试参考文本"))
+            .expect("20s 应能自动裁剪");
         assert!(
             prepared.path.starts_with(voice_trimmed_dir()),
             "副本必须落在 voice-trimmed：{}",
@@ -16342,14 +16533,15 @@ mod tests {
         // 10s → 原样返回
         let ref10 = dir.join("ref-10s.wav");
         std::fs::write(&ref10, test_wav_bytes(10.0, None)).unwrap();
-        let short = prepare_reference_for_clone(&ref10.to_string_lossy()).expect("10s 放行");
+        let short = prepare_reference_for_clone(&ref10.to_string_lossy(), Some("测试参考文本"))
+            .expect("10s 放行");
         assert_eq!(short.path, ref10);
         assert!(short.note.is_none(), "未裁剪就不该有提示");
 
         // 读不出时长 → fail-open 原样
         let garbage = dir.join("ref-garbage.mp3");
         std::fs::write(&garbage, b"not audio").unwrap();
-        let open = prepare_reference_for_clone(&garbage.to_string_lossy())
+        let open = prepare_reference_for_clone(&garbage.to_string_lossy(), Some("测试参考文本"))
             .expect("读不出时长必须 fail-open");
         assert_eq!(open.path, garbage);
         assert!(open.note.is_none());
@@ -16357,8 +16549,8 @@ mod tests {
         // 头声明 20s、数据截断 → 裁剪失败 → 红色拦截文案（含原因 + 手动建议）
         let truncated = dir.join("ref-trunc.wav");
         std::fs::write(&truncated, test_wav_bytes(20.0, Some(1.0))).unwrap();
-        let err =
-            prepare_reference_for_clone(&truncated.to_string_lossy()).expect_err("裁剪失败必须拦");
+        let err = prepare_reference_for_clone(&truncated.to_string_lossy(), Some("测试参考文本"))
+            .expect_err("裁剪失败必须拦");
         assert!(err.contains("20.0 秒，超过 15 秒上限"), "{err}");
         assert!(err.contains("自动取前 15 秒失败"), "{err}");
         assert!(err.contains("裁到 15 秒内再合成"), "{err}");
@@ -19392,6 +19584,14 @@ mod tests {
             6,
             "prepare 定义 + 三个 UI 入口 + load_resumable 输入收敛 + migrate helper；\
              加/删入口必须同步加/删"
+        );
+        // 每个入口都必须把 voice_ref_text 一起交给 prepare：裁剪副本的旁车文本
+        // 只能从这里生成（漏传 → 旁车缺失 → 回到「84 字音频配 1077 字文本」的错配）。
+        assert!(
+            src.matches("prepare_reference_for_clone(&path, voice_ref_text.as_deref())")
+                .count()
+                >= 3,
+            "三个 UI 入口必须把 voice_ref_text 一起交给 prepare（旁车文本来源）"
         );
         for anchor in [
             ".send(Cmd::Run {",
