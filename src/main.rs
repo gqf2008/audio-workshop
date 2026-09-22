@@ -19,6 +19,7 @@
 //!   projects/<工程名>/project.json      工程（逐句落盘 → 断点续作）
 //!   projects/<工程名>/sentences/NNN.wav  逐句音频
 //!   projects/<工程名>/out/final.wav|srt 成品
+//!   voice-trimmed/<slug>-<hash8>-15s.wav 超长参考音频的裁剪副本（原文件不动，克隆用它）
 //!   <工程名>.wav / <工程名>.srt          导出（复制自 out/）
 
 mod backup;
@@ -4647,20 +4648,20 @@ fn worker_loop(ctx: WorkerCtx) {
                     });
                     continue;
                 }
-                // 时长护栏：重录的 voice_ref 在**工程里**（UI 路径只是它当时的投影），
-                // 所以唯一可靠的拦截点在发起重录请求之前、按工程的 voice_ref 判。
-                // 超限不发起任何请求（发出去就会把引擎进程打死）。
-                if let Some(path) = project.voice_ref.as_deref() {
-                    if let Some(note) = reference_over_limit_note(path) {
-                        let _ = ctx.tx.send(WorkerMsg {
-                            revision,
-                            msg: Msg::RedoDone {
-                                index,
-                                error: Some(note),
-                            },
-                        });
-                        continue;
-                    }
+                // 重录的 voice_ref 在**工程里**（UI 路径只是它当时的投影），所以请求
+                // 前按工程的 voice_ref 走迁移/裁剪（migrate_overlong_voice_ref）：
+                // load_resumable 已迁过 Run 装入的工程，这里兜 OpenProject（启动恢复）
+                // 灌进来的——规则不变：请求实际使用 ≤15s 的路径。裁剪失败按红字拦截，
+                // 不发起任何请求（发出去就会把引擎进程打死）。
+                if let Err(note) = migrate_overlong_voice_ref(dir, project) {
+                    let _ = ctx.tx.send(WorkerMsg {
+                        revision,
+                        msg: Msg::RedoDone {
+                            index,
+                            error: Some(note),
+                        },
+                    });
+                    continue;
                 }
                 let client = match make_client() {
                     Ok(c) => c,
@@ -4905,6 +4906,115 @@ fn project_dir(stem: &str) -> PathBuf {
 /// 音色设计产物的落点：~/Documents/音频作坊/voice-design/（与应用设置、导出目录同级）。
 fn voice_design_dir() -> PathBuf {
     workshop_dir().join("voice-design")
+}
+
+/// 超长参考音频的裁剪副本目录：~/Documents/音频作坊/voice-trimmed/（应用自管目录，
+/// 用户原文件绝不改动）。
+fn voice_trimmed_dir() -> PathBuf {
+    // cfg(test) 注入缝：单测不得往用户真实数据目录写裁剪副本（见
+    // `LESSON_单测不得写用户真实运行数据须拆出注入缝`）——整个测试进程共用临时
+    // 目录里的一份（OnceLock，跨 worker 线程可见，无并发改值竞态）。
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+        OVERRIDE
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!(
+                    "audio-workshop-test-voice-trimmed-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).expect("建测试 voice-trimmed 目录失败");
+                dir
+            })
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        workshop_dir().join("voice-trimmed")
+    }
+}
+
+/// 参考音频在**发起克隆请求前**的应用侧唯一入口：超长 → voice-trimmed 副本，
+/// 原样/读不出 → 原路径（fail-open，取舍见 `aw_core::ref_audio` 模块注释）。
+///
+/// 四个会发克隆请求的入口（开始合成 / 批量提交 / 单句重录 / 音色试听）都用它返回
+/// 的路径发请求——规则只有一条：**请求实际使用 ≤15s 的路径**。旧工程的 voice_ref
+/// 迁移（load_resumable / Cmd::Redo 分支）也走这里（见 [`migrate_overlong_voice_ref`]）。
+///
+/// 故意不带 ui 参数：worker 侧（load_resumable / Cmd::Redo）也要用，而 ui 只能由
+/// UI 线程碰——信息提示（`note`）由调用点在能碰 ui 的地方就地 set_status_text。
+///
+/// 源码守卫 `every_clone_request_entrance_uses_prepared_reference` 钉住调用点，
+/// 加新入口必须同步加。
+#[derive(Debug)]
+struct PreparedReference {
+    /// 本次请求该用的参考音频路径（原路径或 voice-trimmed 副本）。
+    path: PathBuf,
+    /// 超长被裁剪时的信息提示（状态行用）；原样使用/读不出时长为 None。
+    note: Option<String>,
+}
+
+fn prepare_reference_for_clone(path: &str) -> Result<PreparedReference, String> {
+    let src = Path::new(path);
+    let Some(secs) = aw_core::reference_duration_seconds(src) else {
+        // 时长读不出 → 原样返回（fail-open：最坏结果与没有护栏一样，取舍见
+        // aw_core::ref_audio 模块注释——不把"探测坏了"放大成"克隆不可用"）。
+        return Ok(PreparedReference {
+            path: src.to_path_buf(),
+            note: None,
+        });
+    };
+    if secs <= aw_core::REFERENCE_MAX_SECONDS {
+        return Ok(PreparedReference {
+            path: src.to_path_buf(),
+            note: None,
+        });
+    }
+    match aw_core::trim_reference_first_seconds(src, &voice_trimmed_dir(), aw_core::REFERENCE_MAX_SECONDS) {
+        Ok(trimmed) => Ok(PreparedReference {
+            path: trimmed,
+            note: Some(format!(
+                "参考音频 {secs:.1} 秒 → 将使用前 {:.0} 秒（原文件未改动）",
+                aw_core::REFERENCE_MAX_SECONDS
+            )),
+        }),
+        // 裁剪失败（解码/写盘失败）→ 退回红色拦截文案：15s 上限 + 手动处理建议，
+        // 并说清「自动裁剪失败」的原因。
+        Err(reason) => Err(format!(
+            "参考音频 {secs:.1} 秒，超过 {:.0} 秒上限，自动取前 {:.0} 秒失败（{reason}）。请手动裁到 {:.0} 秒内再合成。",
+            aw_core::REFERENCE_MAX_SECONDS, aw_core::REFERENCE_MAX_SECONDS, aw_core::REFERENCE_MAX_SECONDS
+        )),
+    }
+}
+
+/// 旧工程迁移：工程里存的 voice_ref 超过 15s → 换成 voice-trimmed 里的裁剪副本，
+/// 并更新 voice_ref_hash 一起落盘（**显式迁移**，不是"下次提交时顺手改"）。
+///
+/// 为什么必须落盘：project.json 里存着超长路径的话（例如真机打崩引擎的 192.9s
+/// 那条），`Cmd::Redo` 这类由 worker 直接用工程 voice_ref 发请求的路径仍会拿超长
+/// 文件打引擎；只有把迁移写回 project.json，之后所有读工程的路径才都拿到 ≤15s
+/// 的路径。读不出时长按 fail-open 跳过（与入口同口径）。
+///
+/// 返回 Ok(Some(note)) = 迁移过（信息提示可交给用户），Ok(None) = 无需迁移，
+/// Err = 自动裁剪失败（调用方把文案交给用户并按红字拦截）。
+fn migrate_overlong_voice_ref(
+    dir: &Path,
+    project: &mut aw_core::Project,
+) -> Result<Option<String>, String> {
+    let Some(path) = project.voice_ref.clone() else {
+        return Ok(None);
+    };
+    let prepared = prepare_reference_for_clone(&path)?;
+    if prepared.path == Path::new(&path) {
+        return Ok(None);
+    }
+    project.voice_ref = Some(prepared.path.to_string_lossy().into_owned());
+    project.voice_ref_hash = Some(sha256_file(&prepared.path)?);
+    project
+        .save(dir)
+        .map_err(|e| format!("工程落盘失败: {e}"))?;
+    Ok(prepared.note)
 }
 
 /// 把生成的音色设计 wav 落盘，返回完整路径。
@@ -5212,18 +5322,6 @@ fn reference_text_missing(
     }
 }
 
-/// 参考音频时长护栏（30s 硬上限）的**唯一入口**：超限返回可执行文案，读不出时长
-/// fail-open 放行（取舍见 `aw_core::ref_audio` 模块注释）。
-///
-/// 所有会发克隆请求的入口（开始合成 / 批量提交 / 单句重录 / 音色试听）都必须在
-/// **发起前**过它——192.9s 参考音实测让引擎申请 14,539 MiB Metal buffer 失败后
-/// 空指针 SIGSEGV，整个引擎进程死掉（用户 8080 引擎 2026-09-22 崩了两次）。
-/// 源码守卫 `every_clone_request_entrance_is_guarded_by_reference_limit` 钉住调用点，
-/// 加新入口必须同步加护栏。
-fn reference_over_limit_note(path: &str) -> Option<String> {
-    aw_core::reference_over_limit(Path::new(path))
-}
-
 // 8 个参数确实多，但每个都是调用方必须显式给出的决策（路径/稿子/引擎/音色两项/停顿/
 // 兜底/词典）。打包成配置结构体只是把同一串东西换个地方写，调用点反而更啰嗦——
 // 与 `Project::new` 的处理一致。
@@ -5245,13 +5343,30 @@ fn load_resumable(
         None
     };
     let dict_hash = dictionaries::fingerprint(dict);
-    let voice_ref_hash = match voice_ref.as_deref() {
-        Some(path) => Some(sha256_file(Path::new(path))?),
-        None => None,
+    // ① 输入侧先收敛到 ≤15s：四个 UI 入口已 prepare 过，这里在 worker 侧再走一遍
+    // 不是重复——覆盖直接调用方与旧工程输入，保证**进工程的 voice_ref 一定是
+    // ≤15s 的路径**（超长→voice-trimmed 副本），并顺手在这算内容哈希。
+    let (voice_ref, voice_ref_hash) = match voice_ref.as_deref() {
+        Some(path) => {
+            let prepared = prepare_reference_for_clone(path)?;
+            let hash = sha256_file(&prepared.path)?;
+            (
+                Some(prepared.path.to_string_lossy().into_owned()),
+                Some(hash),
+            )
+        }
+        None => (None, None),
     };
     // 损坏的工程在这里必须**中止**：`.ok()` 会把它当成"没有工程"，已合成句全变待合成，
     // 随后第一次落盘还会覆盖掉损坏文件（现场丢失）。见 Project::load_if_present。
-    let saved = Project::load_if_present(dir)?;
+    let mut saved = Project::load_if_present(dir)?;
+    // ② 旧工程显式迁移：工程里存的 voice_ref 仍可能是超长路径（旧上限 30s 或更早
+    // 的无上限工程）——把该工程的 voice_ref 一次性迁移为裁剪副本（更新 voice_ref
+    // 与新 voice_ref_hash 并落盘）。与输入同源时两者会裁出同一个副本名，
+    // settings_allow_reuse 仍能匹配 → 续作不丢（见 migrate_overlong_voice_ref）。
+    if let Some(saved) = saved.as_mut() {
+        migrate_overlong_voice_ref(dir, saved)?;
+    }
     if let Some(saved) = saved.as_ref() {
         // 兜底开关与模型/音色同类：它变了，spoken 文本就变，旧音频不能算数。
         // 停顿不进这个条件——它只影响拼装，改了不必重录（下面就直接改字段）。
@@ -7725,14 +7840,22 @@ fn wire_batch(
             ui.set_batch_summary(reference_text_required_note(&model).into());
             return;
         }
-        // 时长护栏：批量每篇都会带同一份 voice_ref 发克隆请求，超 30s 一篇都
-        // 不能提交（拦一次顶 N 次引擎崩溃）。
-        if let Some(path) = voice_ref.as_deref() {
-            if let Some(note) = reference_over_limit_note(path) {
-                ui.set_batch_summary(note.into());
-                return;
-            }
-        }
+        // 唯一入口 prepare：批量每篇都会带同一份 voice_ref 发克隆请求，超 15s
+        // 自动取前 15 秒（拦一次顶 N 次引擎崩溃），裁剪失败才红字拦截。
+        let mut trim_note: Option<String> = None;
+        let voice_ref = match voice_ref {
+            Some(path) => match prepare_reference_for_clone(&path) {
+                Ok(prepared) => {
+                    trim_note = prepared.note;
+                    Some(prepared.path.to_string_lossy().into_owned())
+                }
+                Err(note) => {
+                    ui.set_batch_summary(note.into());
+                    return;
+                }
+            },
+            None => None,
+        };
 
         // 每条先登记成一条配音任务（排队中），worker 轮到它时用 TaskStarted 抬成运行中
         let mut items = Vec::new();
@@ -7760,7 +7883,14 @@ fn wire_batch(
         st.batch_running.set(true);
         ui.set_batch_running(true);
         ui.set_status_text(
-            format!("批量已提交：{total} 篇按顺序跑（任务中心能看到每一条）").into(),
+            match trim_note {
+                // 信息提示留在状态行上（随后的"批量已提交"会盖掉它），拼在前面。
+                Some(trimmed) => {
+                    format!("{trimmed} · 批量已提交：{total} 篇按顺序跑（任务中心能看到每一条）")
+                }
+                None => format!("批量已提交：{total} 篇按顺序跑（任务中心能看到每一条）"),
+            }
+            .into(),
         );
         refresh_tasks(&ui, &st);
         refresh_batch_rows(&ui, &st);
@@ -8429,13 +8559,22 @@ fn wire_voice_panel(
             ui.set_status_text(reference_text_required_note(&model).into());
             return;
         }
-        // 克隆态试听同样是一次真实克隆请求：时长护栏同一条，超 30s 不发起。
-        if let Some(path) = voice_ref.as_deref() {
-            if let Some(note) = reference_over_limit_note(path) {
-                ui.set_status_text(note.into());
-                return;
-            }
-        }
+        // 克隆态试听同样是一次真实克隆请求：唯一入口 prepare 同一条——超 15s
+        // 自动取前 15 秒，裁剪失败才红字拦截（不发起）。
+        let mut trim_note: Option<String> = None;
+        let voice_ref = match voice_ref {
+            Some(path) => match prepare_reference_for_clone(&path) {
+                Ok(prepared) => {
+                    trim_note = prepared.note;
+                    Some(prepared.path.to_string_lossy().into_owned())
+                }
+                Err(note) => {
+                    ui.set_status_text(note.into());
+                    return;
+                }
+            },
+            None => None,
+        };
         let what = if voice_ref.is_some() {
             "克隆音色"
         } else {
@@ -8444,7 +8583,14 @@ fn wire_voice_panel(
         // 试听本身也是一条 worker 命令：置 busy 让"提交即运行中"的互斥任务（配音/BGM）
         // 在试听期间也被挡住，否则它们会排在试听后面却显示成已在跑。
         ui.set_busy(true);
-        ui.set_status_text(format!("正在合成试听（{what} · {model}）…").into());
+        ui.set_status_text(
+            match trim_note {
+                // 信息提示留在状态行上（随后的"正在合成试听"会盖掉它），拼在前面。
+                Some(trimmed) => format!("{trimmed} · 正在合成试听（{what} · {model}）…"),
+                None => format!("正在合成试听（{what} · {model}）…"),
+            }
+            .into(),
+        );
         if tx
             .send(Cmd::PreviewVoice {
                 revision: st.project_revision.get(),
@@ -8487,11 +8633,11 @@ fn wire_voice_panel(
             ui.set_status_text("任务进行中：参考音暂不可改".into());
             return;
         }
-        ui.set_status_text("正在打开文件选择框（选 5–30 秒干净人声）…".into());
+        ui.set_status_text("正在打开文件选择框（选 5–15 秒干净人声）…".into());
         let msg_pick = msg_pick.clone();
         std::thread::spawn(move || {
             let pick = picker::pick_file(
-                "选择参考音频（5–30 秒干净人声）",
+                "选择参考音频（5–15 秒干净人声）",
                 "音频",
                 &["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"],
             );
@@ -8814,20 +8960,31 @@ fn wire_run(
             }
         }
         let (voice_ref, voice_ref_text) = voice_input_from_ui(&ui);
-        if let Some(path) = voice_ref.as_deref() {
-            if !Path::new(path).is_file() {
-                ui.set_status_text(
-                    format!("参考音频不存在或不可读：{path}（修正后再开始合成）").into(),
-                );
-                return;
+        // 唯一入口 prepare：超 15s 自动取前 15 秒（原文件不动，副本进 voice-trimmed），
+        // 裁剪失败才红字拦截——**发请求前**收敛到 ≤15s 的路径（不拦会把引擎进程打死，
+        // 见 prepare_reference_for_clone 的注释），不排任务、不发任何请求。
+        let mut trim_note: Option<String> = None;
+        let voice_ref = match voice_ref {
+            Some(path) => {
+                if !Path::new(&path).is_file() {
+                    ui.set_status_text(
+                        format!("参考音频不存在或不可读：{path}（修正后再开始合成）").into(),
+                    );
+                    return;
+                }
+                match prepare_reference_for_clone(&path) {
+                    Ok(prepared) => {
+                        trim_note = prepared.note;
+                        Some(prepared.path.to_string_lossy().into_owned())
+                    }
+                    Err(note) => {
+                        ui.set_status_text(note.into());
+                        return;
+                    }
+                }
             }
-            // 时长护栏：超 30s 在**发请求前**拦下（不拦会把引擎进程打死，见
-            // `reference_over_limit_note` 的注释），不排任务、不发任何请求。
-            if let Some(note) = reference_over_limit_note(path) {
-                ui.set_status_text(note.into());
-                return;
-            }
-        }
+            None => None,
+        };
         // 克隆音色缺参考文本：**发起前**拦住。发出去的话每一句都会撞同一个 500
         // （服务端原文用户看不懂，而且 N 句 = N 条一模一样的失败）。
         // 按**当前引擎**判断（audio8-tts 要、index-tts2 不要），文案与界面提示
@@ -8898,6 +9055,11 @@ fn wire_run(
         };
         // 边合成边校听（streaming-preview §3 变更点 1）：运行中已完成句随时可点行内「试听」
         note.push_str("（已完成的句子可随时点「试听」）");
+        // 超长参考音被自动裁剪的信息提示要留在状态行上（随后那句"合成中"会盖掉它）——
+        // 拼在前面，状态栏 elide 截断时丢的是尾巴。
+        if let Some(trimmed) = trim_note {
+            note = format!("{trimmed} · {note}");
+        }
         ui.set_status_text(note.into());
     });
 
@@ -11574,23 +11736,24 @@ fn refresh_voice_labels(ui: &MainWindow) {
     let exists = !ref_trimmed.is_empty() && Path::new(&ref_trimmed).is_file();
     ui.set_reference_exists(exists);
 
-    // 参考音频时长回显 + 30s 硬上限红色警告：文本与"是否超限"都在这里算好下发，
-    // slint 只显示不算（判据只有 aw_core::ref_audio 一份，别在 UI 里再造）。
+    // 参考音频时长回显：文本在这里算好下发，slint 只显示不算（判据只有
+    // aw_core::ref_audio 一份，别在 UI 里再造）。超 15 秒不再红拦——使用时会自动
+    // 取前 15 秒（prepare_reference_for_clone），这里如实回显将要发生什么。
     // 读不出时长 = fail-open（只显示"读不出"，不拦）。
-    let (duration_text, over_limit) = match non_empty(ref_trimmed.clone()) {
+    let duration_text = match non_empty(ref_trimmed.clone()) {
         Some(path) if Path::new(&path).is_file() => {
             match aw_core::reference_duration_seconds(Path::new(&path)) {
-                Some(secs) => match aw_core::reference_too_long(secs) {
-                    Some(note) => (note, true),
-                    None => (format!("参考音频时长：{secs:.1} 秒"), false),
-                },
-                None => ("参考音频时长：读不出（不影响合成）".to_string(), false),
+                Some(secs) if secs > aw_core::REFERENCE_MAX_SECONDS => format!(
+                    "参考音频时长：{secs:.1} 秒 → 将使用前 {:.0} 秒（原文件未改动）",
+                    aw_core::REFERENCE_MAX_SECONDS
+                ),
+                Some(secs) => format!("参考音频时长：{secs:.1} 秒"),
+                None => "参考音频时长：读不出（不影响合成）".to_string(),
             }
         }
-        _ => ("".to_string(), false),
+        _ => "".to_string(),
     };
     ui.set_reference_duration(duration_text.into());
-    ui.set_reference_over_limit(over_limit);
 
     // 判据算一次，UI 只消费：主按钮可用性 / 内置音色行 / 阻断提示同一份结论。
     // 参考文本那条规则由 `voice_readiness` 内部转调 main 的 `reference_text_missing`
@@ -13683,6 +13846,30 @@ mod tests {
             MAX_CHARS,
             |t| aw_core::normalize(t, &Default::default()),
         )
+    }
+
+    /// 主 crate 没有 hound，RIFF 头手写（与 tiny_silent_wav 同一套路）：
+    /// 8kHz 单声道 16bit 静音 wav，**头里声明 `seconds` 秒**，实际数据可截断
+    /// （`data_seconds` = None 时写满）——用来造"头声明超长、数据损坏"的假参考音。
+    fn test_wav_bytes(seconds: f64, data_seconds: Option<f64>) -> Vec<u8> {
+        let rate = 8_000u32;
+        let declared = (seconds * rate as f64).round() as u32 * 2;
+        let actual = (data_seconds.unwrap_or(seconds) * rate as f64).round() as u32 * 2;
+        let mut out = Vec::with_capacity(44 + actual as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + declared).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&declared.to_le_bytes());
+        out.resize(44 + actual as usize, 0);
+        out
     }
 
     // ── 音色克隆：参考文本是音色的一部分（招牌功能 D11）────────────────────
@@ -15898,40 +16085,111 @@ mod tests {
         assert_eq!(cancel.len(), 0, "取走过的登记项不能留在表里（表要有界）");
     }
 
-    /// 单句重录的时长护栏在 worker 侧（按**工程的 voice_ref** 判——那是请求的
-    /// 真实来源，UI 路径只是它当时的投影）：超 30s 参考音 → RedoDone 带回可执行
-    /// 文案、**不发任何请求**（护栏在 make_client 之前，测试不需要服务端）。
+    /// 单句重录对**工程里存着的超长 voice_ref**（UI 路径只是它当时的投影）：
+    /// 发起请求前按工程的 voice_ref 走迁移——31s 参考音被自动裁成 voice-trimmed
+    /// 里的 15s 副本、voice_ref 与新 hash 一起落盘，随后照常走到 make_client 之后
+    /// 的阶段（**没被时长拦死**）。
     ///
-    /// 阳性对照（实测过）：把 `Cmd::Redo` 分支里的护栏删掉，本用例收到的是
-    /// make_client 的"未发现服务"错误而不是时长文案，立刻红。
+    /// 工程故意给空稿（0 句）：这样无论本机有没有真服务端，都不会发出真实 HTTP
+    /// 请求——无服务时报"没有服务地址"、有服务时 redo 报"没有第 0 句"，两条都证明
+    /// 已经过了时长判据（旧护栏会在这里直接拦成时长文案）。
+    ///
+    /// 阳性对照（实测过）：把 `Cmd::Redo` 分支里的 migrate 调用删掉，本用例
+    /// 收到的 RedoDone 后工程里 voice_ref 仍是 31s 原路径 → 立刻红。
     #[test]
-    fn redo_with_overlong_reference_is_blocked_before_any_request() {
-        let root = std::env::temp_dir().join(format!("aw-redo-limit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        // 31s 真实 wav（8kHz 单声道 16bit 静音，约 0.5MB）：主 crate 没有 hound，
-        // RIFF 头手写（与 tiny_silent_wav 同一套路，时长字段 31s > 30s 上限）。
+    fn redo_migrates_overlong_reference_before_any_request() {
+        let root = temp_dir("redo-migrate");
+        // 31s 真实 wav（8kHz 单声道 16bit 静音，约 0.5MB）
         let ref_wav = root.join("ref-31s.wav");
-        {
-            let rate = 8_000u32;
-            let frames = 31 * rate;
-            let data_len = frames * 2;
-            let mut out = Vec::with_capacity(44 + data_len as usize);
-            out.extend_from_slice(b"RIFF");
-            out.extend_from_slice(&(36 + data_len).to_le_bytes());
-            out.extend_from_slice(b"WAVEfmt ");
-            out.extend_from_slice(&16u32.to_le_bytes());
-            out.extend_from_slice(&1u16.to_le_bytes());
-            out.extend_from_slice(&1u16.to_le_bytes());
-            out.extend_from_slice(&rate.to_le_bytes());
-            out.extend_from_slice(&(rate * 2).to_le_bytes());
-            out.extend_from_slice(&2u16.to_le_bytes());
-            out.extend_from_slice(&16u16.to_le_bytes());
-            out.extend_from_slice(b"data");
-            out.extend_from_slice(&data_len.to_le_bytes());
-            out.resize(44 + data_len as usize, 0);
-            std::fs::write(&ref_wav, &out).unwrap();
-        }
+        std::fs::write(&ref_wav, test_wav_bytes(31.0, None)).unwrap();
+        let project = saved_project("", Some(ref_wav.to_str().unwrap()));
+
+        // OpenProject 把工程灌进 worker（模拟启动恢复：工程里存着超长路径）
+        let (cmd_tx, cmd_rx) = channel::<Cmd>();
+        let (msg_tx, msg_rx) = channel::<WorkerMsg>();
+        let worker_root = root.clone();
+        let handle = std::thread::spawn(move || {
+            worker_loop(WorkerCtx {
+                rx: cmd_rx,
+                tx: msg_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                sep_stop: Arc::new(AtomicBool::new(false)),
+                eval_stop: Arc::new(AtomicBool::new(false)),
+                projects_root: worker_root,
+                cancel: cancel::CancelRegistry::new(),
+            })
+        });
+        cmd_tx
+            .send(Cmd::OpenProject {
+                revision: 1,
+                dir: root.clone(),
+                project,
+            })
+            .unwrap();
+        cmd_tx
+            .send(Cmd::Redo {
+                revision: 1,
+                index: 0,
+            })
+            .unwrap();
+        let m = msg_rx.recv().expect("redo 应回报终态");
+        let Msg::RedoDone { index, error } = m.msg else {
+            panic!("应是 RedoDone")
+        };
+        assert_eq!(index, 0);
+        // 两条出路都必须证明"过了时长判据"：无服务报 make_client、有服务报空稿没这句
+        let err = error.expect("空稿 redo 必须有终态错误");
+        assert!(
+            err.contains("没有服务地址") || err.contains("没有第 0 句"),
+            "必须是 make_client 之后阶段的错误（不能被时长文案拦死）：{err}"
+        );
+        assert!(
+            !err.contains("上限") && !err.contains("15 秒"),
+            "不能是时长拦截文案：{err}"
+        );
+
+        // 迁移已落盘：工程里 voice_ref 换成 voice-trimmed 的 15s 副本、hash 同步更新
+        let on_disk = aw_core::Project::load(&root).expect("迁移后工程应可读");
+        let migrated = on_disk.voice_ref.expect("迁移后仍有 voice_ref");
+        assert_ne!(
+            migrated,
+            ref_wav.to_string_lossy().into_owned(),
+            "必须换成裁剪副本，不能还是原路径"
+        );
+        assert!(
+            migrated.starts_with(voice_trimmed_dir().to_string_lossy().as_ref()),
+            "副本必须落在 voice-trimmed：{migrated}"
+        );
+        assert!(migrated.ends_with("-15s.wav"), "{migrated}");
+        let secs =
+            aw_core::reference_duration_seconds(Path::new(&migrated)).expect("副本应是合法 wav");
+        assert!(secs <= 15.0 + 1e-6, "迁移后必须 ≤15s：{secs}");
+        assert_eq!(
+            on_disk.voice_ref_hash,
+            Some(sha256_file(Path::new(&migrated)).unwrap()),
+            "hash 必须与新副本一致"
+        );
+        assert_ne!(
+            on_disk.voice_ref_hash.as_deref(),
+            Some(sha256_file(&ref_wav).unwrap().as_str()),
+            "hash 必须换成新文件的，不是旧文件的"
+        );
+
+        drop(cmd_tx);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 迁移失败（头声明超长但数据截断 → 自动裁剪读报错）必须退回红色拦截文案、
+    /// 不发任何请求，且**不落盘**（工程里仍是原路径，用户手动修好后还能再试）。
+    ///
+    /// 阳性对照：这是"自动裁剪失败才拦"的拦支——上一条用例钉迁移支，本条钉拦支，
+    /// 两条缺一不可（只绿一条说明另一条路断了）。
+    #[test]
+    fn redo_blocks_with_red_note_when_trim_fails() {
+        let root = temp_dir("redo-trim-fail");
+        let ref_wav = root.join("ref-trunc.wav");
+        std::fs::write(&ref_wav, test_wav_bytes(31.0, Some(1.0))).unwrap();
         let project = saved_project("第一句。第二句。", Some(ref_wav.to_str().unwrap()));
 
         let (cmd_tx, cmd_rx) = channel::<Cmd>();
@@ -15966,12 +16224,140 @@ mod tests {
             panic!("应是 RedoDone")
         };
         assert_eq!(index, 0);
-        let err = error.expect("超限参考音必须被拦");
-        assert!(err.contains("31"), "文案要带实际秒数：{err}");
-        assert!(err.contains("裁到 30 秒内再合成"), "文案要带动作：{err}");
+        let err = error.expect("裁剪失败必须拦");
+        assert!(
+            err.contains("31.0 秒，超过 15 秒上限"),
+            "文案要带实际秒数与上限：{err}"
+        );
+        assert!(
+            err.contains("自动取前 15 秒失败"),
+            "文案要说明自动裁剪失败：{err}"
+        );
+        assert!(err.contains("裁到 15 秒内再合成"), "文案要带动作：{err}");
+        // 迁移失败不落盘：工程文件不该被改写出来（手动修好原文件后还能再试）
+        assert!(
+            !root.join("project.json").exists(),
+            "裁剪失败不能把迁移写进工程"
+        );
+
         drop(cmd_tx);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// prepare 的应用侧行为：20s → voice-trimmed 副本 + 信息提示；10s → 原样；
+    /// 读不出 → fail-open 原样；头声明超长但数据截断 → 红色拦截文案（含原因）。
+    #[test]
+    fn prepare_trims_overlong_and_passes_short_and_unreadable() {
+        let dir = temp_dir("prepare-ref");
+
+        // 20s → 自动裁剪副本，原文件不动
+        let ref20 = dir.join("ref-20s.wav");
+        std::fs::write(&ref20, test_wav_bytes(20.0, None)).unwrap();
+        let prepared =
+            prepare_reference_for_clone(&ref20.to_string_lossy()).expect("20s 应能自动裁剪");
+        assert!(
+            prepared.path.starts_with(voice_trimmed_dir()),
+            "副本必须落在 voice-trimmed：{}",
+            prepared.path.display()
+        );
+        assert_ne!(prepared.path, ref20);
+        let note = prepared.note.expect("裁剪要有信息提示");
+        assert!(note.contains("20.0 秒 → 将使用前 15 秒"), "{note}");
+        assert!(note.contains("原文件未改动"), "{note}");
+        let secs = aw_core::reference_duration_seconds(&prepared.path).expect("副本应是合法 wav");
+        assert!((secs - 15.0).abs() < 0.01, "副本时长应约 15s：{secs}");
+        assert_eq!(
+            std::fs::metadata(&ref20).unwrap().len(),
+            44 + 20 * 8000 * 2,
+            "原文件必须原封不动"
+        );
+
+        // 10s → 原样返回
+        let ref10 = dir.join("ref-10s.wav");
+        std::fs::write(&ref10, test_wav_bytes(10.0, None)).unwrap();
+        let short = prepare_reference_for_clone(&ref10.to_string_lossy()).expect("10s 放行");
+        assert_eq!(short.path, ref10);
+        assert!(short.note.is_none(), "未裁剪就不该有提示");
+
+        // 读不出时长 → fail-open 原样
+        let garbage = dir.join("ref-garbage.mp3");
+        std::fs::write(&garbage, b"not audio").unwrap();
+        let open = prepare_reference_for_clone(&garbage.to_string_lossy())
+            .expect("读不出时长必须 fail-open");
+        assert_eq!(open.path, garbage);
+        assert!(open.note.is_none());
+
+        // 头声明 20s、数据截断 → 裁剪失败 → 红色拦截文案（含原因 + 手动建议）
+        let truncated = dir.join("ref-trunc.wav");
+        std::fs::write(&truncated, test_wav_bytes(20.0, Some(1.0))).unwrap();
+        let err =
+            prepare_reference_for_clone(&truncated.to_string_lossy()).expect_err("裁剪失败必须拦");
+        assert!(err.contains("20.0 秒，超过 15 秒上限"), "{err}");
+        assert!(err.contains("自动取前 15 秒失败"), "{err}");
+        assert!(err.contains("裁到 15 秒内再合成"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧工程迁移（load_resumable）：工程里存着超长 voice_ref → 一次性迁移为
+    /// 裁剪副本（voice_ref 与新 voice_ref_hash 都变、≤15s）并**落盘**——之后
+    /// Cmd::Redo 等直接用工程 voice_ref 的路径才不会再拿超长文件打引擎。
+    ///
+    /// 阳性对照（实测过）：去掉 load_resumable 里的 migrate 调用，本用例的
+    /// voice_ref 还是 20s 原路径 → 立刻红。
+    #[test]
+    fn load_resumable_migrates_overlong_voice_ref_and_persists() {
+        let dir = temp_dir("migrate-ref");
+        let ref20 = dir.join("ref-20s.wav");
+        std::fs::write(&ref20, test_wav_bytes(20.0, None)).unwrap();
+        let mut saved = saved_project("第一句。第二句。", Some(ref20.to_str().unwrap()));
+        saved.voice_ref_hash = Some(sha256_file(&ref20).unwrap());
+        // 第一句标记已合成：迁移后工程与输入仍匹配 ⇒ 走快路径 ⇒ 已合成句**不丢**
+        saved.sentences[0].status = "done".into();
+        saved.save(&dir).unwrap();
+
+        let loaded = load_resumable(
+            &dir,
+            "第一句。第二句。",
+            "audio8-tts",
+            Some(ref20.to_string_lossy().into_owned()),
+            None,
+            GAP_MS,
+            true,
+            &empty_dict(),
+        )
+        .expect("旧工程应能迁移");
+        assert_eq!(
+            loaded.project.sentences[0].status, "done",
+            "迁移不能破坏续作：输入与工程同源，裁剪后仍应命中复用判据（否则整轮重录）"
+        );
+
+        let migrated = loaded.project.voice_ref.expect("迁移后仍有 voice_ref");
+        assert_ne!(
+            migrated,
+            ref20.to_string_lossy().into_owned(),
+            "必须换成裁剪副本"
+        );
+        assert!(
+            migrated.starts_with(voice_trimmed_dir().to_string_lossy().as_ref()),
+            "副本必须落在 voice-trimmed：{migrated}"
+        );
+        let secs =
+            aw_core::reference_duration_seconds(Path::new(&migrated)).expect("副本应是合法 wav");
+        assert!(secs <= 15.0 + 1e-6, "迁移后必须 ≤15s：{secs}");
+        assert_eq!(
+            loaded.project.voice_ref_hash,
+            Some(sha256_file(Path::new(&migrated)).unwrap()),
+            "hash 必须与新副本一致"
+        );
+
+        // 已落盘：再读一次工程文件也是迁移后的路径（显式迁移，不是内存里顺手改）
+        let on_disk = aw_core::Project::load(&dir).expect("迁移后工程应可读");
+        assert_eq!(on_disk.voice_ref.as_deref(), Some(migrated.as_str()));
+        assert_eq!(on_disk.voice_ref_hash, loaded.project.voice_ref_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 挂死引擎（进程活着但 /health 不响应）的自愈结论必须如实报 Failed，
@@ -18926,22 +19312,20 @@ mod tests {
         );
     }
 
-    /// 参考音频时长护栏必须盖住**每个**会发克隆请求的入口。
+    /// 参考音频入口必须全部走 prepare：四个入口（开始合成 / 批量提交 / 音色试听 /
+    /// 单句重录）的**请求实际使用 ≤15s 的路径**。出现次数 = prepare 定义 +
+    /// 三个 UI 入口 + load_resumable 输入收敛 + migrate helper（Redo 走它）= 6 处。
     ///
-    /// 四个入口：开始合成（Cmd::Run 发送处）/ 批量提交（Cmd::RunBatch 发送处）/
-    /// 音色试听（Cmd::PreviewVoice 发送处）/ 单句重录（Cmd::Redo 的 worker 分支，
-    /// 唯一持有工程 voice_ref 的地方）。护栏 helper 定义 + 四个调用点 = 5 处出现。
-    ///
-    /// 阳性对照（实测过）：删掉任意一个入口的护栏 → 计数变 4 红；
-    /// 新加一个克隆请求入口而不同步加护栏 → 计数仍为 5 但发送点前的窗口扫不到
-    /// helper → 红。
+    /// 阳性对照（实测过）：删掉任意一个 UI 入口的 prepare → 计数变 5 红；
+    /// 新加一个克隆请求入口而不同步加 prepare → 计数不变但发送点前的窗口扫不到 → 红。
     #[test]
-    fn every_clone_request_entrance_is_guarded_by_reference_limit() {
+    fn every_clone_request_entrance_uses_prepared_reference() {
         let src = production_source();
         assert_eq!(
-            src.matches("reference_over_limit_note(").count(),
-            5,
-            "护栏 helper 定义 + 四个入口调用点；加/删入口必须同步加/删护栏"
+            src.matches("prepare_reference_for_clone(").count(),
+            6,
+            "prepare 定义 + 三个 UI 入口 + load_resumable 输入收敛 + migrate helper；\
+             加/删入口必须同步加/删"
         );
         for anchor in [
             ".send(Cmd::Run {",
@@ -18959,11 +19343,11 @@ mod tests {
             }
             let before = &src[start..at];
             assert!(
-                before.contains("reference_over_limit_note("),
-                "{anchor} 之前必须已经过时长护栏（在发起前拦，不拦会把引擎进程打死）"
+                before.contains("prepare_reference_for_clone("),
+                "{anchor} 之前必须已经过 prepare（在发起前收敛到 ≤15s，不收敛会把引擎进程打死）"
             );
         }
-        // Redo 的请求在 worker 侧按工程 voice_ref 发出：护栏必须在分支里、
+        // Redo 的请求在 worker 侧按工程 voice_ref 发出：迁移必须在分支里、
         // make_client 之前（那里才是不发任何请求的拦截点）。
         let redo_at = src
             .find("Cmd::Redo { revision, index } =>")
@@ -18973,8 +19357,8 @@ mod tests {
             .expect("Redo 分支里应有 make_client");
         let arm = &src[redo_at..redo_at + client_at];
         assert!(
-            arm.contains("reference_over_limit_note("),
-            "Cmd::Redo 分支必须在 make_client 之前过时长护栏"
+            arm.contains("migrate_overlong_voice_ref("),
+            "Cmd::Redo 分支必须在 make_client 之前把工程 voice_ref 收敛到 ≤15s（migrate helper）"
         );
     }
 

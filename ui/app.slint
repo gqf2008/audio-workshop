@@ -189,10 +189,9 @@ export component MainWindow inherits Window {
     // 当前引擎（模型）显示名与参考音可用性：供音色区说明内置音色来源与克隆可否试听
     in property <string> engine-label: "";
     in property <bool> reference-exists: false;
-    // 参考音频时长回显 + 30s 硬上限红色警告：文本与"是否超限"都由 Rust 的
-    // refresh_voice_labels 算好下发（判据只有 aw-core 一份），UI 只显示不算。
+    // 参考音频时长回显：文本由 Rust 的 refresh_voice_labels 算好下发（判据只有
+    // aw-core 一份），UI 只显示不算；超 15 秒显示"将使用前 15 秒"而不是红色拦截。
     in property <string> reference-duration: "";
-    in property <bool> reference-over-limit: false;
     // 引擎能力（Rust 侧唯一判据的投影，界面只消费，不重拼条件）：
     in property <bool> engine-requires-voice-ref: false;  // 该引擎硬要求参考音
     in property <bool> engine-requires-reference-text: false;  // 克隆路径硬要求参考文本
@@ -555,7 +554,6 @@ export component MainWindow inherits Window {
                     voice-ref-text-busy: root.voice-ref-text-busy;
                     reference-exists: root.reference-exists;
                     reference-duration: root.reference-duration;
-                    reference-over-limit: root.reference-over-limit;
                     show-voice <=> root.dub-voice;
                     change-voice => { root.dub-voice = !root.dub-voice; }
                     engine-changed => { root.model-changed(); }
@@ -666,7 +664,6 @@ export component MainWindow inherits Window {
                     reference-text-status: root.voice-ref-text-status;
                     engine-requires-reference-text: root.engine-requires-reference-text;
                     reference-duration: root.reference-duration;
-                    reference-over-limit: root.reference-over-limit;
                     transcribing: root.voice-ref-text-busy;
                     busy: root.busy || root.running;
                     design-text <=> root.design-text;

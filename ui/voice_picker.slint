@@ -101,10 +101,9 @@ export component VoicePanel inherits Rectangle {
     in property <bool> transcribing: false;
     in property <bool> busy: false;
     in property <bool> reference-exists: false;
-    // 参考音频时长回显 + 30s 硬上限红色警告：文本与"是否超限"都由 Rust 的
-    // refresh_voice_labels 算好下发（判据只有 aw-core 一份），这里只显示不算。
+    // 参考音频时长回显：文本由 Rust 的 refresh_voice_labels 算好下发（判据只有
+    // aw-core 一份），这里只显示不算；超 15 秒显示"将使用前 15 秒"而不是红色拦截。
     in property <string> reference-duration: "";
-    in property <bool> reference-over-limit: false;
     // 当前引擎是否硬要求参考音（index-tts2）：true 时内置默认音色行不可用，
     // 文案也说清"必须提供参考音频"——不再对任何引擎都写"免参考音，开箱可用"。
     in property <bool> engine-requires-voice-ref: false;
@@ -184,7 +183,7 @@ export component VoicePanel inherits Rectangle {
         //    所以不放"使用"按钮（放了也必然恒禁，等于死按钮）。
         VoiceOptionRow {
             title: "参考音频克隆";
-            detail: "用一段 5–30 秒干净人声克隆成你的音色（填下面路径即切换）";
+            detail: "用一段 5–15 秒干净人声克隆成你的音色（填下面路径即切换）";
             current: root.cloning;
             enabled: !root.busy && root.reference-path != "";
             show-apply: false;
@@ -211,7 +210,7 @@ export component VoicePanel inherits Rectangle {
             PixelButton {
                 width: 70px;
                 text: "选择…";
-                Tooltip { text: @markdown("从系统文件框选一段参考音频（5–30 秒干净人声）"); }
+                Tooltip { text: @markdown("从系统文件框选一段参考音频（5–15 秒干净人声）"); }
                 enabled: !root.busy;
                 clicked => { root.reference-pick(); }
             }
@@ -270,10 +269,10 @@ export component VoicePanel inherits Rectangle {
                 wrap: word-wrap;
             }
             if root.reference-duration != "" : Text {
-                // 时长回显；超 30s 硬上限时同一条文本就是可执行警告（红色），
-                // 内容由 Rust 侧用 aw-core 的唯一判据生成。
+                // 时长回显；超 15 秒时同一条文本告知"将自动取前 15 秒"（非拦截，
+                // 不红色示警），内容由 Rust 侧用 aw-core 的唯一判据生成。
                 text: root.reference-duration;
-                color: root.reference-over-limit ? PixelTheme.danger : PixelTheme.dim;
+                color: PixelTheme.dim;
                 font-size: 11px;
                 wrap: word-wrap;
             }

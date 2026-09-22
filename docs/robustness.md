@@ -103,14 +103,35 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
 
 ### 本批应用侧护栏（上游修好之前用户不能再踩）
 
-- `aw_core::ref_audio`：时长读取（wav 读 RIFF 头 / 非 wav symphonia 探测，
-  读不出 **fail-open**）+ 纯判据 `reference_too_long`（30s 硬上限，文案含实际秒数 +
-  「裁到 30 秒内再合成」+ 为什么）；
-- 四个会发克隆请求的入口（开始合成 / 批量提交 / 单句重录 / 音色试听）在**发起前**
-  拦，不发请求；UI 选中参考音频后显示时长、超限红色警告（配音页 + 音色设计 Tab）；
-- 单测：20s 放行 / 192.9s 拦截 / 读不出 fail-open / Redo 入口不发请求
-  （`aw_core` `ref_audio::tests` + main 的
-  `redo_with_overlong_reference_is_blocked_before_any_request`）；
+第一批（30s 硬上限）在四个克隆入口拦死超长参考音；本批
+（thread cc-ai-audio-workshop-ref-limit-15s）把上限收紧到 15s 并改为**自动取前
+15 秒**——原文件不动，应用生成一份本地 wav 副本用于克隆，裁剪失败才退回红色拦截
+文案（15s 上限 + 手动处理建议 + 自动裁剪失败原因）。
+
+- `aw_core::ref_audio`：时长读取（wav 读 RIFF 头 / 非 wav symphonia 探测，读不出
+  **fail-open**）+ 纯判据 `reference_too_long`（15s 上限，文案含实际秒数 +
+  「裁到 15 秒内再合成」+ 为什么）+ `trim_reference_first_seconds`（wav 逐帧拷贝
+  保留原规格 / 非 wav symphonia 解码成 s16le；原子写：临时文件 + fsync + rename，
+  失败不留半截；副本名 `<slug>-<hash8(规范路径|size|mtime)>-15s.wav`，同一源稳定
+  复用、源更新不误用旧副本；源 ≤15s 直接返回源路径）；
+- 四个会发克隆请求的入口（开始合成 / 批量提交 / 单句重录 / 音色试听）都用
+  `prepare_reference_for_clone` 返回的路径发起——**请求实际使用 ≤15s 的路径**；
+  裁剪成功时状态行给信息提示「参考音频 192.9 秒 → 将使用前 15 秒（原文件未改动）」；
+- 旧工程**显式迁移**：工程里存着的超长 `voice_ref`（例如 192.9s 真机打崩引擎那条）
+  在加载/重录时一次性迁移为 `~/Documents/音频作坊/voice-trimmed/` 下的裁剪副本，
+  `voice_ref` 与新 `voice_ref_hash` 一起更新并落盘——否则 `Cmd::Redo` 这类由 worker
+  直接用工程 voice_ref 的路径仍会拿超长文件打引擎；
+- UI 选中参考音频后显示时长，超 15 秒显示「→ 将使用前 15 秒（原文件未改动）」（不再
+  红色警告——自动裁剪不是错误态）；
+- 单测：10s/15.0s 放行 / 15.01s 拦 / 读不出 fail-open / wav 20s 裁出 15s 且规格不变
+  / wav 10s 返回原路径 / 非 wav flac 真解码裁剪 / 坏文件 Err 且不留 `.tmp` /
+  15.0 放行、15.01 裁剪到 15 / 同一源稳定复用、源更新产新副本
+  （`aw_core` `ref_audio::tests`）+ main 的 prepare 与旧工程迁移
+  （`prepare_trims_overlong_and_passes_short_and_unreadable` /
+  `load_resumable_migrates_overlong_voice_ref_and_persists` /
+  `redo_migrates_overlong_reference_before_any_request` /
+  `redo_blocks_with_red_note_when_trim_fails`，源码守卫
+  `every_clone_request_entrance_uses_prepared_reference`）；
 - 配套（同批 `fix(engine)`）：托管引擎周期健康检查 + 节流自愈（崩溃后 30s 内自动重拉，
   显式地址不碰）；`server.json` 的 `min_free_memory_mb` 从 0 改为 1024
   （与 schema §1 第 19 行同口径）。

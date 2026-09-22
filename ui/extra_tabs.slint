@@ -17,9 +17,8 @@ export component VoiceDesignTab inherits Rectangle {
     /// index-tts2 不要文本）
     in-out property <string> reference-text: "";
     in property <string> reference-text-status: "";
-    /// 参考音频时长回显与 30s 硬上限红色警告（Rust 算好下发，本 Tab 只显示不算）
+    /// 参考音频时长回显（Rust 算好下发，本 Tab 只显示不算；超 15 秒显示"将使用前 15 秒"）
     in property <string> reference-duration: "";
-    in property <bool> reference-over-limit: false;
     /// 该引擎的克隆路径是否**必须**给参考文本（audio8-tts 要、index-tts2 不要）——
     /// 与配音页共用同一份能力来源（app 透传），红色告警只属于「必填引擎缺文本」。
     in property <bool> engine-requires-reference-text: false;
@@ -111,7 +110,7 @@ export component VoiceDesignTab inherits Rectangle {
                             }
                         }
                         Text {
-                            text: "选一段 5–30 秒干净人声（无背景音乐）。本机用它克隆音色，逐句配音时无需联网。";
+                            text: "选一段 5–15 秒干净人声（无背景音乐）。本机用它克隆音色，逐句配音时无需联网。";
                             color: PixelTheme.dim;
                             font-size: 12px;
                             wrap: word-wrap;
@@ -160,10 +159,10 @@ export component VoiceDesignTab inherits Rectangle {
                             wrap: word-wrap;
                         }
                         if root.reference-duration != "" : Text {
-                            // 时长回显；超 30s 硬上限时同一条文本就是可执行警告（红色），
+                            // 时长回显；超 15 秒时同一条文本告知"将自动取前 15 秒"（非拦截），
                             // 内容由 Rust 侧用 aw-core 的唯一判据生成。
                             text: root.reference-duration;
-                            color: root.reference-over-limit ? PixelTheme.danger : PixelTheme.dim;
+                            color: PixelTheme.dim;
                             font-size: 11px;
                             wrap: word-wrap;
                         }

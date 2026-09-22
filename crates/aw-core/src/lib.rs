@@ -7,7 +7,7 @@
 //! - [`bgm`]：BGM 生成 / 时长对齐 / ducking / 三轨导出
 //! - [`song`]：yue2 / ace-step 文生歌与 sheetsage2 翻唱链路
 //! - [`eval`]：质检（ASR 回读可懂度 + 首个差异定位；口径与 CHARTER M0 一致）
-//! - [`ref_audio`]：参考音频时长读取 + 30s 硬上限判据（克隆请求的前置护栏）
+//! - [`ref_audio`]：参考音频时长读取 + 15s 上限判据 + 超长自动取前 15 秒（克隆请求的前置护栏）
 
 pub mod audio_client;
 pub mod bgm;
@@ -33,7 +33,8 @@ pub use dub::{
 };
 pub use eval::{diff_snippet, intelligibility, Intelligibility};
 pub use ref_audio::{
-    reference_duration_seconds, reference_over_limit, reference_too_long, REFERENCE_MAX_SECONDS,
+    reference_duration_seconds, reference_over_limit, reference_too_long,
+    trim_reference_first_seconds, REFERENCE_MAX_SECONDS,
 };
 pub use separate::{
     separate_tracks, Progress as SeparationProgress, SeparatedTracks, SeparationOutcome,
