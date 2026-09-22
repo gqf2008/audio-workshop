@@ -334,10 +334,15 @@ fn build_synth_request(text: &str, seed: Option<u64>, source: VoiceSource<'_>) -
     let mut request = json!({ "text": text, "options": Value::Object(options) });
     if let VoiceSource::Clone(c) = source {
         request["voice_ref"] = json!(c.path());
+        // 裁剪副本带「参考文本旁车」时**以旁车为准**：v0.1.10 只裁音频不同步文本，
+        // 192.9s→15s 后音频只念了前 84 字、却把工程里 1077 字全文发过去，
+        // audio8-tts 克隆出完全不对的声音（用户实测）。旁车只在裁剪时写。
+        let paired = crate::ref_audio::paired_reference_text(std::path::Path::new(c.path()));
+        let text = paired.as_deref().unwrap_or_else(|| c.reference_text());
         // 参考文本**按引擎可选**：空文本连字段都不发（发空串与"没给"不是一回事，
         // audio8-tts 会拒；index-tts2 只给 voice_ref 就 200，真机实测）。
-        if !c.reference_text().trim().is_empty() {
-            request["reference_text"] = json!(c.reference_text());
+        if !text.trim().is_empty() {
+            request["reference_text"] = json!(text);
         }
     }
     request
@@ -644,6 +649,37 @@ mod tests {
         assert_eq!(with_ref["voice_ref"], json!("/tmp/ref.wav"));
         assert_eq!(with_ref["reference_text"], json!("参考音念的内容"));
         assert!(with_ref["options"].as_object().unwrap().is_empty());
+    }
+
+    /// 裁剪副本带旁车时，请求里的 `reference_text` 必须以旁车为准——工程里的文本
+    /// 可能还是原全文（v0.1.10 只裁音频不同步文本：84 字音频配 1077 字文本，克隆声音
+    /// 完全不对）。没旁车时必须原样使用传入文本（≤15s 的正常路径不受影响）。
+    #[test]
+    fn synth_request_prefers_paired_reference_text_for_trimmed_copy() {
+        let dir =
+            std::env::temp_dir().join(format!("aw-reftext-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trimmed = dir.join("ref-15s.wav");
+        std::fs::write(&trimmed, b"x").unwrap();
+        crate::ref_audio::write_reference_text_sidecar(&trimmed, "裁剪段的真实台词。").unwrap();
+        let clone = VoiceClone::new(trimmed.to_str().unwrap(), "工程里的长全文").unwrap();
+        let body = build_synth_request("要合成的句子", None, VoiceSource::Clone(clone));
+        assert_eq!(
+            body["reference_text"],
+            json!("裁剪段的真实台词。"),
+            "有旁车时必须用旁车文本（与裁剪音频匹配）"
+        );
+
+        let plain = dir.join("ref-plain.wav");
+        std::fs::write(&plain, b"x").unwrap();
+        let clone2 = VoiceClone::new(plain.to_str().unwrap(), "原样文本").unwrap();
+        let body2 = build_synth_request("句子", None, VoiceSource::Clone(clone2));
+        assert_eq!(
+            body2["reference_text"],
+            json!("原样文本"),
+            "没旁车时不得改变行为"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 三种音色来源各只有自己的字段：内置两不沾、克隆成对、设计只发 instruction。
