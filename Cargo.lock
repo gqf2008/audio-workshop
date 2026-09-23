@@ -1891,7 +1891,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.20",
- "windows 0.62.2",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -3894,7 +3894,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -5036,7 +5036,8 @@ dependencies = [
 [[package]]
 name = "slint-pixel"
 version = "0.2.3"
-source = "git+https://github.com/gqf2008/slint-pixel?rev=63b34c4d58d675db2c4c7d63eb8552a6cc993dd4#63b34c4d58d675db2c4c7d63eb8552a6cc993dd4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b90733ae47b792c05f99deefbff8de2ab919f4f472120c7e0ed32852b11ca6"
 dependencies = [
  "image",
  "raw-window-handle",
