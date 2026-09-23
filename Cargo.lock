@@ -475,6 +475,7 @@ dependencies = [
  "dirs",
  "embed-resource",
  "fontique",
+ "i-slint-backend-testing",
  "libc",
  "rodio",
  "serde",

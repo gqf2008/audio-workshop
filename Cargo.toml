@@ -48,6 +48,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
 ] }
 
+[dev-dependencies]
+# 无头 UI 行为守卫（tests/macos_first_click.rs）：用 Slint testing backend 注入点击/按键，
+# 不连真实显示后端。
+i-slint-backend-testing = "1.18"
+
 [build-dependencies]
 slint-build = "1.18"
 # build.rs 需要 slint_pixel::library_paths() 注册 `@slint_pixel` 库路径。
