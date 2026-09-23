@@ -54,6 +54,9 @@ export component MainWindow inherits Window {
 
     // ── 五个主 Tab（首屏常驻） ──
     in-out property <int> scene: 0;
+    /// 窗口级键盘焦点是否落在 keyboard-scope 上（快捷键没反应时先看这条；
+    /// 也是 tests/macos_first_click.rs 的判据——它在最上层时会抢走第一次点击）。
+    out property <bool> keyboard-focus: keyboard-scope.has-focus;
     in property <[string]> scenes: ["配音", "BGM", "人声分离", "音乐制作", "音色设计"];
 
     // ── 右侧抽屉（工程 / 视图 / 音色细节 / 任务 / 导出）：默认收起 ──
@@ -380,6 +383,54 @@ export component MainWindow inherits Window {
         PixelTheme.primary-border-width = 1px;
     }
     changed theme-scheme => { PixelTheme.scheme = root.theme-scheme; }
+
+    // 键盘：↑/↓ 选句、空格 播放/停止；配音 Tab 下 V 开音色选择器、Esc 关闭。
+    // 焦点在输入框里时按键归输入框（输入框自己 focus()），这是预期行为。
+    //
+    // ⚠ 顺序是契约：**必须声明成窗口内容之前（即最底层）**。Slint 的 FocusScope 在
+    // `focus-on-click`（默认 true）下只要自己还没有焦点，就会把「左键按下」这一下
+    // **接受走**（拿键盘焦点，EventAccepted，不再向下派发）——它又铺满窗口且原本
+    // 声明在最后＝最上层，于是**第一次点击被它吃掉**：目标控件只收到松开、没有按下，
+    // `clicked` 不触发 —— 表现就是「Tab / 按钮要点两次」，且只在窗口刚激活的那一下。
+    // 放到最底层后：可点控件先拿到按下（不再被吞），只有点空白处才会把焦点交给它。
+    // 启动时主动 focus()，保证不点任何东西也能用快捷键。
+    keyboard-scope := FocusScope {
+        width: root.width;
+        height: root.height;
+        focus-on-click: true;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            // Esc 的优先序：全局设置卡片 → 音色区（与 interaction-spec 的"Esc 关闭抽屉"一致）
+            if (event.text == Key.Escape && root.drawer-open) {
+                root.drawer-open = false;
+                return accept;
+            }
+            if (event.text == Key.Escape && root.dub-voice) {
+                root.dub-voice = false;
+                return accept;
+            }
+            if (event.text == Key.UpArrow || event.text == Key.V) {
+                if (event.text == Key.V) {
+                    if (root.scene == 0) {
+                        root.dub-voice = !root.dub-voice;
+                        return accept;
+                    }
+                    return reject;
+                }
+                root.key-prev();
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.key-next();
+                return accept;
+            }
+            if (event.text == Key.Space) {
+                root.key-toggle();
+                return accept;
+            }
+            return reject;
+        }
+    }
 
     // ═══ 根：贴窗口的 2px 纯黑描边 + 10px 圆角（参考 ../abb） ═══
     Rectangle {
@@ -776,6 +827,11 @@ export component MainWindow inherits Window {
             background: #00000080;
             TouchArea {
                 width: 100%; height: 100%;
+                // 点遮罩 = 关抽屉；顺手把窗口级键盘焦点交回 keyboard-scope，
+                // 否则焦点留在输入框里时 Esc 不再归窗口（见 keyboard-scope 的说明）
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) { keyboard-scope.focus(); }
+                }
                 clicked => { root.drawer-open = false; }
             }
         }
@@ -794,7 +850,13 @@ export component MainWindow inherits Window {
 
             // 面板空白区自己吃掉点击：否则点击按钮边缘时会穿到下面的遮罩，
             // 第一次点击被当成“关闭抽屉”，看起来像按钮要点两次。
-            TouchArea { width: 100%; height: 100%; }
+            // 同样在这里把键盘焦点交回窗口级 FocusScope（Esc 关层不受"刚点过输入框"影响）。
+            TouchArea {
+                width: 100%; height: 100%;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) { keyboard-scope.focus(); }
+                }
+            }
 
             VerticalLayout {
                 padding: 16px;
@@ -1179,44 +1241,6 @@ export component MainWindow inherits Window {
         width: 100%; height: 100%;
 
         begin-resize(dir) => { root.begin-resize(dir); }
-    }
-
-    // 键盘：↑/↓ 选句、空格 播放/停止；配音 Tab 下 V 开音色选择器、Esc 关闭。
-    // FocusScope 不抢鼠标（无 TouchArea），焦点在输入框里时按键归输入框，这是预期行为。
-    FocusScope {
-        width: root.width;
-        height: root.height;
-        key-pressed(event) => {
-            // Esc 的优先序：全局设置卡片 → 音色区（与 interaction-spec 的"Esc 关闭抽屉"一致）
-            if (event.text == Key.Escape && root.drawer-open) {
-                root.drawer-open = false;
-                return accept;
-            }
-            if (event.text == Key.Escape && root.dub-voice) {
-                root.dub-voice = false;
-                return accept;
-            }
-            if (event.text == Key.UpArrow || event.text == Key.V) {
-                if (event.text == Key.V) {
-                    if (root.scene == 0) {
-                        root.dub-voice = !root.dub-voice;
-                        return accept;
-                    }
-                    return reject;
-                }
-                root.key-prev();
-                return accept;
-            }
-            if (event.text == Key.DownArrow) {
-                root.key-next();
-                return accept;
-            }
-            if (event.text == Key.Space) {
-                root.key-toggle();
-                return accept;
-            }
-            return reject;
-        }
     }
 
     // 右下角通知（导出提示等）：用 if 控制实例化，保证每次弹出都是干净状态
