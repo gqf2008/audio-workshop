@@ -118,6 +118,15 @@ mkdir -p "${OUT_DIR}"
 python3 - "${TARBALL}" "${OUT_DIR}" "${BIN_NAME}" <<'PY'
 import os, re, sys, tarfile, zipfile
 
+# Windows：Git Bash 里拉起的 python 的 stdout 是 cp1252，打印中文/"✅" 会
+# UnicodeEncodeError 把整个打包打断（2026-09-24 release 流水线 Windows job 实测）。
+# 显式设成 UTF-8 —— bash 侧输出本来就是 UTF-8 字节，日志也按 UTF-8 解码。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 tarball, out_dir, bin_name = sys.argv[1], sys.argv[2], sys.argv[3]
 want = {bin_name, "LICENSE"}
 runtime_re = re.compile(r"^(lib.*\.so(\.\d+)*|.*\.dll|.*\.dylib)$", re.IGNORECASE)
