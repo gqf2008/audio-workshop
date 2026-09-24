@@ -1,6 +1,6 @@
 [package]
 name = "audio-workshop"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 license = "Apache-2.0"
 description = "音频作坊：本地优先的音频工作台（配音 / BGM / 歌曲），配音先行"
