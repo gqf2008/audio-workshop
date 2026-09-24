@@ -317,12 +317,25 @@ def _fake_size(url: str) -> int:
     return 1024
 
 
-class DeclaredWeightsGuardTests(unittest.TestCase):
-    """挑中的包必须覆盖 schema 声明的权重，覆盖不了就 no-source（**不猜**）。
+class DeclaredWeightsComposeTests(unittest.TestCase):
+    """schema 声明的权重必须能在 `entry` 里凑齐。
 
     依据：应用只下载 `entry`（`src/model_sources.rs` 不读 `aux_files`），所以
-    "一个包凑不齐产品要加载的文件" = 用户下完也用不了 —— 这种情况必须如实标没有源。
+    "凑不齐产品要加载的文件" = 用户下完也用不了。yue2 是真实例子：主权重与 vae 分属两个包。
+
+    跨包组出来的条目是**多文件**的，而 app 今天只认单文件入口（
+    `usable_builtin_package` 要求 `files.len()==1`）—— 所以整条能力挂在
+    `gen.APP_SUPPORTS_MULTI_FILE_ENTRY` 后面：默认 False（如实 no-source + 写明阻塞点），
+    开关打开才组条目。两侧都要有用例，免得开关悄悄失效。
     """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_flag = gen.APP_SUPPORTS_MULTI_FILE_ENTRY
+        self.addCleanup(self._restore_flag)
+
+    def _restore_flag(self):
+        gen.APP_SUPPORTS_MULTI_FILE_ENTRY = self._saved_flag
 
     def _model(self, schema_model, specs):
         by_path, by_dir = gen.package_local_index(specs)
@@ -370,13 +383,47 @@ class DeclaredWeightsGuardTests(unittest.TestCase):
             },
         }
         m = self._model(schema_model, {"yue2": spec})
-        self.assertEqual(m["status"], "no-source", "覆盖不了就不能标 downloadable")
-        self.assertIsNone(m["entry"], "不覆盖就不许给下载入口")
-        self.assertIn("yue2-3b-q4_0.gguf", m["note"], m["note"])
+        # 默认（app 还不支持多文件入口）：如实 no-source，并把真阻塞点写进 note
+        self.assertEqual(m["status"], "no-source", "开关关着时不许给出点不动的入口")
+        self.assertIsNone(m["entry"])
+        self.assertIn("多文件入口", m["note"], m["note"])
+        self.assertIn("yue2-vae-f16.gguf", m["note"], m["note"])
+
+        # 开关打开（= app 侧支持多文件入口之后）：主包取最早声明键命中的那个，vae 跨包补齐
+        gen.APP_SUPPORTS_MULTI_FILE_ENTRY = True
+        m = self._model(schema_model, {"yue2": spec})
+        self.assertEqual(m["status"], "downloadable")
+        self.assertEqual(m["entry"]["id"], "yue2_main_q4_0", m["note"])
+        self.assertEqual(m["entry"]["composed_from"], ["yue2_main_q4_0", "yue2_vae_f16"])
+        names = [p.rsplit("/", 1)[-1] for p in m["entry"]["local_paths"]]
+        self.assertIn("yue2-3b-q4_0.gguf", names)
+        self.assertIn("yue2-vae-f16.gguf", names)
+        urls = [f["url"] for f in m["entry"]["files"]]
+        self.assertEqual(len(urls), len(set(urls)), "跨包补齐必须按 URL 去重")
+        self.assertIn("跨包补齐", m["note"])
+
+    def test_declared_weight_without_unique_source_is_no_source(self):
+        """声明了但没有任何候选包提供它 → fail closed（no-source），绝不猜 URL。"""
+        spec = _dir_spec(
+            "yue2",
+            [_pkg("yue2_main_q4_0", "q4_0", "Yue2-3B-GGUF", ["yue2-3b-q4_0.gguf"])],
+        )
+        schema_model = {
+            "family": "yue2",
+            "path": "${models_root}/Yue2-3B-GGUF",
+            "session_options": {
+                "yue2.model_gguf": "yue2-3b-q4_0.gguf",
+                "yue2.vae_gguf": "yue2-vae-f16.gguf",  # 上游没有这个包
+            },
+        }
+        gen.APP_SUPPORTS_MULTI_FILE_ENTRY = True
+        m = self._model(schema_model, {"yue2": spec})
+        self.assertEqual(m["status"], "no-source")
+        self.assertIsNone(m["entry"])
         self.assertIn("yue2-vae-f16.gguf", m["note"], m["note"])
 
     def test_dir_match_covering_declared_weight_is_downloadable(self):
-        """阳性对照：声明的权重就在挑中的包里 → 照旧 downloadable（守卫不误伤）。"""
+        """阳性对照：声明的权重就在挑中的包里 → downloadable 且**不发生**跨包补齐。"""
         spec = _dir_spec(
             "yue2",
             [
@@ -396,6 +443,22 @@ class DeclaredWeightsGuardTests(unittest.TestCase):
         m = self._model(schema_model, {"yue2": spec})
         self.assertEqual(m["status"], "downloadable")
         self.assertEqual(m["entry"]["id"], "yue2_only")
+        self.assertNotIn("composed_from", m["entry"], "单包就够时不该出现跨包来源")
+
+    def test_without_declared_weights_keeps_single_package_fallback(self):
+        """回归对照：schema 没声明本目录权重时，维持原来的单包口径（q8_0 优先）。"""
+        spec = _dir_spec(
+            "gen",
+            [
+                _pkg("m_q4_0", "q4_0", "M-GGUF", ["m-q4_0.gguf"]),
+                _pkg("m_q8_0", "q8_0", "M-GGUF", ["m-q8_0.gguf"]),
+            ],
+        )
+        schema_model = {"family": "gen", "path": "${models_root}/M-GGUF"}
+        m = self._model(schema_model, {"gen": spec})
+        self.assertEqual(m["status"], "downloadable")
+        self.assertEqual(m["entry"]["id"], "m_q8_0", "无声明时仍按 q8_0 兜底")
+        self.assertNotIn("composed_from", m["entry"])
 
     def test_aux_weight_from_another_family_does_not_block(self):
         """别的 family 的辅助权重（qwen3-asr 形态）不算在内：本模型照样 downloadable。"""

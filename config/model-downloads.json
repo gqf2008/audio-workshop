@@ -2269,7 +2269,7 @@
       "entry": null,
       "family": "yue2",
       "id": "yue2",
-      "note": "落点选中 yue2_main_q8_0，但它覆盖不了 schema 声明的权重（缺 yue2-3b-q4_0.gguf、yue2-vae-f16.gguf）—— 没有任何单个上游包能凑齐产品要加载的文件，按「不猜地址」处置：标 no-source —— 暂无下载入口，不猜地址",
+      "note": "选中 yue2_main_q8_0，但它覆盖不了 schema 声明的权重（缺 yue2-3b-q4_0.gguf、yue2-vae-f16.gguf）；跨包组条目需要 app 侧支持**多文件入口**（`usable_builtin_package` 今天只认单文件包）—— 按「不猜地址」标 no-source —— 暂无下载入口，不猜地址",
       "packages": [
         {
           "bytes": 4266763861,

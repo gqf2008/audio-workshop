@@ -1407,7 +1407,7 @@ mod tests {
             "入口应是上游那个单文件包"
         );
 
-        // 0.1B 变体、yue2（没有单包能凑齐 schema 声明的权重）：如实标"没有源"，且不给 URL
+        // 0.1B 变体（上游没有对应包）与 yue2：如实标"没有源"，且不给 URL
         for id in ["audio8-tts-01b", "audio8-tts-01b-stream", "yue2"] {
             let m = by_id[id];
             assert_eq!(m.status, "no-source", "{id} 应标 no-source");
@@ -1418,9 +1418,11 @@ mod tests {
             by_id["audio8-asr"].status, "no-source",
             "上游明确不发布它的 GGUF"
         );
+        // yue2 的原因必须写清**真阻塞点**：跨包组条目是多文件的，而 app 只认单文件入口
+        // （2026-09-25：生成器已能跨包组条目，但挂在 APP_SUPPORTS_MULTI_FILE_ENTRY 后面）。
         assert!(
-            by_id["yue2"].note.contains("覆盖不了 schema 声明的权重"),
-            "yue2 的原因必须写清是「条目覆盖不了声明」而不是泛泛的没有源：{}",
+            by_id["yue2"].note.contains("多文件入口"),
+            "yue2 的 note 要写明阻塞点是 app 不支持多文件入口：{}",
             by_id["yue2"].note
         );
 
@@ -1448,34 +1450,48 @@ mod tests {
                 "{}：URL 必须 https：{url}",
                 m.id
             );
-            assert!(pkg.files.len() == 1, "{}：本批只给单文件包下载入口", m.id);
+            assert!(!pkg.files.is_empty(), "{}：入口至少要有一个文件", m.id);
         }
 
-        // 本批验收点：真实清单的 10 条下载入口全部带 per-file sha256（64 位十六进制）——
+        // 验收点：真实清单的 10 条入口**权重文件**都带 per-file sha256（64 位十六进制）——
         // 缺失 = 那条下载会静默退化成"只对长度"（同大小的旧权重查不出来）。
+        // 2026-09-25 起入口可能是**跨包组**的（yue2 = 主权重 + vae + sidecars）：sidecar 这类
+        // 非 LFS 小文件本来就没有 lfs.oid（生成器如实留 null），所以判据落在"至少一个权重文件带
+        // sha256，且凡带了的必须是 64 位十六进制"。
         let entries: Vec<&Package> = c.models.iter().filter_map(|m| m.entry.as_ref()).collect();
         assert_eq!(entries.len(), 10, "随包清单的下载入口数量变了，同步本用例");
         for pkg in entries {
-            let sha = pkg.files[0].sha256.as_deref().unwrap_or("");
-            assert_eq!(
-                sha.len(),
-                64,
-                "{}：per-file sha256 缺失或不是 64 位",
-                pkg.id
-            );
+            let with_sha: Vec<&str> = pkg
+                .files
+                .iter()
+                .filter_map(|f| f.sha256.as_deref())
+                .collect();
             assert!(
-                sha.chars().all(|c| c.is_ascii_hexdigit()),
-                "{}：sha256 必须是十六进制：{sha}",
+                !with_sha.is_empty(),
+                "{}：入口至少要有一个带 sha256 的权重文件",
                 pkg.id
             );
+            for sha in with_sha {
+                assert_eq!(
+                    sha.len(),
+                    64,
+                    "{}：per-file sha256 不是 64 位：{sha}",
+                    pkg.id
+                );
+                assert!(
+                    sha.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{}：sha256 必须是十六进制：{sha}",
+                    pkg.id
+                );
+            }
         }
     }
 
     /// 真实 14 个产品模型的规划结果：**10 个有入口、4 个如实标没有源**。
     ///
-    /// 2026-09-24 清单刷新后：sheetsage2 由"没有源"变成有入口（上游补了 original-dtype 单文件包）；
-    /// yue2 仍是"没有源"——上游新增了 5 个包，但没有单个包能凑齐 schema 声明的
-    /// q4_0 主权重 + vae f16（生成器按"覆盖不了就不猜"标 no-source）。
+    /// 2026-09-24 清单刷新：sheetsage2 由"没有源"变成有入口（上游补了 original-dtype 单文件包）。
+    /// yue2 仍是"没有源"：它的两件权重分属两个上游包（跨包组条目 = 多文件），
+    /// 而 app 的下载入口今天只支持单文件包 —— 生成器把这条能力挂在开关后面，等 app 侧先落地。
     #[test]
     fn plan_for_the_real_machine_counts_ten_with_entry_and_four_without() {
         let c = catalog().unwrap();
