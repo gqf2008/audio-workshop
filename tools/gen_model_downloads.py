@@ -764,8 +764,8 @@ def build_model(
             if missing:
                 why = (
                     f"选中 {entry['id']}，但它覆盖不了 schema 声明的权重"
-                    f"（缺 {'、'.join(missing)}）；跨包组条目需要 app 侧支持**多文件入口**"
-                    "（`usable_builtin_package` 今天只认单文件包）—— 按「不猜地址」标 no-source"
+                    f"（缺 {'、'.join(missing)}）；跨包组条目需要 app 侧的**多文件入口**支持"
+                    "（本开关关掉时就是这条回退路径）—— 按「不猜地址」标 no-source"
                 )
                 entry = None
     if entry is not None:

@@ -3205,6 +3205,8 @@ fn download_row_for(
     } else {
         None
     };
+    // 盘上已经齐了（重启后没有任何内存快照）→ 如实说"已就位"，别因为"没快照"就报未下载。
+    let all_on_disk = m.files.iter().all(|f| f.dest.exists());
     let (state_text, base, progress, active) = match latest {
         Some(snap) => {
             let downloading = matches!(
@@ -3238,9 +3240,17 @@ fn download_row_for(
                 !snap.state.is_terminal(),
             )
         }
-        None if m.primary().dest.exists() => (
+        None if all_on_disk => (
             "已就位".to_string(),
-            m.primary().dest.display().to_string(),
+            if m.files.len() > 1 {
+                format!(
+                    "{} 个文件都在盘上 · 主文件 {}",
+                    m.files.len(),
+                    m.primary().dest.display()
+                )
+            } else {
+                m.primary().dest.display().to_string()
+            },
             1.0,
             false,
         ),
@@ -3251,7 +3261,7 @@ fn download_row_for(
             false,
         ),
     };
-    let (state_text, base, progress, active) = if m.files.len() > 1 {
+    let (state_text, base, progress, active) = if m.files.len() > 1 && !snaps.is_empty() {
         aggregate_files(m, snaps)
     } else {
         (state_text, base, progress, active)
@@ -3492,8 +3502,40 @@ fn latest_snapshots_for<'a>(
     all: &'a [download::Snapshot],
 ) -> Vec<&'a download::Snapshot> {
     m.dests()
-        .filter_map(|dest| all.iter().filter(|s| &s.dest == dest).max_by_key(|s| s.id))
+        .filter_map(|dest| {
+            all.iter()
+                // 只认**本模型自己**排的任务：不同模型可能共享同一落点
+                // （audio8-tts 与 audio8-tts-stream 指向同一份权重），按 dest 取快照会让
+                // 两行互看对方的状态（一行在下载，另一行也显示"取消"却点不动）。
+                .filter(|s| &s.dest == dest && s.label == m.id)
+                .max_by_key(|s| s.id)
+        })
         .collect()
+}
+
+/// 取消一条入口的**全部**任务，按"最需要说的那个结果"回报。
+///
+/// 单独抽出来是因为这里被独立评审抓到过真 bug：早先写成"第一个 Requested 就 `return`"，
+/// 多文件入口（一次排 N 条任务）点一次「取消」只会取消第一个文件，其余继续下 ——
+/// 而且当时那条单测用的是 mock 闭包，钉不住真实逻辑。现在循环**必须走完**：
+/// 优先级 Requested > AlreadyRequested > Finished（有真的新取消，就报"正在取消"）。
+fn cancel_all(
+    ids: &[u64],
+    mut cancel: impl FnMut(u64) -> download::CancelOutcome,
+) -> download::CancelOutcome {
+    let mut outcome = download::CancelOutcome::Finished;
+    for id in ids {
+        match cancel(*id) {
+            download::CancelOutcome::Requested => outcome = download::CancelOutcome::Requested,
+            download::CancelOutcome::AlreadyRequested => {
+                if outcome == download::CancelOutcome::Finished {
+                    outcome = download::CancelOutcome::AlreadyRequested;
+                }
+            }
+            download::CancelOutcome::Finished => {}
+        }
+    }
+    outcome
 }
 
 /// 一次「下载/取消」点击实际发生了什么（UI 只据它发提示）。
@@ -3614,22 +3656,7 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
         let effect = apply_download_click(
             &st,
             &key,
-            move |ids: &[u64]| {
-                // 多文件入口：逐个取消，按"最需要说的那个结果"回报
-                let mut outcome = download::CancelOutcome::Finished;
-                for id in ids {
-                    match dl_cancel.cancel(*id) {
-                        download::CancelOutcome::Requested => {
-                            return download::CancelOutcome::Requested;
-                        }
-                        download::CancelOutcome::AlreadyRequested => {
-                            outcome = download::CancelOutcome::AlreadyRequested;
-                        }
-                        download::CancelOutcome::Finished => {}
-                    }
-                }
-                outcome
-            },
+            move |ids: &[u64]| cancel_all(ids, |id| dl_cancel.cancel(id)),
             move || {
                 // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
                 let model = download_entry_for(&start_key)?;
@@ -14160,6 +14187,45 @@ mod tests {
             active_download_ids(&state2, "yue2").is_empty(),
             "全是重复时不许登记（登记了就再也取消不掉别人的任务）"
         );
+    }
+
+    /// 取消一条入口的**全部**任务：`cancel_all` 必须把每个 id 都走一遍（评审抓到的真 bug：
+    /// 早先"第一个 Requested 就 return"，多文件点一次取消只取消第一个文件）。
+    ///
+    /// 这条不是 mock 语义上的自证：`cancel_all` 就是生产路径用的那份逻辑
+    /// （`wire_downloads` 里 `move |ids| cancel_all(ids, |id| dl_cancel.cancel(id))`），
+    /// 注入的只有 `Downloader::cancel` 本身（它自己的语义在 `src/download.rs` 有用例）。
+    #[test]
+    fn cancel_all_visits_every_file_and_keeps_the_strongest_outcome() {
+        use download::CancelOutcome::{AlreadyRequested, Finished, Requested};
+
+        // ① 两个 id 都必须被取消（第一个 Requested 不许提前收手）
+        let mut seen: Vec<u64> = Vec::new();
+        let got = cancel_all(&[7, 8], |id| {
+            seen.push(id);
+            if id == 7 {
+                Requested
+            } else {
+                AlreadyRequested
+            }
+        });
+        assert_eq!(seen, vec![7, 8], "每个文件的任务都要取消，不能提前 return");
+        assert_eq!(got, Requested, "有真的新取消 → 报「正在取消」");
+
+        // ② 全部 AlreadyRequested → 报 AlreadyRequested（别谎报"正在取消"）
+        let got = cancel_all(&[7, 8], |_| AlreadyRequested);
+        assert_eq!(got, AlreadyRequested);
+
+        // ③ 全部 Finished → 报 Finished（任务其实已经收尾）
+        let got = cancel_all(&[7, 8], |_| Finished);
+        assert_eq!(got, Finished);
+
+        // ④ 顺序不影响优先级：先 AlreadyRequested 后 Requested 仍是 Requested
+        let got = cancel_all(
+            &[7, 8],
+            |id| if id == 8 { Requested } else { AlreadyRequested },
+        );
+        assert_eq!(got, Requested);
     }
 
     /// 多文件行：状态取最坏、进度 = Σ已下载 / Σ总长；有文件没 sha 时要如实说。
