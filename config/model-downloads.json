@@ -870,7 +870,7 @@
           "target_directory": "IndexTTS2-GGUF"
         },
         {
-          "bytes": 3484956803,
+          "bytes": 8084367138,
           "default": false,
           "display_name": "IndexTTS2 Safetensors",
           "downloadable": true,
@@ -892,6 +892,114 @@
               "remote_path": "gpt.safetensors",
               "sha256": "b7fe532dd49e9b4536ca108ac71869c23d94091cec8494b9ef87d4bdf63adb47",
               "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/gpt.safetensors"
+            },
+            {
+              "bytes": 1874,
+              "remote_path": "w2v-bert-2.0/config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/w2v-bert-2.0/config.json"
+            },
+            {
+              "bytes": 275,
+              "remote_path": "w2v-bert-2.0/preprocessor_config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/w2v-bert-2.0/preprocessor_config.json"
+            },
+            {
+              "bytes": 1405,
+              "remote_path": "bigvgan/config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/bigvgan/config.json"
+            },
+            {
+              "bytes": 727,
+              "remote_path": "qwen0.6bemo4-merge/config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/config.json"
+            },
+            {
+              "bytes": 117,
+              "remote_path": "qwen0.6bemo4-merge/generation_config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/generation_config.json"
+            },
+            {
+              "bytes": 11422654,
+              "remote_path": "qwen0.6bemo4-merge/tokenizer.json",
+              "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/tokenizer.json"
+            },
+            {
+              "bytes": 5433,
+              "remote_path": "qwen0.6bemo4-merge/tokenizer_config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/tokenizer_config.json"
+            },
+            {
+              "bytes": 2776833,
+              "remote_path": "qwen0.6bemo4-merge/vocab.json",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/vocab.json"
+            },
+            {
+              "bytes": 1671853,
+              "remote_path": "qwen0.6bemo4-merge/merges.txt",
+              "sha256": null,
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/merges.txt"
+            },
+            {
+              "bytes": 414842448,
+              "remote_path": "s2mel.safetensors",
+              "sha256": "860e84339df1c634e92fcd3ba3a5ebf4ee04320b8c98537d2a9373c1c937e6d2",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/s2mel.safetensors"
+            },
+            {
+              "bytes": 56304,
+              "remote_path": "feat1.safetensors",
+              "sha256": "f06f05cc218e57b6d0df2e9b373c0ddff0f70c4786cb71276fcebf5a49bc7dd4",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/feat1.safetensors"
+            },
+            {
+              "bytes": 374000,
+              "remote_path": "feat2.safetensors",
+              "sha256": "98e6358c213f040f50ea196ccc5ba0bb19d20b6ea06de7981c4fb9a73d828989",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/feat2.safetensors"
+            },
+            {
+              "bytes": 8496,
+              "remote_path": "wav2vec2bert_stats.safetensors",
+              "sha256": "35249a869711f74cbe605be872534dea359048ddeb576d143a18c46b7ebb9128",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/wav2vec2bert_stats.safetensors"
+            },
+            {
+              "bytes": 2322063736,
+              "remote_path": "w2v-bert-2.0/model.safetensors",
+              "sha256": "eb890c9660ed6e3414b6812e27257b8ce5454365d5490d3ad581ea60b93be043",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/w2v-bert-2.0/model.safetensors"
+            },
+            {
+              "bytes": 177183712,
+              "remote_path": "semantic_codec_model.safetensors",
+              "sha256": "ec947271175d8cad75ec37e83aa487e27c97a0f72a303393772da5ffa84bddf2",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/semantic_codec_model.safetensors"
+            },
+            {
+              "bytes": 27846536,
+              "remote_path": "campplus.safetensors",
+              "sha256": "52f18b7f5b6a85951a9931d441cf031882e81090f0c79fffd3b8a79d31be0def",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/campplus.safetensors"
+            },
+            {
+              "bytes": 449018836,
+              "remote_path": "bigvgan/model.safetensors",
+              "sha256": "487f2eaa9856b9a3e8847539dd0c6e0a782c5eb9bd66de7bb8812a0ddedeab2c",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/bigvgan/model.safetensors"
+            },
+            {
+              "bytes": 1192135096,
+              "remote_path": "qwen0.6bemo4-merge/model.safetensors",
+              "sha256": "11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641",
+              "url": "https://huggingface.co/mlx-community/index-tts2-mlx/resolve/main/qwen0.6bemo4-merge/model.safetensors"
             }
           ],
           "format": "safetensors",
@@ -901,7 +1009,25 @@
           "local_paths": [
             "IndexTTS-2/config.yaml",
             "IndexTTS-2/bpe.model",
-            "IndexTTS-2/gpt.safetensors"
+            "IndexTTS-2/gpt.safetensors",
+            "IndexTTS-2/w2v-bert-2.0/config.json",
+            "IndexTTS-2/w2v-bert-2.0/preprocessor_config.json",
+            "IndexTTS-2/bigvgan/config.json",
+            "IndexTTS-2/qwen0.6bemo4-merge/config.json",
+            "IndexTTS-2/qwen0.6bemo4-merge/generation_config.json",
+            "IndexTTS-2/qwen0.6bemo4-merge/tokenizer.json",
+            "IndexTTS-2/qwen0.6bemo4-merge/tokenizer_config.json",
+            "IndexTTS-2/qwen0.6bemo4-merge/vocab.json",
+            "IndexTTS-2/qwen0.6bemo4-merge/merges.txt",
+            "IndexTTS-2/s2mel.safetensors",
+            "IndexTTS-2/feat1.safetensors",
+            "IndexTTS-2/feat2.safetensors",
+            "IndexTTS-2/wav2vec2bert_stats.safetensors",
+            "IndexTTS-2/w2v-bert-2.0/model.safetensors",
+            "IndexTTS-2/semantic_codec_model.safetensors",
+            "IndexTTS-2/campplus.safetensors",
+            "IndexTTS-2/bigvgan/model.safetensors",
+            "IndexTTS-2/qwen0.6bemo4-merge/model.safetensors"
           ],
           "precision": "native",
           "reason": "",
@@ -1526,7 +1652,7 @@
           "target_directory": "Qwen3-TTS-12Hz-0.6B-Base-GGUF"
         },
         {
-          "bytes": 4539721255,
+          "bytes": 4544169927,
           "default": false,
           "display_name": "Qwen3 TTS 12Hz 1.7B Base Safetensors",
           "downloadable": true,
@@ -1566,6 +1692,18 @@
               "remote_path": "tokenizer_config.json",
               "sha256": null,
               "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/tokenizer_config.json"
+            },
+            {
+              "bytes": 2776833,
+              "remote_path": "vocab.json",
+              "sha256": null,
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/vocab.json"
+            },
+            {
+              "bytes": 1671839,
+              "remote_path": "merges.txt",
+              "sha256": null,
+              "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/merges.txt"
             }
           ],
           "format": "safetensors",
@@ -1578,7 +1716,9 @@
             "Qwen3-TTS-12Hz-1.7B-Base/model.safetensors",
             "Qwen3-TTS-12Hz-1.7B-Base/speech_tokenizer/config.json",
             "Qwen3-TTS-12Hz-1.7B-Base/speech_tokenizer/model.safetensors",
-            "Qwen3-TTS-12Hz-1.7B-Base/tokenizer_config.json"
+            "Qwen3-TTS-12Hz-1.7B-Base/tokenizer_config.json",
+            "Qwen3-TTS-12Hz-1.7B-Base/vocab.json",
+            "Qwen3-TTS-12Hz-1.7B-Base/merges.txt"
           ],
           "precision": "native",
           "reason": "",
@@ -1595,14 +1735,66 @@
       "aux_bytes": 0,
       "aux_files": [],
       "aux_unresolved": [],
-      "entry": null,
+      "entry": {
+        "bytes": 2708224512,
+        "default": true,
+        "display_name": "SheetSage2 Original-Dtype GGUF",
+        "downloadable": true,
+        "files": [
+          {
+            "bytes": 2708224512,
+            "remote_path": "sheetsage2-orig.gguf",
+            "sha256": "52bb5846c452037d39931aa8050885b6c751b9c7afcc8ef6d6d3067d241731a4",
+            "url": "https://huggingface.co/audio-cpp/SheetSage2-GGUF/resolve/main/sheetsage2-orig.gguf"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "sheetsage2_orig",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "SheetSage2-GGUF/sheetsage2-orig.gguf"
+        ],
+        "precision": "orig",
+        "reason": "",
+        "repo": "audio-cpp/SheetSage2-GGUF",
+        "revision": "main",
+        "target_directory": "SheetSage2-GGUF"
+      },
       "family": "sheetsage2",
       "id": "sheetsage2",
-      "note": "上游 model_specs 里没有 family=sheetsage2 的 spec —— 暂无下载源，不猜地址",
-      "packages": [],
+      "note": "落点精确匹配：sheetsage2_orig",
+      "packages": [
+        {
+          "bytes": 2708224512,
+          "default": true,
+          "display_name": "SheetSage2 Original-Dtype GGUF",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": 2708224512,
+              "remote_path": "sheetsage2-orig.gguf",
+              "sha256": "52bb5846c452037d39931aa8050885b6c751b9c7afcc8ef6d6d3067d241731a4",
+              "url": "https://huggingface.co/audio-cpp/SheetSage2-GGUF/resolve/main/sheetsage2-orig.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "sheetsage2_orig",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "SheetSage2-GGUF/sheetsage2-orig.gguf"
+          ],
+          "precision": "orig",
+          "reason": "",
+          "repo": "audio-cpp/SheetSage2-GGUF",
+          "revision": "main",
+          "target_directory": "SheetSage2-GGUF"
+        }
+      ],
       "path": "SheetSage2-GGUF/sheetsage2-orig.gguf",
-      "spec": "",
-      "status": "no-source"
+      "spec": "sheetsage2.json",
+      "status": "downloadable"
     },
     {
       "aux_bytes": 0,
@@ -2030,19 +2222,328 @@
       "status": "downloadable"
     },
     {
-      "aux_bytes": 0,
-      "aux_files": [],
-      "aux_unresolved": [
-        "yue2.model_gguf",
-        "yue2.vae_gguf"
+      "aux_bytes": 2935992426,
+      "aux_files": [
+        {
+          "bytes": 959,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+        },
+        {
+          "bytes": 466,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+        },
+        {
+          "bytes": 2561218,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+        },
+        {
+          "bytes": 1378,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+        },
+        {
+          "bytes": 2665645728,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-3b-q4_0.gguf"
+        },
+        {
+          "bytes": 959,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+        },
+        {
+          "bytes": 466,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+        },
+        {
+          "bytes": 2561218,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+        },
+        {
+          "bytes": 1378,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+        },
+        {
+          "bytes": 265218656,
+          "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-vae-f16.gguf"
+        }
       ],
+      "aux_unresolved": [],
       "entry": null,
       "family": "yue2",
       "id": "yue2",
-      "note": "上游 model_specs 里没有 family=yue2 的 spec —— 暂无下载源，不猜地址",
-      "packages": [],
+      "note": "落点选中 yue2_main_q8_0，但它覆盖不了 schema 声明的权重（缺 yue2-3b-q4_0.gguf、yue2-vae-f16.gguf）—— 没有任何单个上游包能凑齐产品要加载的文件，按「不猜地址」处置：标 no-source —— 暂无下载入口，不猜地址",
+      "packages": [
+        {
+          "bytes": 4266763861,
+          "default": true,
+          "display_name": "Yue2 3B Main Q8_0",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": 959,
+              "remote_path": "sidecars/yue2-model-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+            },
+            {
+              "bytes": 466,
+              "remote_path": "sidecars/yue2-generation-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+            },
+            {
+              "bytes": 2561218,
+              "remote_path": "sidecars/yue2-qwen.tiktoken",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+            },
+            {
+              "bytes": 1378,
+              "remote_path": "sidecars/yue2-vae-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+            },
+            {
+              "bytes": 4264199840,
+              "remote_path": "yue2-3b-q8_0.gguf",
+              "sha256": "1bbbfeea90c6219afb0c73b6a212ce7847ca6a982534388064f8e61e031b6a3f",
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-3b-q8_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "yue2_main_q8_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Yue2-3B-GGUF/sidecars/yue2-model-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-generation-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-qwen.tiktoken",
+            "Yue2-3B-GGUF/sidecars/yue2-vae-config.json",
+            "Yue2-3B-GGUF/yue2-3b-q8_0.gguf"
+          ],
+          "precision": "q8_0",
+          "reason": "",
+          "repo": "audio-cpp/Yue2-3B-GGUF",
+          "revision": "main",
+          "target_directory": "Yue2-3B-GGUF"
+        },
+        {
+          "bytes": 7264052821,
+          "default": false,
+          "display_name": "Yue2 3B Main BF16",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": 959,
+              "remote_path": "sidecars/yue2-model-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+            },
+            {
+              "bytes": 466,
+              "remote_path": "sidecars/yue2-generation-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+            },
+            {
+              "bytes": 2561218,
+              "remote_path": "sidecars/yue2-qwen.tiktoken",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+            },
+            {
+              "bytes": 1378,
+              "remote_path": "sidecars/yue2-vae-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+            },
+            {
+              "bytes": 7261488800,
+              "remote_path": "yue2-3b-bf16.gguf",
+              "sha256": "e37c461329f3db45552f6f6d7453f0b1944f3fd8344855a2e50083ea9db6ee98",
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-3b-bf16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "yue2_main_bf16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Yue2-3B-GGUF/sidecars/yue2-model-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-generation-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-qwen.tiktoken",
+            "Yue2-3B-GGUF/sidecars/yue2-vae-config.json",
+            "Yue2-3B-GGUF/yue2-3b-bf16.gguf"
+          ],
+          "precision": "bf16",
+          "reason": "",
+          "repo": "audio-cpp/Yue2-3B-GGUF",
+          "revision": "main",
+          "target_directory": "Yue2-3B-GGUF"
+        },
+        {
+          "bytes": 2668209749,
+          "default": false,
+          "display_name": "Yue2 3B Main Q4_0",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": 959,
+              "remote_path": "sidecars/yue2-model-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+            },
+            {
+              "bytes": 466,
+              "remote_path": "sidecars/yue2-generation-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+            },
+            {
+              "bytes": 2561218,
+              "remote_path": "sidecars/yue2-qwen.tiktoken",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+            },
+            {
+              "bytes": 1378,
+              "remote_path": "sidecars/yue2-vae-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+            },
+            {
+              "bytes": 2665645728,
+              "remote_path": "yue2-3b-q4_0.gguf",
+              "sha256": "cb1f76c8c90755a4c5c9cc0220b26b914570d74f4dc3ec6599469a46d7990f4b",
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-3b-q4_0.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "yue2_main_q4_0",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Yue2-3B-GGUF/sidecars/yue2-model-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-generation-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-qwen.tiktoken",
+            "Yue2-3B-GGUF/sidecars/yue2-vae-config.json",
+            "Yue2-3B-GGUF/yue2-3b-q4_0.gguf"
+          ],
+          "precision": "q4_0",
+          "reason": "",
+          "repo": "audio-cpp/Yue2-3B-GGUF",
+          "revision": "main",
+          "target_directory": "Yue2-3B-GGUF"
+        },
+        {
+          "bytes": 267782677,
+          "default": false,
+          "display_name": "Yue2 VAE F16",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": 959,
+              "remote_path": "sidecars/yue2-model-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+            },
+            {
+              "bytes": 466,
+              "remote_path": "sidecars/yue2-generation-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+            },
+            {
+              "bytes": 2561218,
+              "remote_path": "sidecars/yue2-qwen.tiktoken",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+            },
+            {
+              "bytes": 1378,
+              "remote_path": "sidecars/yue2-vae-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+            },
+            {
+              "bytes": 265218656,
+              "remote_path": "yue2-vae-f16.gguf",
+              "sha256": "d4f4a05d8f291ae820cd1e43609da3fa91b56465810091a2b08c3350b751719d",
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-vae-f16.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "yue2_vae_f16",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Yue2-3B-GGUF/sidecars/yue2-model-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-generation-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-qwen.tiktoken",
+            "Yue2-3B-GGUF/sidecars/yue2-vae-config.json",
+            "Yue2-3B-GGUF/yue2-vae-f16.gguf"
+          ],
+          "precision": "f16",
+          "reason": "",
+          "repo": "audio-cpp/Yue2-3B-GGUF",
+          "revision": "main",
+          "target_directory": "Yue2-3B-GGUF"
+        },
+        {
+          "bytes": 533101781,
+          "default": false,
+          "display_name": "Yue2 VAE F32",
+          "downloadable": true,
+          "files": [
+            {
+              "bytes": 959,
+              "remote_path": "sidecars/yue2-model-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+            },
+            {
+              "bytes": 466,
+              "remote_path": "sidecars/yue2-generation-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+            },
+            {
+              "bytes": 2561218,
+              "remote_path": "sidecars/yue2-qwen.tiktoken",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+            },
+            {
+              "bytes": 1378,
+              "remote_path": "sidecars/yue2-vae-config.json",
+              "sha256": null,
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+            },
+            {
+              "bytes": 530537760,
+              "remote_path": "yue2-vae-f32.gguf",
+              "sha256": "cf3b71c6ef13b8b7970f8c1013b899e4af6ff9756c93bda45bef542dd6e10546",
+              "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-vae-f32.gguf"
+            }
+          ],
+          "format": "gguf",
+          "gated": false,
+          "id": "yue2_vae_f32",
+          "kind": "huggingface_snapshot",
+          "local_paths": [
+            "Yue2-3B-GGUF/sidecars/yue2-model-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-generation-config.json",
+            "Yue2-3B-GGUF/sidecars/yue2-qwen.tiktoken",
+            "Yue2-3B-GGUF/sidecars/yue2-vae-config.json",
+            "Yue2-3B-GGUF/yue2-vae-f32.gguf"
+          ],
+          "precision": "f32",
+          "reason": "",
+          "repo": "audio-cpp/Yue2-3B-GGUF",
+          "revision": "main",
+          "target_directory": "Yue2-3B-GGUF"
+        }
+      ],
       "path": "Yue2-3B-GGUF",
-      "spec": "",
+      "spec": "yue2.json",
       "status": "no-source"
     }
   ],
@@ -2050,7 +2551,7 @@
     "generated_by": "tools/gen_model_downloads.py",
     "note": "由生成脚本产出，勿手改；sha256 来自 HF tree API 的 lfs.oid（--fetch-hashes），bytes 来自 HTTP HEAD（--fetch-sizes）；取不到就是 null（不填 0、不拿别的档推算）",
     "schema": "config/models.schema.yaml",
-    "spec_count": 72,
+    "spec_count": 94,
     "specs": "model_specs/*.json"
   },
   "version": 1

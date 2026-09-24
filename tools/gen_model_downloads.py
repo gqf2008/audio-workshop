@@ -33,8 +33,16 @@ P7 的下载队列（串行 / 断点续传 / 校验后提交）已经能跑，�
 - 相等 → 这个包就是该模型的下载源。能区分 0.1B/0.6B、2.0/2.5、medium/small-music。
 - schema path 正好等于包的 `target_directory`（gen 类模型 path 指目录）→ 目录匹配；
   候选多于一个时按 `precision_preference` → `q8_0` 的顺序挑，挑的结果写进 note。
-- 匹配不上（`yue2` / `sheetsage2` 上游根本没有 spec；`audio8-tts-01b` 的 0.1B
-  上游没有对应包）→ `status = "no-source"`，**不猜 URL**。
+- **覆盖校验（2026-09-24 加）**：挑中的包还必须覆盖 `session_options` 里声明、且落点
+  **在本模型目录内**的权重文件（按文件名比对）；覆盖不了 → `no-source`，note 写明缺哪些。
+  依据：应用**只下载 `entry`**（`src/model_sources.rs` 连 `aux_files` 字段都不读，
+  `aux_bytes` 只进占用估算），所以 entry 凑不齐产品要加载的文件就是"下完也用不了"。
+  典型：`yue2` 的 `path` 是目录、上游 5 个包每个只含 4 个 sidecars + 1 个权重
+  （main q8_0/bf16/q4_0 或 vae f16/f32），而 schema 要的是 q4_0 主权重 + vae f16
+  —— 没有任何单包能凑齐，只能如实标 `no-source`（跨包组条目的能力另开批次）。
+  落在**别的 family** 目录里的声明（如 `qwen3_asr.forced_aligner_model_path`）不算——
+  那些在界面上按独立模型看待，已由 `aux_bytes` / `aux_unresolved` 如实呈现。
+- 匹配不上（`audio8-tts-01b` 的 0.1B 上游没有对应包）→ `status = "no-source"`，**不猜 URL**。
 - 包没有可用下载源（`kind == "unsupported"`，如 `audio8-asr` 是 CC-BY-NC-4.0 需本地转换）
   → `no-source`，并把上游给的原因原样带上。
 
@@ -554,6 +562,36 @@ def choose_package(candidates: list, tail: str, precision_preference: list):
     return None, f"{matched_by}但同处有多个量化档且挑不出唯一一个：{ids}"
 
 
+def landing_dir_of(tail: str) -> str:
+    """模型的落点目录：`path` 指文件时取父目录，指目录时就是它自己。"""
+    name = tail.rsplit("/", 1)[-1]
+    return tail.rsplit("/", 1)[0] if "." in name else tail
+
+
+def declared_weights_missing(schema_model: dict, tail: str, entry: dict) -> list:
+    """挑中的包**覆盖不了**哪些声明权重（返回文件名列表，空 = 覆盖了）。
+
+    只算「落点在本模型目录内」的声明：`session_options` 里指向别的 family 的辅助权重
+    （如 `qwen3_asr.forced_aligner_model_path`）在界面上按独立模型看待，不参与
+    "这条能不能用"的判定；目录型声明（如 `${models_root}/silero_vad`）不是单文件，
+    没法按文件名核对，跳过（它们已由 `aux_bytes` / `aux_unresolved` 如实呈现）。
+    """
+    options = schema_model.get("session_options") or {}
+    provided = {p.rsplit("/", 1)[-1] for p in entry.get("local_paths") or []}
+    home = landing_dir_of(tail)
+    missing = []
+    for key in sorted(options):
+        local = aux_local_path(options[key], tail)
+        if not local:
+            continue
+        head, _, name = local.rpartition("/")
+        if "." not in name or head != home:
+            continue
+        if name not in provided:
+            missing.append(name)
+    return missing
+
+
 def build_model(
     schema_model: dict,
     model_id: str,
@@ -612,6 +650,16 @@ def build_model(
         }
 
     entry, why = choose_package(candidates, tail, preference)
+    if entry is not None:
+        missing = declared_weights_missing(schema_model, tail, entry)
+        if missing:
+            # 覆盖不了就**不猜**：与其让用户下完一堆用不上的权重，不如如实标"没有源"。
+            why = (
+                f"落点选中 {entry['id']}，但它覆盖不了 schema 声明的权重"
+                f"（缺 {'、'.join(missing)}）—— 没有任何单个上游包能凑齐产品要加载的文件，"
+                "按「不猜地址」处置：标 no-source"
+            )
+            entry = None
     status = "downloadable" if entry else "no-source"
     if not entry:
         why = f"{why} —— 暂无下载入口，不猜地址"
