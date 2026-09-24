@@ -589,7 +589,13 @@ pub struct Action {
 }
 
 impl Action {
-    /// 主文件（权重本身）。空入口不该存在（构造处都有断言），这里取第一个。
+    /// 主文件（权重本身）。生成器保证"声明过的权重"排在 `files` 前面；空入口不该存在
+    /// （构造处都有判据），这里取第一个。
+    ///
+    /// **谁在用它**：模块内测试，以及 `#[cfg(debug_assertions)]` 的 `AW_UI_STATE` 调试摘要。
+    /// release 构建里应用读的是 UI 侧自己的 `DownloadableModel::primary()`（同为 `files[0]`），
+    /// 所以这里用同样的 cfg 门控 —— 否则 release 构建会报 `method is never used`。
+    #[cfg(any(test, debug_assertions))]
     pub fn primary(&self) -> &ActionFile {
         &self.files[0]
     }
