@@ -2991,15 +2991,43 @@ fn spawn_batch_export(
 // ===========================================================================
 
 /// 一条真的能点的下载入口（落点 / 校验依据 / 来源 / 落点提醒）。
-struct DownloadableModel {
-    id: String,
+/// 入口里的一个文件（与 `model_sources::ActionFile` 同形，UI 侧不再借清单的类型）。
+struct DownloadableFile {
     url: String,
     sha256: Option<String>,
-    size: Option<u64>,
+    /// 这个文件自己的期望字节数（清单里取不到就是 None → 下载器退回按响应长度核）。
+    bytes: Option<u64>,
     dest: PathBuf,
+}
+
+struct DownloadableModel {
+    id: String,
+    /// 这条入口要下的**全部文件**（单文件条目就是长度 1）。点击时**逐个入队**，
+    /// 界面按模型把它们的进度/状态聚合起来显示。
+    /// 每个文件自带期望大小（`bytes`）用于校验；这个 `size` 是**条目总计**，只用于行上显示。
+    files: Vec<DownloadableFile>,
+    size: Option<u64>,
     origin: model_sources::Origin,
     /// 与 server.json 声明的 path 对不上时的提醒（下完服务可能仍加载不了）。
     conflict: Option<String>,
+}
+
+impl DownloadableModel {
+    /// 主文件（权重本身）——落点提醒、按钮文案都以它为准。
+    fn primary(&self) -> &DownloadableFile {
+        &self.files[0]
+    }
+
+    /// 这条入口的全部目标路径（判断"哪个文件属于哪个模型"、聚合快照用）。
+    fn dests(&self) -> impl Iterator<Item = &PathBuf> {
+        self.files.iter().map(|f| &f.dest)
+    }
+
+    /// 单文件入口没有 sha256 时，校验只能按大小 —— 行上要如实说。
+    /// 多文件时只要**任一**文件缺 sha 也要说出来（别让人以为整条都验过）。
+    fn any_file_without_sha(&self) -> bool {
+        self.files.iter().any(|f| f.sha256.is_none())
+    }
 }
 
 /// 下载面板的完整规划：**显示与点击共用这一份**（两处各拼一次判据已经被复核抓过）。
@@ -3129,10 +3157,17 @@ fn download_entry_for(key: &str) -> Option<DownloadableModel> {
         .and_then(|r| {
             r.action.map(|a| DownloadableModel {
                 id: r.id,
-                url: a.url,
-                sha256: a.sha256,
+                files: a
+                    .files
+                    .into_iter()
+                    .map(|f| DownloadableFile {
+                        url: f.url,
+                        sha256: f.sha256,
+                        bytes: f.bytes,
+                        dest: f.dest,
+                    })
+                    .collect(),
                 size: a.size,
-                dest: a.dest,
                 origin: a.origin,
                 conflict: a.conflict,
             })
@@ -3156,12 +3191,20 @@ fn short_bytes(n: u64) -> String {
 ///
 /// `tiers` / `advice` 由 `model_sources` 算好（纯函数 + 注入的本机尺度），
 /// 这里只做投影 —— 界面不拼判据。
+///
+/// `snaps` 是**这条入口各文件**的最新快照（队列按文件入队，所以这里按 dest 收集）。
+/// 单文件时与多文件之前逐字一致；多文件时状态/进度按整条入口聚合（见 `aggregate_files`）。
 fn download_row_for(
     m: &DownloadableModel,
-    latest: Option<&download::Snapshot>,
+    snaps: &[&download::Snapshot],
     tiers: &[model_sources::Tier],
     advice: &model_sources::Advice,
 ) -> DownloadRow {
+    let latest = if m.files.len() == 1 {
+        snaps.first().copied()
+    } else {
+        None
+    };
     let (state_text, base, progress, active) = match latest {
         Some(snap) => {
             let downloading = matches!(
@@ -3195,18 +3238,23 @@ fn download_row_for(
                 !snap.state.is_terminal(),
             )
         }
-        None if m.dest.exists() => (
+        None if m.primary().dest.exists() => (
             "已就位".to_string(),
-            m.dest.display().to_string(),
+            m.primary().dest.display().to_string(),
             1.0,
             false,
         ),
         None => (
             "未下载".to_string(),
-            m.dest.display().to_string(),
+            m.primary().dest.display().to_string(),
             0.0,
             false,
         ),
+    };
+    let (state_text, base, progress, active) = if m.files.len() > 1 {
+        aggregate_files(m, snaps)
+    } else {
+        (state_text, base, progress, active)
     };
     // 来源 + 落点提醒都要写在行上：否则用户看不出"权重是哪来的"，也看不出
     // "下完了服务为什么还是加载不了"。
@@ -3214,8 +3262,13 @@ fn download_row_for(
     // 没有 sha256 的条目必须如实说：校验只对大小（同大小的旧权重查不出来）。
     // 真实清单重生成后每一条都带哈希，这条基本不可达；留着是给"服务侧给了 url、
     // 两边都没 sha"的兜底形态一个诚实的说法，不许假装有哈希。
-    if m.sha256.is_none() {
+    if m.any_file_without_sha() {
         detail.push_str(" · 仅校验大小");
+    }
+    if m.files.len() > 1 {
+        if let Some(total) = m.size {
+            detail.push_str(&format!(" · 总计 {}", short_bytes(total)));
+        }
     }
     if let Some(conflict) = &m.conflict {
         detail.push_str(" · ⚠ ");
@@ -3232,6 +3285,96 @@ fn download_row_for(
         active,
         actionable: true,
     }
+}
+
+/// 多文件入口的状态/进度聚合（队列是"一条任务一个文件"，行是"一个模型"）。
+///
+/// 判据全落在**已收集到的快照**上，缺一个文件就如实说"还有 N 个文件没有回执"：
+/// - 有失败 → 失败；有取消 → 已取消；
+/// - 所有文件都已 `Done` → 已完成；
+/// - 否则按下在跑的文件报"下载中 / 校验中 / 排队"。
+///
+/// 进度 = Σ已下载 / Σ总长（总长缺的文件按它自己的完成度计入，缺总长且没完成就退化成"已下载 X"）。
+fn aggregate_files(
+    m: &DownloadableModel,
+    snaps: &[&download::Snapshot],
+) -> (String, String, f32, bool) {
+    let total_files = m.files.len();
+    let done = snaps
+        .iter()
+        .filter(|s| s.state == download::State::Done)
+        .count();
+    let failed = snaps
+        .iter()
+        .any(|s| matches!(s.state, download::State::Failed(_)));
+    let cancelled = snaps.iter().any(|s| s.state == download::State::Cancelled);
+    let running = snaps.iter().any(|s| {
+        matches!(
+            s.state,
+            download::State::Downloading | download::State::Verifying
+        )
+    });
+    let queued = snaps.iter().any(|s| s.state == download::State::Queued);
+
+    let state_text = if failed {
+        "失败".to_string()
+    } else if cancelled {
+        "已取消".to_string()
+    } else if done == total_files && snaps.len() == total_files {
+        "已完成".to_string()
+    } else if running {
+        "下载中".to_string()
+    } else if queued {
+        "排队".to_string()
+    } else {
+        "未下载".to_string()
+    };
+
+    let mut downloaded = 0u64;
+    let mut total = 0u64;
+    let mut unknown_total = false;
+    for snap in snaps {
+        downloaded += snap.downloaded;
+        match snap.total {
+            Some(t) => total += t,
+            None => unknown_total = true,
+        }
+    }
+    let progress = if total > 0 && !unknown_total {
+        (downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+
+    let base = if running || queued {
+        format!(
+            "共 {total_files} 个文件（已完成 {done} 个）· 已下载 {} / {}",
+            short_bytes(downloaded),
+            if unknown_total {
+                "?".to_string()
+            } else {
+                short_bytes(total)
+            }
+        )
+    } else {
+        let notes: Vec<&str> = snaps
+            .iter()
+            .filter(|s| !s.note.trim().is_empty())
+            .map(|s| s.note.as_str())
+            .collect();
+        let head = if notes.is_empty() {
+            if failed || cancelled {
+                "见每个文件的状态".to_string()
+            } else {
+                format!("共 {total_files} 个文件")
+            }
+        } else {
+            notes.join("；")
+        };
+        format!("{head} · 主文件 {}", m.primary().dest.display())
+    };
+    let active = snaps.iter().any(|s| !s.state.is_terminal());
+    (state_text, base, progress, active)
 }
 
 /// 没有下载源的模型也占一行：如实说为什么，**按钮不可点**。
@@ -3267,15 +3410,22 @@ fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
                 Some(action) => {
                     let model = DownloadableModel {
                         id,
-                        url: action.url,
-                        sha256: action.sha256,
+                        files: action
+                            .files
+                            .into_iter()
+                            .map(|f| DownloadableFile {
+                                url: f.url,
+                                sha256: f.sha256,
+                                bytes: f.bytes,
+                                dest: f.dest,
+                            })
+                            .collect(),
                         size: action.size,
-                        dest: action.dest,
                         origin: action.origin,
                         conflict: action.conflict,
                     };
-                    let latest = snapshots.iter().rev().find(|s| s.label == model.id);
-                    download_row_for(&model, latest, &tiers, &advice)
+                    let latest = latest_snapshots_for(&model, &snapshots);
+                    download_row_for(&model, &latest, &tiers, &advice)
                 }
                 None => no_source_row_for(&id, &reason),
             }
@@ -3285,12 +3435,17 @@ fn refresh_download_rows(ui: &MainWindow, state: &Rc<UiState>) {
     ui.set_download_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
-/// 某模型当前在跑的下载任务 id（只读；借用在本函数内就还掉）。
+/// 某模型当前在跑的下载任务 id（**这条入口可能有多条：多文件逐文件入队**）。
 ///
 /// 「读」与「摘」刻意分开：`if let Some(x) = map.borrow().get(..)` 在 Rust 2021 里
 /// 临时借用会活到整个 if-let（含块），块里再 `borrow_mut` 会直接 panic——自己抓到过的真坑。
-fn active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
-    state.download_ids.borrow().get(key).copied()
+fn active_download_ids(state: &Rc<UiState>, key: &str) -> Vec<u64> {
+    state
+        .download_ids
+        .borrow()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// 摘掉某模型的下载登记——**只有"登记的确实就是这条任务"才摘**。
@@ -3302,26 +3457,43 @@ fn active_download_id(state: &Rc<UiState>, key: &str) -> Option<u64> {
 ///
 /// （P7 第二段之后一条任务只推**一条**终态——`worker_loop` 收尾后那条；但"迟到快照"
 /// 依然可能出现：取消与重排之间的顺序不保证，所以这道按 id 认领的守卫仍然必要。）
-fn release_download_id(ids: &mut HashMap<String, u64>, label: &str, id: u64) -> bool {
-    if ids.get(label) == Some(&id) {
+fn release_download_id(ids: &mut HashMap<String, Vec<u64>>, label: &str, id: u64) -> bool {
+    let Some(list) = ids.get_mut(label) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|x| *x != id);
+    let removed = list.len() != before;
+    if list.is_empty() {
         ids.remove(label);
-        true
-    } else {
-        false
     }
+    removed
 }
 
-/// 把一条快照并进列表：同一模型只保留**最新那条任务**的快照。
+/// 把一条快照并进列表：**同一目标文件**只保留最新那条任务的快照。
 ///
 /// id 单调递增，"最新"就是 id 最大。旧任务的迟到快照（尤其是它的终态）不能盖掉新任务的
 /// 进度与状态——否则界面会显示旧任务的「已取消 / 已完成」，而新任务其实正在跑，
 /// 按钮文案与 `download_ids` 的登记也会对不上。
+///
+/// 2026-09-25 起按 **dest** 而不是按 label 合并：一条入口可能有多文件（各自一条任务），
+/// 按 label 合并会让同一模型的几个文件互相覆盖，只剩最后一个文件的进度。
 fn merge_download_snapshot(list: &mut Vec<download::Snapshot>, snap: download::Snapshot) {
-    match list.iter_mut().find(|s| s.label == snap.label) {
+    match list.iter_mut().find(|s| s.dest == snap.dest) {
         Some(slot) if snap.id >= slot.id => *slot = snap,
         Some(_) => {}
         None => list.push(snap),
     }
+}
+
+/// 一条入口各文件的"最新那条"快照（按 dest 取 id 最大者）。多文件行靠它聚合。
+fn latest_snapshots_for<'a>(
+    m: &DownloadableModel,
+    all: &'a [download::Snapshot],
+) -> Vec<&'a download::Snapshot> {
+    m.dests()
+        .filter_map(|dest| all.iter().filter(|s| &s.dest == dest).max_by_key(|s| s.id))
+        .collect()
 }
 
 /// 一次「下载/取消」点击实际发生了什么（UI 只据它发提示）。
@@ -3334,7 +3506,15 @@ enum ClickEffect {
     /// 任务其实已经收尾（终态快照还在路上）：如实说，不谎报"已取消"
     AlreadyFinished(u64),
     /// 没有在跑的 → 新排一条
-    Enqueued { id: u64, dest: PathBuf },
+    /// 没有在跑的 → 新排任务（多文件入口会一次排**多条**：每个文件一条队列任务）
+    Enqueued {
+        /// 本次真的排上的任务 id（可能多条）
+        ids: Vec<u64>,
+        /// 这条入口一共几个文件（用于提示"还有几个已经在队列里"）
+        total_files: usize,
+        /// 主文件的落点（提示里显示它）
+        dest: PathBuf,
+    },
     /// 队列里已经有别的任务在写**同一个目标文件**（不同模型 id、同一落点，
     /// 例如 audio8-tts 与 audio8-tts-stream 指向同一份权重）：第二个 writer 会把
     /// `.part` 搅坏，所以拒绝，并说清是谁在写。
@@ -3353,24 +3533,47 @@ enum ClickEffect {
 fn apply_download_click(
     state: &Rc<UiState>,
     key: &str,
-    cancel: impl FnOnce(u64) -> download::CancelOutcome,
-    enqueue: impl FnOnce() -> Option<(download::Enqueued, PathBuf)>,
+    cancel: impl FnOnce(&[u64]) -> download::CancelOutcome,
+    enqueue: impl FnOnce() -> Option<(Vec<download::Enqueued>, PathBuf, usize)>,
 ) -> ClickEffect {
-    if let Some(id) = active_download_id(state, key) {
-        return match cancel(id) {
-            download::CancelOutcome::Requested => ClickEffect::CancelRequested(id),
-            download::CancelOutcome::AlreadyRequested => ClickEffect::AlreadyCancelling(id),
-            download::CancelOutcome::Finished => ClickEffect::AlreadyFinished(id),
+    let active = active_download_ids(state, key);
+    if !active.is_empty() {
+        let first = active[0];
+        return match cancel(&active) {
+            download::CancelOutcome::Requested => ClickEffect::CancelRequested(first),
+            download::CancelOutcome::AlreadyRequested => ClickEffect::AlreadyCancelling(first),
+            download::CancelOutcome::Finished => ClickEffect::AlreadyFinished(first),
         };
     }
     match enqueue() {
-        Some((download::Enqueued::Started(id), dest)) => {
-            state.download_ids.borrow_mut().insert(key.to_string(), id);
-            ClickEffect::Enqueued { id, dest }
-        }
-        // 队列层去重：**不登记**（登记了就再也取消不掉别人的任务）
-        Some((download::Enqueued::Duplicate { existing }, _)) => {
-            ClickEffect::DuplicateDestination { existing }
+        Some((results, dest, total_files)) => {
+            let ids: Vec<u64> = results
+                .iter()
+                .filter_map(|r| match r {
+                    download::Enqueued::Started(id) => Some(*id),
+                    download::Enqueued::Duplicate { .. } => None,
+                })
+                .collect();
+            if ids.is_empty() {
+                // 队列层去重：**不登记**（登记了就再也取消不掉别人的任务）
+                let existing = results
+                    .iter()
+                    .find_map(|r| match r {
+                        download::Enqueued::Duplicate { existing } => Some(*existing),
+                        download::Enqueued::Started(_) => None,
+                    })
+                    .unwrap_or(0);
+                return ClickEffect::DuplicateDestination { existing };
+            }
+            state
+                .download_ids
+                .borrow_mut()
+                .insert(key.to_string(), ids.clone());
+            ClickEffect::Enqueued {
+                ids,
+                total_files,
+                dest,
+            }
         }
         None => ClickEffect::UnknownModel,
     }
@@ -3411,28 +3614,67 @@ fn wire_downloads(ui: &MainWindow, msg_tx: &Sender<WorkerMsg>, state: &Rc<UiStat
         let effect = apply_download_click(
             &st,
             &key,
-            move |id| dl_cancel.cancel(id),
+            move |ids: &[u64]| {
+                // 多文件入口：逐个取消，按"最需要说的那个结果"回报
+                let mut outcome = download::CancelOutcome::Finished;
+                for id in ids {
+                    match dl_cancel.cancel(*id) {
+                        download::CancelOutcome::Requested => {
+                            return download::CancelOutcome::Requested;
+                        }
+                        download::CancelOutcome::AlreadyRequested => {
+                            outcome = download::CancelOutcome::AlreadyRequested;
+                        }
+                        download::CancelOutcome::Finished => {}
+                    }
+                }
+                outcome
+            },
             move || {
                 // 点到真正开跑之间清单可能被改过：找不到就说出来，不静默排个空
                 let model = download_entry_for(&start_key)?;
+                let total_files = model.files.len();
+                let primary_dest = model.primary().dest.clone();
                 // **入队时**按当前生效的源改写 URL（唯一一处调用 rewrite_url）。
                 // 填了镜像就只走镜像：地址不通就是网络错误，不静默回退官方。
-                let enqueued = dl_start.enqueue(
-                    download::TaskSpec {
-                        label: model.id.clone(),
-                        url: model.url.clone(),
-                        dest: model.dest.clone(),
-                        expected_sha256: model.sha256.clone(),
-                        expected_size: model.size,
-                    },
-                    download_mirror_rewrite,
-                );
-                Some((enqueued, model.dest))
+                // 多文件入口**逐文件入队**（队列本身就是"一条任务一个目标文件"：
+                // 按 dest 去重、逐文件 sha/大小校验、逐文件断点续传）。
+                let results = model
+                    .files
+                    .iter()
+                    .map(|f| {
+                        dl_start.enqueue(
+                            download::TaskSpec {
+                                label: model.id.clone(),
+                                url: f.url.clone(),
+                                dest: f.dest.clone(),
+                                expected_sha256: f.sha256.clone(),
+                                // 逐文件大小：包级 `size` 是多文件之和，不能当单文件依据
+                                expected_size: f.bytes,
+                            },
+                            download_mirror_rewrite,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Some((results, primary_dest, total_files))
             },
         );
         let text = match effect {
-            ClickEffect::Enqueued { dest, .. } => {
-                format!("已加入下载队列：{key} → {}", dest.display())
+            ClickEffect::Enqueued {
+                ids,
+                total_files,
+                dest,
+            } => {
+                if total_files > 1 {
+                    format!(
+                        "已加入下载队列：{key}（{}/{} 个文件） → {}",
+                        ids.len(),
+                        total_files,
+                        dest.display()
+                    )
+                } else {
+                    format!("已加入下载队列：{key} → {}", dest.display())
+                }
             }
             ClickEffect::CancelRequested(_) => format!(
                 "正在取消下载：{key}（取消是协作式的，等这一步收尾；这期间不会再为它排新下载）"
@@ -5613,10 +5855,10 @@ struct UiState {
     batch_skipped_notes: RefCell<Vec<String>>,
     /// 批量导出是否在跑（后台线程）：防连点起一堆线程；导出与 worker 互不干扰
     batch_export_running: std::cell::Cell<bool>,
-    /// 模型下载（P7）：队列里每条任务的最新快照（按 id 覆盖，真相在 download 侧）。
+    /// 模型下载（P7）：队列里每条任务的快照（同一目标文件只留最新那条，真相在 download 侧）。
     downloads: RefCell<Vec<download::Snapshot>>,
-    /// 模型 id → 当前在跑的下载任务 id（点「取消」时按它找回任务）
-    download_ids: RefCell<HashMap<String, u64>>,
+    /// 模型 id → 当前在跑的下载任务 id（**多文件入口会有多条**：逐文件入队；点「取消」时按它全部找回）
+    download_ids: RefCell<HashMap<String, Vec<u64>>>,
     /// 一键备份是否在跑（后台线程，**含正在弹目录选择框那段**）。
     /// 防连点起一堆线程、两批同时往同一个目标目录里写。这是真相，
     /// ui 的 `backup-running` 只是它的投影（按钮据此禁用）。
@@ -6026,7 +6268,7 @@ fn apply_shot_state(ui: &MainWindow, rows: &Rc<VecModel<Sentence>>, ui_state: &R
                         eprintln!(
                             "  {} → {}（{}）{warn}",
                             r.id,
-                            a.dest.display(),
+                            a.primary().dest.display(),
                             a.origin.label()
                         )
                     }
@@ -13832,6 +14074,191 @@ mod tests {
     // 服务清单没给布局时按 path/url 兜底）：那些分支的用例在 `src/model_sources.rs`，
     // 这里不重复一份——两份实现正是这条链路上被抓过的错。
 
+    /// 一个多文件入口（跨包组条目）的模型：主权重 + vae，各有自己的落点/校验依据。
+    fn multi_file_model(id: &str) -> DownloadableModel {
+        DownloadableModel {
+            id: id.to_string(),
+            files: vec![
+                DownloadableFile {
+                    url: "https://example.com/yue2-3b-q4_0.gguf".into(),
+                    sha256: Some("a".repeat(64)),
+                    bytes: Some(100),
+                    dest: PathBuf::from(format!("/models/{id}/yue2-3b-q4_0.gguf")),
+                },
+                DownloadableFile {
+                    url: "https://example.com/yue2-vae-f16.gguf".into(),
+                    // 配套文件可能没有 sha（非 LFS 小文件）——行上必须如实说"仅校验大小"
+                    sha256: None,
+                    bytes: Some(20),
+                    dest: PathBuf::from(format!("/models/{id}/yue2-vae-f16.gguf")),
+                },
+            ],
+            size: Some(120),
+            origin: model_sources::Origin::Builtin,
+            conflict: None,
+        }
+    }
+
+    /// 多文件入口：点一次「下载」要**逐文件入队**（N 个文件 = N 条队列任务），
+    /// 点一次「取消」要**覆盖这条入口的全部任务**；全是重复时不登记。
+    #[test]
+    fn multi_file_entry_enqueues_one_task_per_file_and_cancels_all() {
+        let state = Rc::new(UiState::default());
+        let dest = PathBuf::from("/models/Yue2-3B-GGUF/yue2-3b-q4_0.gguf");
+        let fx = apply_download_click(
+            &state,
+            "yue2",
+            |_| unreachable!("还没在跑，不该走取消"),
+            || {
+                Some((
+                    vec![
+                        download::Enqueued::Started(7),
+                        download::Enqueued::Started(8),
+                    ],
+                    dest.clone(),
+                    2,
+                ))
+            },
+        );
+        assert_eq!(
+            fx,
+            ClickEffect::Enqueued {
+                ids: vec![7, 8],
+                total_files: 2,
+                dest: dest.clone()
+            }
+        );
+        assert_eq!(
+            active_download_ids(&state, "yue2"),
+            vec![7, 8],
+            "两个文件的任务都要登记（否则取消时漏掉第二个）"
+        );
+
+        let mut seen: Vec<u64> = Vec::new();
+        let fx = apply_download_click(
+            &state,
+            "yue2",
+            |ids| {
+                seen.extend_from_slice(ids);
+                download::CancelOutcome::Requested
+            },
+            || unreachable!("已经在跑，不该再入队"),
+        );
+        assert_eq!(fx, ClickEffect::CancelRequested(7));
+        assert_eq!(seen, vec![7, 8], "取消要覆盖这条入口的全部文件");
+
+        // 全是重复（队列里已有别的 writer 占着这些 dest）→ 如实报重复、不登记
+        let state2 = Rc::new(UiState::default());
+        let fx = apply_download_click(
+            &state2,
+            "yue2",
+            |_| unreachable!("还没在跑"),
+            || Some((vec![download::Enqueued::Duplicate { existing: 3 }], dest, 2)),
+        );
+        assert_eq!(fx, ClickEffect::DuplicateDestination { existing: 3 });
+        assert!(
+            active_download_ids(&state2, "yue2").is_empty(),
+            "全是重复时不许登记（登记了就再也取消不掉别人的任务）"
+        );
+    }
+
+    /// 多文件行：状态取最坏、进度 = Σ已下载 / Σ总长；有文件没 sha 时要如实说。
+    #[test]
+    fn multi_file_row_aggregates_state_and_progress() {
+        let model = multi_file_model("yue2");
+        let make = |id: u64, dest: &str, state: download::State, got: u64, total: Option<u64>| {
+            download::Snapshot {
+                id,
+                label: "yue2".into(),
+                dest: PathBuf::from(dest),
+                state,
+                downloaded: got,
+                total,
+                note: String::new(),
+            }
+        };
+        let done = make(
+            1,
+            "/models/yue2/yue2-3b-q4_0.gguf",
+            download::State::Done,
+            100,
+            Some(100),
+        );
+        let running = make(
+            2,
+            "/models/yue2/yue2-vae-f16.gguf",
+            download::State::Downloading,
+            10,
+            Some(20),
+        );
+        let row = download_row_for(
+            &model,
+            &[&done, &running],
+            &[],
+            &model_sources::Advice {
+                tier: None,
+                note: String::new(),
+            },
+        );
+        assert_eq!(row.state, "下载中", "有文件在跑就报在跑");
+        assert!(
+            (row.progress - (110.0 / 120.0)).abs() < 1e-6,
+            "进度必须是 Σ已下载/Σ总长：{}",
+            row.progress
+        );
+        assert!(row.detail.contains("共 2 个文件"), "{}", row.detail);
+        assert!(
+            row.detail.contains("仅校验大小"),
+            "有文件没有 sha256 时必须如实说：{}",
+            row.detail
+        );
+        assert!(row.active, "还有文件没结束 → 按钮应当是取消态");
+
+        // 两个文件都完成 → 已完成、非活动
+        let done2 = make(
+            2,
+            "/models/yue2/yue2-vae-f16.gguf",
+            download::State::Done,
+            20,
+            Some(20),
+        );
+        let row = download_row_for(
+            &model,
+            &[&done, &done2],
+            &[],
+            &model_sources::Advice {
+                tier: None,
+                note: String::new(),
+            },
+        );
+        assert_eq!(row.state, "已完成");
+        assert!(!row.active);
+
+        // 任一文件失败 → 整行报失败（别让用户以为还有悬念）
+        let failed = make(
+            2,
+            "/models/yue2/yue2-vae-f16.gguf",
+            download::State::Failed("sha256 校验失败".into()),
+            20,
+            Some(20),
+        );
+        let row = download_row_for(
+            &model,
+            &[&done, &failed],
+            &[],
+            &model_sources::Advice {
+                tier: None,
+                note: String::new(),
+            },
+        );
+        assert_eq!(row.state, "失败");
+        assert!(
+            !row.active,
+            "失败是终态 → 按钮回到「下载/重下」（active=false），别让它卡在取消态"
+        );
+        assert!(row.actionable, "有入口就永远可点（失败之后重下）");
+    }
+
     /// B1（复核阻塞项）：点取消之后**不能**立刻允许为同一模型再排一条。
     ///
     /// 取消是协作式的：旧任务可能还在写 `.part`（读循环最多再落一个 64KiB 块才看到
@@ -13853,35 +14280,36 @@ mod tests {
             |_| unreachable!("还没在跑，不该走取消"),
             || {
                 enqueues.push(1);
-                Some((download::Enqueued::Started(7), dest.clone()))
+                Some((vec![download::Enqueued::Started(7)], dest.clone(), 1))
             },
         );
         assert_eq!(
             fx,
             ClickEffect::Enqueued {
-                id: 7,
+                ids: vec![7],
+                total_files: 1,
                 dest: dest.clone()
             }
         );
-        assert_eq!(active_download_id(&state, "m"), Some(7));
+        assert_eq!(active_download_ids(&state, "m"), vec![7]);
 
         // 点取消：请求发出去，但 id 必须**留在** download_ids 里（等 worker 终态快照摘）
         let fx = apply_download_click(
             &state,
             "m",
-            |id| {
-                assert_eq!(id, 7);
+            |ids| {
+                assert_eq!(ids, [7]);
                 download::CancelOutcome::Requested
             },
             || {
                 enqueues.push(2);
-                Some((download::Enqueued::Started(8), dest.clone()))
+                Some((vec![download::Enqueued::Started(8)], dest.clone(), 1))
             },
         );
         assert_eq!(fx, ClickEffect::CancelRequested(7));
         assert_eq!(
-            active_download_id(&state, "m"),
-            Some(7),
+            active_download_ids(&state, "m"),
+            vec![7],
             "取消时不能摘 id：摘了下一次点击就会再排一条，两条抢同一个 .part"
         );
 
@@ -13892,7 +14320,7 @@ mod tests {
             |_| download::CancelOutcome::AlreadyRequested,
             || {
                 enqueues.push(3);
-                Some((download::Enqueued::Started(9), dest.clone()))
+                Some((vec![download::Enqueued::Started(9)], dest.clone(), 1))
             },
         );
         assert_eq!(fx, ClickEffect::AlreadyCancelling(7));
@@ -13910,10 +14338,17 @@ mod tests {
             |_| unreachable!("已经摘了 id，不该走取消"),
             || {
                 enqueues.push(4);
-                Some((download::Enqueued::Started(10), dest.clone()))
+                Some((vec![download::Enqueued::Started(10)], dest.clone(), 1))
             },
         );
-        assert_eq!(fx, ClickEffect::Enqueued { id: 10, dest });
+        assert_eq!(
+            fx,
+            ClickEffect::Enqueued {
+                ids: vec![10],
+                total_files: 1,
+                dest
+            }
+        );
         assert_eq!(enqueues, vec![1, 4]);
     }
 
@@ -13922,7 +14357,7 @@ mod tests {
     #[test]
     fn click_on_already_finished_task_says_finished_and_never_enqueues() {
         let state = Rc::new(UiState::default());
-        state.download_ids.borrow_mut().insert("m".into(), 7);
+        state.download_ids.borrow_mut().insert("m".into(), vec![7]);
         let fx = apply_download_click(
             &state,
             "m",
@@ -13931,7 +14366,7 @@ mod tests {
         );
         assert_eq!(fx, ClickEffect::AlreadyFinished(7));
         // 终态快照还没到，id 仍在册；下一次点击还是按"取消"这条路走
-        assert_eq!(active_download_id(&state, "m"), Some(7));
+        assert_eq!(active_download_ids(&state, "m"), vec![7]);
     }
 
     /// 复核第二轮 B1：旧任务的**迟到终态快照**不能把用户刚登记的新任务摘掉。
@@ -13943,21 +14378,34 @@ mod tests {
     /// 这条对"只按 label 摘"的旧实现会红：第一、二条断言都会失败。
     #[test]
     fn stale_terminal_snapshot_does_not_release_the_new_task() {
-        let mut ids: HashMap<String, u64> = HashMap::new();
-        ids.insert("m".to_string(), 2); // 用户已经给同一个模型登记了新任务
-                                        // 旧任务（id=1）迟到来的终态：不许摘掉新任务
+        // 多文件入口下，同一个模型可以同时挂着几条任务（逐文件入队）；这里模拟
+        // "同一模型登记了 id=2 的新任务、id=1 的旧任务迟到终态"。
+        let mut ids: HashMap<String, Vec<u64>> = HashMap::new();
+        ids.insert("m".to_string(), vec![2]); // 用户已经给同一个模型登记了新任务
         assert!(
             !release_download_id(&mut ids, "m", 1),
             "旧任务的终态不该认领新任务的登记"
         );
         assert_eq!(
             ids.get("m"),
-            Some(&2),
+            Some(&vec![2]),
             "旧任务的终态快照不能把新任务的 id 摘掉"
         );
         // 确实是这条任务自己的终态才摘
         assert!(release_download_id(&mut ids, "m", 2));
         assert!(ids.is_empty());
+
+        // 多文件：摘掉其中一个文件的任务后，其余登记必须还在（整条入口没结束）
+        ids.insert("n".to_string(), vec![11, 12, 13]);
+        assert!(release_download_id(&mut ids, "n", 12));
+        assert_eq!(
+            ids.get("n"),
+            Some(&vec![11, 13]),
+            "同一入口其它文件的登记不能被牵连"
+        );
+        assert!(release_download_id(&mut ids, "n", 11));
+        assert!(release_download_id(&mut ids, "n", 13));
+        assert!(ids.is_empty(), "最后一个文件的任务摘掉后整条登记清空");
     }
 
     /// 同理，旧任务的迟到快照也不能盖掉**界面行**里新任务的状态：

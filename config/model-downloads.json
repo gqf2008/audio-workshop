@@ -2266,10 +2266,74 @@
         }
       ],
       "aux_unresolved": [],
-      "entry": null,
+      "entry": {
+        "bytes": 2933428405,
+        "composed_from": [
+          "yue2_main_q4_0",
+          "yue2_vae_f16"
+        ],
+        "default": false,
+        "display_name": "Yue2 3B Main Q4_0",
+        "downloadable": true,
+        "files": [
+          {
+            "bytes": 2665645728,
+            "remote_path": "yue2-3b-q4_0.gguf",
+            "sha256": "cb1f76c8c90755a4c5c9cc0220b26b914570d74f4dc3ec6599469a46d7990f4b",
+            "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-3b-q4_0.gguf"
+          },
+          {
+            "bytes": 265218656,
+            "remote_path": "yue2-vae-f16.gguf",
+            "sha256": "d4f4a05d8f291ae820cd1e43609da3fa91b56465810091a2b08c3350b751719d",
+            "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/yue2-vae-f16.gguf"
+          },
+          {
+            "bytes": 959,
+            "remote_path": "sidecars/yue2-model-config.json",
+            "sha256": null,
+            "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-model-config.json"
+          },
+          {
+            "bytes": 466,
+            "remote_path": "sidecars/yue2-generation-config.json",
+            "sha256": null,
+            "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-generation-config.json"
+          },
+          {
+            "bytes": 2561218,
+            "remote_path": "sidecars/yue2-qwen.tiktoken",
+            "sha256": null,
+            "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-qwen.tiktoken"
+          },
+          {
+            "bytes": 1378,
+            "remote_path": "sidecars/yue2-vae-config.json",
+            "sha256": null,
+            "url": "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/sidecars/yue2-vae-config.json"
+          }
+        ],
+        "format": "gguf",
+        "gated": false,
+        "id": "yue2_main_q4_0",
+        "kind": "huggingface_snapshot",
+        "local_paths": [
+          "Yue2-3B-GGUF/yue2-3b-q4_0.gguf",
+          "Yue2-3B-GGUF/yue2-vae-f16.gguf",
+          "Yue2-3B-GGUF/sidecars/yue2-model-config.json",
+          "Yue2-3B-GGUF/sidecars/yue2-generation-config.json",
+          "Yue2-3B-GGUF/sidecars/yue2-qwen.tiktoken",
+          "Yue2-3B-GGUF/sidecars/yue2-vae-config.json"
+        ],
+        "precision": "q4_0",
+        "reason": "",
+        "repo": "audio-cpp/Yue2-3B-GGUF",
+        "revision": "main",
+        "target_directory": "Yue2-3B-GGUF"
+      },
       "family": "yue2",
       "id": "yue2",
-      "note": "选中 yue2_main_q8_0，但它覆盖不了 schema 声明的权重（缺 yue2-3b-q4_0.gguf、yue2-vae-f16.gguf）；跨包组条目需要 app 侧支持**多文件入口**（`usable_builtin_package` 今天只认单文件包）—— 按「不猜地址」标 no-source —— 暂无下载入口，不猜地址",
+      "note": "目录匹配（模型 path 指目录），按 schema 声明选中 yue2_main_q4_0，并跨包补齐 yue2_vae_f16",
       "packages": [
         {
           "bytes": 4266763861,
@@ -2544,7 +2608,7 @@
       ],
       "path": "Yue2-3B-GGUF",
       "spec": "yue2.json",
-      "status": "no-source"
+      "status": "downloadable"
     }
   ],
   "source": {

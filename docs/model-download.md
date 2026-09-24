@@ -78,18 +78,24 @@ python3 tools/gen_model_downloads.py --check         # 与上游比对，不一�
   q4_0 主权重 + vae f16 —— **没有任何单包能凑齐**，于是如实标 `no-source`。
   落在**别的 family** 目录里的声明（如 `qwen3_asr.forced_aligner_model_path`）不算，
   那些在界面上按独立模型看待，由 `aux_bytes` / `aux_unresolved` 如实呈现。
-- **跨包组条目（2026-09-25 加，默认关闭）**：单包凑不齐时的正解是把缺的声明文件**从别的包
-  合并进来**：主包按**最早声明键**命中的那个包选（惯例是主权重），其余声明文件按 URL 去重
-  合并，来源写进 `entry.composed_from`，note 会写"跨包补齐 <包 id>"。
-  **但它默认不开**：组出来的是多文件条目，而下载入口今天只认单文件包 ——
-  `src/model_sources.rs::usable_builtin_package` 要求 `files.len() == 1 && local_paths.len() == 1`，
-  下载执行层 `src/download.rs::TaskSpec` 也只接受单个 `url → dest`（全仓没有遍历 `entry.files` 的地方）。
-  真开出来会变成"清单说 downloadable、界面判点不动"的两头不一致，所以生成器用
-  `APP_SUPPORTS_MULTI_FILE_ENTRY`（默认 `False`）把这条能力关着：关着时 `yue2` 照旧
-  `no-source`，note 点名阻塞点。**放开顺序**（下一批）：
-  ① `usable_builtin_package` 放宽单文件约束；② `Action` 由单 `url/dest` 改成文件列表；
-  ③ `src/download.rs` 队列按文件入队（逐文件 sha / 进度 / 断点，`TaskSpec` 已有全部零件）；
-  ④ 界面按模型聚合显示多文件的进度与结果；⑤ 把 `APP_SUPPORTS_MULTI_FILE_ENTRY` 改 `True` 并重生成。
+- **跨包组条目 / 多文件入口（2026-09-25 落地）**：单包凑不齐时的正解是把缺的声明文件
+  **从别的包合并进来** —— 主包按**最早声明键**命中的包选（惯例是主权重），其余声明文件按
+  URL 去重合并，来源写进 `entry.composed_from`，note 写"跨包补齐 <包 id>"。
+  条目的文件顺序是"**声明过的权重在前**（保持声明顺序）、其余（sidecars）在后"：
+  `files[0]` 恒为**主文件（权重）**，界面行上显示的落点与落点冲突提醒都以它为准。
+
+  与之配套的 app 侧改动（同一批）：
+  ① `usable_builtin_package` 放宽到"文件与落点数量一致且都有 URL"（不再是单文件）；
+  ② `model_sources::Action` 由单 `url/dest/sha` 改成 `files: Vec<ActionFile>`，每个文件带
+     自己的 `url` / `sha256` / `bytes`（逐文件期望大小 —— 包级 `bytes` 是各文件之和，不能拿来核单个文件）/ `dest`；
+  ③ 点击时**逐文件入队**（`src/download.rs` 不动：它本来就是"一条任务一个目标文件"，
+     按 dest 去重、逐文件 sha/大小校验、逐文件断点续传）；
+  ④ 界面按模型聚合：状态取最坏（有失败报失败、有在跑报下载中）、进度 = Σ已下载/Σ总长、
+     取消一次覆盖这条入口的全部任务；快照按 **dest** 合并（否则同一模型的几个文件会互相覆盖）；
+  ⑤ 生成器的 `APP_SUPPORTS_MULTI_FILE_ENTRY` 置 `True`（关掉时仍会如实 `no-source` 并点名
+     "需要多文件入口"，这是回退路径的守卫）。
+  服务清单（`server.json`）只声明单个 `path`，所以"服务侧给了 url"那条路径永远是单文件；
+  它的 `sha256`/`size` **只覆盖主文件**，配套文件用清单里各自的值。
 
 ### 1.3 体积与哈希（`bytes` / `sha256`）是怎么取的
 
@@ -361,8 +367,9 @@ P7 给每个模型加了三个可选字段：
   2.0；`qwen3_asr` 选 0.6B 而非 1.7B；`stable_audio` 选 small-music 而非 medium）。
   sha256 字段级回落三条各有用例：①服务侧有 sha 用之（内置值不覆盖）；②服务侧为空用内置
   per-file 的兜底；③两边都没有 → `None`（只按大小校验，行为不变）；打进二进制的那份真实
-  清单在用例里钉住"10 条入口全部带 64 位十六进制 per-file sha256"，并钉住 sheetsage2 由
-  "没有源"转为有入口、yue2 仍因"跨包组条目需要多文件入口支持"标 no-source（覆盖校验与跨包组能力的正/负对照）。
+  清单在用例里钉住"11 条入口的**主文件**都带 64 位十六进制 per-file sha256"，并钉住 sheetsage2 由
+  "没有源"转为有入口、yue2 由跨包组条目变成可下载（多文件：主权重 + vae + sidecars，
+  `entry.composed_from` 记来源）；生成器开关关掉时 yue2 必须回到 no-source 并点名"需要多文件入口"（两侧对照）。
   另有落点校验（清单 path 在模型目录外 → 报冲突；path 指目录 → 不报）。
   默认模型目录推导（`model_root_from_paths`）另有 5 条用例：多条 / 单条 / 空 / 相对路径 / 跨根，
   外加"显式设置优先"一条；跨卷那条注入假 volume（一台机器上造不出第二个文件系统）。

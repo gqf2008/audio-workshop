@@ -35,12 +35,11 @@ P7 的下载队列（串行 / 断点续传 / 校验后提交）已经能跑，�
   候选多于一个时按 `precision_preference` → `q8_0` 的顺序挑，挑的结果写进 note。
 - **覆盖校验（2026-09-24 加）**：`session_options` 里声明、且落点**在本模型目录内**的权重文件，
   必须能在 `entry` 里凑齐；凑不齐 → `no-source` 并在 note 写明缺哪些（**不猜 URL**）。
-- **跨包组条目（2026-09-25 加，默认关闭）**：单包凑不齐时的正解是把缺的声明文件从别的包
-  合并进来（见 `compose_entry`：主包按**最早声明键**命中的那个选，其余按 URL 去重合并、
-  来源写进 `entry.composed_from`）。但组出来的条目是**多文件**的，而 app 的下载入口今天
-  只认单文件包（`src/model_sources.rs::usable_builtin_package` 要求 `files.len()==1`），
-  所以整条能力挂在 `APP_SUPPORTS_MULTI_FILE_ENTRY`（默认 `False`）后面 —— 关着时 `yue2`
-  仍如实标 `no-source`，但 note 会点名真阻塞点是"app 不支持多文件入口"。
+- **跨包组条目（2026-09-25 加并打开）**：单包凑不齐时把缺的声明文件从别的包合并进来
+  （见 `compose_entry`：主包按**最早声明键**命中的那个选，其余按 URL 去重合并、
+  来源写进 `entry.composed_from`）。条目因此可能**多文件**；app 侧同步做了多文件入口
+  （`Action.files` 逐文件入队 + 界面按模型聚合），能力开关 `APP_SUPPORTS_MULTI_FILE_ENTRY = True`。
+  开关关着时（历史状态）生成器会把这类模型标 `no-source` 并在 note 点名"需要多文件入口"。
   依据：应用**只下载 `entry`**（`src/model_sources.rs` 连 `aux_files` 字段都不读，
   `aux_bytes` 只进占用估算），所以 entry 凑不齐产品要加载的文件就是"下完也用不了"。
   典型：`yue2` 声明要 q4_0 主权重 + vae f16，而上游 5 个包每个只含 4 个 sidecars + 1 个权重
@@ -123,14 +122,15 @@ DOWNLOADABLE_KINDS = ("huggingface_snapshot", "modelscope_snapshot")
 # 先按 q8_0（体积/质量折中，本产品在 audio8-tts 上也首选它），再按包 id 定序（确定性）。
 FALLBACK_PRECISION = "q8_0"
 
-# 应用侧能力开关：**今天只支持单文件入口**。
-# `src/model_sources.rs::usable_builtin_package` 明确要求 `files.len() == 1 && local_paths.len() == 1`，
-# 下载执行层 `src/download.rs::TaskSpec` 也只接受单个 `url → dest`（全仓没有遍历 `entry.files` 的地方）。
-# 跨包组出来的条目天然是多文件（yue2 = 主权重 + vae + sidecars），**在 app 支持多文件入口之前不许出厂**：
-# 否则清单说 downloadable、界面判"点不动"（`usable_builtin_package` 返回 None），两边不一致。
-# 放开步骤（下一批）：① `usable_builtin_package` 放宽单文件约束；② `Action` 由单 url/dest 改成文件列表；
-# ③ `download.rs` 队列按文件入队（逐文件 sha/进度/断点）；④ 界面按模型聚合显示；⑤ 本开关改 True。
-APP_SUPPORTS_MULTI_FILE_ENTRY = False
+# 应用侧能力开关：**多文件入口**（2026-09-25 打开）。
+# 开之前 app 只认单文件包（`usable_builtin_package` 要求 `files.len() == 1`，`TaskSpec` 只接受
+# 单个 `url → dest`），跨包组出来的多文件条目会"清单说 downloadable、界面判点不动"。
+# 现在的落地方式：① `usable_builtin_package` 放宽到"文件与落点数量一致且都有 URL"；
+# ② `Action` 带 `files: Vec<ActionFile>`（每个文件自己的 url/sha/bytes/dest）；
+# ③ 点击时**逐文件入队**（队列本身就是一条任务一个 dest：逐文件 sha/大小校验、逐文件断点续传）；
+# ④ 界面按模型聚合（状态取最坏、进度 = Σ已下载/Σ总长）；
+# ⑤ 即本开关置 True —— 生成器从此可以给出跨包组的多文件条目。
+APP_SUPPORTS_MULTI_FILE_ENTRY = True
 
 
 def load_schema(path=SCHEMA_PATH):
@@ -676,8 +676,16 @@ def compose_entry(schema_model: dict, tail: str, candidates: list) -> tuple:
         locals_ += [p for p in extra.get("local_paths") or [] if p not in locals_]
         composed_from.append(extra["id"])
 
-    entry["files"] = files
-    entry["local_paths"] = locals_
+    # **主文件必须是权重，不是 sidecar**：`files[0]` 在应用侧就是"这条入口的主文件"
+    # （行上显示的落点、`server.json` 落点冲突提醒都以它为准）。上游包内的顺序是
+    # "sidecars 在前、权重在后"，所以这里按"声明过的权重在前（保持声明顺序）、其余按原顺序"
+    # 重排 —— files 与 local_paths 必须**同步重排**（应用按同下标配对）。
+    declared_local = [local for _key, local, _name in declared]
+    order = [i for i, lp in enumerate(locals_) if lp in declared_local] + [
+        i for i, lp in enumerate(locals_) if lp not in declared_local
+    ]
+    entry["files"] = [files[i] for i in order]
+    entry["local_paths"] = [locals_[i] for i in order]
     entry["bytes"] = package_bytes(files)
     if len(composed_from) > 1:
         entry["composed_from"] = composed_from
