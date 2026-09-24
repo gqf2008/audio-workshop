@@ -31,6 +31,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import _console  # noqa: F401  副作用 import：stdout/stderr→UTF-8（Windows 上必须）
+
 # --- 系统自带、不随包分发 ------------------------------------------------
 
 # Windows：OS 自带或 VC++ 运行库由系统提供时才略过 —— 这里全部**要求随包**，

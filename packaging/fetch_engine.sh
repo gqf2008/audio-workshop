@@ -115,8 +115,14 @@ fi
 # （GNU tar 直接报错退出、bsdtar 给警告、unzip 返回 11），拼命令行容易变成假失败。
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
-python3 - "${TARBALL}" "${OUT_DIR}" "${BIN_NAME}" <<'PY'
+python3 - "${TARBALL}" "${OUT_DIR}" "${BIN_NAME}" "$(pwd)/tools" <<'PY'
 import os, re, sys, tarfile, zipfile
+
+# Windows：Git Bash 里拉起的 python 的 stdout 是 cp1252，打印中文/"✅" 会
+# UnicodeEncodeError 把整个打包打断（2026-09-24 release 流水线 Windows job 实测）。
+# 复用仓库里已有的那份实现（tools/_console.py），不再各写一遍。
+sys.path.insert(0, sys.argv[4])
+import _console  # noqa: F401  副作用 import：stdout/stderr→UTF-8（Windows 上必须）
 
 tarball, out_dir, bin_name = sys.argv[1], sys.argv[2], sys.argv[3]
 want = {bin_name, "LICENSE"}
