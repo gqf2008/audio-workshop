@@ -97,26 +97,69 @@ else
   echo "   → sha256 校验通过"
 fi
 
-# 解包只取需要的两样：服务二进制 + Apache-2.0 许可。
-# 上游压缩包里还有 cli/gguf/tools/model_specs（model spec 已编进 server），随发布会白白变大。
+# 解包只取需要的三类：服务二进制 + Apache-2.0 许可 + **与二进制同级的运行库**。
+# 上游压缩包里还有 cli/gguf/tools/model_specs（model spec 已编进 server），随发布会白白变大
+# （audiocpp_cli 一个就 ~29 MB）。
+#
+# 为什么必须带上同级运行库（2026-09-24 实测，判据与实现见 tools/check_engine_deps.py）：
+#   · Windows：`audiocpp_server.exe` 的导入表里有 MSVCP140 / VCRUNTIME140 / VCOMP140…，
+#     上游把对应 DLL 摆在归档根；只解出 exe 就是"找不到 MSVCP140.dll"，
+#     而 package_windows.ps1 对外承诺的是"用户不用装 VC++ Redist"。
+#   · Linux：`audiocpp_server` 的 DT_NEEDED 含 libggml.so.0 / libggml-base.so.0，
+#     且 RUNPATH=$ORIGIN —— 加载器只去**二进制所在目录**找，缺了就起不来。
+#   · macOS：当前产物只链系统框架，属于"没有同级依赖"的正例。
+#
+# 用 python3 解包（而不是 unzip/tar 命令行）的原因：三种归档、两种包内布局
+# （上游 release 资产 = 文件在归档根；GitHub Actions artifact 形态 = 多一层目录）
+# 都要吃得下，而 `tar`/`unzip` 在"某个模式一个都没匹配上"时行为各不相同
+# （GNU tar 直接报错退出、bsdtar 给警告、unzip 返回 11），拼命令行容易变成假失败。
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
-# 两种包内布局都要吃得下：
-#   · 上游 release 资产：文件在归档根（`audiocpp_server` / `LICENSE`）
-#   · GitHub Actions artifact 形态：多一层 `<artifact-name>/` 目录
-case "${ASSET}" in
-  *.zip)
-    if ! unzip -q -j "${TARBALL}" "${BIN_NAME}" "LICENSE" -d "${OUT_DIR}" 2>/dev/null; then
-      unzip -q -j "${TARBALL}" "*/${BIN_NAME}" "*/LICENSE" -d "${OUT_DIR}"
-    fi ;;
-  *)
-    if ! tar xzf "${TARBALL}" -C "${OUT_DIR}" "${BIN_NAME}" "LICENSE" 2>/dev/null; then
-      tar xzf "${TARBALL}" -C "${OUT_DIR}" --strip-components=1 \
-        --wildcards "*/${BIN_NAME}" "*/LICENSE"
-    fi ;;
-esac
+python3 - "${TARBALL}" "${OUT_DIR}" "${BIN_NAME}" <<'PY'
+import os, re, sys, tarfile, zipfile
+
+tarball, out_dir, bin_name = sys.argv[1], sys.argv[2], sys.argv[3]
+want = {bin_name, "LICENSE"}
+runtime_re = re.compile(r"^(lib.*\.so(\.\d+)*|.*\.dll|.*\.dylib)$", re.IGNORECASE)
+
+
+def wanted(name: str) -> bool:
+    base = os.path.basename(name)
+    return base in want or bool(runtime_re.match(base))
+
+
+def copy_members(members, reader):
+    got = []
+    for name in members:
+        base = os.path.basename(name)
+        with open(os.path.join(out_dir, base), "wb") as fh:
+            fh.write(reader(name))
+        got.append(base)
+    return got
+
+
+if tarball.lower().endswith(".zip"):
+    with zipfile.ZipFile(tarball) as zf:
+        names = [n for n in zf.namelist() if wanted(n)]
+        got = copy_members(names, zf.read)
+else:
+    with tarfile.open(tarball, "r:*") as tf:
+        names = [m.name for m in tf.getmembers() if m.isfile() and wanted(m.name)]
+
+        def read(name):
+            return tf.extractfile(name).read()
+
+        got = copy_members(names, read)
+
+print("   解出：" + ", ".join(sorted(got)))
+PY
 
 [ -f "${OUT_DIR}/${BIN_NAME}" ] || { echo "❌ 解包后找不到 ${BIN_NAME}" >&2; exit 1; }
 [ -f "${OUT_DIR}/LICENSE" ] || { echo "❌ 解包后找不到 LICENSE" >&2; exit 1; }
-chmod +x "${OUT_DIR}/${BIN_NAME}"
-echo "   → 引擎就绪：${OUT_DIR}/${BIN_NAME} ($(du -h "${OUT_DIR}/${BIN_NAME}" | awk '{print $1}'))"
+chmod +x "${OUT_DIR}/${BIN_NAME}" "${OUT_DIR}"/*.so* 2>/dev/null || chmod +x "${OUT_DIR}/${BIN_NAME}"
+
+# 运行时依赖门禁：二进制的**真实依赖**（PE 导入表 / ELF DT_NEEDED / otool -L）必须都在这一层。
+# 放在这里而不是各平台打包脚本里：三平台共用一份取件逻辑，门禁也就只有一处。
+python3 tools/check_engine_deps.py "${OUT_DIR}"
+
+echo "   → 引擎就绪：${OUT_DIR}/${BIN_NAME} ($(du -sh "${OUT_DIR}" | awk '{print $1}'))"

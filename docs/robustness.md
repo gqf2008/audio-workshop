@@ -80,7 +80,8 @@ BGM 混音 wav / 歌曲 wav / 分离两轨的写出与 rename / 句子复用（�
 
 ## 3.5 参考音频时长护栏（2026-09-22 · thread cc-ai-audio-workshop-ref-audio-limit）
 
-> 本节记录**引擎进程被参考音频打死**的复现与护栏口径；数字来源：随包 v0.8.2-metalbf16
+> 本节记录**引擎进程被参考音频打死**的复现与护栏口径；数字来源：换引擎前随包的
+> fork 构建 `v0.8.2-metalbf16`（= 官方 v0.8.2 的同一份 Metal bf16 能力，见 `docs/release.md`）
 > 真机实测，证据目录 `/Volumes/DataExt/tmp/aw-stream/repro-193s/`（ref20s.json/wav + engine.log）。
 
 ### 复现

@@ -173,13 +173,16 @@ cargo test --bin audio-workshop real_default_manifest -- --ignored --nocapture
 
 ```json
 {
-  "source": { "repo": "gqf2008/audio.cpp", "tag": "v0.8.2-metalbf16", "base": "0xShug0/audio.cpp v0.8.1" },
+  "source": { "repo": "0xShug0/audio.cpp", "tag": "v0.8.2", "base": "0xShug0/audio.cpp v0.8.2" },
   "artifacts": { "macos-arm64": { "asset": "...", "sha256": "..." } }
 }
 ```
 
-`v0.8.2-metalbf16` = 上游 v0.8.1 + 三个 **Metal BF16** 补丁（BreezeTTS 2 的 bf16 激活与
-bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文件，然后**重跑三平台验收**。
+**2026-09-24 起取的是上游官方 `v0.8.2`**：本仓库此前维护的 fork `gqf2008/audio.cpp`
+（tag `v0.8.2-metalbf16` = 上游 v0.8.1 + 三个 **Metal BF16** 补丁：BreezeTTS 2 的 bf16 激活与
+bf16 KV cache，含 `f16<->bf16` 拷贝内核）**已退役**——那些补丁作为上游 PR #554 于 2026-09-19
+并入官方，官方 `v0.8.2` 自带这份能力，所以随包取件回到上游官方产物。
+改引擎就是改这个文件，然后**重跑三平台验收**。
 
 ## 各平台的产物形态
 
@@ -188,6 +191,35 @@ bf16 KV cache，含 `f16<->bf16` 拷贝内核）。改引擎就是改这个文�
 | macOS | `AudioWorkshop-<v>.dmg` | `<App>.app/Contents/Resources/engine/audiocpp_server` |
 | Windows | `...-windows-x64.zip` + `...-windows-x64-setup.exe`（per-user Inno Setup，免 UAC） | `engine\audiocpp_server.exe`（exe 同级） |
 | Linux | `...-linux-x64.tar.gz` | `engine/audiocpp_server`（exe 同级） |
+
+## 引擎不是"一个二进制"：同级运行库必须一起随包（2026-09-24 实测）
+
+上游归档里，`audiocpp_server` **旁边**还摆着它要加载的运行库。原来 `fetch_engine.sh` 只解出
+「二进制 + LICENSE」，结果是 **Linux/Windows 的包里引擎根本起不来**（macOS 那份只链系统框架，
+所以本机一直没暴露）。现在取件改成"二进制 + LICENSE + 同级运行库"，并在取件末尾跑
+`tools/check_engine_deps.py` —— 它按**二进制的真实依赖**（PE 导入表 / ELF `DT_NEEDED` /
+`otool -L`）判，凡是系统不提供的依赖都必须在引擎目录里找到同名文件：
+
+| 平台 | 引擎的真实依赖 | 缺了会怎样 |
+|---|---|---|
+| Windows | `MSVCP140.dll` / `VCRUNTIME140.dll` / `VCRUNTIME140_1.dll` / `VCOMP140.DLL` / `MSVCP140_CODECVT_IDS.dll`（PE 导入表实测，上游随 zip 提供） | 启动即"找不到 MSVCP140.dll" —— 而本仓库对外承诺"用户不用装 VC++ Redist" |
+| Linux | `libggml.so.0` / `libggml-base.so.0`（`DT_NEEDED`，且 `RUNPATH=$ORIGIN`） | `error while loading shared libraries: libggml.so.0` |
+| macOS | 只有 `/usr/lib`、`/System` 系统库 | 无（属"没有同级依赖"的正例，不是"不用检查"） |
+
+**Linux 真机/容器实测（2026-09-24，colima + `ubuntu:24.04` amd64）**：
+
+```
+# 取件后的 engine/ 目录（含 libggml*.so*）
+audio.cpp 0.8.2 / git: 4d88768f 2026-09-23 / build: Release, gcc 13.3.0, Linux x86_64 / backends: cpu   rc=0
+# 只放二进制的旧形态
+./audiocpp_server: error while loading shared libraries: libggml.so.0: cannot open shared object file   rc=127
+```
+
+**Linux 目标机要求（随包引擎的编译基线，实测）**：glibc **≥ 2.38** 与 `libgomp1`
+（引擎用 `debian:bookworm-slim`＝glibc 2.36 起不来：`version GLIBC_2.38 not found`、
+`GLIBCXX_3.4.32 not found`；裸 `ubuntu:24.04` 缺 `libgomp.so.1`，装上才起来）。
+即 Ubuntu 24.04+ / Debian 13+ 一路可用；更老的发行版需要自行升级或换用系统里的引擎。
+（同类判据见 `LESSON_随包第三方工具需校验minOS或glibc及依赖与签名状态.md`。）
 
 ## 两个必须记住的前提
 

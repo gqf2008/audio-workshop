@@ -2,7 +2,7 @@
 #
 # 与上游 audio.cpp 的分工：
 #   · 引擎（audiocpp_server）**不在这里编** —— 它是 C++/CMake 工程，产物由上游那套
-#     流水线出（fork 的 tag v0.8.2-metalbf16），这里只按 engine-lock.json 校验 sha256 后取件。
+#     流水线出（上游 0xShug0/audio.cpp 的 tag v0.8.2），这里只按 engine-lock.json 校验 sha256 后取件。
 #     两件事分开，是因为引擎构建要 CUDA/Metal 工具链与 2 小时级 runner，而壳只要几分钟。
 #   · 这条流水线只负责"壳 + 引擎 → 用户能装的包"。
 #
