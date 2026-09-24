@@ -2,35 +2,35 @@
   "_comment": "随包推理引擎的来源与校验。改这里等于换引擎，必须重新跑三平台验收。",
   "_why": "audio.cpp 的 audiocpp_server 随包分发，用户下载即用、不需要自己编译或跑服务。",
   "source": {
-    "repo": "gqf2008/audio.cpp",
-    "tag": "v0.8.2-metalbf16",
-    "base": "0xShug0/audio.cpp v0.8.1",
-    "patches": "Metal 后端启用 BreezeTTS 2 的 bf16 激活与 bf16 KV cache（含 f16<->bf16 拷贝内核）",
+    "repo": "0xShug0/audio.cpp",
+    "tag": "v0.8.2",
+    "base": "0xShug0/audio.cpp v0.8.2",
+    "patches": "无（原 fork 的 Metal bf16 补丁 #554 已含于官方 v0.8.2，fork 定制引擎退役）",
     "license": "Apache-2.0"
   },
-  "release_base": "https://github.com/gqf2008/audio.cpp/releases/download/v0.8.2-metalbf16",
+  "release_base": "https://github.com/0xShug0/audio.cpp/releases/download/v0.8.2",
   "artifacts": {
     "macos-arm64": {
-      "asset": "audio-v0.8.2-metalbf16-bin-macos-arm64-metal.tar.gz",
-      "sha256": "6231af8ff44122529e0bc2dd9625ab580654515154c40f3e801bf347d5e97067",
+      "asset": "audio-v0.8.2-bin-macos-arm64-metal.tar.gz",
+      "sha256": "d33db13695fbf3ba73ea85a8b59575b98a66f7b6ff89bbb59599c75b4689f9a5",
       "binary": "audiocpp_server",
       "backend": "metal"
     },
     "macos-x64": {
-      "asset": "audio-v0.8.2-metalbf16-bin-macos-x64-metal.tar.gz",
-      "sha256": "97dad9e7e11afb4ef921f5bf793b0f1744f3de2de0068e753aa13d4386075ccd",
+      "asset": "audio-v0.8.2-bin-macos-x64-metal.tar.gz",
+      "sha256": "6edcf84ea530f782c465fb9b37c7f3c1e8ac1e8ded865a9a59ebacc5140d8b67",
       "binary": "audiocpp_server",
       "backend": "metal"
     },
     "windows-x64": {
-      "asset": "audio-v0.8.2-metalbf16-bin-windows-x64-cpu-portable.zip",
-      "sha256": "691fc5cf1c6aba3300cf41e71b9827bbbe9ded0c4c08d3d7cd8f781847afcb39",
+      "asset": "audio-v0.8.2-bin-windows-x64-cpu-portable.zip",
+      "sha256": "aa83a7992ddf9a520d16839bbd3c8999155e2cc46845860627ee689c5bcd40cd",
       "binary": "audiocpp_server.exe",
       "backend": "cpu"
     },
     "linux-x64": {
-      "asset": "audio-v0.8.2-metalbf16-bin-ubuntu-x64-cpu-portable.tar.gz",
-      "sha256": "f825337d4e4955ed779928999d7eacb5b00d2334fb8003b524ec96a95402f765",
+      "asset": "audio-v0.8.2-bin-ubuntu-x64-cpu-portable.tar.gz",
+      "sha256": "8b9ec2fc7678545820d673b861743da6785193d94d5f24fbc79419d66c6f36c2",
       "binary": "audiocpp_server",
       "backend": "cpu"
     }

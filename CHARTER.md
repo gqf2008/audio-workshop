@@ -5,6 +5,7 @@
 > **2026-09-15 修订 2（第三轮独立评审后，与方案 v0.3 对齐）**：§2 第 3 条改为**条件式**（出片 ≤ 纯合成时间 ×1.2，"≤20 分钟"在 RTF≈4 端不可达）；§5/§9 **拆分模型下载器**（M1 基础下载免费 / P7 增强下载器 M4 付费）并校正项数口径（8 项 P1~P8）；§6/§8 引擎改为"**独立仓库 checkout，submodule 化待落**"（原文写 submodule 锁 tag，与仓库事实不符）；§7 更正 ace-step 备注（**按 RTF，不是"快 2.8×"**）；§10 统一判据分母（3 人）。
 > **2026-09-20 修订 3（文档口径同步批次）**：引擎版本口径统一为「**以 `engine-lock.json` 为准（当前 `v0.8.2-metalbf16`）**，随包预编译取件（sha256 校验）」——此前各处写死的"当前 v0.7.3"随版本演进漂移且与锁文件不符；README、本文件 §6/§8、product-plan §5.2 同步。
 > **2026-09-20 修订 4（LICENSE 批次）**：§11 的「自研层协议」由待定**定稿为全仓 Apache-2.0**（与上游 audio.cpp 一致，方案③）。同步：根 crate `Cargo.toml` 的 `license` 由 `MIT` 改为 `Apache-2.0`、新增仓库根 `LICENSE` 全文、README 增「许可 / License」小节、发版脚本（`release.sh` / `package.sh` → `packaging/check_license.sh`）加「LICENSE 存在且与 Cargo.toml 元数据一致」断言。依据 `LESSON_公开仓库发版前须落LICENSE且与包元数据一致.md`。
+> **2026-09-24 修订 5（引擎回到上游官方）**：随包引擎由 fork `gqf2008/audio.cpp` 的 `v0.8.2-metalbf16` 换回**上游官方 `0xShug0/audio.cpp v0.8.2`**——fork 定制引擎退役（其 Metal bf16 补丁 PR #554 于 2026-09-19 并入官方）。口径不变：**以 `engine-lock.json` 为准**（sha256 校验后取件）。同步 README、本文件 §6/§8、`docs/release.md`、`docs/product-plan.md`、`docs/robustness.md`、`docs/streaming-preview.md`。
 
 ## 1. 定位
 
@@ -59,11 +60,11 @@ Mac（M 系列 Metal）先行 → Windows（消费级 N 卡 CUDA）→ Linux。
 场景层   配音 / BGM / 歌曲        ← 创作者只看到这三个入口
 配置层   models.schema.yaml       ← 模型旋钮 + known_issues + product_excluded
 文本层   规范化 + 发音词典         ← 补上游缺口（如年份逐位读）
-引擎层   audio.cpp（随包预编译取件，版本以 engine-lock.json 为准：当前 v0.8.2-metalbf16）+ 服务/server
+引擎层   audio.cpp（随包预编译取件，版本以 engine-lock.json 为准：当前上游 v0.8.2）+ 服务/server
 评估层   audio-eval               ← 可懂度/耗时/内存 + 回归对比
 ```
 
-**引擎引入方式**：本仓库**既无 `.gitmodules` 也无 `external/`**（`external/` 是引擎仓库自己的目录）。随包引擎是**按 `engine-lock.json` 取件的预编译产物**（锁 **`v0.8.2-metalbf16`**，sha256 校验），用户下载即用；开发机做适配仍用本机另一处 checkout，**源码 submodule 化待落**。在那之前**"锁版本"靠 `engine-lock.json`，不靠 checkout 上的 tag**（tag 只是发布上游产物时的名字）。早期版本写的"以 submodule 锁定 tag 引入"与仓库事实不符。
+**引擎引入方式**：本仓库**既无 `.gitmodules` 也无 `external/`**（`external/` 是引擎仓库自己的目录）。随包引擎是**按 `engine-lock.json` 取件的预编译产物**（锁**上游 `0xShug0/audio.cpp` 的 `v0.8.2`**，sha256 校验），用户下载即用；开发机做适配仍用本机另一处 checkout，**源码 submodule 化待落**。在那之前**"锁版本"靠 `engine-lock.json`，不靠 checkout 上的 tag**（tag 只是发布上游产物时的名字）。早期版本写的"以 submodule 锁定 tag 引入"与仓库事实不符；2026-09-24 前锁的是本仓库自己维护的 fork `gqf2008/audio.cpp v0.8.2-metalbf16`，该 fork 已退役（补丁并入上游）。
 
 **设计原则**：技术会进步、模型会换 —— 产品价值在配置层，不在改模型。上游模型不稳的地方（数字读法、0.1B 变体不可用）由配置层声明与兜底，不写死在代码里。
 
@@ -87,7 +88,7 @@ Mac（M 系列 Metal）先行 → Windows（消费级 N 卡 CUDA）→ Linux。
 | 剪映免费且够用 | 高 | 只打它给不了的：声音是自己的、素材不出机器、无限量 |
 | Mac/Metal 性能需自扛 | 高 | 主动投入并反哺上游（#554 模式）；评估台量化每一步 |
 | 模型许可（NC/不可分发） | 高 | 只做下载器；配置层区分"可商用/仅自用" |
-| 上游节奏快（每日合并） | 中 | 引擎**随包预编译取件（engine-lock.json 锁 v0.8.2-metalbf16），源码 submodule 化待落**；滞后 1~2 版；适配只在自己薄层 |
+| 上游节奏快（每日合并） | 中 | 引擎**随包预编译取件（engine-lock.json 锁上游 v0.8.2），源码 submodule 化待落**；滞后 1~2 版；适配只在自己薄层（补丁按 #554 模式争取并入上游，不再自己维护 fork） |
 | 歌曲质量不够产品级 | 中 | 降级为彩蛋，不作主打（8 分钟/首 + 质量不稳） |
 | **界面密度过高** | **高** | 原型被真实用户打回（原话"看得我头皮发麻"：首屏 32 组件 / 句子行 7 元素 / 五区域全展开）→ 按方案 §3.1 红线收敛：首屏 ≤12 组件、句子行只留 序号+文本+状态点 |
 | **未做用户验证** | **高** | 见第 10 节，与 M0 并行 |

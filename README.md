@@ -26,7 +26,7 @@
 
 模型的能力/硬要求（哪个引擎必须给参考音频、哪个变体不可用）由 `config/models.schema.yaml` 声明，经**两条路**投递到 App：`server.json`（显式、优先级高）与上面那份随包能力清单（兜底）。所以**不需要**先跑 `audio_config.py render --write` 才有提示；详见 `docs/model-capabilities.md`。
 
-引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0，本仓库适配基于 fork `gqf2008/audio.cpp`）。随包版本**以 [`engine-lock.json`](engine-lock.json) 为准（当前 `v0.8.2-metalbf16`）**：发布包按它校验 sha256 后取预编译 `audiocpp_server`，用户下载即用；源码 checkout 的 **submodule 化待落**（在那之前"锁版本"不靠 checkout 上的 tag，靠这个锁文件）；适配只写在本仓库的薄层。
+引擎是 [audio.cpp](https://github.com/0xShug0/audio.cpp)（Apache 2.0）。随包取的是**上游官方产物**：此前维护的 `gqf2008` fork 已退役——它的 Metal bf16 补丁 [PR #554](https://github.com/0xShug0/audio.cpp/pull/554) 已于 2026-09-19 并入官方，官方 `v0.8.2` 自带这份能力，所以不再需要定制引擎。随包版本**以 [`engine-lock.json`](engine-lock.json) 为准（当前上游 `v0.8.2`）**：发布包按它校验 sha256 后取预编译 `audiocpp_server`，用户下载即用；源码 checkout 的 **submodule 化待落**（在那之前"锁版本"不靠 checkout 上的 tag，靠这个锁文件）；适配只写在本仓库的薄层。
 
 ## 快速开始
 

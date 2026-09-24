@@ -51,6 +51,18 @@ cargo check --workspace --target x86_64-pc-windows-gnu
 
 结果：通过（2026-09-16，约 30s）。
 
+## 随包引擎的平台基线（2026-09-24）
+
+引擎与壳是两码事：壳的移植清单在上面，**引擎自己还有一套基线**，随包取件时必须一起满足
+（细节与实测输出见 `docs/release.md#引擎不是一个二进制同级运行库必须一起随包2026-09-24-实测`）：
+
+- **同级运行库必须随包**：Windows 的 `MSVCP140/VCRUNTIME140/VCOMP140…`、Linux 的
+  `libggml*.so*`（`RUNPATH=$ORIGIN`）。取件脚本已改成一起解出，并有
+  `tools/check_engine_deps.py` 按二进制真实依赖做门禁。
+- **Linux 目标机基线**：glibc **≥ 2.38** + `libgomp1`（colima + `ubuntu:24.04` amd64 实测能跑；
+  `debian:bookworm-slim`＝glibc 2.36 报 `GLIBC_2.38 not found`）。也就是说 **Ubuntu 24.04+ /
+  Debian 13+** 一路可用，更老的发行版不能用随包引擎。
+
 ## 交叉编译阻塞
 
 ```bash
