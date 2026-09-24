@@ -112,6 +112,11 @@ pub struct PackageFile {
     /// 取不到是 null）。**只描述这个 `url` 指向的那份文件**。
     #[serde(default)]
     pub sha256: Option<String>,
+    /// 这个文件自己的字节数（生成脚本 HEAD 取到；取不到是 null）。
+    /// **只描述这个 `url` 指向的那份文件**——多文件入口必须用逐文件大小做校验依据，
+    /// 包级 `bytes`（各文件之和）不能拿来核单个文件。
+    #[serde(default)]
+    pub bytes: Option<u64>,
 }
 
 /// 内置清单。`Err` = **内置文件本身坏了**（读不出来），不是"这个模型没有下载源"——
@@ -353,7 +358,9 @@ pub fn recommend_tier(tiers: &[Tier], budget: &MachineBudget) -> Advice {
 ///   `ACE-Step1.5-GGUF` 下，混在一起会把"另一个模型"当成"另一档"；
 /// - family 更粗：`qwen3_asr` 同时管 0.6B 与 1.7B，`index_tts2` 同时管 2.0 与 2.5。
 ///
-/// 只收**单文件**包：多文件包（safetensors 等）下载器还不支持，列出来等于给一个点不了的入口。
+/// 只收**单文件**包：档位是"同目录的另一个量化档"（一个权重文件）；多文件包（跨包组条目、
+/// safetensors 目录）不是"档"，列进来会把整条入口当成一档，反而看不出可选档位。
+/// （多文件**入口**本身是支持的 —— 见 `Action` 与 `usable_builtin_package`。）
 fn tiers_of(model: &CatalogModel) -> Vec<Tier> {
     let Some(entry) = model.entry.as_ref() else {
         return Vec::new();
@@ -554,17 +561,38 @@ impl Origin {
     }
 }
 
-/// 一条真的能点的下载入口。
+/// 入口里的一个文件：下哪、放哪、校验依据。
 #[derive(Debug, Clone)]
-pub struct Action {
+pub struct ActionFile {
     pub url: String,
     pub sha256: Option<String>,
-    pub size: Option<u64>,
+    /// 这个文件自己的期望字节数（拿不到就是 `None`，下载器会退回按响应长度核）。
+    pub bytes: Option<u64>,
     /// 最终落点：`<模型目录>/<相对落点>`。
     pub dest: PathBuf,
+}
+
+/// 一条真的能点的下载入口。
+///
+/// **一个入口可以带多个文件**（2026-09-25 起）：`yue2` 这种"主权重与 vae 分属两个上游包"的
+/// 模型，条目是跨包组出来的。下载队列本身是"一条任务一个目标文件"，所以消费方按
+/// `files` **逐个入队**（`src/download.rs` 不动：按 dest 去重、逐文件 sha/进度/断点），
+/// 界面再按模型把同一入口的文件聚合起来显示。`files[0]` 是主文件（权重）。
+#[derive(Debug, Clone)]
+pub struct Action {
+    pub files: Vec<ActionFile>,
+    /// 入口总体积：各文件之和；任一文件未知就是 `None`（不许拿已知项推算）。
+    pub size: Option<u64>,
     pub origin: Origin,
     /// 与 `server.json` 的 `path` 对不上时的提醒（`None` = 对得上或清单没声明）。
     pub conflict: Option<String>,
+}
+
+impl Action {
+    /// 主文件（权重本身）。空入口不该存在（构造处都有断言），这里取第一个。
+    pub fn primary(&self) -> &ActionFile {
+        &self.files[0]
+    }
 }
 
 /// 下载面板的一行：能下载的（`action = Some`）或没有下载源的（`action = None` + 原因）。
@@ -620,24 +648,13 @@ pub fn plan_rows(
         for m in &c.models {
             if !seen.contains(m.id.as_str()) {
                 rows.push(match usable_builtin_package(Some(m)) {
-                    Some(pkg) => {
-                        let url = pkg.files[0].url.clone().unwrap_or_default();
-                        let dest = model_dir.join(&pkg.local_paths[0]);
-                        Row {
-                            id: m.id.clone(),
-                            // 服务清单里没有这个模型 → 服务侧校验信息没得谈（空条目）；
-                            // sha256 由内置清单 per-file 兜底
-                            action: Some(action_for(
-                                &ServerEntry::default(),
-                                url,
-                                dest,
-                                Origin::Builtin,
-                                pkg.files[0].sha256.as_deref(),
-                                model_dir,
-                            )),
-                            reason: String::new(),
-                        }
-                    }
+                    // 服务清单里没有这个模型 → 服务侧校验信息没得谈（空条目）；
+                    // 校验依据全部由内置清单**逐文件**兜底（多文件条目也一样）。
+                    Some(pkg) => Row {
+                        id: m.id.clone(),
+                        action: action_for_builtin(pkg, &ServerEntry::default(), model_dir),
+                        reason: String::new(),
+                    },
                     None => no_source_row(m),
                 });
             }
@@ -684,17 +701,7 @@ fn server_action(s: &ServerEntry, cat: Option<&CatalogModel>, model_dir: &Path) 
         ));
     }
     let pkg = usable_builtin_package(cat)?;
-    let rel = &pkg.local_paths[0];
-    let url = pkg.files[0].url.clone()?;
-    let dest = model_dir.join(rel);
-    Some(action_for(
-        s,
-        url,
-        dest,
-        Origin::Builtin,
-        pkg.files[0].sha256.as_deref(),
-        model_dir,
-    ))
+    action_for_builtin(pkg, s, model_dir)
 }
 
 /// 组装一条下载入口——**唯一一处**（两个分支共用，免得"服务侧校验信息"在其中一条上漂掉）。
@@ -722,29 +729,78 @@ fn action_for(
             .map(str::to_string)
     };
     Action {
-        url,
-        sha256: sha,
+        // 服务清单只声明单个 path/url：这条永远是单文件，期望大小沿用服务侧给的 size。
+        files: vec![ActionFile {
+            url,
+            sha256: sha,
+            bytes: s.size,
+            dest: dest.clone(),
+        }],
         size: s.size,
         conflict: conflict_note(&s.path, &dest, model_dir),
-        dest,
         origin,
     }
 }
 
-/// 内置清单给的相对落点（上游布局，含 `target_directory` 那一层）。
+/// 内置条目 → 多文件入口：**一个文件一条**，逐个算落点与校验依据。
+///
+/// 服务清单（`server.json`）只声明单个 `path`，所以"服务侧给了 url"那条路径永远是单文件；
+/// 多文件只可能来自内置清单的跨包组条目（`yue2` 的主权重 + vae + sidecars）。
+/// 服务侧 sha256 只对**它自己那一份**有效，所以这里不拿它去覆盖内置的多文件。
+fn action_for_builtin(pkg: &Package, s: &ServerEntry, model_dir: &Path) -> Option<Action> {
+    if pkg.files.len() != pkg.local_paths.len() || pkg.files.is_empty() {
+        // 清单自相矛盾（文件与落点数量对不上）：不给入口，别猜哪个配哪个
+        return None;
+    }
+    let mut files = Vec::with_capacity(pkg.files.len());
+    for (file, rel) in pkg.files.iter().zip(pkg.local_paths.iter()) {
+        let url = file.url.clone()?;
+        files.push(ActionFile {
+            url,
+            sha256: file.sha256.clone(),
+            bytes: file.bytes,
+            dest: model_dir.join(rel),
+        });
+    }
+    // 服务侧的校验信息**只描述它自己声明的那一份**（`server.json` 是单文件），所以只覆盖
+    // 主文件；多文件条目的配套文件（vae / sidecars）用清单里各自的 sha 与 bytes。
+    let server_sha = s.sha256.trim();
+    if !server_sha.is_empty() {
+        files[0].sha256 = Some(server_sha.to_string());
+    }
+    if s.size.is_some() {
+        files[0].bytes = s.size;
+    }
+    Some(Action {
+        files,
+        // 条目总体积：服务侧声明优先，没有就用清单的包级 `bytes`（各文件之和）。
+        // **只用于界面显示**；校验一律用逐文件的 `ActionFile::bytes`。
+        size: s.size.or(pkg.bytes),
+        conflict: conflict_note(&s.path, &model_dir.join(&pkg.local_paths[0]), model_dir),
+        origin: Origin::Builtin,
+    })
+}
+
+/// 内置清单给的相对落点（上游布局，含 `target_directory` 那一层）——**主文件**的落点。
 fn builtin_rel(cat: Option<&CatalogModel>) -> Option<String> {
     usable_builtin_package(cat)?.local_paths.first().cloned()
 }
 
-/// 内置清单这一条是不是真的能点：`status == downloadable`、未 gated、单文件且带 URL。
+/// 内置清单这一条是不是真的能点：`status == downloadable`、未 gated、文件与落点数量一致且都带 URL。
 ///
 /// **gated 在这里再拦一道**：清单里万一标成 gated 却仍进了 downloadable，应用也不许把
 /// 那个 URL 交出去（HF 上会 401/403，点了必然失败）——与"不给假入口"同一条口径。
+///
+/// 2026-09-25 起**放开单文件约束**：跨包组条目天然是多文件（yue2 = 主权重 + vae + sidecars）。
+/// 下载与界面都按"逐个文件"消费（见 `Action` 的说明），所以入口本身可以是多文件的。
 fn usable_builtin_package(cat: Option<&CatalogModel>) -> Option<&Package> {
     let pkg = cat
         .filter(|c| c.status == "downloadable")
         .and_then(|c| c.entry.as_ref())?;
-    if pkg.gated || pkg.local_paths.len() != 1 || pkg.files.len() != 1 || pkg.files[0].url.is_none()
+    if pkg.gated
+        || pkg.files.is_empty()
+        || pkg.files.len() != pkg.local_paths.len()
+        || pkg.files.iter().any(|f| f.url.is_none())
     {
         return None;
     }
@@ -872,10 +928,75 @@ mod tests {
             files: vec![PackageFile {
                 url: Some(url.into()),
                 sha256: sha256.map(str::to_string),
+                bytes: None,
             }],
         }
     }
 
+    /// 多文件入口（跨包组条目的形状）：文件与落点按下标一一对应，各有自己的 sha 与字节数。
+    #[test]
+    fn builtin_multi_file_entry_yields_one_action_file_per_file() {
+        let mut pkg = pkg_sha(
+            "Yue2-3B-GGUF/yue2-3b-q4_0.gguf",
+            "https://example.com/q4_0.gguf",
+            Some(&"a".repeat(64)),
+        );
+        pkg.id = "yue2_main_q4_0".into();
+        pkg.precision = "q4_0".into();
+        pkg.bytes = Some(150);
+        pkg.local_paths = vec![
+            "Yue2-3B-GGUF/yue2-3b-q4_0.gguf".into(),
+            "Yue2-3B-GGUF/yue2-vae-f16.gguf".into(),
+        ];
+        pkg.files = vec![
+            PackageFile {
+                url: Some("https://example.com/q4_0.gguf".into()),
+                sha256: Some("a".repeat(64)),
+                bytes: Some(100),
+            },
+            PackageFile {
+                url: Some("https://example.com/vae_f16.gguf".into()),
+                sha256: Some("b".repeat(64)),
+                bytes: Some(50),
+            },
+        ];
+        let cat = Catalog {
+            models: vec![cat_model("yue2", "downloadable", "跨包组条目", Some(pkg))],
+        };
+
+        // 只有内置清单（服务侧没这一条）：逐文件都用自己的 sha / 大小
+        let rows = plan_rows(&[], Ok(&cat), Path::new("/models"));
+        let a = rows[0].action.as_ref().expect("多文件条目也该有入口");
+        assert_eq!(a.files.len(), 2, "两个文件各成一条");
+        assert_eq!(
+            a.files[0].dest,
+            Path::new("/models/Yue2-3B-GGUF/yue2-3b-q4_0.gguf")
+        );
+        assert_eq!(
+            a.files[1].dest,
+            Path::new("/models/Yue2-3B-GGUF/yue2-vae-f16.gguf")
+        );
+        assert_eq!(a.files[0].sha256.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(a.files[1].bytes, Some(50), "每个文件的字节数各归各");
+
+        // 服务侧写了 sha/size（但没给 url）：只覆盖**主文件**，第二个文件仍用清单里的值
+        let mut server = entry("yue2", "", "/models/Yue2-3B-GGUF/yue2-3b-q4_0.gguf");
+        server.sha256 = "deadbeef".into();
+        server.size = Some(123);
+        let rows = plan_rows(&[server], Ok(&cat), Path::new("/models"));
+        let a = rows[0].action.as_ref().unwrap();
+        assert_eq!(
+            a.primary().sha256.as_deref(),
+            Some("deadbeef"),
+            "服务侧 sha 覆盖主文件"
+        );
+        assert_eq!(a.primary().bytes, Some(123), "服务侧 size 覆盖主文件");
+        assert_eq!(
+            a.files[1].sha256.as_deref(),
+            Some("b".repeat(64).as_str()),
+            "配套文件不许被服务侧的 sha 顶掉（它只描述自己那一份）"
+        );
+    }
     /// 造一个"有档位"的模型：`(precision, 体积, 是不是下载按钮那一档)`，同目录。
     fn model_with_tiers(
         dir: &str,
@@ -895,6 +1016,7 @@ mod tests {
                 files: vec![PackageFile {
                     url: Some(format!("https://example.com/{dir}/{precision}.gguf")),
                     sha256: None,
+                    bytes: None,
                 }],
             })
             .collect();
@@ -945,10 +1067,10 @@ mod tests {
             Path::new("/models"),
         );
         let action = rows[0].action.as_ref().expect("服务给了 url 就该有入口");
-        assert_eq!(action.url, "https://mirror.example/m.gguf");
+        assert_eq!(action.primary().url, "https://mirror.example/m.gguf");
         assert_eq!(action.origin, Origin::Server);
         // 落点仍取内置清单的上游布局（服务只给了 URL，没给布局）
-        assert_eq!(action.dest, Path::new("/models/M-GGUF/m.gguf"));
+        assert_eq!(action.primary().dest, Path::new("/models/M-GGUF/m.gguf"));
     }
 
     /// 服务清单没给 url → 用内置清单的 URL 与上游落点。
@@ -976,9 +1098,12 @@ mod tests {
         );
         let action = rows[0].action.as_ref().expect("内置清单有就该有入口");
         assert_eq!(action.origin, Origin::Builtin);
-        assert_eq!(action.url, "https://huggingface.co/x/y/resolve/main/z.gguf");
         assert_eq!(
-            action.dest,
+            action.primary().url,
+            "https://huggingface.co/x/y/resolve/main/z.gguf"
+        );
+        assert_eq!(
+            action.primary().dest,
             Path::new("/models/Audio8-TTS-Preview-0.6B-GGUF/audio8-tts-preview-0.6b-q8_0.gguf")
         );
         assert_eq!(action.conflict, None, "落点与清单 path 一致时不该报冲突");
@@ -1051,7 +1176,7 @@ mod tests {
             Path::new("/models"),
         );
         assert_eq!(
-            rows[0].action.as_ref().map(|a| a.url.as_str()),
+            rows[0].action.as_ref().map(|a| a.primary().url.as_str()),
             Some("https://mirror.example/a.gguf")
         );
         let reason = &rows[1].reason;
@@ -1084,6 +1209,7 @@ mod tests {
                 .action
                 .as_ref()
                 .unwrap()
+                .primary()
                 .dest
                 .clone()
         };
@@ -1140,9 +1266,9 @@ mod tests {
         let rows = plan_rows(&[s], Ok(&catalog), Path::new("/models"));
         let a = rows[0].action.as_ref().expect("内置清单有就该有入口");
         assert_eq!(a.origin, Origin::Builtin, "url 确实来自内置清单");
-        assert_eq!(a.url, "https://builtin.example/m.gguf");
+        assert_eq!(a.primary().url, "https://builtin.example/m.gguf");
         assert_eq!(
-            a.sha256.as_deref(),
+            a.primary().sha256.as_deref(),
             Some("deadbeef"),
             "服务侧 sha256 不能被丢掉，也不能被内置清单的 builtinfilehash 覆盖"
         );
@@ -1174,7 +1300,7 @@ mod tests {
         let a = rows[0].action.as_ref().expect("内置清单有就该有入口");
         assert_eq!(a.origin, Origin::Builtin);
         assert_eq!(
-            a.sha256.as_deref(),
+            a.primary().sha256.as_deref(),
             Some(builtin_sha.as_str()),
             "服务侧没写 sha256 时必须用内置清单 per-file 的值兜底"
         );
@@ -1195,7 +1321,7 @@ mod tests {
         s.size = Some(9); // 大小校验依据还在，只是没有哈希
         let rows = plan_rows(&[s], Ok(&catalog), Path::new("/models"));
         let a = rows[0].action.as_ref().expect("内置清单有就该有入口");
-        assert_eq!(a.sha256, None, "两边都没有哈希就该如实 None");
+        assert_eq!(a.primary().sha256, None, "两边都没有哈希就该如实 None");
         assert_eq!(a.size, Some(9));
     }
 
@@ -1267,7 +1393,11 @@ mod tests {
             s.size = c.server_size;
             let rows = plan_rows(&[s], Ok(&catalog), Path::new("/models"));
             let a = rows[0].action.as_ref().unwrap();
-            let got = (a.url.as_str(), a.sha256.as_deref(), a.size);
+            let got = (
+                a.primary().url.as_str(),
+                a.primary().sha256.as_deref(),
+                a.size,
+            );
             assert_eq!(
                 got,
                 (c.want_url, c.want_sha256, c.want_size),
@@ -1407,8 +1537,47 @@ mod tests {
             "入口应是上游那个单文件包"
         );
 
-        // 0.1B 变体（上游没有对应包）与 yue2：如实标"没有源"，且不给 URL
-        for id in ["audio8-tts-01b", "audio8-tts-01b-stream", "yue2"] {
+        // yue2：主权重（q4_0）与 vae（f16）分属两个上游包，由**跨包组条目**凑齐 →
+        // 它现在**有**下载源，一条入口覆盖产品要加载的两件权重（app 侧已支持多文件入口）。
+        assert_eq!(
+            by_id["yue2"].status, "downloadable",
+            "跨包组条目已落地：yue2 应当有入口。note={}",
+            by_id["yue2"].note
+        );
+        let yue2_entry = by_id["yue2"].entry.as_ref().expect("yue2 应有 entry");
+        assert_eq!(
+            yue2_entry.id, "yue2_main_q4_0",
+            "主包按最早声明键（主权重）选"
+        );
+        assert!(
+            yue2_entry
+                .local_paths
+                .iter()
+                .any(|p| p.ends_with("yue2-3b-q4_0.gguf")),
+            "入口要含 schema 声明的主权重：{:?}",
+            yue2_entry.local_paths
+        );
+        assert!(
+            yue2_entry
+                .local_paths
+                .iter()
+                .any(|p| p.ends_with("yue2-vae-f16.gguf")),
+            "入口要含 schema 声明的 vae：{:?}",
+            yue2_entry.local_paths
+        );
+        assert_eq!(
+            yue2_entry.files.len(),
+            yue2_entry.local_paths.len(),
+            "多文件条目：文件与落点一一对应（应用按下标配对）"
+        );
+        assert!(
+            by_id["yue2"].note.contains("跨包补齐"),
+            "note 要说清是跨包补齐来的：{}",
+            by_id["yue2"].note
+        );
+
+        // 0.1B 变体（上游没有对应包）：如实标"没有源"，且不给 URL
+        for id in ["audio8-tts-01b", "audio8-tts-01b-stream"] {
             let m = by_id[id];
             assert_eq!(m.status, "no-source", "{id} 应标 no-source");
             assert!(m.entry.is_none(), "{id} 不该有 entry");
@@ -1417,13 +1586,6 @@ mod tests {
         assert_eq!(
             by_id["audio8-asr"].status, "no-source",
             "上游明确不发布它的 GGUF"
-        );
-        // yue2 的原因必须写清**真阻塞点**：跨包组条目是多文件的，而 app 只认单文件入口
-        // （2026-09-25：生成器已能跨包组条目，但挂在 APP_SUPPORTS_MULTI_FILE_ENTRY 后面）。
-        assert!(
-            by_id["yue2"].note.contains("多文件入口"),
-            "yue2 的 note 要写明阻塞点是 app 不支持多文件入口：{}",
-            by_id["yue2"].note
         );
 
         // 每个能下载的入口都得是 https、落点相对、且带文件 URL
@@ -1453,13 +1615,13 @@ mod tests {
             assert!(!pkg.files.is_empty(), "{}：入口至少要有一个文件", m.id);
         }
 
-        // 验收点：真实清单的 10 条入口**权重文件**都带 per-file sha256（64 位十六进制）——
+        // 验收点：真实清单的 11 条入口**权重文件**都带 per-file sha256（64 位十六进制）——
         // 缺失 = 那条下载会静默退化成"只对长度"（同大小的旧权重查不出来）。
         // 2026-09-25 起入口可能是**跨包组**的（yue2 = 主权重 + vae + sidecars）：sidecar 这类
         // 非 LFS 小文件本来就没有 lfs.oid（生成器如实留 null），所以判据落在"至少一个权重文件带
         // sha256，且凡带了的必须是 64 位十六进制"。
         let entries: Vec<&Package> = c.models.iter().filter_map(|m| m.entry.as_ref()).collect();
-        assert_eq!(entries.len(), 10, "随包清单的下载入口数量变了，同步本用例");
+        assert_eq!(entries.len(), 11, "随包清单的下载入口数量变了，同步本用例");
         for pkg in entries {
             let with_sha: Vec<&str> = pkg
                 .files
@@ -1487,13 +1649,13 @@ mod tests {
         }
     }
 
-    /// 真实 14 个产品模型的规划结果：**10 个有入口、4 个如实标没有源**。
+    /// 真实 14 个产品模型的规划结果：**11 个有入口、3 个如实标没有源**。
     ///
     /// 2026-09-24 清单刷新：sheetsage2 由"没有源"变成有入口（上游补了 original-dtype 单文件包）。
     /// yue2 仍是"没有源"：它的两件权重分属两个上游包（跨包组条目 = 多文件），
     /// 而 app 的下载入口今天只支持单文件包 —— 生成器把这条能力挂在开关后面，等 app 侧先落地。
     #[test]
-    fn plan_for_the_real_machine_counts_ten_with_entry_and_four_without() {
+    fn plan_for_the_real_machine_counts_eleven_with_entry_and_three_without() {
         let c = catalog().unwrap();
         let server: Vec<ServerEntry> = c
             .models
@@ -1531,25 +1693,24 @@ mod tests {
                 "sheetsage2",
                 "sortformer-diar",
                 "stable-audio-small-music",
+                "yue2",
             ],
-            "10 个有下载入口"
+            "11 个有下载入口"
         );
         assert_eq!(
             missing,
-            vec![
-                "audio8-asr",
-                "audio8-tts-01b",
-                "audio8-tts-01b-stream",
-                "yue2",
-            ],
-            "4 个如实标没有源"
+            vec!["audio8-asr", "audio8-tts-01b", "audio8-tts-01b-stream"],
+            "3 个如实标没有源"
         );
-        // 10 条入口都必须带 sha256（内置清单 per-file 兜底）——没带的那条会静默退化成只对长度
+        // 11 条入口的**主文件**都必须带 sha256（内置清单 per-file 兜底）——没带的会退化成只对长度。
+        // 多文件条目的配套文件（vae/sidecars）各有自己的 sha，闸门在
+        // `bundled_catalog_parses_and_maps_by_landing_path_not_family` 里逐文件核过。
         assert!(
-            rows.iter()
-                .filter(|r| r.action.is_some())
-                .all(|r| r.action.as_ref().is_some_and(|a| a.sha256.is_some())),
-            "10 条下载入口都必须带 sha256"
+            rows.iter().filter(|r| r.action.is_some()).all(|r| r
+                .action
+                .as_ref()
+                .is_some_and(|a| a.primary().sha256.is_some())),
+            "11 条下载入口都必须带 sha256"
         );
     }
 
@@ -1759,10 +1920,12 @@ mod tests {
             PackageFile {
                 url: Some("https://example.com/a.json".into()),
                 sha256: None,
+                bytes: None,
             },
             PackageFile {
                 url: Some("https://example.com/b.safetensors".into()),
                 sha256: None,
+                bytes: None,
             },
         ];
         model.packages.push(multi);
