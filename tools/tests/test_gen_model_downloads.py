@@ -290,5 +290,138 @@ class OfflineRoundTripTests(unittest.TestCase):
             )
 
 
+def _dir_spec(family: str, packages: list) -> dict:
+    """合成一份上游 spec：同一个 HF repo 下若干包，落点由 target_directory 决定。"""
+    return {
+        "family": family,
+        "_spec_file": f"{family}.json",
+        "package_defaults": {
+            "download": {"kind": "huggingface_snapshot", "repo": "audio-cpp/Test-GGUF"}
+        },
+        "packages": packages,
+    }
+
+
+def _pkg(pid: str, precision: str, target: str, files: list) -> dict:
+    return {
+        "id": pid,
+        "precision": precision,
+        "format": "gguf",
+        "target_directory": target,
+        "files": files,
+    }
+
+
+# 合成包只要一个稳定体积（注意：写成类属性 lambda 会被当方法绑 self，参数个数就不对了）
+def _fake_size(url: str) -> int:
+    return 1024
+
+
+class DeclaredWeightsGuardTests(unittest.TestCase):
+    """挑中的包必须覆盖 schema 声明的权重，覆盖不了就 no-source（**不猜**）。
+
+    依据：应用只下载 `entry`（`src/model_sources.rs` 不读 `aux_files`），所以
+    "一个包凑不齐产品要加载的文件" = 用户下完也用不了 —— 这种情况必须如实标没有源。
+    """
+
+    def _model(self, schema_model, specs):
+        by_path, by_dir = gen.package_local_index(specs)
+        return gen.build_model(
+            schema_model,
+            schema_model.get("family", "x"),
+            specs,
+            _fake_size,
+            None,
+            by_path,
+            by_dir,
+        )
+
+    def test_dir_match_without_declared_weight_is_no_source(self):
+        """yue2 形态：目录匹配挑中 q8_0，但 schema 要 q4_0 主权重 + vae f16。"""
+        spec = _dir_spec(
+            "yue2",
+            [
+                _pkg(
+                    "yue2_main_q8_0",
+                    "q8_0",
+                    "Yue2-3B-GGUF",
+                    ["sidecars/a.json", "yue2-3b-q8_0.gguf"],
+                ),
+                _pkg(
+                    "yue2_main_q4_0",
+                    "q4_0",
+                    "Yue2-3B-GGUF",
+                    ["sidecars/a.json", "yue2-3b-q4_0.gguf"],
+                ),
+                _pkg(
+                    "yue2_vae_f16",
+                    "f16",
+                    "Yue2-3B-GGUF",
+                    ["sidecars/a.json", "yue2-vae-f16.gguf"],
+                ),
+            ],
+        )
+        schema_model = {
+            "family": "yue2",
+            "path": "${models_root}/Yue2-3B-GGUF",
+            "session_options": {
+                "yue2.model_gguf": "yue2-3b-q4_0.gguf",
+                "yue2.vae_gguf": "yue2-vae-f16.gguf",
+            },
+        }
+        m = self._model(schema_model, {"yue2": spec})
+        self.assertEqual(m["status"], "no-source", "覆盖不了就不能标 downloadable")
+        self.assertIsNone(m["entry"], "不覆盖就不许给下载入口")
+        self.assertIn("yue2-3b-q4_0.gguf", m["note"], m["note"])
+        self.assertIn("yue2-vae-f16.gguf", m["note"], m["note"])
+
+    def test_dir_match_covering_declared_weight_is_downloadable(self):
+        """阳性对照：声明的权重就在挑中的包里 → 照旧 downloadable（守卫不误伤）。"""
+        spec = _dir_spec(
+            "yue2",
+            [
+                _pkg(
+                    "yue2_only",
+                    "q4_0",
+                    "Yue2-3B-GGUF",
+                    ["sidecars/a.json", "yue2-3b-q4_0.gguf"],
+                ),
+            ],
+        )
+        schema_model = {
+            "family": "yue2",
+            "path": "${models_root}/Yue2-3B-GGUF",
+            "session_options": {"yue2.model_gguf": "yue2-3b-q4_0.gguf"},
+        }
+        m = self._model(schema_model, {"yue2": spec})
+        self.assertEqual(m["status"], "downloadable")
+        self.assertEqual(m["entry"]["id"], "yue2_only")
+
+    def test_aux_weight_from_another_family_does_not_block(self):
+        """别的 family 的辅助权重（qwen3-asr 形态）不算在内：本模型照样 downloadable。"""
+        specs = {
+            "asr": _dir_spec(
+                # files 是**仓库内相对路径**，落点 = target_directory + 它（别再写一遍目录名）
+                "asr", [_pkg("asr_q8_0", "q8_0", "ASR-GGUF", ["a.gguf"])]
+            ),
+            "aligner": _dir_spec(
+                "aligner",
+                [_pkg("aligner_q8_0", "q8_0", "Aligner-GGUF", ["al.gguf"])],
+            ),
+        }
+        schema_model = {
+            "family": "asr",
+            "path": "${models_root}/ASR-GGUF/a.gguf",
+            "session_options": {
+                "asr.forced_aligner_model_path": "${models_root}/Aligner-GGUF/al.gguf",
+                "asr.vad_model_path": "${models_root}/silero_vad",
+            },
+        }
+        m = self._model(schema_model, specs)
+        self.assertEqual(m["status"], "downloadable")
+        self.assertGreater(m["aux_bytes"], 0, "辅助权重的体积应照旧进估算")
+        self.assertEqual(m["aux_unresolved"], ["asr.vad_model_path"], "目录型声明如实记为未解析")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

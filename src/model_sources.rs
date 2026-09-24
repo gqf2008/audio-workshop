@@ -1389,13 +1389,26 @@ mod tests {
             by_id["stable-audio-small-music"].note
         );
 
-        // 0.1B 变体与没有 spec 的两个：如实标"没有源"，且不给 URL
-        for id in [
-            "audio8-tts-01b",
-            "audio8-tts-01b-stream",
-            "yue2",
-            "sheetsage2",
-        ] {
+        // 上游新增了 SheetSage2 的 original-dtype 包（单文件，落点与 schema 的 path 逐字一致）
+        // → 它现在**有**下载源了（2026-09-24 清单刷新）。
+        assert_eq!(
+            by_id["sheetsage2"].status, "downloadable",
+            "上游给了 sheetsage2-orig.gguf 且落点与 schema path 一致，应当有入口"
+        );
+        assert_eq!(
+            local("sheetsage2").as_deref(),
+            Some("SheetSage2-GGUF/sheetsage2-orig.gguf")
+        );
+        assert!(
+            by_id["sheetsage2"]
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.id == "sheetsage2_orig"),
+            "入口应是上游那个单文件包"
+        );
+
+        // 0.1B 变体、yue2（没有单包能凑齐 schema 声明的权重）：如实标"没有源"，且不给 URL
+        for id in ["audio8-tts-01b", "audio8-tts-01b-stream", "yue2"] {
             let m = by_id[id];
             assert_eq!(m.status, "no-source", "{id} 应标 no-source");
             assert!(m.entry.is_none(), "{id} 不该有 entry");
@@ -1404,6 +1417,11 @@ mod tests {
         assert_eq!(
             by_id["audio8-asr"].status, "no-source",
             "上游明确不发布它的 GGUF"
+        );
+        assert!(
+            by_id["yue2"].note.contains("覆盖不了 schema 声明的权重"),
+            "yue2 的原因必须写清是「条目覆盖不了声明」而不是泛泛的没有源：{}",
+            by_id["yue2"].note
         );
 
         // 每个能下载的入口都得是 https、落点相对、且带文件 URL
@@ -1433,10 +1451,10 @@ mod tests {
             assert!(pkg.files.len() == 1, "{}：本批只给单文件包下载入口", m.id);
         }
 
-        // 本批验收点：真实清单的 9 条下载入口全部带 per-file sha256（64 位十六进制）——
+        // 本批验收点：真实清单的 10 条下载入口全部带 per-file sha256（64 位十六进制）——
         // 缺失 = 那条下载会静默退化成"只对长度"（同大小的旧权重查不出来）。
         let entries: Vec<&Package> = c.models.iter().filter_map(|m| m.entry.as_ref()).collect();
-        assert_eq!(entries.len(), 9, "随包清单的下载入口数量变了，同步本用例");
+        assert_eq!(entries.len(), 10, "随包清单的下载入口数量变了，同步本用例");
         for pkg in entries {
             let sha = pkg.files[0].sha256.as_deref().unwrap_or("");
             assert_eq!(
@@ -1453,9 +1471,13 @@ mod tests {
         }
     }
 
-    /// 真实 14 个产品模型的规划结果：**9 个有入口、5 个如实标没有源**。
+    /// 真实 14 个产品模型的规划结果：**10 个有入口、4 个如实标没有源**。
+    ///
+    /// 2026-09-24 清单刷新后：sheetsage2 由"没有源"变成有入口（上游补了 original-dtype 单文件包）；
+    /// yue2 仍是"没有源"——上游新增了 5 个包，但没有单个包能凑齐 schema 声明的
+    /// q4_0 主权重 + vae f16（生成器按"覆盖不了就不猜"标 no-source）。
     #[test]
-    fn plan_for_the_real_machine_counts_nine_with_entry_and_five_without() {
+    fn plan_for_the_real_machine_counts_ten_with_entry_and_four_without() {
         let c = catalog().unwrap();
         let server: Vec<ServerEntry> = c
             .models
@@ -1490,10 +1512,11 @@ mod tests {
                 "index-tts2",
                 "qwen3-asr",
                 "qwen3-tts-voicedesign",
+                "sheetsage2",
                 "sortformer-diar",
                 "stable-audio-small-music",
             ],
-            "9 个有下载入口"
+            "10 个有下载入口"
         );
         assert_eq!(
             missing,
@@ -1501,17 +1524,16 @@ mod tests {
                 "audio8-asr",
                 "audio8-tts-01b",
                 "audio8-tts-01b-stream",
-                "sheetsage2",
                 "yue2",
             ],
-            "5 个如实标没有源"
+            "4 个如实标没有源"
         );
-        // 9 条入口都必须带 sha256（内置清单 per-file 兜底）——没带的那条会静默退化成只对长度
+        // 10 条入口都必须带 sha256（内置清单 per-file 兜底）——没带的那条会静默退化成只对长度
         assert!(
             rows.iter()
                 .filter(|r| r.action.is_some())
                 .all(|r| r.action.as_ref().is_some_and(|a| a.sha256.is_some())),
-            "9 条下载入口都必须带 sha256"
+            "10 条下载入口都必须带 sha256"
         );
     }
 
