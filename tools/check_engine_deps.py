@@ -31,6 +31,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import _console  # noqa: F401  副作用 import：stdout/stderr→UTF-8（Windows 上必须）
+
 # --- 系统自带、不随包分发 ------------------------------------------------
 
 # Windows：OS 自带或 VC++ 运行库由系统提供时才略过 —— 这里全部**要求随包**，
@@ -59,23 +62,6 @@ MACHO_SYSTEM_PREFIXES = ("/usr/lib/", "/System/")
 
 class DepError(Exception):
     """解析失败（格式不对/读不出来），调用方按"没检查"处理，不当成通过。"""
-
-
-def force_utf8_stdio() -> None:
-    """把 stdout/stderr 显式设成 UTF-8。
-
-    为什么（2026-09-24 release 流水线 Windows job 实测）：Windows 上由 **Git Bash**
-    拉起 python 时，stdout 是 cp1252 —— 打印中文/`✅` 直接 `UnicodeEncodeError`，
-    整个 Windows 打包失败（`python3 - <<PY` 那段解包脚本先踩的，同一处修复）。
-    bash 侧打印的中文本来就是 UTF-8 字节，GitHub Actions 日志也按 UTF-8 解码，
-    所以这里改成 UTF-8 才是与其它输出一致的做法（不是"换个符号绕过"）。
-    `reconfigure` 不可用时（老解释器/非文本流）保持原样，不因此报错。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, OSError, ValueError):  # pragma: no cover - 环境相关
-            pass
 
 
 def _find_binary(engine_dir: Path) -> Path:
@@ -270,7 +256,6 @@ def check(engine_dir: Path) -> tuple[list[str], str]:
 
 
 def main(argv: list[str]) -> int:
-    force_utf8_stdio()
     if len(argv) != 2:
         print("用法: check_engine_deps.py <engine-dir>", file=sys.stderr)
         return 2
