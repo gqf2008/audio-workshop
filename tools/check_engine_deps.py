@@ -31,7 +31,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+# 取本文件所在目录进 sys.path 再用 _console：**不要**写 `__file__.rsplit("/", 1)[0]`
+# （tools/ 下几个老脚本的写法）—— Windows 上 `__file__` 是带反斜杠的绝对路径，
+# 按 "/" 切会切不动、把整个路径塞进 sys.path，于是 `import _console` 报
+# ModuleNotFoundError（2026-09-24 CI 门禁 Windows job 实测：本文件被
+# tools/tests 用 importlib 载入时正是这条路径）。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _console  # noqa: F401  副作用 import：stdout/stderr→UTF-8（Windows 上必须）
 
 # --- 系统自带、不随包分发 ------------------------------------------------
