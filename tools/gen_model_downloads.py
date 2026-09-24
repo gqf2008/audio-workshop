@@ -33,13 +33,18 @@ P7 的下载队列（串行 / 断点续传 / 校验后提交）已经能跑，�
 - 相等 → 这个包就是该模型的下载源。能区分 0.1B/0.6B、2.0/2.5、medium/small-music。
 - schema path 正好等于包的 `target_directory`（gen 类模型 path 指目录）→ 目录匹配；
   候选多于一个时按 `precision_preference` → `q8_0` 的顺序挑，挑的结果写进 note。
-- **覆盖校验（2026-09-24 加）**：挑中的包还必须覆盖 `session_options` 里声明、且落点
-  **在本模型目录内**的权重文件（按文件名比对）；覆盖不了 → `no-source`，note 写明缺哪些。
+- **覆盖校验（2026-09-24 加）**：`session_options` 里声明、且落点**在本模型目录内**的权重文件，
+  必须能在 `entry` 里凑齐；凑不齐 → `no-source` 并在 note 写明缺哪些（**不猜 URL**）。
+- **跨包组条目（2026-09-25 加，默认关闭）**：单包凑不齐时的正解是把缺的声明文件从别的包
+  合并进来（见 `compose_entry`：主包按**最早声明键**命中的那个选，其余按 URL 去重合并、
+  来源写进 `entry.composed_from`）。但组出来的条目是**多文件**的，而 app 的下载入口今天
+  只认单文件包（`src/model_sources.rs::usable_builtin_package` 要求 `files.len()==1`），
+  所以整条能力挂在 `APP_SUPPORTS_MULTI_FILE_ENTRY`（默认 `False`）后面 —— 关着时 `yue2`
+  仍如实标 `no-source`，但 note 会点名真阻塞点是"app 不支持多文件入口"。
   依据：应用**只下载 `entry`**（`src/model_sources.rs` 连 `aux_files` 字段都不读，
   `aux_bytes` 只进占用估算），所以 entry 凑不齐产品要加载的文件就是"下完也用不了"。
-  典型：`yue2` 的 `path` 是目录、上游 5 个包每个只含 4 个 sidecars + 1 个权重
-  （main q8_0/bf16/q4_0 或 vae f16/f32），而 schema 要的是 q4_0 主权重 + vae f16
-  —— 没有任何单包能凑齐，只能如实标 `no-source`（跨包组条目的能力另开批次）。
+  典型：`yue2` 声明要 q4_0 主权重 + vae f16，而上游 5 个包每个只含 4 个 sidecars + 1 个权重
+  → 主包取 `yue2_main_q4_0`，再跨包补 `yue2_vae_f16`。
   落在**别的 family** 目录里的声明（如 `qwen3_asr.forced_aligner_model_path`）不算——
   那些在界面上按独立模型看待，已由 `aux_bytes` / `aux_unresolved` 如实呈现。
 - 匹配不上（`audio8-tts-01b` 的 0.1B 上游没有对应包）→ `status = "no-source"`，**不猜 URL**。
@@ -117,6 +122,15 @@ DOWNLOADABLE_KINDS = ("huggingface_snapshot", "modelscope_snapshot")
 # 同目录多个量化档、且产品没声明 precision_preference 时的兜底顺序：
 # 先按 q8_0（体积/质量折中，本产品在 audio8-tts 上也首选它），再按包 id 定序（确定性）。
 FALLBACK_PRECISION = "q8_0"
+
+# 应用侧能力开关：**今天只支持单文件入口**。
+# `src/model_sources.rs::usable_builtin_package` 明确要求 `files.len() == 1 && local_paths.len() == 1`，
+# 下载执行层 `src/download.rs::TaskSpec` 也只接受单个 `url → dest`（全仓没有遍历 `entry.files` 的地方）。
+# 跨包组出来的条目天然是多文件（yue2 = 主权重 + vae + sidecars），**在 app 支持多文件入口之前不许出厂**：
+# 否则清单说 downloadable、界面判"点不动"（`usable_builtin_package` 返回 None），两边不一致。
+# 放开步骤（下一批）：① `usable_builtin_package` 放宽单文件约束；② `Action` 由单 url/dest 改成文件列表；
+# ③ `download.rs` 队列按文件入队（逐文件 sha/进度/断点）；④ 界面按模型聚合显示；⑤ 本开关改 True。
+APP_SUPPORTS_MULTI_FILE_ENTRY = False
 
 
 def load_schema(path=SCHEMA_PATH):
@@ -535,13 +549,19 @@ def path_tail(raw: str) -> str:
     return str(raw or "").replace("${models_root}", "").strip().strip("/")
 
 
-def choose_package(candidates: list, tail: str, precision_preference: list):
-    """用产品自己的落点选包。返回 (包 | None, 说明)。"""
+def matching_candidates(candidates: list, tail: str):
+    """落点等于 `tail` 的候选（先精确、再目录匹配）。返回 (列表, 匹配方式说明)。"""
     exact = [p for p in candidates if tail in p["local_paths"]]
     matched_by = "落点精确匹配"
     if not exact:
         exact = [p for p in candidates if p["target_directory"] == tail]
         matched_by = "目录匹配（模型 path 指目录）"
+    return exact, matched_by
+
+
+def choose_package(candidates: list, tail: str, precision_preference: list):
+    """用产品自己的落点选包。返回 (包 | None, 说明)。"""
+    exact, matched_by = matching_candidates(candidates, tail)
     if not exact:
         ids = ", ".join(p["id"] for p in candidates)
         return None, f"没有落点等于 {tail} 的包（该 family 的可下载包：{ids}）"
@@ -568,18 +588,18 @@ def landing_dir_of(tail: str) -> str:
     return tail.rsplit("/", 1)[0] if "." in name else tail
 
 
-def declared_weights_missing(schema_model: dict, tail: str, entry: dict) -> list:
-    """挑中的包**覆盖不了**哪些声明权重（返回文件名列表，空 = 覆盖了）。
+def declared_weights_in_landing(schema_model: dict, tail: str) -> list:
+    """schema 声明、且**落点在本模型目录内**的权重文件，按声明键排序。
 
-    只算「落点在本模型目录内」的声明：`session_options` 里指向别的 family 的辅助权重
-    （如 `qwen3_asr.forced_aligner_model_path`）在界面上按独立模型看待，不参与
-    "这条能不能用"的判定；目录型声明（如 `${models_root}/silero_vad`）不是单文件，
+    返回 `[(key, local_path, 文件名)]`。只算落点在本模型目录内的那些：
+    `session_options` 里指向别的 family 的辅助权重（如
+    `qwen3_asr.forced_aligner_model_path`）在界面上按独立模型看待，不参与
+    "这条下载能不能用"的判定；目录型声明（如 `${models_root}/silero_vad`）不是单文件，
     没法按文件名核对，跳过（它们已由 `aux_bytes` / `aux_unresolved` 如实呈现）。
     """
     options = schema_model.get("session_options") or {}
-    provided = {p.rsplit("/", 1)[-1] for p in entry.get("local_paths") or []}
     home = landing_dir_of(tail)
-    missing = []
+    declared = []
     for key in sorted(options):
         local = aux_local_path(options[key], tail)
         if not local:
@@ -587,9 +607,85 @@ def declared_weights_missing(schema_model: dict, tail: str, entry: dict) -> list
         head, _, name = local.rpartition("/")
         if "." not in name or head != home:
             continue
-        if name not in provided:
-            missing.append(name)
-    return missing
+        declared.append((key, local, name))
+    return declared
+
+
+def declared_weights_missing(schema_model: dict, tail: str, entry: dict) -> list:
+    """挑中的包**覆盖不了**哪些声明权重（返回文件名列表，空 = 覆盖了）。
+
+    组条目（`compose_entry`）之后仍然留作**兜底断言**：整条 entry 该覆盖的都覆盖了。
+    判据见 `declared_weights_in_landing`。
+    """
+    provided = {p.rsplit("/", 1)[-1] for p in entry.get("local_paths") or []}
+    return [
+        name
+        for _key, _local, name in declared_weights_in_landing(schema_model, tail)
+        if name not in provided
+    ]
+
+
+def compose_entry(schema_model: dict, tail: str, candidates: list) -> tuple:
+    """挑主包；schema 里声明、本目录内还缺的权重，从别的包补齐。返回 (entry | None, 说明)。
+
+    为什么需要（2026-09-24 实测）：`yue2` 的 `path` 指目录，上游 5 个包每个只含
+    「4 个 sidecars + 1 个权重」（main q8_0/bf16/q4_0 或 vae f16/f32），而 schema 声明要加载
+    q4_0 主权重 **与** vae f16 —— 没有任何单包能凑齐；而应用**只下载 `entry`**
+    （`src/model_sources.rs` 连 `aux_files` 都不读），所以"单包口径"下只能如实标 no-source。
+    这里改成：主包按**最早声明键**命中的那个包选（惯例是主权重），其余声明文件跨包补齐。
+
+    fail closed：声明文件找不到**唯一**来源时返回 `(None, 原因)`，绝不猜 URL
+    （与"落点匹配不上就 no-source"同一条纪律）。
+    """
+    exact, matched_by = matching_candidates(candidates, tail)
+    if not exact:
+        ids = ", ".join(p["id"] for p in candidates)
+        return None, f"没有落点等于 {tail} 的包（该 family 的可下载包：{ids}）"
+
+    declared = declared_weights_in_landing(schema_model, tail)
+    if not declared:
+        # 没有"本目录内的权重声明"：维持原来的单包口径（目录多档 → precision 优先）
+        return choose_package(candidates, tail, [])
+
+    first_key, first_local, first_name = declared[0]
+    primary = [p for p in exact if first_local in (p.get("local_paths") or [])]
+    if len(primary) != 1:
+        return None, (
+            f"声明 {first_key}={first_name} 没有唯一的上游包提供它"
+            f"（命中 {len(primary)} 个）—— 组不出条目，不猜"
+        )
+    entry = dict(primary[0])
+    files = list(entry.get("files") or [])
+    locals_ = list(entry.get("local_paths") or [])
+    seen_urls = {f.get("url") for f in files}
+    composed_from = [entry["id"]]
+    for key, local, name in declared:
+        if local in locals_:
+            continue
+        hit = [p for p in exact if local in (p.get("local_paths") or [])]
+        if len(hit) != 1:
+            return None, (
+                f"声明 {key}={name} 要跨包补齐，但没有唯一来源（命中 {len(hit)} 个）—— 不猜"
+            )
+        extra = hit[0]
+        for f in extra.get("files") or []:
+            if f.get("url") in seen_urls:
+                continue  # 跨包重复（sidecars 在每个包里都有）按 URL 去重
+            seen_urls.add(f.get("url"))
+            files.append(f)
+        locals_ += [p for p in extra.get("local_paths") or [] if p not in locals_]
+        composed_from.append(extra["id"])
+
+    entry["files"] = files
+    entry["local_paths"] = locals_
+    entry["bytes"] = package_bytes(files)
+    if len(composed_from) > 1:
+        entry["composed_from"] = composed_from
+    why = (
+        f"{matched_by}，按 schema 声明选中 {entry['id']}"
+        + (f"，并跨包补齐 {'、'.join(composed_from[1:])}" if len(composed_from) > 1 else "")
+    )
+    return entry, why
 
 
 def build_model(
@@ -649,15 +745,27 @@ def build_model(
             "aux_files": aux_files,
         }
 
-    entry, why = choose_package(candidates, tail, preference)
+    declared = declared_weights_in_landing(schema_model, tail)
+    if declared and APP_SUPPORTS_MULTI_FILE_ENTRY:
+        # 组条目：主包 + schema 声明、本目录内还缺的权重从别的包补齐（见 compose_entry）。
+        entry, why = compose_entry(schema_model, tail, candidates)
+    else:
+        entry, why = choose_package(candidates, tail, preference)
+        if entry is not None and declared:
+            missing = declared_weights_missing(schema_model, tail, entry)
+            if missing:
+                why = (
+                    f"选中 {entry['id']}，但它覆盖不了 schema 声明的权重"
+                    f"（缺 {'、'.join(missing)}）；跨包组条目需要 app 侧支持**多文件入口**"
+                    "（`usable_builtin_package` 今天只认单文件包）—— 按「不猜地址」标 no-source"
+                )
+                entry = None
     if entry is not None:
         missing = declared_weights_missing(schema_model, tail, entry)
-        if missing:
-            # 覆盖不了就**不猜**：与其让用户下完一堆用不上的权重，不如如实标"没有源"。
+        if missing:  # 兜底断言：组完还得覆盖全（正常不该发生）
             why = (
-                f"落点选中 {entry['id']}，但它覆盖不了 schema 声明的权重"
-                f"（缺 {'、'.join(missing)}）—— 没有任何单个上游包能凑齐产品要加载的文件，"
-                "按「不猜地址」处置：标 no-source"
+                f"选中 {entry['id']}，但条目仍覆盖不了 schema 声明的权重"
+                f"（缺 {'、'.join(missing)}）—— 按「不猜地址」处置：标 no-source"
             )
             entry = None
     status = "downloadable" if entry else "no-source"
@@ -760,14 +868,22 @@ def main() -> int:
             return None
 
         build(schema, specs, collect)
-        fetched, failed = {}, {}
+        # 取不到时**沿用盘上已有的值**：不回退的话，一次网络抖动就会把已经取到的体积
+        # 洗成 null（2026-09-25 实测：一次 `--fetch-sizes --fetch-hashes` 掉了 38 条 bytes
+        # 与 13 条 sha256）——「不编造」是对的，「把已有真值擦掉」不是。
+        existing_sizes = read_existing_sizes(out)
+        fetched, failed, kept_from_disk = {}, {}, {}
 
         def size_of(url):
             if not url:
                 return None
             size, how = head_content_length(url)
             if size is None:
-                failed[url] = how
+                size = existing_sizes.get(url)
+                if size is None:
+                    failed[url] = how
+                else:
+                    kept_from_disk[url] = how
             else:
                 fetched[url] = size
             return size
@@ -789,7 +905,9 @@ def main() -> int:
     if a.fetch_hashes:
         # 按 (repo, revision) 缓存 tree API 的取回结果：同一次生成里同一仓库只请求一次。
         fetcher = HfTreeFetcher()
-        fetched_hashes, failed_hashes = {}, {}
+        # 同上：取不到就沿用盘上已有的 sha256，别把真值洗成 null。
+        existing_hashes = read_existing_hashes(out)
+        fetched_hashes, failed_hashes, hashes_from_disk = {}, {}, {}
 
         def hash_of(download, remote, url):
             if not url:
@@ -804,7 +922,11 @@ def main() -> int:
                 str(download.get("repo") or ""), package_revision(download), remote
             )
             if sha is None:
-                failed_hashes[url] = why
+                sha = existing_hashes.get(url)
+                if sha is None:
+                    failed_hashes[url] = why
+                else:
+                    hashes_from_disk[url] = why
             else:
                 fetched_hashes[url] = sha
             return sha
@@ -847,8 +969,11 @@ def main() -> int:
         )
         print(
             f"体积：{len(wanted)} 条需要体积，其中 {len(fetched)} 条取到、{len(failed)} 条取不到；"
+            f"{len(kept_from_disk)} 条沿用盘上已有值；"
             f"产物里共 {nulls} 条为 null（含不可下载的包，那些根本没去探）"
         )
+        for url in sorted(kept_from_disk):
+            print(f"  沿用盘上值 ← {kept_from_disk[url]}  {url}", file=sys.stderr)
         for url in sorted(failed):
             print(f"  null ← {failed[url]}  {url}", file=sys.stderr)
     else:
@@ -863,8 +988,11 @@ def main() -> int:
         )
         print(
             f"哈希：{len(fetched_hashes)} 条取到、{len(failed_hashes)} 条取不到；"
+            f"{len(hashes_from_disk)} 条沿用盘上已有值；"
             f"产物里共 {nulls} 条为 null（含不可下载的包，那些根本没去探）"
         )
+        for url in sorted(hashes_from_disk):
+            print(f"  沿用盘上值 ← {hashes_from_disk[url]}  {url}", file=sys.stderr)
         for url in sorted(failed_hashes):
             print(f"  null ← {failed_hashes[url]}  {url}", file=sys.stderr)
     else:

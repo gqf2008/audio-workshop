@@ -75,9 +75,21 @@ python3 tools/gen_model_downloads.py --check         # 与上游比对，不一�
   **应用只下载 `entry`**（`src/model_sources.rs` 不读 `aux_files`，`aux_bytes` 只进占用估算），
   所以"包凑不齐产品要加载的文件"= 用户下完也用不了。真实例子：`yue2` 的 `path` 指目录、
   上游 5 个包每个只含 sidecars + 1 个权重（main q8_0/bf16/q4_0 或 vae f16/f32），而 schema 要
-  q4_0 主权重 + vae f16 —— **没有任何单包能凑齐**，于是如实标 `no-source`（跨包组条目的能力
-  另开批次）。落在**别的 family** 目录里的声明（如 `qwen3_asr.forced_aligner_model_path`）不算，
+  q4_0 主权重 + vae f16 —— **没有任何单包能凑齐**，于是如实标 `no-source`。
+  落在**别的 family** 目录里的声明（如 `qwen3_asr.forced_aligner_model_path`）不算，
   那些在界面上按独立模型看待，由 `aux_bytes` / `aux_unresolved` 如实呈现。
+- **跨包组条目（2026-09-25 加，默认关闭）**：单包凑不齐时的正解是把缺的声明文件**从别的包
+  合并进来**：主包按**最早声明键**命中的那个包选（惯例是主权重），其余声明文件按 URL 去重
+  合并，来源写进 `entry.composed_from`，note 会写"跨包补齐 <包 id>"。
+  **但它默认不开**：组出来的是多文件条目，而下载入口今天只认单文件包 ——
+  `src/model_sources.rs::usable_builtin_package` 要求 `files.len() == 1 && local_paths.len() == 1`，
+  下载执行层 `src/download.rs::TaskSpec` 也只接受单个 `url → dest`（全仓没有遍历 `entry.files` 的地方）。
+  真开出来会变成"清单说 downloadable、界面判点不动"的两头不一致，所以生成器用
+  `APP_SUPPORTS_MULTI_FILE_ENTRY`（默认 `False`）把这条能力关着：关着时 `yue2` 照旧
+  `no-source`，note 点名阻塞点。**放开顺序**（下一批）：
+  ① `usable_builtin_package` 放宽单文件约束；② `Action` 由单 `url/dest` 改成文件列表；
+  ③ `src/download.rs` 队列按文件入队（逐文件 sha / 进度 / 断点，`TaskSpec` 已有全部零件）；
+  ④ 界面按模型聚合显示多文件的进度与结果；⑤ 把 `APP_SUPPORTS_MULTI_FILE_ENTRY` 改 `True` 并重生成。
 
 ### 1.3 体积与哈希（`bytes` / `sha256`）是怎么取的
 
@@ -350,7 +362,7 @@ P7 给每个模型加了三个可选字段：
   sha256 字段级回落三条各有用例：①服务侧有 sha 用之（内置值不覆盖）；②服务侧为空用内置
   per-file 的兜底；③两边都没有 → `None`（只按大小校验，行为不变）；打进二进制的那份真实
   清单在用例里钉住"10 条入口全部带 64 位十六进制 per-file sha256"，并钉住 sheetsage2 由
-  "没有源"转为有入口、yue2 仍因"条目覆盖不了 schema 声明的权重"标 no-source（覆盖校验的正/负对照）。
+  "没有源"转为有入口、yue2 仍因"跨包组条目需要多文件入口支持"标 no-source（覆盖校验与跨包组能力的正/负对照）。
   另有落点校验（清单 path 在模型目录外 → 报冲突；path 指目录 → 不报）。
   默认模型目录推导（`model_root_from_paths`）另有 5 条用例：多条 / 单条 / 空 / 相对路径 / 跨根，
   外加"显式设置优先"一条；跨卷那条注入假 volume（一台机器上造不出第二个文件系统）。
