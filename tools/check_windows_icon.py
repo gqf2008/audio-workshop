@@ -23,10 +23,15 @@ tools/tests/test_check_windows_icon.py）。
 """
 
 import argparse
+import os
 import struct
 import sys
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+# 取本文件所在目录：**不要**用 `__file__.rsplit("/", 1)[0]` —— Windows 上被 importlib
+# 载入时 `__file__` 是带反斜杠的绝对路径，按 "/" 切不动，等于把整个文件路径塞进
+# sys.path，`import _console` 会 ModuleNotFoundError（2026-09-24 CI 门禁 Windows job
+# 在姊妹脚本 tools/check_engine_deps.py 上实测踩过）。tools/ 下其它脚本用的就是下面这种写法。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _console  # noqa: F401  副作用 import：stdout→UTF-8（Windows 上必须）
 
 # 资源类型：windows.h 里的 RT_ICON / RT_GROUP_ICON
