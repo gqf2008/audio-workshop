@@ -9,10 +9,17 @@ DOS+PE 头、节表、导入表描述符；ELF 头、节表、.dynamic/.dynstr/.
 from __future__ import annotations
 
 import importlib.util
+import os
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+# 与 tools/tests 下其它用例同一套做法：先把自己的上层目录（tools/）放进 sys.path。
+# 少了这行，被载入的脚本内部那句 `import _console` 在 Windows 上会找不到模块
+# （CI 门禁 Windows job 实测红过）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TOOL = Path(__file__).resolve().parents[1] / "check_engine_deps.py"
 spec = importlib.util.spec_from_file_location("check_engine_deps", TOOL)
